@@ -201,7 +201,7 @@ mod tests {
 
     #[test]
     fn load_order_is_recency_but_touch_preserves_it() {
-        let mut entries = vec![wt("old"), wt("new")];
+        let mut entries = [wt("old"), wt("new")];
         entries[0].last_opened_ms = 100;
         entries[1].last_opened_ms = 200;
         entries.sort_by_key(|e| std::cmp::Reverse(e.last_opened_ms));

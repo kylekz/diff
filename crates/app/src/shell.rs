@@ -65,9 +65,11 @@ pub struct AppShell {
     /// would wedge the foreground executor (and thus the whole automation
     /// channel) until a human dismissed it.
     automation: bool,
-    /// Per-recent-entry review badge (latest review's open-comment count /
-    /// submitted flag), refreshed off-thread.
-    badges: HashMap<usize, ReviewBadge>,
+    /// Per-repo review badge (latest review's open-comment count /
+    /// submitted flag), refreshed off-thread. Keyed by location, not list
+    /// index — the recent list shifts when new entries insert at the top
+    /// (review finding: index keys wore the wrong rows' badges).
+    badges: HashMap<RepoLocation, ReviewBadge>,
     /// Keeps the active workspace's ReviewChanged subscription alive.
     _ws_subscription: Option<Subscription>,
 }
@@ -150,14 +152,15 @@ impl AppShell {
         };
         let location = entry.location.clone();
         cx.spawn(async move |this, cx| {
+            let key = location.clone();
             let badge = cx
                 .background_executor()
                 .spawn(async move { compute_badge(location) })
                 .await;
             this.update(cx, |this, cx| {
                 match badge {
-                    Some(badge) => this.badges.insert(index, badge),
-                    None => this.badges.remove(&index),
+                    Some(badge) => this.badges.insert(key, badge),
+                    None => this.badges.remove(&key),
                 };
                 cx.notify();
             })
@@ -181,13 +184,16 @@ impl AppShell {
                 .spawn(async move {
                     locations
                         .into_iter()
-                        .enumerate()
-                        .filter_map(|(i, loc)| compute_badge(loc).map(|b| (i, b)))
+                        .filter_map(|loc| compute_badge(loc.clone()).map(|b| (loc, b)))
                         .collect::<Vec<_>>()
                 })
                 .await;
             this.update(cx, |this, cx| {
-                this.badges = badges.into_iter().collect();
+                // Merge rather than replace: entries opened while the walk
+                // ran already have fresher badges.
+                for (loc, badge) in badges {
+                    this.badges.entry(loc).or_insert(badge);
+                }
                 cx.notify();
             })
             .ok();
@@ -315,7 +321,7 @@ impl AppShell {
                     .truncate()
                     .child(entry.title.clone()),
             )
-            .children(self.badges.get(&index).map(|badge| {
+            .children(self.badges.get(&entry.location).map(|badge| {
                 if badge.open > 0 {
                     div()
                         .flex_none()

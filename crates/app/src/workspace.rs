@@ -472,6 +472,7 @@ impl Workspace {
                     };
                     if fingerprint(&this.review) != fingerprint(&review) {
                         this.review = review;
+                        cx.emit(ReviewChanged);
                         this.reset_diff_list(cx);
                         cx.notify();
                     }
@@ -519,6 +520,7 @@ impl Workspace {
                         this.files = files;
                         this.source = source;
                         this.review = review;
+                        cx.emit(ReviewChanged);
                         this.location = store_location.clone();
                         this.status = Status::Ready;
                         // Start watching now that the true store path is
@@ -556,11 +558,15 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) {
         if self.selected != Some(index) {
-            if self.editor.as_ref().is_some_and(|e| e.saving) {
+            if self.editor.as_ref().is_some_and(|e| e.saving)
+                || self.thread_input.as_ref().is_some_and(|t| t.saving)
+            {
                 return;
             }
             self.selection = None;
-            if self.editor.take().is_some() {
+            let dropped_editor = self.editor.take().is_some();
+            let dropped_input = self.thread_input.take().is_some();
+            if dropped_editor || dropped_input {
                 window.focus(&self.focus_handle, cx);
             }
         }
@@ -577,13 +583,16 @@ impl Workspace {
         self.current_hunk = 0;
         self.file_scroll
             .scroll_to_item(index, ScrollStrategy::Nearest);
-        self.reset_diff_list(cx);
+        let jumped = self.reset_diff_list(cx);
         // reset_diff_list preserves the viewport for in-place updates; a
-        // file switch starts reading from the top.
-        self.diff_list.scroll_to(ListOffset {
-            item_ix: 0,
-            offset_in_item: px(0.),
-        });
+        // file switch starts reading from the top — unless a summary jump
+        // just placed the viewport (last scroll_to wins).
+        if !jumped {
+            self.diff_list.scroll_to(ListOffset {
+                item_ix: 0,
+                offset_in_item: px(0.),
+            });
+        }
         cx.notify();
 
         // A cached failure retries on reselect; a good diff is final.
@@ -635,8 +644,10 @@ impl Workspace {
                 // above); re-sync the list and re-anchor the viewport on
                 // the current hunk so the content doesn't visually jump.
                 if this.selected == Some(index) {
-                    this.reset_diff_list(cx);
-                    this.scroll_to_current_hunk();
+                    let jumped = this.reset_diff_list(cx);
+                    if !jumped {
+                        this.scroll_to_current_hunk();
+                    }
                 }
                 cx.notify();
             })
@@ -709,6 +720,7 @@ impl Workspace {
                 },
             })),
             "display_rows": self.display.len(),
+            "scroll_item": self.diff_list.logical_scroll_top().item_ix,
             "palette": self.palette.as_ref().map(|p| json!({
                 "matches": p.matches.len(),
                 "selected": p.selected,
@@ -836,7 +848,7 @@ impl Workspace {
     /// Anything that changes rows, comments, selection, or the editor calls
     /// this. Threads whose anchor line isn't visible (outside hunks, stale)
     /// append at the end so they're never silently hidden.
-    fn reset_diff_list(&mut self, cx: &mut Context<Self>) {
+    fn reset_diff_list(&mut self, cx: &mut Context<Self>) -> bool {
         let row_count = self.diff_row_count();
         let file_path = self.selected.map(|i| self.files[i].path.clone());
 
@@ -893,10 +905,15 @@ impl Workspace {
         self.diff_list.reset(self.display.len());
         self.diff_list.scroll_to(top);
 
-        cx.emit(ReviewChanged);
-
-        // A summary-panel jump lands once its thread row exists.
-        if let Some(id) = self.pending_jump.clone()
+        // A summary-panel jump lands once its thread row exists — and only
+        // against real rows: with the diff still computing, every thread
+        // sits in the unanchored placeholder section and consuming the jump
+        // there would burn it before the true anchor rows exist (review
+        // finding: jumps never landed).
+        let mut jumped = false;
+        let diff_loaded = self.selected.and_then(|i| self.diffs.get(&i)).is_some();
+        if diff_loaded
+            && let Some(id) = self.pending_jump.clone()
             && let Some(review) = &self.review
             && let Some(ci) = review.comments.iter().position(|c| c.id == id)
             && let Some(ix) = self
@@ -909,9 +926,22 @@ impl Workspace {
                 item_ix: ix.saturating_sub(2), // a little context above
                 offset_in_item: px(0.),
             });
+            jumped = true;
+        }
+
+        // An externally-deleted comment must not leave a ghost reply/edit
+        // input alive (hidden card + EditorOpen key context = dead keys).
+        if let Some(ti) = &self.thread_input
+            && self
+                .review
+                .as_ref()
+                .is_none_or(|r| !r.comments.iter().any(|c| c.id == ti.comment_id))
+        {
+            self.thread_input = None;
         }
 
         self.refresh_stale(cx);
+        jumped
     }
 
     /// Re-check which of the selected file's comments have drifted anchors
@@ -946,19 +976,23 @@ impl Workspace {
             let (checked, stale_ids) = cx
                 .background_executor()
                 .spawn(async move {
-                    // One git call per side present, not per comment.
-                    let mut current: HashMap<bool, Option<String>> = HashMap::new();
+                    // One git call per side present, not per comment. The
+                    // outer Option is the git call itself: a transient
+                    // failure (index.lock, WSL hiccup) must leave existing
+                    // verdicts untouched, not flag everything stale.
+                    let mut current: HashMap<bool, Option<Option<String>>> = HashMap::new();
                     let mut checked = Vec::new();
                     let mut stale = Vec::new();
                     for (id, side, sha) in anchored {
                         let Some(sha) = sha else { continue }; // unverifiable
                         let is_new = matches!(side, dv_core::Side::New);
                         let entry = current.entry(is_new).or_insert_with(|| {
-                            repo.blob_sha(&anchor_spec(&source, side, &path))
-                                .ok()
-                                .flatten()
+                            repo.blob_sha(&anchor_spec(&source, side, &path)).ok()
                         });
-                        if entry.as_deref() != Some(sha.as_str()) {
+                        let Some(current_sha) = entry else {
+                            continue; // git failed — skip, keep prior verdict
+                        };
+                        if current_sha.as_deref() != Some(sha.as_str()) {
                             stale.push(id.clone());
                         }
                         checked.push(id);
@@ -1170,7 +1204,10 @@ impl Workspace {
                 match result {
                     // Keep showing the just-submitted review; the next
                     // comment auto-creates a fresh draft.
-                    Ok(review) => this.review = Some(review),
+                    Ok(review) => {
+                        this.review = Some(review);
+                        cx.emit(ReviewChanged);
+                    }
                     Err(err) => eprintln!("finish review failed: {err:#}"),
                 }
                 this.reset_diff_list(cx);
@@ -1288,6 +1325,7 @@ impl Workspace {
                 match result {
                     Ok(review) => {
                         this.review = Some(review);
+                        cx.emit(ReviewChanged);
                         this.close_editor(window, cx);
                     }
                     Err(err) => {
@@ -1333,7 +1371,10 @@ impl Workspace {
                 .await;
             this.update(cx, |this, cx| {
                 match result {
-                    Ok(review) => this.review = Some(review),
+                    Ok(review) => {
+                        this.review = Some(review);
+                        cx.emit(ReviewChanged);
+                    }
                     Err(err) => eprintln!("comment status update failed: {err:#}"),
                 }
                 this.reset_diff_list(cx);
@@ -1365,7 +1406,10 @@ impl Workspace {
                 .await;
             this.update(cx, |this, cx| {
                 match result {
-                    Ok(review) => this.review = Some(review),
+                    Ok(review) => {
+                        this.review = Some(review);
+                        cx.emit(ReviewChanged);
+                    }
                     Err(err) => eprintln!("comment delete failed: {err:#}"),
                 }
                 this.reset_diff_list(cx);
@@ -1386,6 +1430,12 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) {
         use gpui_component::input::{InputEvent, InputState};
+        // An in-flight save keeps its input alive: replacing it here would
+        // drop the pending body (and the completion would close the NEW
+        // input). Finish or fail first.
+        if self.thread_input.as_ref().is_some_and(|ti| ti.saving) {
+            return;
+        }
         let prefill = match mode {
             ThreadInputMode::Reply => String::new(),
             ThreadInputMode::EditBody => self
@@ -1456,6 +1506,7 @@ impl Workspace {
         cx.notify();
 
         let comment_id = ti.comment_id.clone();
+        let done_id = ti.comment_id.clone();
         let mode = ti.mode;
         let location = self.location.clone();
         cx.spawn_in(window, async move |this, cx| {
@@ -1487,14 +1538,23 @@ impl Workspace {
                 .await;
 
             this.update_in(cx, |this, window, cx| {
+                // Only touch the input this save belongs to — the user may
+                // have opened a different one meanwhile.
+                let same_input = this
+                    .thread_input
+                    .as_ref()
+                    .is_some_and(|ti| ti.comment_id == done_id && ti.mode == mode);
                 match result {
                     Ok(review) => {
                         this.review = Some(review);
-                        this.close_thread_input(window, cx);
+                        cx.emit(ReviewChanged);
+                        if same_input {
+                            this.close_thread_input(window, cx);
+                        }
                     }
                     Err(err) => {
                         eprintln!("thread input save failed: {err:#}");
-                        if let Some(ti) = &mut this.thread_input {
+                        if same_input && let Some(ti) = &mut this.thread_input {
                             ti.saving = false;
                         }
                     }

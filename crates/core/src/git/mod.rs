@@ -336,6 +336,64 @@ impl GitRepo {
         }
     }
 
+    /// The blob object id of one side of a file, for anchoring review
+    /// comments to `(path, blob_sha, side, line range)` — see
+    /// `docs/phase-2-review-layer.md`. `Ok(None)` when the path doesn't
+    /// exist on that side; a genuine git failure (bad rev, ...) stays
+    /// `Err`.
+    pub fn blob_sha(&self, spec: &BlobSpec) -> Result<Option<String>> {
+        match spec {
+            BlobSpec::Rev { rev, path } => self.blob_sha_rev(rev, path),
+            BlobSpec::Index { path } => self.blob_sha_index(path),
+            BlobSpec::Working { path } => self.blob_sha_working(path),
+        }
+    }
+
+    /// `git ls-tree <rev> -- <path>` and parse the sha field, rather than
+    /// `git rev-parse <rev>:<path>` and try to tell "path missing" apart
+    /// from a real failure by grepping stderr — `ls-tree` prints nothing
+    /// (exit 0) for a missing path, so absence and failure are already
+    /// distinguished by the command layer's own success/error split.
+    fn blob_sha_rev(&self, rev: &str, path: &str) -> Result<Option<String>> {
+        let root = self.root_arg();
+        let output = self
+            .builder
+            .run_text("git", &["-C", &root, "ls-tree", rev, "--", path])
+            .with_context(|| format!("git ls-tree {rev} -- {path}"))?;
+        Ok(parse_ls_tree_sha(&output))
+    }
+
+    /// `git ls-files -s -- <path>` and parse the stage-0 sha. Empty output
+    /// (untracked or nonexistent path) → `None`. A path stuck at stages
+    /// 1-3 (unresolved merge conflict) has no stage-0 entry either, and
+    /// also reports `None` — there is no single "the" blob to anchor to.
+    fn blob_sha_index(&self, path: &str) -> Result<Option<String>> {
+        let root = self.root_arg();
+        let output = self
+            .builder
+            .run_text("git", &["-C", &root, "ls-files", "-s", "--", path])
+            .with_context(|| format!("git ls-files -s -- {path}"))?;
+        Ok(parse_ls_files_stage0_sha(&output))
+    }
+
+    /// `git hash-object -- <path>` against the working file (`-C` scopes it
+    /// to the repo root the same way every other git call here does, so
+    /// `path` stays repo-relative for both Local and Wsl). A missing file
+    /// fails the command; that failure is `Ok(None)` when it names a
+    /// missing path, `Err` for anything else (permissions, not a repo,
+    /// ...).
+    fn blob_sha_working(&self, path: &str) -> Result<Option<String>> {
+        let root = self.root_arg();
+        match self
+            .builder
+            .run_text("git", &["-C", &root, "hash-object", "--", path])
+        {
+            Ok(sha) => Ok(Some(sha)),
+            Err(err) if err.to_string().contains("No such file or directory") => Ok(None),
+            Err(err) => Err(err),
+        }
+    }
+
     fn working_blob(&self, path: &str) -> Result<Option<Vec<u8>>> {
         match &self.location {
             RepoLocation::Local(root) => match std::fs::read(root.join(path)) {
@@ -419,6 +477,34 @@ fn parse_name_status_z(bytes: &[u8]) -> Result<Vec<ChangedFile>> {
     Ok(files)
 }
 
+/// Parse the sha field out of one `git ls-tree <rev> -- <path>` line
+/// (`<mode> <type> <sha>\t<path>`). Empty input (path absent at `rev`) →
+/// `None`.
+fn parse_ls_tree_sha(output: &str) -> Option<String> {
+    let line = output.lines().next()?;
+    let (info, _path) = line.split_once('\t')?;
+    let sha = info.split_whitespace().nth(2)?;
+    Some(sha.to_string())
+}
+
+/// Parse the stage-0 sha out of `git ls-files -s -- <path>` output
+/// (`<mode> <sha> <stage>\t<path>`, one line per stage present). `None` if
+/// there is no stage-0 line (path not in the index, or stuck at stages
+/// 1-3 from an unresolved merge conflict).
+fn parse_ls_files_stage0_sha(output: &str) -> Option<String> {
+    for line in output.lines() {
+        let (info, _path) = line.split_once('\t')?;
+        let mut parts = info.split_whitespace();
+        let _mode = parts.next()?;
+        let sha = parts.next()?;
+        let stage = parts.next()?;
+        if stage == "0" {
+            return Some(sha.to_string());
+        }
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -478,5 +564,54 @@ mod tests {
     fn malformed_rename_missing_new_path_errors() {
         let raw = b"R100\0old.txt\0";
         assert!(parse_name_status_z(raw).is_err());
+    }
+
+    #[test]
+    fn parses_ls_tree_sha_line() {
+        let line = "100644 blob e69de29bb2d1d6434b8b29ae775ad8c2e48c5391\tfoo.txt";
+        assert_eq!(
+            parse_ls_tree_sha(line),
+            Some("e69de29bb2d1d6434b8b29ae775ad8c2e48c5391".to_string())
+        );
+    }
+
+    #[test]
+    fn empty_ls_tree_output_is_none() {
+        assert_eq!(parse_ls_tree_sha(""), None);
+    }
+
+    #[test]
+    fn parses_ls_files_stage0_sha_line() {
+        let output = "100644 e69de29bb2d1d6434b8b29ae775ad8c2e48c5391 0\tfoo.txt";
+        assert_eq!(
+            parse_ls_files_stage0_sha(output),
+            Some("e69de29bb2d1d6434b8b29ae775ad8c2e48c5391".to_string())
+        );
+    }
+
+    #[test]
+    fn ls_files_stage0_skips_conflict_stages() {
+        // An unresolved merge conflict has stages 1/2/3 but no stage 0.
+        let output = "\
+100644 aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa 1\tfoo.txt
+100644 bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb 2\tfoo.txt
+100644 cccccccccccccccccccccccccccccccccccccccc 3\tfoo.txt";
+        assert_eq!(parse_ls_files_stage0_sha(output), None);
+    }
+
+    #[test]
+    fn ls_files_stage0_finds_it_among_other_stages() {
+        let output = "\
+100644 aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa 1\tfoo.txt
+100644 bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb 0\tfoo.txt";
+        assert_eq!(
+            parse_ls_files_stage0_sha(output),
+            Some("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".to_string())
+        );
+    }
+
+    #[test]
+    fn empty_ls_files_output_is_none() {
+        assert_eq!(parse_ls_files_stage0_sha(""), None);
     }
 }

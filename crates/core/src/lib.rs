@@ -10,10 +10,12 @@ pub mod command;
 pub mod diff;
 pub mod git;
 pub mod location;
+pub mod review;
 
 pub use command::CommandBuilder;
 pub use diff::{DiffLine, DiffOptions, FileDiff, Hunk, LineKind};
 pub use git::{BlobSpec, ChangeStatus, ChangedFile, DiffSource, GitRepo};
 pub use location::RepoLocation;
+pub use review::{Comment, CommentStatus, Reply, Review, ReviewState, ReviewStore, Side, Verdict};
 
 pub const APP_NAME: &str = "dv";

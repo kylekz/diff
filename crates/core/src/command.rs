@@ -3,9 +3,10 @@
 //! as `wsl.exe -d <distro> --exec <program> <args…>`. Nothing in dv spawns a
 //! repo-scoped process any other way.
 
+use std::io::Write;
 #[cfg(windows)]
 use std::os::windows::process::CommandExt;
-use std::process::Command;
+use std::process::{Command, Stdio};
 
 use anyhow::{Context, Result, bail};
 
@@ -95,6 +96,61 @@ impl CommandBuilder {
     pub fn run_text(&self, program: &str, args: &[&str]) -> Result<String> {
         let bytes = self.run(program, args)?;
         Ok(decode_output(&bytes).trim_end().to_string())
+    }
+
+    /// Like [`Self::run`], but writes `stdin_bytes` to the child's stdin
+    /// before collecting output. Used by the review store's WSL write path
+    /// (`sh -c 'mkdir -p … && cat > tmp && mv tmp final'`), which has no
+    /// other way to get bytes into the pipeline.
+    ///
+    /// The stdin handle is closed (dropped) before `wait_with_output`, not
+    /// after: a child that consumes all of stdin before it starts writing
+    /// stdout would otherwise deadlock (child blocked on a full stdout pipe
+    /// no one is draining yet, us blocked on a `wait` that needs the child
+    /// to exit) — same hazard `std::process::Command` docs warn about.
+    pub fn run_with_stdin(
+        &self,
+        program: &str,
+        args: &[&str],
+        stdin_bytes: &[u8],
+    ) -> Result<Vec<u8>> {
+        let mut cmd = self.command(program, args);
+        cmd.stdin(Stdio::piped());
+        cmd.stdout(Stdio::piped());
+        cmd.stderr(Stdio::piped());
+
+        let mut child = cmd
+            .spawn()
+            .with_context(|| format!("failed to run {program}: spawn failed"))?;
+
+        {
+            let mut stdin = child
+                .stdin
+                .take()
+                .with_context(|| format!("{program}: missing stdin handle"))?;
+            stdin
+                .write_all(stdin_bytes)
+                .with_context(|| format!("failed writing to {program} stdin"))?;
+        } // drop closes the pipe, signalling EOF to the child
+
+        let output = child
+            .wait_with_output()
+            .with_context(|| format!("failed waiting for {program}"))?;
+
+        if !output.status.success() {
+            let joined_args = args.join(" ");
+            let code = match output.status.code() {
+                Some(code) => code.to_string(),
+                None => "terminated by signal".to_string(),
+            };
+            let mut stderr = decode_output(&output.stderr);
+            if stderr.len() > 2000 {
+                stderr.truncate(2000);
+            }
+            bail!("{program} {joined_args} failed (exit {code}): {stderr}");
+        }
+
+        Ok(output.stdout)
     }
 }
 

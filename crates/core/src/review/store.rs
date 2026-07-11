@@ -1,0 +1,85 @@
+//! [`ReviewStore`]: the per-repo collection of [`Review`]s persisted under
+//! `.git/dv/reviews/*.json`. This is the only piece of the review layer
+//! meant to be used from outside [`crate::review`] — [`super::io`] is
+//! deliberately private.
+
+use anyhow::{Context, Result};
+
+use super::io::StoreIo;
+use super::{Review, check_schema_version};
+use crate::git::DiffSource;
+use crate::location::RepoLocation;
+
+const REVIEWS_DIR: &str = "dv/reviews";
+
+pub struct ReviewStore {
+    io: StoreIo,
+}
+
+impl ReviewStore {
+    /// Cheap: no I/O happens until a method below is called.
+    pub fn open(location: RepoLocation) -> Self {
+        Self {
+            io: StoreIo::new(location),
+        }
+    }
+
+    /// Every review in the store, newest (`created_ms`) first.
+    pub fn list(&self) -> Result<Vec<Review>> {
+        let names = self.io.list(REVIEWS_DIR)?;
+        let mut reviews = Vec::with_capacity(names.len());
+        for name in names {
+            // Anything not a `<id>.json` file (a stray `.tmp-*` left by an
+            // interrupted write, say) is silently skipped rather than
+            // failing the whole listing.
+            let Some(id) = name.strip_suffix(".json") else {
+                continue;
+            };
+            if let Some(review) = self.load(id)? {
+                reviews.push(review);
+            }
+        }
+        reviews.sort_by_key(|r| std::cmp::Reverse(r.created_ms));
+        Ok(reviews)
+    }
+
+    /// Load one review by id. `Ok(None)` if it doesn't exist. Errors if
+    /// the stored JSON is malformed or its schema `v` is newer than this
+    /// build supports.
+    pub fn load(&self, id: &str) -> Result<Option<Review>> {
+        let rel = review_path(id);
+        let Some(bytes) = self.io.read(&rel)? else {
+            return Ok(None);
+        };
+        let review: Review = serde_json::from_slice(&bytes)
+            .with_context(|| format!("parsing review {id} ({rel})"))?;
+        check_schema_version(review.v)?;
+        Ok(Some(review))
+    }
+
+    /// Persist `review` (create or overwrite). Does not touch
+    /// `updated_ms` — callers own that (the mutation helpers on [`Review`]
+    /// already bump it).
+    pub fn save(&self, review: &Review) -> Result<()> {
+        let rel = review_path(&review.id);
+        let bytes = serde_json::to_vec_pretty(review)
+            .with_context(|| format!("serializing review {}", review.id))?;
+        self.io.write_atomic(&rel, &bytes)
+    }
+
+    /// Remove a review. Not an error if it doesn't exist.
+    pub fn delete(&self, id: &str) -> Result<()> {
+        self.io.remove(&review_path(id))
+    }
+
+    /// Create, persist, and return a new draft review over `source`.
+    pub fn create(&self, source: DiffSource) -> Result<Review> {
+        let review = Review::new_draft(source);
+        self.save(&review)?;
+        Ok(review)
+    }
+}
+
+fn review_path(id: &str) -> String {
+    format!("{REVIEWS_DIR}/{id}.json")
+}

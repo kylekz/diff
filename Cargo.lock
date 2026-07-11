@@ -1423,6 +1423,7 @@ dependencies = [
  "anyhow",
  "imara-diff",
  "serde",
+ "serde_json",
 ]
 
 [[package]]

@@ -85,12 +85,13 @@ impl AppShell {
         // against whatever cwd the app is next launched from.
         let location = absolutize(location);
         let title = title_for(&location, &source);
-        self.recent.touch(RecentEntry {
+        let index = self.recent.touch(RecentEntry {
             location: location.clone(),
             source: source.clone(),
             title,
+            last_opened_ms: 0, // touch stamps the real time
         });
-        self.selected = Some(0); // touch() moved it to the front
+        self.selected = Some(index);
 
         let workspace = cx.new(|cx| Workspace::new(location, source, window, cx));
         let handle = workspace.focus_handle(cx);

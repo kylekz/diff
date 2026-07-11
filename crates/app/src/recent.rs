@@ -16,6 +16,11 @@ pub struct RecentEntry {
     pub source: DiffSource,
     /// Display label, e.g. `difftest — working tree`.
     pub title: String,
+    /// When this review was last opened. Recency sorts the list at *load*
+    /// only — never live, so items don't jump around under the user's
+    /// clicks. Defaults to 0 for entries persisted before this field.
+    #[serde(default)]
+    pub last_opened_ms: u64,
 }
 
 impl RecentEntry {
@@ -42,12 +47,15 @@ impl RecentStore {
     /// can be determined, in which case the store works in-memory.
     pub fn load() -> Self {
         let path = default_path();
-        let entries = path
+        let mut entries = path
             .as_ref()
             .and_then(|p| std::fs::read(p).ok())
             .and_then(|bytes| serde_json::from_slice::<Persisted>(&bytes).ok())
             .map(|p| p.entries)
             .unwrap_or_default();
+        // Recency ordering is applied here, once — while the app runs the
+        // order stays put (see `touch`).
+        entries.sort_by_key(|e| std::cmp::Reverse(e.last_opened_ms));
         Self { path, entries }
     }
 
@@ -55,13 +63,41 @@ impl RecentStore {
         &self.entries
     }
 
-    /// Move `entry` to the front (deduping an existing same-review entry so a
-    /// re-open just bumps recency and refreshes the title), then persist.
-    pub fn touch(&mut self, entry: RecentEntry) {
-        self.entries.retain(|e| !e.same_review(&entry));
-        self.entries.insert(0, entry);
-        self.entries.truncate(MAX_ENTRIES);
+    /// Record that `entry`'s review was opened, and return its index in the
+    /// display list. An existing same-review entry is updated **in place**
+    /// (recency bumped, title refreshed) — deliberately not moved: a live
+    /// list that reorders under the user's click is disorienting. New
+    /// entries go on top. Recency ordering applies at next load.
+    pub fn touch(&mut self, mut entry: RecentEntry) -> usize {
+        entry.last_opened_ms = now_ms();
+        let index = match self.entries.iter().position(|e| e.same_review(&entry)) {
+            Some(index) => {
+                self.entries[index] = entry;
+                index
+            }
+            None => {
+                self.entries.insert(0, entry);
+                // Drop the *least recently opened* entry over the cap, not
+                // blindly the last one (display order isn't recency order).
+                // `skip(1)` protects the just-inserted entry: timestamps
+                // have millisecond resolution, so it can tie with existing
+                // entries and min_by_key would happily pick it.
+                if self.entries.len() > MAX_ENTRIES
+                    && let Some(oldest) = self
+                        .entries
+                        .iter()
+                        .enumerate()
+                        .skip(1)
+                        .min_by_key(|(_, e)| e.last_opened_ms)
+                        .map(|(i, _)| i)
+                {
+                    self.entries.remove(oldest);
+                }
+                0
+            }
+        };
         self.save();
+        index
     }
 
     fn save(&self) {
@@ -84,6 +120,10 @@ impl RecentStore {
 
 fn default_path() -> Option<PathBuf> {
     dirs::data_dir().map(|d| d.join("dv").join("recent.json"))
+}
+
+fn now_ms() -> u64 {
+    dv_core::review::now_ms()
 }
 
 /// Human title for a review, e.g. `difftest — working tree` or
@@ -136,37 +176,66 @@ mod tests {
             title: title_for(&location, &source),
             location,
             source,
+            last_opened_ms: 0,
         }
     }
 
     #[test]
-    fn touch_dedups_and_moves_to_front() {
+    fn touch_updates_existing_entry_in_place() {
         let mut store = RecentStore {
             path: None,
             entries: Vec::new(),
         };
-        store.touch(wt("a"));
-        store.touch(wt("b"));
-        store.touch(wt("a")); // re-open a
+        store.touch(wt("a")); // index 0
+        store.touch(wt("b")); // inserted on top → [b, a]
+        // Re-opening `a` must NOT move it — the list stays put under the
+        // user's clicks (the reported sidebar-jump bug).
+        let index = store.touch(wt("a"));
+        assert_eq!(index, 1);
         assert_eq!(store.entries().len(), 2);
-        assert_eq!(store.entries()[0].location, wt("a").location);
-        assert_eq!(store.entries()[1].location, wt("b").location);
+        assert_eq!(store.entries()[0].location, wt("b").location);
+        assert_eq!(store.entries()[1].location, wt("a").location);
+        // Recency was still recorded, for ordering at next load.
+        assert!(store.entries()[1].last_opened_ms >= store.entries()[0].last_opened_ms);
     }
 
     #[test]
-    fn touch_caps_at_max() {
+    fn load_order_is_recency_but_touch_preserves_it() {
+        let mut entries = vec![wt("old"), wt("new")];
+        entries[0].last_opened_ms = 100;
+        entries[1].last_opened_ms = 200;
+        entries.sort_by_key(|e| std::cmp::Reverse(e.last_opened_ms));
+        assert_eq!(entries[0].location, wt("new").location);
+    }
+
+    #[test]
+    fn touch_caps_at_max_evicting_least_recent() {
         let mut store = RecentStore {
             path: None,
             entries: Vec::new(),
         };
-        for i in 0..(MAX_ENTRIES + 10) {
-            store.touch(wt(&i.to_string()));
+        // Distinct explicit timestamps: wall-clock ones tie at millisecond
+        // resolution inside a test loop, making eviction order arbitrary.
+        for i in 0..MAX_ENTRIES {
+            let mut e = wt(&i.to_string());
+            e.last_opened_ms = 1_000 + i as u64; // "0" is least recent
+            store.entries.push(e);
         }
+        let index = store.touch(wt("newcomer"));
+        assert_eq!(index, 0);
         assert_eq!(store.entries().len(), MAX_ENTRIES);
-        // Most-recent (highest index) is first.
-        assert_eq!(
-            store.entries()[0].location,
-            wt(&(MAX_ENTRIES + 9).to_string()).location
+        assert!(
+            store
+                .entries()
+                .iter()
+                .any(|e| e.location == wt("newcomer").location)
+        );
+        // The least-recently-opened entry was the one evicted.
+        assert!(
+            !store
+                .entries()
+                .iter()
+                .any(|e| e.location == wt("0").location)
         );
     }
 

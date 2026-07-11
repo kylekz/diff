@@ -8,9 +8,8 @@ use dv_core::{
 };
 use gpui::prelude::FluentBuilder;
 use gpui::*;
-use gpui_component::ActiveTheme;
 use gpui_component::highlighter::HighlightTheme;
-use gpui_component::{h_flex, v_flex};
+use gpui_component::{ActiveTheme, Disableable as _, StyledExt as _, h_flex, v_flex};
 
 use crate::highlight::{self, LineRuns};
 
@@ -24,6 +23,7 @@ actions!(
         ToggleSplit,
         JumpToFile,
         ClearSelection,
+        CancelComment,
         PaletteNext,
         PalettePrev,
         PaletteClose
@@ -31,6 +31,10 @@ actions!(
 );
 
 const KEY_CONTEXT: &str = "Workspace";
+/// Stamped onto the workspace node while the inline comment editor is open
+/// (same mechanism as [`PALETTE_CONTEXT`]) — single-char bindings must not
+/// fire while the user types a comment.
+const EDITOR_CONTEXT: &str = "EditorOpen";
 
 /// Every diff row (lines and hunk headers alike) renders at this exact
 /// height. uniform_list sizes its slots from a measured row; any variant
@@ -43,8 +47,10 @@ const ROW_HEIGHT: f32 = 24.;
 const PALETTE_CONTEXT: &str = "PaletteOpen";
 
 pub fn init(cx: &mut App) {
-    let browse = Some("Workspace && !PaletteOpen");
+    let browse = Some("Workspace && !PaletteOpen && !EditorOpen");
     let palette = Some("Workspace && PaletteOpen");
+    let editor = Some("Workspace && EditorOpen");
+    cx.bind_keys([KeyBinding::new("escape", CancelComment, editor)]);
     cx.bind_keys([
         KeyBinding::new("j", NextFile, browse),
         KeyBinding::new("down", NextFile, browse),
@@ -180,6 +186,26 @@ impl GutterSelection {
     }
 }
 
+/// One row of the diff pane as displayed: the precomputed diff rows with
+/// comment threads (and the comment editor) interleaved under their anchor
+/// lines.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DisplayRow {
+    /// Index into the RenderedDiff rows for the active view mode.
+    Diff(usize),
+    /// Index into the current review's comments.
+    Thread(usize),
+    /// The inline comment editor.
+    Editor,
+}
+
+/// The inline comment editor, open under the gutter selection.
+struct CommentEditor {
+    input: Entity<gpui_component::input::InputState>,
+    saving: bool,
+    _subscription: Subscription,
+}
+
 /// The jump-to-file palette, while open: a text input plus a live-filtered
 /// view of the file list.
 struct Palette {
@@ -220,9 +246,49 @@ pub struct Workspace {
     palette: Option<Palette>,
     /// Live gutter selection (comment anchor being chosen).
     selection: Option<GutterSelection>,
+    /// The repo location, for opening the review store off-thread.
+    location: RepoLocation,
+    /// The active draft review (latest draft in the store), lazily loaded.
+    review: Option<dv_core::Review>,
+    editor: Option<CommentEditor>,
+    /// Diff rows + interleaved threads/editor, in display order. The list
+    /// element renders these; rebuilt by [`Self::rebuild_display`].
+    display: Vec<DisplayRow>,
+    /// diff row index → display row index, for hunk scrolling.
+    diff_to_display: Vec<usize>,
     /// Wall-clock of the most recent per-file diff computation (blob fetch
     /// + diff + highlight), for `--automation` perf validation.
     last_diff_ms: Option<u64>,
+}
+
+/// Which blob a comment on `side` of `path` anchors to, given the review's
+/// (resolved) diff source. The CLI carries the same mapping; keep in sync
+/// until it moves into dv-core (backlog).
+fn anchor_spec(source: &DiffSource, side: dv_core::Side, path: &str) -> BlobSpec {
+    match (side, source) {
+        (dv_core::Side::Old, DiffSource::WorkingTree | DiffSource::Staged) => BlobSpec::Rev {
+            rev: "HEAD".into(),
+            path: path.into(),
+        },
+        (dv_core::Side::Old, DiffSource::Range { base, .. }) => BlobSpec::Rev {
+            rev: base.clone(),
+            path: path.into(),
+        },
+        (dv_core::Side::Old, DiffSource::Commit(sha)) => BlobSpec::Rev {
+            rev: format!("{sha}^"),
+            path: path.into(),
+        },
+        (dv_core::Side::New, DiffSource::WorkingTree) => BlobSpec::Working { path: path.into() },
+        (dv_core::Side::New, DiffSource::Staged) => BlobSpec::Index { path: path.into() },
+        (dv_core::Side::New, DiffSource::Range { head, .. }) => BlobSpec::Rev {
+            rev: head.clone(),
+            path: path.into(),
+        },
+        (dv_core::Side::New, DiffSource::Commit(sha)) => BlobSpec::Rev {
+            rev: sha.clone(),
+            path: path.into(),
+        },
+    }
 }
 
 /// A one-row "diff" carrying an error message where the hunks would be.
@@ -269,6 +335,11 @@ impl Workspace {
             focus_handle: cx.focus_handle(),
             title: location.display_name().into(),
             source_desc: source_label(&source).into(),
+            location: location.clone(),
+            review: None,
+            editor: None,
+            display: Vec::new(),
+            diff_to_display: Vec::new(),
             source: source.clone(),
             status: Status::Loading,
             repo: None,
@@ -291,7 +362,7 @@ impl Workspace {
             let loaded = cx
                 .background_executor()
                 .spawn(async move {
-                    let repo = GitRepo::open(location)?;
+                    let repo = GitRepo::open(location.clone())?;
                     let head = repo.head_label().unwrap_or_default();
                     // Resolve a merge-base range to a concrete two-dot range
                     // once here, so both the file list and every per-file
@@ -300,17 +371,25 @@ impl Workspace {
                     // the fork point). `git diff a...b` ≡ `a-merge-base..b`.
                     let source = resolve_source(&repo, source)?;
                     let files = repo.changed_files(&source)?;
-                    anyhow::Ok((Arc::new(repo), head, files, source))
+                    // The latest draft review is the one comments accumulate
+                    // into (matching the CLI's default targeting).
+                    let review = dv_core::ReviewStore::open(location)
+                        .list()
+                        .unwrap_or_default()
+                        .into_iter()
+                        .find(|r| matches!(r.state, dv_core::ReviewState::Draft));
+                    anyhow::Ok((Arc::new(repo), head, files, source, review))
                 })
                 .await;
 
             this.update(cx, |this, cx| {
                 match loaded {
-                    Ok((repo, head, files, source)) => {
+                    Ok((repo, head, files, source, review)) => {
                         this.repo = Some(repo);
                         this.head = head.into();
                         this.files = files;
                         this.source = source;
+                        this.review = review;
                         this.status = Status::Ready;
                         if !this.files.is_empty() {
                             this.select_file(0, cx);
@@ -445,6 +524,15 @@ impl Workspace {
                     "end": end,
                 })
             }),
+            "editor_open": self.editor.is_some(),
+            "review": self.review.as_ref().map(|r| json!({
+                "id": r.id,
+                "comments": r.comments.len(),
+                "open": r.comments.iter()
+                    .filter(|c| c.status == dv_core::CommentStatus::Open)
+                    .count(),
+            })),
+            "display_rows": self.display.len(),
             "palette": self.palette.as_ref().map(|p| json!({
                 "matches": p.matches.len(),
                 "selected": p.selected,
@@ -539,17 +627,95 @@ impl Workspace {
             })
     }
 
-    /// Re-sync the list's item count after anything that changes the row
-    /// set (file switch, mode toggle, recompute) and park it at the top.
+    /// The diff row a `(side, line)` anchor points at in the active mode —
+    /// where a comment thread (or the editor) hangs.
+    fn anchor_row(&self, side: DiffSide, line: u32) -> Option<usize> {
+        let diff = self.selected.and_then(|i| self.diffs.get(&i))?;
+        match self.view_mode {
+            ViewMode::Unified => diff.unified.iter().position(|row| match row {
+                Row::Line {
+                    old_line, new_line, ..
+                } => match side {
+                    DiffSide::New => *new_line == Some(line),
+                    DiffSide::Old => *old_line == Some(line),
+                },
+                _ => false,
+            }),
+            ViewMode::Split => diff.split.iter().position(|row| match row {
+                SplitRow::Pair { left, right } => {
+                    let cell = match side {
+                        DiffSide::Old => left,
+                        DiffSide::New => right,
+                    };
+                    cell.as_ref().is_some_and(|c| c.line == Some(line))
+                }
+                _ => false,
+            }),
+        }
+    }
+
+    /// Rebuild the display row set — diff rows with comment threads and the
+    /// editor interleaved under their anchors — and re-sync the list.
+    /// Anything that changes rows, comments, selection, or the editor calls
+    /// this. Threads whose anchor line isn't visible (outside hunks, stale)
+    /// append at the end so they're never silently hidden.
     fn reset_diff_list(&mut self, _cx: &mut Context<Self>) {
-        self.diff_list.reset(self.diff_row_count());
+        let row_count = self.diff_row_count();
+        let file_path = self.selected.map(|i| self.files[i].path.clone());
+
+        // Anchor each of this file's comments to a diff row.
+        let mut at_row: HashMap<usize, Vec<usize>> = HashMap::new();
+        let mut unanchored: Vec<usize> = Vec::new();
+        if let (Some(path), Some(review)) = (&file_path, &self.review) {
+            for (ci, comment) in review.comments.iter().enumerate() {
+                if &comment.path != path {
+                    continue;
+                }
+                let side = match comment.side {
+                    dv_core::Side::Old => DiffSide::Old,
+                    dv_core::Side::New => DiffSide::New,
+                };
+                match self.anchor_row(side, comment.end_line) {
+                    Some(row) => at_row.entry(row).or_default().push(ci),
+                    None => unanchored.push(ci),
+                }
+            }
+        }
+        let editor_row = self
+            .editor
+            .as_ref()
+            .and(self.selection)
+            .and_then(|sel| self.anchor_row(sel.side, sel.range().1));
+
+        let mut display = Vec::with_capacity(row_count + 8);
+        let mut diff_to_display = Vec::with_capacity(row_count);
+        for row in 0..row_count {
+            diff_to_display.push(display.len());
+            display.push(DisplayRow::Diff(row));
+            if let Some(comments) = at_row.get(&row) {
+                display.extend(comments.iter().map(|&ci| DisplayRow::Thread(ci)));
+            }
+            if editor_row == Some(row) {
+                display.push(DisplayRow::Editor);
+            }
+        }
+        display.extend(unanchored.into_iter().map(DisplayRow::Thread));
+        if self.editor.is_some() && editor_row.is_none() {
+            display.push(DisplayRow::Editor);
+        }
+
+        self.display = display;
+        self.diff_to_display = diff_to_display;
+        self.diff_list.reset(self.display.len());
     }
 
     fn scroll_to_current_hunk(&mut self) {
         let current = self.current_hunk;
-        if let Some(&row) = self.hunk_rows().and_then(|rows| rows.get(current)) {
+        if let Some(&row) = self.hunk_rows().and_then(|rows| rows.get(current))
+            && let Some(&display_ix) = self.diff_to_display.get(row)
+        {
             self.diff_list.scroll_to(ListOffset {
-                item_ix: row,
+                item_ix: display_ix,
                 offset_in_item: px(0.),
             });
         }
@@ -614,11 +780,14 @@ impl Workspace {
         }
     }
 
-    fn gutter_up(&mut self, cx: &mut Context<Self>) {
+    fn gutter_up(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if let Some(sel) = &mut self.selection
             && sel.dragging
         {
             sel.dragging = false;
+            // Releasing the drag is the commitment: open the editor under
+            // the selection, GitHub-style.
+            self.open_editor(window, cx);
             cx.notify();
         }
     }
@@ -631,6 +800,209 @@ impl Workspace {
 
     fn on_clear_selection(&mut self, _: &ClearSelection, _: &mut Window, cx: &mut Context<Self>) {
         self.clear_selection(cx);
+    }
+
+    // ---- Inline comment editor + store operations ---------------------
+
+    fn open_editor(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        use gpui_component::input::{InputEvent, InputState};
+        if self.selection.is_none() {
+            return;
+        }
+        if let Some(editor) = &self.editor {
+            let input = editor.input.clone();
+            input.update(cx, |input, cx| input.focus(window, cx));
+            self.reset_diff_list(cx);
+            return;
+        }
+        let input = cx.new(|cx| {
+            InputState::new(window, cx)
+                .multi_line(true)
+                .auto_grow(3, 12)
+                .placeholder("Leave a comment… (ctrl-enter to submit, esc to cancel)")
+        });
+        let subscription =
+            cx.subscribe_in(&input, window, |this, _, event: &InputEvent, window, cx| {
+                if let InputEvent::PressEnter {
+                    secondary: true, ..
+                } = event
+                {
+                    this.submit_comment(window, cx);
+                }
+            });
+        input.update(cx, |input, cx| input.focus(window, cx));
+        self.editor = Some(CommentEditor {
+            input,
+            saving: false,
+            _subscription: subscription,
+        });
+        self.reset_diff_list(cx);
+        if let Some(ix) = self.display.iter().position(|r| *r == DisplayRow::Editor) {
+            self.diff_list.scroll_to_reveal_item(ix);
+        }
+        cx.notify();
+    }
+
+    fn close_editor(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.editor.take().is_some() {
+            self.selection = None;
+            window.focus(&self.focus_handle, cx);
+            self.reset_diff_list(cx);
+            cx.notify();
+        }
+    }
+
+    fn on_cancel_comment(
+        &mut self,
+        _: &CancelComment,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.close_editor(window, cx);
+    }
+
+    /// Persist the comment under composition: ensure a draft review exists,
+    /// anchor the comment to the current blob, save — all off-thread (the
+    /// store may do subprocess I/O into WSL).
+    fn submit_comment(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(editor) = &mut self.editor else {
+            return;
+        };
+        if editor.saving {
+            return;
+        }
+        let Some(sel) = self.selection else {
+            return;
+        };
+        let Some(file) = self.selected else {
+            return;
+        };
+        let Some(repo) = self.repo.clone() else {
+            return;
+        };
+        let body = editor.input.read(cx).value().to_string();
+        if body.trim().is_empty() {
+            self.close_editor(window, cx);
+            return;
+        }
+        editor.saving = true;
+        cx.notify();
+
+        let path = self.files[file].path.clone();
+        let side = match sel.side {
+            DiffSide::Old => dv_core::Side::Old,
+            DiffSide::New => dv_core::Side::New,
+        };
+        let (start, end) = sel.range();
+        let location = self.location.clone();
+        let source = self.source.clone();
+        let existing = self.review.clone();
+
+        cx.spawn_in(window, async move |this, cx| {
+            let result = cx
+                .background_executor()
+                .spawn(async move {
+                    let store = dv_core::ReviewStore::open(location);
+                    let mut review = match existing {
+                        Some(review) => review,
+                        None => store.create(source.clone())?,
+                    };
+                    let sha = repo
+                        .blob_sha(&anchor_spec(&source, side, &path))
+                        .ok()
+                        .flatten();
+                    review.add_comment(path, side, start, end, sha, body, "human")?;
+                    store.save(&review)?;
+                    anyhow::Ok(review)
+                })
+                .await;
+
+            this.update_in(cx, |this, window, cx| {
+                match result {
+                    Ok(review) => {
+                        this.review = Some(review);
+                        this.close_editor(window, cx);
+                    }
+                    Err(err) => {
+                        // Keep the editor (and the typed body) so nothing is
+                        // lost; surface the failure in the card.
+                        eprintln!("comment save failed: {err:#}");
+                        if let Some(editor) = &mut this.editor {
+                            editor.saving = false;
+                        }
+                    }
+                }
+                this.reset_diff_list(cx);
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// Toggle a comment's open/resolved status (by id), persisting
+    /// off-thread.
+    fn set_comment_status(
+        &mut self,
+        comment_id: String,
+        status: dv_core::CommentStatus,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(review) = self.review.clone() else {
+            return;
+        };
+        let location = self.location.clone();
+        cx.spawn(async move |this, cx| {
+            let result = cx
+                .background_executor()
+                .spawn(async move {
+                    let mut review = review;
+                    review.set_status(&comment_id, status)?;
+                    dv_core::ReviewStore::open(location).save(&review)?;
+                    anyhow::Ok(review)
+                })
+                .await;
+            this.update(cx, |this, cx| {
+                match result {
+                    Ok(review) => this.review = Some(review),
+                    Err(err) => eprintln!("comment status update failed: {err:#}"),
+                }
+                this.reset_diff_list(cx);
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// Delete a comment (by id), persisting off-thread.
+    fn delete_comment(&mut self, comment_id: String, cx: &mut Context<Self>) {
+        let Some(review) = self.review.clone() else {
+            return;
+        };
+        let location = self.location.clone();
+        cx.spawn(async move |this, cx| {
+            let result = cx
+                .background_executor()
+                .spawn(async move {
+                    let mut review = review;
+                    review.comments.retain(|c| c.id != comment_id);
+                    review.updated_ms = dv_core::review::now_ms();
+                    dv_core::ReviewStore::open(location).save(&review)?;
+                    anyhow::Ok(review)
+                })
+                .await;
+            this.update(cx, |this, cx| {
+                match result {
+                    Ok(review) => this.review = Some(review),
+                    Err(err) => eprintln!("comment delete failed: {err:#}"),
+                }
+                this.reset_diff_list(cx);
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
     }
 
     /// The side+line a unified row anchors to: New wherever the line exists
@@ -894,6 +1266,157 @@ impl Workspace {
         }
     }
 
+    /// One display row: a diff row (per view mode), an inline comment
+    /// thread, or the comment editor.
+    fn render_display_row(&self, display_ix: usize, cx: &mut Context<Self>) -> AnyElement {
+        match self.display.get(display_ix) {
+            Some(&DisplayRow::Diff(row)) => match self.view_mode {
+                ViewMode::Unified => self.render_diff_row(row, cx).into_any_element(),
+                ViewMode::Split => self.render_split_row(row, cx).into_any_element(),
+            },
+            Some(&DisplayRow::Thread(comment_ix)) => {
+                self.render_thread(comment_ix, cx).into_any_element()
+            }
+            Some(&DisplayRow::Editor) => self.render_editor(cx).into_any_element(),
+            None => div().into_any_element(),
+        }
+    }
+
+    /// An inline comment thread card under its anchor line.
+    fn render_thread(&self, comment_ix: usize, cx: &mut Context<Self>) -> Div {
+        use gpui_component::button::{Button, ButtonVariants as _};
+        let theme = cx.theme();
+        let Some(comment) = self
+            .review
+            .as_ref()
+            .and_then(|r| r.comments.get(comment_ix))
+        else {
+            return div();
+        };
+        let resolved = comment.status == dv_core::CommentStatus::Resolved;
+        let id = comment.id.clone();
+        let id_for_delete = comment.id.clone();
+        let lines = if comment.start_line == comment.end_line {
+            format!("line {}", comment.start_line)
+        } else {
+            format!("lines {}–{}", comment.start_line, comment.end_line)
+        };
+        let side = match comment.side {
+            dv_core::Side::Old => "old",
+            dv_core::Side::New => "new",
+        };
+
+        div().w_full().px_4().py_1().child(
+            v_flex()
+                .w_full()
+                .max_w(px(720.))
+                .p_3()
+                .gap_2()
+                .bg(theme.popover)
+                .border_1()
+                .border_color(if resolved {
+                    theme.border
+                } else {
+                    theme.primary.opacity(0.5)
+                })
+                .rounded_lg()
+                .child(
+                    h_flex()
+                        .gap_2()
+                        .text_sm()
+                        .child(div().font_semibold().child(comment.author.clone()))
+                        .child(
+                            div()
+                                .text_color(theme.muted_foreground)
+                                .child(format!("{side} · {lines}")),
+                        )
+                        .when(resolved, |el| {
+                            el.child(div().text_color(theme.success).child("✓ resolved"))
+                        })
+                        .child(div().flex_1())
+                        .child(
+                            Button::new(("resolve", comment_ix))
+                                .ghost()
+                                .label(if resolved { "Unresolve" } else { "Resolve" })
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    let status = if resolved {
+                                        dv_core::CommentStatus::Open
+                                    } else {
+                                        dv_core::CommentStatus::Resolved
+                                    };
+                                    this.set_comment_status(id.clone(), status, cx);
+                                })),
+                        )
+                        .child(
+                            Button::new(("delete", comment_ix))
+                                .ghost()
+                                .label("Delete")
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    this.delete_comment(id_for_delete.clone(), cx);
+                                })),
+                        ),
+                )
+                .child(div().text_sm().child(comment.body.clone()))
+                .children(comment.replies.iter().map(|reply| {
+                    h_flex()
+                        .gap_2()
+                        .pl_3()
+                        .border_l_2()
+                        .border_color(theme.border)
+                        .text_sm()
+                        .child(div().font_semibold().child(reply.author.clone()))
+                        .child(div().child(reply.body.clone()))
+                })),
+        )
+    }
+
+    /// The inline comment editor card.
+    fn render_editor(&self, cx: &mut Context<Self>) -> Div {
+        use gpui_component::button::{Button, ButtonVariants as _};
+        let theme = cx.theme();
+        let Some(editor) = &self.editor else {
+            return div();
+        };
+        let saving = editor.saving;
+
+        div().w_full().px_4().py_1().child(
+            v_flex()
+                .w_full()
+                .max_w(px(720.))
+                .p_3()
+                .gap_2()
+                .bg(theme.popover)
+                .border_1()
+                .border_color(theme.primary.opacity(0.7))
+                .rounded_lg()
+                .child(gpui_component::input::Input::new(&editor.input))
+                .child(
+                    h_flex()
+                        .gap_2()
+                        .justify_end()
+                        .child(
+                            Button::new("cancel-comment")
+                                .ghost()
+                                .label("Cancel")
+                                .on_click(
+                                    cx.listener(|this, _, window, cx| {
+                                        this.close_editor(window, cx)
+                                    }),
+                                ),
+                        )
+                        .child(
+                            Button::new("submit-comment")
+                                .primary()
+                                .label(if saving { "Saving…" } else { "Comment" })
+                                .disabled(saving)
+                                .on_click(cx.listener(|this, _, window, cx| {
+                                    this.submit_comment(window, cx)
+                                })),
+                        ),
+                ),
+        )
+    }
+
     fn render_diff_row(&self, row_index: usize, cx: &mut Context<Self>) -> Div {
         let theme = cx.theme();
         let Some(diff) = self.selected.and_then(|i| self.diffs.get(&i)) else {
@@ -1000,7 +1523,7 @@ impl Workspace {
                         }))
                         .on_mouse_up(
                             MouseButton::Left,
-                            cx.listener(|this, _, _, cx| this.gutter_up(cx)),
+                            cx.listener(|this, _, window, cx| this.gutter_up(window, cx)),
                         )
                     })
                     .child(gutter)
@@ -1135,7 +1658,7 @@ impl Workspace {
                 }))
                 .on_mouse_up(
                     MouseButton::Left,
-                    cx.listener(|this, _, _, cx| this.gutter_up(cx)),
+                    cx.listener(|this, _, window, cx| this.gutter_up(window, cx)),
                 )
             })
             .child(gutter)
@@ -1586,27 +2109,26 @@ impl Render for Workspace {
                     .child(div().h_full().flex_1().min_w(px(0.)).child({
                         let this = cx.weak_entity();
                         list(self.diff_list.clone(), move |ix, _window, cx| {
-                            this.update(cx, |this, cx| match this.view_mode {
-                                ViewMode::Unified => {
-                                    this.render_diff_row(ix, cx).into_any_element()
-                                }
-                                ViewMode::Split => this.render_split_row(ix, cx).into_any_element(),
-                            })
-                            .unwrap_or_else(|_| div().into_any_element())
+                            this.update(cx, |this, cx| this.render_display_row(ix, cx))
+                                .unwrap_or_else(|_| div().into_any_element())
                         })
                         .size_full()
                     })),
             ),
         };
 
-        // While the palette is open the workspace node also carries the
-        // PaletteOpen identifier, flipping which key bindings apply (see
-        // `init`).
-        let key_context = if self.palette.is_some() {
-            format!("{KEY_CONTEXT} {PALETTE_CONTEXT}")
-        } else {
-            KEY_CONTEXT.to_string()
-        };
+        // While the palette or the comment editor is open the workspace node
+        // carries an extra identifier, flipping which key bindings apply
+        // (see `init`).
+        let mut key_context = KEY_CONTEXT.to_string();
+        if self.palette.is_some() {
+            key_context.push(' ');
+            key_context.push_str(PALETTE_CONTEXT);
+        }
+        if self.editor.is_some() {
+            key_context.push(' ');
+            key_context.push_str(EDITOR_CONTEXT);
+        }
 
         v_flex()
             .size_full()
@@ -1620,6 +2142,7 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::on_toggle_split))
             .on_action(cx.listener(Self::on_jump_to_file))
             .on_action(cx.listener(Self::on_clear_selection))
+            .on_action(cx.listener(Self::on_cancel_comment))
             .on_action(cx.listener(Self::on_palette_next))
             .on_action(cx.listener(Self::on_palette_prev))
             .on_action(cx.listener(Self::on_palette_close))

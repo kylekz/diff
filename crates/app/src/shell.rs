@@ -420,8 +420,25 @@ impl AppShell {
                     } else {
                         // Explicit ask: recompute unconditionally, and
                         // fetch PR status for every linked entry — WSL
-                        // included.
-                        this.badges.insert(loc.clone(), badge);
+                        // included. Still seed the recomputed badge's
+                        // `pr` from whatever this entry already showed
+                        // (review finding P2, proven live: the dot
+                        // flickers off on every refresh) via the same
+                        // `merge_local_badge` carry-over the
+                        // `ReviewChanged`-triggered path already uses —
+                        // otherwise every entry's badge blanks to
+                        // `pr: None` the instant this pass lands, and
+                        // only comes back if (and whenever) its own
+                        // network fetch below succeeds. The fetch is
+                        // still queued unconditionally here (unlike the
+                        // `fetch_remote: false` caller of
+                        // `merge_local_badge`), so a success still
+                        // overwrites with fresh data; a failure just
+                        // leaves the carried-over value in place (stale
+                        // beats blank).
+                        let existing = this.badges.get(&loc).copied();
+                        this.badges
+                            .insert(loc.clone(), merge_local_badge(existing, badge, false));
                         if let Some(remote) = remote {
                             to_fetch.push((loc, remote));
                         }
@@ -452,6 +469,14 @@ impl AppShell {
 
     fn on_refresh_badges(&mut self, _: &RefreshBadges, _: &mut Window, cx: &mut Context<Self>) {
         self.refresh_all_badges(false, cx);
+        // Also refresh the active workspace's PR header band, if it has
+        // one open (review finding P3-b) — `RefreshBadges` is already the
+        // one manual "go sync with GitHub" gesture in the UI, so the
+        // header shouldn't need a second, undiscoverable way to unstick
+        // itself. `Workspace::refresh_pr` no-ops when no PR is open.
+        if let Some(ws) = &self.active {
+            ws.update(cx, |ws, cx| ws.refresh_pr(cx));
+        }
     }
 
     // ---- Theme picker ---------------------------------------------------
@@ -504,7 +529,12 @@ impl AppShell {
         self.close_theme_picker(window, cx);
     }
 
-    fn on_theme_picker_next(&mut self, _: &ThemePickerNext, _: &mut Window, cx: &mut Context<Self>) {
+    fn on_theme_picker_next(
+        &mut self,
+        _: &ThemePickerNext,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         if let Some(picker) = &mut self.theme_picker {
             let len = themes::names().count();
             if len > 0 {
@@ -514,7 +544,12 @@ impl AppShell {
         }
     }
 
-    fn on_theme_picker_prev(&mut self, _: &ThemePickerPrev, _: &mut Window, cx: &mut Context<Self>) {
+    fn on_theme_picker_prev(
+        &mut self,
+        _: &ThemePickerPrev,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         if let Some(picker) = &mut self.theme_picker {
             picker.selected = picker.selected.saturating_sub(1);
             cx.notify();
@@ -847,38 +882,36 @@ impl AppShell {
                                 .text_color(muted)
                                 .child("Theme \u{b7} enter to apply, esc to close"),
                         )
-                        .child(
-                            v_flex().w_full().children(themes::names().enumerate().map(
-                                |(i, name)| {
-                                    let selected = i == picker.selected;
-                                    let is_active = name == active_theme;
-                                    h_flex()
-                                        .id(("theme-picker-row", i))
-                                        .w_full()
-                                        .gap_2()
-                                        .px_2()
-                                        .py_1()
-                                        .rounded_sm()
-                                        .cursor_pointer()
-                                        .when(selected, |el| el.bg(accent))
-                                        .hover(|el| el.bg(accent.opacity(0.5)))
-                                        .on_mouse_down(
-                                            MouseButton::Left,
-                                            cx.listener(move |this, _, window, cx| {
-                                                this.choose_theme(name, window, cx);
-                                            }),
-                                        )
-                                        .child(
-                                            div()
-                                                .flex_none()
-                                                .w(px(16.))
-                                                .text_color(success)
-                                                .child(if is_active { "\u{2713}" } else { "" }),
-                                        )
-                                        .child(div().flex_1().text_sm().child(name))
-                                },
-                            )),
-                        ),
+                        .child(v_flex().w_full().children(themes::names().enumerate().map(
+                            |(i, name)| {
+                                let selected = i == picker.selected;
+                                let is_active = name == active_theme;
+                                h_flex()
+                                    .id(("theme-picker-row", i))
+                                    .w_full()
+                                    .gap_2()
+                                    .px_2()
+                                    .py_1()
+                                    .rounded_sm()
+                                    .cursor_pointer()
+                                    .when(selected, |el| el.bg(accent))
+                                    .hover(|el| el.bg(accent.opacity(0.5)))
+                                    .on_mouse_down(
+                                        MouseButton::Left,
+                                        cx.listener(move |this, _, window, cx| {
+                                            this.choose_theme(name, window, cx);
+                                        }),
+                                    )
+                                    .child(
+                                        div()
+                                            .flex_none()
+                                            .w(px(16.))
+                                            .text_color(success)
+                                            .child(if is_active { "\u{2713}" } else { "" }),
+                                    )
+                                    .child(div().flex_1().text_sm().child(name))
+                            },
+                        ))),
                 ),
         )
     }

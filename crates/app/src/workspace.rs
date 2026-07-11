@@ -33,7 +33,8 @@ actions!(
         PrPickerNext,
         PrPickerPrev,
         PrPickerClose,
-        PrPickerChoose
+        PrPickerChoose,
+        RefreshPr
     ]
 );
 
@@ -273,6 +274,29 @@ struct PrHeader {
     review_decision: Option<ReviewDecision>,
     url: SharedString,
     body: SharedString,
+}
+
+impl From<PrMeta> for PrHeader {
+    /// Everything the header band shows, straight from a fresh `pr_meta`
+    /// fetch — shared by `open_pr`, `start_submit_validation`, and
+    /// `refresh_pr` (review finding P3-b) so the three call sites can't
+    /// drift and each keeps the header in sync with whatever `gh` just
+    /// said, rather than only ever refreshing on the original `open_pr`.
+    fn from(meta: PrMeta) -> Self {
+        Self {
+            number: meta.number,
+            title: meta.title.into(),
+            author: meta.author.into(),
+            state: meta.state,
+            is_draft: meta.is_draft,
+            base_ref: meta.base_ref.into(),
+            head_ref: meta.head_ref.into(),
+            checks: meta.checks,
+            review_decision: meta.review_decision,
+            url: meta.url.into(),
+            body: meta.body.into(),
+        }
+    }
 }
 
 /// The PR picker overlay (`ctrl-g`), while open.
@@ -658,6 +682,18 @@ fn error_diff(msg: SharedString) -> RenderedDiff {
     }
 }
 
+/// Trim trailing newline(s) from a comment/reply body before it's
+/// persisted (review finding P3-a, proven live: a GUI-saved body ended
+/// `"...here.\n"`). `ctrl-enter` (secondary `PressEnter`) races the
+/// multi-line input's own newline-on-Enter handling, so the value read at
+/// submit time can carry one or more trailing `\n` the user never meant
+/// to type — the CLI's bodies never have one. Trailing *newlines* only:
+/// a whole-body `trim_end()` would also eat intentional trailing spaces
+/// (e.g. inside a fenced code block), which this must leave alone.
+fn trim_trailing_newlines(body: String) -> String {
+    body.trim_end_matches('\n').to_string()
+}
+
 fn source_label(source: &DiffSource) -> &'static str {
     match source {
         DiffSource::WorkingTree => "working tree",
@@ -736,6 +772,30 @@ fn violation_kind_word(kind: ViolationKind) -> &'static str {
     }
 }
 
+/// Whether `review` is the review `load_pr`'s find-or-create should adopt
+/// as the active review for PR `pr` on `slug`. Slug comparison is
+/// case-insensitive, matching main.rs's origin/URL slug comparison.
+///
+/// Deliberately requires `Draft` state (review finding P1, proven live):
+/// without this, re-opening a PR whose review was already **submitted**
+/// would "adopt" that submitted review as the mutable active one, and the
+/// very next gutter comment would append into it — stranded, since the
+/// verdict bar hides comments on a submitted review and the CLI refuses
+/// to touch one. A submitted review matching this PR must be treated as
+/// no match at all, so the caller falls through to creating a fresh
+/// draft (linked to the same PR, `submitted_review_id`/`submitted_url`
+/// left `None`). This does NOT affect [`pick_review`]'s PR-arm, which
+/// intentionally still matches a submitted review for *display* (the
+/// Done panel case) — only this find-or-create's *adoption for further
+/// mutation* is restricted to drafts.
+fn review_adopts_pr(review: &dv_core::Review, slug: &str, pr: u64) -> bool {
+    matches!(review.state, dv_core::ReviewState::Draft)
+        && review
+            .remote
+            .as_ref()
+            .is_some_and(|remote| remote.pr == pr && remote.slug.eq_ignore_ascii_case(slug))
+}
+
 /// Fetch a PR's metadata, make sure its diff range is available locally,
 /// reload the changed-file list against it, and find-or-create the draft
 /// review it links to — everything [`Workspace::open_pr`] needs, done
@@ -760,13 +820,12 @@ fn load_pr(repo: &GitRepo, number: u64, location: RepoLocation) -> anyhow::Resul
     let slug = client.slug().to_string();
     // Case-insensitive, matching main.rs's `resolve_pr_target` slug
     // comparison — a host/owner/repo differing only in case is the same
-    // repo on GitHub.
-    let matches_this_pr = |r: &dv_core::Review| {
-        r.remote
-            .as_ref()
-            .is_some_and(|remote| remote.pr == number && remote.slug.eq_ignore_ascii_case(&slug))
-    };
-    let existing = store.list()?.into_iter().find(|r| matches_this_pr(r));
+    // repo on GitHub. Only a Draft review is eligible for adoption here —
+    // see `review_adopts_pr` (review finding P1).
+    let existing = store
+        .list()?
+        .into_iter()
+        .find(|r| review_adopts_pr(r, &slug, number));
     let review = match existing {
         Some(review) => review,
         None => {
@@ -778,7 +837,10 @@ fn load_pr(repo: &GitRepo, number: u64, location: RepoLocation) -> anyhow::Resul
             // second concurrent open — review finding P2-b), but this is a
             // cheap belt-and-suspenders check against future regressions
             // or an out-of-process writer.
-            let recheck = store.list()?.into_iter().find(|r| matches_this_pr(r));
+            let recheck = store
+                .list()?
+                .into_iter()
+                .find(|r| review_adopts_pr(r, &slug, number));
             match recheck {
                 Some(review) => review,
                 None => {
@@ -1296,19 +1358,7 @@ impl Workspace {
                         this.pr_remote = review.remote.clone();
                         this.review = Some(review);
                         cx.emit(ReviewChanged);
-                        this.pr = Some(PrHeader {
-                            number: meta.number,
-                            title: meta.title.into(),
-                            author: meta.author.into(),
-                            state: meta.state,
-                            is_draft: meta.is_draft,
-                            base_ref: meta.base_ref.into(),
-                            head_ref: meta.head_ref.into(),
-                            checks: meta.checks,
-                            review_decision: meta.review_decision,
-                            url: meta.url.into(),
-                            body: meta.body.into(),
-                        });
+                        this.pr = Some(meta.into());
                         this.pr_details_open = false;
                         this.status = Status::Ready;
                         if this.files.is_empty() {
@@ -1331,6 +1381,64 @@ impl Workspace {
             .ok();
         })
         .detach();
+    }
+
+    /// Re-fetch this workspace's open PR's metadata and refresh just the
+    /// header band from it (review finding P3-b, proven live: a DRAFT
+    /// chip persisted through both `gh pr ready` and merge, since the
+    /// header used to only ever refresh on `open_pr`). Unlike `open_pr`
+    /// this never touches source/files/review/selection, so there's no
+    /// save-in-flight/TOCTOU concern to guard against — only the result
+    /// needs an epoch check. A no-op with no PR open. Wired to the
+    /// sidebar's `RefreshBadges` button and directly dispatchable via the
+    /// `RefreshPr` action (no keybinding — there's no natural key for it,
+    /// automation/the button are the only callers). Deliberately not
+    /// auto-polled; only ever fired by an explicit user gesture.
+    pub(crate) fn refresh_pr(&mut self, cx: &mut Context<Self>) {
+        if self.pr_loading.is_some() {
+            // An `open_pr` is in flight: `source_epoch` was already bumped
+            // but `self.pr` still shows the OLD header, so a refresh spawned
+            // now would fetch the old PR yet pass the epoch check and stamp
+            // its header over the new PR's. Refresh after the open lands.
+            return;
+        }
+        let Some(current) = &self.pr else {
+            return;
+        };
+        let Some(repo) = self.repo.clone() else {
+            return;
+        };
+        let number = current.number;
+        let epoch = self.source_epoch;
+        cx.spawn(async move |this, cx| {
+            let result: anyhow::Result<PrMeta> = cx
+                .background_executor()
+                .spawn(async move {
+                    let client = submit::github_client(&repo)?;
+                    anyhow::Ok(client.pr_meta(number)?)
+                })
+                .await;
+            this.update(cx, |this, cx| {
+                if this.source_epoch != epoch || this.pr.as_ref().map(|p| p.number) != Some(number)
+                {
+                    // A source switch (or a fresh `open_pr`) superseded
+                    // this fetch — discard rather than clobber whatever
+                    // replaced it. The number check is belt-and-braces for
+                    // any header swap that didn't bump the epoch.
+                    return;
+                }
+                if let Ok(meta) = result {
+                    this.pr = Some(meta.into());
+                }
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    fn on_refresh_pr(&mut self, _: &RefreshPr, _: &mut Window, cx: &mut Context<Self>) {
+        self.refresh_pr(cx);
     }
 
     // ---- PR picker -----------------------------------------------------
@@ -2199,6 +2307,16 @@ impl Workspace {
                     // state (review finding P1-1).
                     return;
                 }
+                // A fresh `pr_meta` just came back — refresh the header
+                // band from it in this same completion (review finding
+                // P3-b), so a PR that went ready/merged/etc. since the
+                // last `open_pr`/`refresh_pr` doesn't keep showing a
+                // stale chip indefinitely. No extra fetch, no new race:
+                // this is the same epoch-guarded completion already
+                // deciding whether to land at all.
+                if let Ok((meta, _)) = &outcome {
+                    this.pr = Some(meta.clone().into());
+                }
                 this.submit = Some(submit_flow_from_validation(verdict, review_id, outcome));
                 cx.notify();
             })
@@ -2351,7 +2469,7 @@ impl Workspace {
         let Some(repo) = self.repo.clone() else {
             return;
         };
-        let body = editor.input.read(cx).value().to_string();
+        let body = trim_trailing_newlines(editor.input.read(cx).value().to_string());
         if body.trim().is_empty() {
             self.close_editor(window, cx);
             return;
@@ -2391,11 +2509,42 @@ impl Workspace {
                     // since the watcher's reload then agrees with our write.
                     // Re-load the freshest state and mutate that.
                     let mut review = match &existing {
-                        Some(known) => store
-                            .load(&known.id)
-                            .ok()
-                            .flatten()
-                            .unwrap_or_else(|| known.clone()),
+                        Some(known) => {
+                            let fresh = store
+                                .load(&known.id)
+                                .ok()
+                                .flatten()
+                                .unwrap_or_else(|| known.clone());
+                            if matches!(fresh.state, dv_core::ReviewState::Submitted { .. }) {
+                                // The active review has already been
+                                // submitted — to GitHub, or finished
+                                // locally via `submit_review` — so
+                                // appending here would strand the
+                                // comment where the verdict bar hides it
+                                // and the CLI refuses to touch it
+                                // (review finding P1, mutation-guard
+                                // half). Start a fresh draft instead,
+                                // carrying over the PR linkage (minus
+                                // the submission ids) when there was
+                                // one — this is exactly what
+                                // `submit_review`'s doc comment already
+                                // promises ("the next comment
+                                // auto-creates a fresh draft"), made to
+                                // actually hold.
+                                let mut draft = store.create(source.clone())?;
+                                if let Some(remote) = &fresh.remote {
+                                    draft.remote = Some(dv_core::RemoteRef {
+                                        submitted_review_id: None,
+                                        submitted_url: None,
+                                        ..remote.clone()
+                                    });
+                                    store.save(&draft)?;
+                                }
+                                draft
+                            } else {
+                                fresh
+                            }
+                        }
                         None => match store
                             .list()
                             .unwrap_or_default()
@@ -2604,7 +2753,7 @@ impl Workspace {
         let Some(review) = self.review.clone() else {
             return;
         };
-        let body = ti.input.read(cx).value().to_string();
+        let body = trim_trailing_newlines(ti.input.read(cx).value().to_string());
         if body.trim().is_empty() {
             self.close_thread_input(window, cx);
             return;
@@ -4611,6 +4760,7 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::on_pr_picker_prev))
             .on_action(cx.listener(Self::on_pr_picker_close))
             .on_action(cx.listener(Self::on_pr_picker_choose))
+            .on_action(cx.listener(Self::on_refresh_pr))
             .child(
                 // Per-review header strip (the window title bar is the
                 // shell's; this shows which review is active).
@@ -4725,9 +4875,10 @@ impl Render for Workspace {
 #[cfg(test)]
 mod tests {
     use super::{
-        ChecksSummary, PrMeta, PrState, PreparedLine, SplitRow, SubmissionOutcome, SubmitFlow,
-        SubmitPrep, Violation, ViolationKind, build_split_rows, cancel_submit_flow_outcome,
-        gap_above, pick_review, submit_flow_from_submission, submit_flow_from_validation,
+        ChecksSummary, PrHeader, PrMeta, PrState, PreparedLine, SplitRow, SubmissionOutcome,
+        SubmitFlow, SubmitPrep, Violation, ViolationKind, build_split_rows,
+        cancel_submit_flow_outcome, gap_above, pick_review, review_adopts_pr,
+        submit_flow_from_submission, submit_flow_from_validation, trim_trailing_newlines,
         verdict_automation_word, verdict_label, violation_kind_word,
     };
     use dv_core::{DiffSource, LineKind, RemoteRef, Review, ReviewState};
@@ -4993,6 +5144,135 @@ mod tests {
         assert!(picked.is_none());
     }
 
+    // ---- review_adopts_pr / load_pr find-or-create (review finding P1) ----
+    //
+    // `load_pr` itself does real git/store I/O and can't run headless, but
+    // its find-or-create is just `reviews.iter().find(|r|
+    // review_adopts_pr(r, slug, pr))` — exercised directly here against
+    // the exact matrix the fix promises: a submitted-only match must miss
+    // (so the caller creates a fresh draft), a draft match must hit, and
+    // with both present the draft must win over the submitted one.
+
+    #[test]
+    fn review_adopts_pr_rejects_a_submitted_matching_review() {
+        let remote = fake_remote(7, "github.com/fake/fake");
+        let submitted = fake_review(
+            "r-submitted",
+            ReviewState::Submitted {
+                verdict: dv_core::Verdict::Approve,
+                at_ms: 0,
+            },
+            Some(remote.clone()),
+        );
+        assert!(!review_adopts_pr(&submitted, &remote.slug, remote.pr));
+    }
+
+    #[test]
+    fn review_adopts_pr_accepts_a_draft_matching_review() {
+        let remote = fake_remote(7, "github.com/fake/fake");
+        let draft = fake_review("r-draft", ReviewState::Draft, Some(remote.clone()));
+        assert!(review_adopts_pr(&draft, &remote.slug, remote.pr));
+    }
+
+    #[test]
+    fn review_adopts_pr_rejects_a_draft_for_a_different_pr_or_slug() {
+        let remote = fake_remote(7, "github.com/fake/fake");
+        let other_pr = fake_review(
+            "r-other-pr",
+            ReviewState::Draft,
+            Some(fake_remote(8, "github.com/fake/fake")),
+        );
+        let other_slug = fake_review(
+            "r-other-slug",
+            ReviewState::Draft,
+            Some(fake_remote(7, "github.com/other/repo")),
+        );
+        assert!(!review_adopts_pr(&other_pr, &remote.slug, remote.pr));
+        assert!(!review_adopts_pr(&other_slug, &remote.slug, remote.pr));
+    }
+
+    #[test]
+    fn find_or_create_with_only_a_submitted_match_finds_none_so_a_fresh_draft_is_created() {
+        let remote = fake_remote(7, "github.com/fake/fake");
+        let reviews = [fake_review(
+            "r-submitted",
+            ReviewState::Submitted {
+                verdict: dv_core::Verdict::Approve,
+                at_ms: 0,
+            },
+            Some(remote.clone()),
+        )];
+        let found = reviews
+            .iter()
+            .find(|r| review_adopts_pr(r, &remote.slug, remote.pr));
+        assert!(
+            found.is_none(),
+            "a submitted-only match must be treated as no-match, so \
+             load_pr's caller creates a fresh draft instead of adopting it"
+        );
+    }
+
+    #[test]
+    fn find_or_create_with_a_draft_match_adopts_it() {
+        let remote = fake_remote(7, "github.com/fake/fake");
+        let reviews = [fake_review(
+            "r-draft",
+            ReviewState::Draft,
+            Some(remote.clone()),
+        )];
+        let found = reviews
+            .iter()
+            .find(|r| review_adopts_pr(r, &remote.slug, remote.pr));
+        assert_eq!(found.map(|r| r.id.as_str()), Some("r-draft"));
+    }
+
+    #[test]
+    fn find_or_create_with_both_submitted_and_draft_adopts_the_draft() {
+        let remote = fake_remote(7, "github.com/fake/fake");
+        let submitted = fake_review(
+            "r-submitted",
+            ReviewState::Submitted {
+                verdict: dv_core::Verdict::Approve,
+                at_ms: 0,
+            },
+            Some(remote.clone()),
+        );
+        let draft = fake_review("r-draft", ReviewState::Draft, Some(remote.clone()));
+        // store.list() returns newest-created first; put the submitted one
+        // (which would be newer, from a real re-review) ahead of the draft
+        // to make sure the state filter — not just the newest-first order
+        // — is what picks the draft.
+        let reviews = [submitted, draft];
+        let found = reviews
+            .iter()
+            .find(|r| review_adopts_pr(r, &remote.slug, remote.pr));
+        assert_eq!(found.map(|r| r.id.as_str()), Some("r-draft"));
+    }
+
+    // ---- trim_trailing_newlines (review finding P3-a) ----------------------
+
+    #[test]
+    fn trim_trailing_newlines_strips_one_or_many_trailing_newlines() {
+        assert_eq!(trim_trailing_newlines("hello".to_string()), "hello");
+        assert_eq!(trim_trailing_newlines("hello\n".to_string()), "hello");
+        assert_eq!(trim_trailing_newlines("hello\n\n\n".to_string()), "hello");
+        assert_eq!(trim_trailing_newlines(String::new()), "");
+    }
+
+    #[test]
+    fn trim_trailing_newlines_preserves_interior_newlines_and_trailing_spaces() {
+        assert_eq!(
+            trim_trailing_newlines("line one\nline two  \n".to_string()),
+            "line one\nline two  ",
+            "only a trailing newline should go — trailing spaces before it \
+             (e.g. inside a fenced code block) must survive"
+        );
+        assert_eq!(
+            trim_trailing_newlines("trailing spaces   ".to_string()),
+            "trailing spaces   "
+        );
+    }
+
     // --- SubmitFlow state machine (docs/phase-3-github.md deliverable 2/4) --
     //
     // The three completion points (`start_submit_validation`,
@@ -5021,6 +5301,28 @@ mod tests {
             review_decision: None,
             checks: ChecksSummary::None,
         }
+    }
+
+    // --- PrHeader::from(PrMeta) (review finding P3-b) ----------------------
+
+    #[test]
+    fn pr_header_from_meta_carries_every_field() {
+        let mut meta = dummy_pr_meta(42);
+        meta.is_draft = true;
+        meta.review_decision = Some(dv_core::ReviewDecision::ChangesRequested);
+        let header: PrHeader = meta.clone().into();
+
+        assert_eq!(header.number, meta.number);
+        assert_eq!(header.title.to_string(), meta.title);
+        assert_eq!(header.author.to_string(), meta.author);
+        assert_eq!(header.state, meta.state);
+        assert_eq!(header.is_draft, meta.is_draft);
+        assert_eq!(header.base_ref.to_string(), meta.base_ref);
+        assert_eq!(header.head_ref.to_string(), meta.head_ref);
+        assert_eq!(header.checks, meta.checks);
+        assert_eq!(header.review_decision, meta.review_decision);
+        assert_eq!(header.url.to_string(), meta.url);
+        assert_eq!(header.body.to_string(), meta.body);
     }
 
     fn dummy_submission(verdict: dv_core::Verdict) -> dv_core::ReviewSubmission {

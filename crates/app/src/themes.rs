@@ -61,15 +61,12 @@ pub fn names() -> impl Iterator<Item = &'static str> {
 /// an unknown name (a stale/corrupt settings.json must never wedge the app
 /// on a theme that no longer exists).
 fn find(name: &str) -> &'static Entry {
-    THEMES
-        .iter()
-        .find(|t| t.name == name)
-        .unwrap_or_else(|| {
-            THEMES
-                .iter()
-                .find(|t| t.name == DEFAULT_THEME)
-                .expect("DEFAULT_THEME must name a registry entry")
-        })
+    THEMES.iter().find(|t| t.name == name).unwrap_or_else(|| {
+        THEMES
+            .iter()
+            .find(|t| t.name == DEFAULT_THEME)
+            .expect("DEFAULT_THEME must name a registry entry")
+    })
 }
 
 /// Parse and apply the bundled theme called `name` (falling back to

@@ -9,7 +9,7 @@ use crate::command::decode_output;
 /// Location of a repository. Everything downstream (git commands, file
 /// reads) routes through [`crate::CommandBuilder`] based on this, which is
 /// what makes WSL support a command prefix instead of a parallel code path.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub enum RepoLocation {
     /// A path on the local (Windows/macOS) filesystem.
     Local(PathBuf),

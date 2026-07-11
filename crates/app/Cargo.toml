@@ -13,3 +13,5 @@ gpui-component.workspace = true
 gpui-component-assets.workspace = true
 ropey.workspace = true
 serde_json = "1.0.150"
+serde = { version = "1.0.228", features = ["derive"] }
+dirs = "6.0.0"

@@ -1402,12 +1402,14 @@ name = "dv"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "dirs",
  "dv-core",
  "gpui",
  "gpui-component",
  "gpui-component-assets",
  "gpui_platform",
  "ropey",
+ "serde",
  "serde_json",
 ]
 
@@ -1417,6 +1419,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "imara-diff",
+ "serde",
 ]
 
 [[package]]

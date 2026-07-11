@@ -1,13 +1,15 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod highlight;
+mod recent;
+mod shell;
 mod workspace;
 
 use dv_core::{DiffSource, RepoLocation};
 use gpui::*;
 use gpui_component::{ActiveTheme as _, Root, TitleBar};
 
-use crate::workspace::Workspace;
+use crate::shell::AppShell;
 
 const USAGE: &str = "\
 usage: dv [<repo-path>] [options]
@@ -21,11 +23,18 @@ options:
   --range <a>..<b> | <a>...<b>  diff two revisions (... = merge base)
   (default)                     working tree vs HEAD";
 
-fn parse_args() -> Result<(RepoLocation, DiffSource), String> {
+/// Returns `None` for a bare launch (`dv` with no arguments) — the app opens
+/// to the shell's empty state. Any argument seeds an initial review.
+fn parse_args() -> Result<Option<(RepoLocation, DiffSource)>, String> {
+    let raw: Vec<String> = std::env::args().skip(1).collect();
+    if raw.is_empty() {
+        return Ok(None);
+    }
+
     let mut location: Option<RepoLocation> = None;
     let mut source = DiffSource::WorkingTree;
 
-    let mut args = std::env::args().skip(1);
+    let mut args = raw.into_iter();
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--help" | "-h" => return Err(USAGE.to_string()),
@@ -60,7 +69,7 @@ fn parse_args() -> Result<(RepoLocation, DiffSource), String> {
         Some(l) => l,
         None => RepoLocation::Local(std::env::current_dir().map_err(|e| e.to_string())?),
     };
-    Ok((location, source))
+    Ok(Some((location, source)))
 }
 
 fn parse_range(value: &str) -> Result<DiffSource, String> {
@@ -93,7 +102,7 @@ fn apply_aura_theme(cx: &mut App) {
 }
 
 fn main() {
-    let (location, source) = match parse_args() {
+    let seed = match parse_args() {
         Ok(parsed) => parsed,
         Err(message) => {
             eprintln!("{message}");
@@ -106,6 +115,7 @@ fn main() {
     app.run(move |cx| {
         gpui_component::init(cx);
         workspace::init(cx);
+        shell::init(cx);
         apply_aura_theme(cx);
 
         cx.spawn(async move |cx| {
@@ -119,7 +129,7 @@ fn main() {
             };
 
             cx.open_window(options, |window, cx| {
-                let view = cx.new(|cx| Workspace::new(location, source, window, cx));
+                let view = cx.new(|cx| AppShell::new(seed, window, cx));
                 cx.new(|cx| Root::new(view, window, cx).bg(cx.theme().background))
             })
             .expect("failed to open window");

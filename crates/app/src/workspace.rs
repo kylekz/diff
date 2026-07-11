@@ -495,6 +495,12 @@ fn render_rows(
     RenderedDiff { rows }
 }
 
+impl Focusable for Workspace {
+    fn focus_handle(&self, _cx: &App) -> FocusHandle {
+        self.focus_handle.clone()
+    }
+}
+
 impl Render for Workspace {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme();
@@ -581,21 +587,28 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::on_next_file))
             .on_action(cx.listener(Self::on_prev_file))
             .child(
-                gpui_component::TitleBar::new().child(
-                    h_flex()
-                        .gap_2()
-                        .child(self.title.clone())
-                        .child(
-                            div()
-                                .text_color(cx.theme().muted_foreground)
-                                .child(self.head.clone()),
-                        )
-                        .child(
-                            div()
-                                .text_color(cx.theme().muted_foreground)
-                                .child(self.source_desc.clone()),
-                        ),
-                ),
+                // Per-review header strip (the window title bar is the
+                // shell's; this shows which review is active).
+                h_flex()
+                    .flex_none()
+                    .w_full()
+                    .gap_2()
+                    .px_3()
+                    .py_1()
+                    .border_b_1()
+                    .border_color(theme.border)
+                    .bg(theme.secondary)
+                    .child(self.title.clone())
+                    .child(
+                        div()
+                            .text_color(theme.muted_foreground)
+                            .child(self.head.clone()),
+                    )
+                    .child(
+                        div()
+                            .text_color(theme.muted_foreground)
+                            .child(self.source_desc.clone()),
+                    ),
             )
             .child(body)
     }

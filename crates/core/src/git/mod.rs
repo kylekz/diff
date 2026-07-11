@@ -14,7 +14,7 @@ use batch::BlobStore;
 
 /// What two states a diff compares. Maps 1:1 onto git invocations — see
 /// `changed_files` for the exact command lines.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum DiffSource {
     /// Working tree (incl. unstaged) vs HEAD: the pre-commit review case.
     WorkingTree,

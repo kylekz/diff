@@ -141,5 +141,13 @@ Phase 2 complete: ReviewStore + agent CLI + GUI commenting (selection,
 editor, threads with reply/edit/resolve/delete), live store watching,
 summary panel with finish-review verdicts, sidebar badges, stale-anchor
 flagging — acceptance loop verified end to end (docs/phase-2-review-layer.md
-§ Acceptance results). Next: Phase 3 — GitHub via gh
-(docs/phase-3-github.md).
+§ Acceptance results). Phase 3 complete: GitHub via gh — `dv pr` (list/
+view/create/fetch + GUI launch), PR picker + header, validated review
+submission from both CLI and GUI (blob anchors, rename-aware paths,
+line-in-diff), sidebar PR status icons, comment author = GitHub login —
+live-accepted against kylekz/difftest (docs/phase-3-github.md § Acceptance
+results). Phase 4 in progress — settings & appearance
+(docs/phase-4-settings-and-theming.md): slice 1 shipped (JetBrains Mono
+bundled, four themes incl. Claude Dark/Light + Dracula, ctrl-shift-t
+picker, settings.json). Next: settings panel, drag-to-resize panels,
+UI polish pass.

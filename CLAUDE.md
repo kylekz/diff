@@ -103,5 +103,7 @@ window — don't trust it.
 
 ## Status
 
-Phase 0 (scaffold) complete. Next: Phase 1 — read-only diff viewer
-(docs/phase-1-diff-viewer.md).
+Phases 0–1 complete: read-only diff viewer (unified + split), WSL routing,
+review-navigator shell, keyboard nav, `--automation`, acceptance validated
+on a zed-sized diff (see docs/phase-1-diff-viewer.md § Acceptance results).
+Next: Phase 2 — review layer (docs/phase-2-review-layer.md).

@@ -180,6 +180,9 @@ pub struct Workspace {
     file_scroll: UniformListScrollHandle,
     diff_scroll: UniformListScrollHandle,
     palette: Option<Palette>,
+    /// Wall-clock of the most recent per-file diff computation (blob fetch
+    /// + diff + highlight), for `--automation` perf validation.
+    last_diff_ms: Option<u64>,
 }
 
 /// A one-row "diff" carrying an error message where the hunks would be.
@@ -240,6 +243,7 @@ impl Workspace {
             file_scroll: UniformListScrollHandle::new(),
             diff_scroll: UniformListScrollHandle::new(),
             palette: None,
+            last_diff_ms: None,
         };
 
         cx.spawn(async move |this, cx| {
@@ -319,13 +323,16 @@ impl Workspace {
             intra_removed: theme.danger.opacity(0.32),
         };
         cx.spawn(async move |this, cx| {
+            let started = std::time::Instant::now();
             let rendered = cx
                 .background_executor()
                 .spawn(async move { compute_diff(&repo, &source, &file, &hl, &expand) })
                 .await;
+            let elapsed_ms = started.elapsed().as_millis() as u64;
 
             this.update(cx, |this, cx| {
                 this.diff_pending.remove(&index);
+                this.last_diff_ms = Some(elapsed_ms);
                 match rendered {
                     Ok(diff) => {
                         this.diffs.insert(index, Arc::new(diff));
@@ -386,6 +393,7 @@ impl Workspace {
             },
             "selected": self.selected,
             "current_hunk": self.current_hunk,
+            "last_diff_ms": self.last_diff_ms,
             "palette": self.palette.as_ref().map(|p| json!({
                 "matches": p.matches.len(),
                 "selected": p.selected,

@@ -48,9 +48,14 @@ pub(super) fn watch(
             std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
             let mut watcher = notify::recommended_watcher(
                 move |event: std::result::Result<notify::Event, notify::Error>| {
-                    if event.is_ok() {
-                        on_change();
+                    // Errors fire the callback too: ReadDirectoryChangesW's
+                    // buffer-overflow error specifically means *dropped*
+                    // events, so a spurious reload is the safe direction —
+                    // silence would mean staleness.
+                    if let Err(err) = &event {
+                        eprintln!("review watcher event error (reloading anyway): {err}");
                     }
+                    on_change();
                 },
             )
             .context("creating file watcher")?;

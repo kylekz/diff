@@ -206,6 +206,26 @@ fn review_router(
             let source =
                 parse_review_create(args).map_err(|reason| usage_err(reason, REVIEW_USAGE))?;
             let repo = resolve_repo(location)?;
+            // Resolve `a...b` to a concrete two-dot range anchored at the
+            // actual merge base, exactly as the GUI does — otherwise
+            // old-side comment anchors would hash blobs at the base *tip*,
+            // which is not what the diff's old side shows once base has
+            // advanced past the fork point.
+            let source = match source {
+                DiffSource::Range {
+                    base,
+                    head,
+                    merge_base: true,
+                } => {
+                    let merged = repo.merge_base(&base, &head).map_err(op_err)?;
+                    DiffSource::Range {
+                        base: merged,
+                        head,
+                        merge_base: false,
+                    }
+                }
+                other => other,
+            };
             let store = ReviewStore::open(repo.location().clone());
             let review = store.create(source).map_err(op_err)?;
             print_review(&review, json);

@@ -335,15 +335,12 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) -> Self {
         // Watch the review store so agent-CLI (or other-window) edits show
-        // up live. The callback fires on a background thread; it only pokes
-        // a channel drained by the foreground task below.
+        // up live. The channel is created now, but the watcher itself only
+        // starts once the repo has loaded: the store must live at the repo
+        // TOPLEVEL (GitRepo::open normalizes), not at whatever subdirectory
+        // dv was pointed at — otherwise the GUI and CLI silently use two
+        // different stores.
         let (watch_tx, mut watch_rx) = futures::channel::mpsc::unbounded::<()>();
-        let watcher = dv_core::ReviewStore::open(location.clone())
-            .watch(Box::new(move || {
-                watch_tx.unbounded_send(()).ok();
-            }))
-            .inspect_err(|err| eprintln!("review watcher unavailable: {err:#}"))
-            .ok();
 
         let this = Self {
             focus_handle: cx.focus_handle(),
@@ -370,17 +367,19 @@ impl Workspace {
             palette: None,
             selection: None,
             last_diff_ms: None,
-            _watcher: watcher,
+            _watcher: None,
         };
 
-        let watch_location = location.clone();
         cx.spawn(async move |this, cx| {
             use futures::StreamExt as _;
             while watch_rx.next().await.is_some() {
                 // Coalesce event bursts (temp write + rename fire separately)
                 // into one reload.
                 while watch_rx.try_recv().is_ok() {}
-                let location = watch_location.clone();
+                // The normalized location (set by the load task).
+                let Ok(location) = this.update(cx, |this, _| this.location.clone()) else {
+                    break;
+                };
                 let review = cx
                     .background_executor()
                     .spawn(async move {
@@ -422,28 +421,40 @@ impl Workspace {
                     // the fork point). `git diff a...b` ≡ `a-merge-base..b`.
                     let source = resolve_source(&repo, source)?;
                     let files = repo.changed_files(&source)?;
+                    // The store lives at the repo toplevel — use the
+                    // normalized location, never the CLI/picker argument.
+                    let store_location = repo.location().clone();
                     // The latest draft review is the one comments accumulate
                     // into (matching the CLI's default targeting).
-                    let review = dv_core::ReviewStore::open(location)
+                    let review = dv_core::ReviewStore::open(store_location.clone())
                         .list()
                         .unwrap_or_default()
                         .into_iter()
                         .find(|r| matches!(r.state, dv_core::ReviewState::Draft));
-                    anyhow::Ok((Arc::new(repo), head, files, source, review))
+                    anyhow::Ok((Arc::new(repo), head, files, source, review, store_location))
                 })
                 .await;
 
             this.update(cx, |this, cx| {
                 match loaded {
-                    Ok((repo, head, files, source, review)) => {
+                    Ok((repo, head, files, source, review, store_location)) => {
                         this.repo = Some(repo);
                         this.head = head.into();
                         this.files = files;
                         this.source = source;
                         this.review = review;
+                        this.location = store_location.clone();
                         this.status = Status::Ready;
+                        // Start watching now that the true store path is
+                        // known.
+                        this._watcher = dv_core::ReviewStore::open(store_location)
+                            .watch(Box::new(move || {
+                                watch_tx.unbounded_send(()).ok();
+                            }))
+                            .inspect_err(|err| eprintln!("review watcher unavailable: {err:#}"))
+                            .ok();
                         if !this.files.is_empty() {
-                            this.select_file(0, cx);
+                            this.select_file_inner(0, cx);
                         }
                     }
                     Err(err) => this.status = Status::Failed(format!("{err:#}")),
@@ -457,7 +468,32 @@ impl Workspace {
         this
     }
 
-    pub(crate) fn select_file(&mut self, index: usize, cx: &mut Context<Self>) {
+    /// Switch to another file. A live gutter selection or comment editor
+    /// belongs to the file it was made on — carrying it across would
+    /// persist a comment against the new file with the old file's line
+    /// numbers (review P1) — so switching drops them. Mid-save the switch
+    /// is refused instead, so the in-flight comment can't be orphaned.
+    pub(crate) fn select_file(
+        &mut self,
+        index: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.selected != Some(index) {
+            if self.editor.as_ref().is_some_and(|e| e.saving) {
+                return;
+            }
+            self.selection = None;
+            if self.editor.take().is_some() {
+                window.focus(&self.focus_handle, cx);
+            }
+        }
+        self.select_file_inner(index, cx);
+    }
+
+    /// The window-free core of [`Self::select_file`], for the initial load
+    /// path (no editor can exist yet there).
+    fn select_file_inner(&mut self, index: usize, cx: &mut Context<Self>) {
         if index >= self.files.len() {
             return;
         }
@@ -466,6 +502,12 @@ impl Workspace {
         self.file_scroll
             .scroll_to_item(index, ScrollStrategy::Nearest);
         self.reset_diff_list(cx);
+        // reset_diff_list preserves the viewport for in-place updates; a
+        // file switch starts reading from the top.
+        self.diff_list.scroll_to(ListOffset {
+            item_ix: 0,
+            offset_in_item: px(0.),
+        });
         cx.notify();
 
         // A cached failure retries on reselect; a good diff is final.
@@ -608,6 +650,7 @@ impl Workspace {
     pub(crate) fn automation_select_file(
         &mut self,
         index: usize,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) -> anyhow::Result<()> {
         if index >= self.files.len() {
@@ -616,7 +659,7 @@ impl Workspace {
                 self.files.len()
             );
         }
-        self.select_file(index, cx);
+        self.select_file(index, window, cx);
         Ok(())
     }
 
@@ -637,14 +680,14 @@ impl Workspace {
         }
     }
 
-    fn on_next_file(&mut self, _: &NextFile, _: &mut Window, cx: &mut Context<Self>) {
+    fn on_next_file(&mut self, _: &NextFile, window: &mut Window, cx: &mut Context<Self>) {
         let next = self.selected.map_or(0, |i| i + 1);
-        self.select_file(next.min(self.files.len().saturating_sub(1)), cx);
+        self.select_file(next.min(self.files.len().saturating_sub(1)), window, cx);
     }
 
-    fn on_prev_file(&mut self, _: &PrevFile, _: &mut Window, cx: &mut Context<Self>) {
+    fn on_prev_file(&mut self, _: &PrevFile, window: &mut Window, cx: &mut Context<Self>) {
         let prev = self.selected.map_or(0, |i| i.saturating_sub(1));
-        self.select_file(prev, cx);
+        self.select_file(prev, window, cx);
     }
 
     fn on_toggle_split(&mut self, _: &ToggleSplit, _: &mut Window, cx: &mut Context<Self>) {
@@ -758,7 +801,15 @@ impl Workspace {
 
         self.display = display;
         self.diff_to_display = diff_to_display;
+        // ListState::reset clears the scroll position (renders from item 0)
+        // — but this rebuild runs for every comment mutation and watcher
+        // reload, where yanking the viewport to the top mid-read would be
+        // hostile. Preserve the offset (scroll_to clamps if rows shrank);
+        // paths that *want* a position change (file switch, hunk jump)
+        // scroll explicitly after calling this.
+        let top = self.diff_list.logical_scroll_top();
         self.diff_list.reset(self.display.len());
+        self.diff_list.scroll_to(top);
     }
 
     fn scroll_to_current_hunk(&mut self) {
@@ -940,6 +991,14 @@ impl Workspace {
         editor.saving = true;
         cx.notify();
 
+        // The selection is made against the selected file by construction
+        // (select_file drops it on switch); refuse to save if they ever
+        // disagree rather than persist a comment on the wrong file.
+        if sel.file != file {
+            self.close_editor(window, cx);
+            return;
+        }
+
         let path = self.files[file].path.clone();
         let side = match sel.side {
             DiffSide::Old => dv_core::Side::Old,
@@ -955,12 +1014,31 @@ impl Workspace {
                 .background_executor()
                 .spawn(async move {
                     let store = dv_core::ReviewStore::open(location);
-                    let mut review = match existing {
-                        Some(review) => review,
-                        None => store.create(source.clone())?,
+                    // Never trust the UI's clone: a CLI write can land while
+                    // this task runs (there's a git subprocess below), and
+                    // saving the stale clone would erase it — unrepairable,
+                    // since the watcher's reload then agrees with our write.
+                    // Re-load the freshest state and mutate that.
+                    let mut review = match &existing {
+                        Some(known) => store
+                            .load(&known.id)
+                            .ok()
+                            .flatten()
+                            .unwrap_or_else(|| known.clone()),
+                        None => match store
+                            .list()
+                            .unwrap_or_default()
+                            .into_iter()
+                            .find(|r| matches!(r.state, dv_core::ReviewState::Draft))
+                        {
+                            Some(fresh) => fresh,
+                            None => store.create(source.clone())?,
+                        },
                     };
+                    // Anchor against the review's own source — it may have
+                    // been created by the CLI over a different one.
                     let sha = repo
-                        .blob_sha(&anchor_spec(&source, side, &path))
+                        .blob_sha(&anchor_spec(&review.source, side, &path))
                         .ok()
                         .flatten();
                     review.add_comment(path, side, start, end, sha, body, "human")?;
@@ -1008,9 +1086,11 @@ impl Workspace {
             let result = cx
                 .background_executor()
                 .spawn(async move {
-                    let mut review = review;
+                    let store = dv_core::ReviewStore::open(location);
+                    // Fresh-load before mutating (see submit_comment).
+                    let mut review = store.load(&review.id).ok().flatten().unwrap_or(review);
                     review.set_status(&comment_id, status)?;
-                    dv_core::ReviewStore::open(location).save(&review)?;
+                    store.save(&review)?;
                     anyhow::Ok(review)
                 })
                 .await;
@@ -1037,10 +1117,12 @@ impl Workspace {
             let result = cx
                 .background_executor()
                 .spawn(async move {
-                    let mut review = review;
+                    let store = dv_core::ReviewStore::open(location);
+                    // Fresh-load before mutating (see submit_comment).
+                    let mut review = store.load(&review.id).ok().flatten().unwrap_or(review);
                     review.comments.retain(|c| c.id != comment_id);
                     review.updated_ms = dv_core::review::now_ms();
-                    dv_core::ReviewStore::open(location).save(&review)?;
+                    store.save(&review)?;
                     anyhow::Ok(review)
                 })
                 .await;
@@ -1118,7 +1200,7 @@ impl Workspace {
         let file = palette.matches.get(palette.selected).copied();
         self.close_palette(window, cx);
         if let Some(file) = file {
-            self.select_file(file, cx);
+            self.select_file(file, window, cx);
         }
     }
 
@@ -1266,7 +1348,7 @@ impl Workspace {
             .hover(|el| el.bg(theme.accent.opacity(0.6)))
             .on_mouse_down(
                 MouseButton::Left,
-                cx.listener(move |this, _, _, cx| this.select_file(index, cx)),
+                cx.listener(move |this, _, window, cx| this.select_file(index, window, cx)),
             )
             .child(
                 div()

@@ -270,13 +270,13 @@ async fn handle(
             })?
         }
 
-        Cmd::SelectFile { index } => cx.update(|cx| {
+        Cmd::SelectFile { index } => cx.update_window(window, |_, window, cx| {
             shell.update(cx, |shell, cx| {
                 shell
-                    .automation_select_file(index, cx)
+                    .automation_select_file(index, window, cx)
                     .map(|()| json!({"selected": index}))
             })
-        }),
+        })?,
 
         Cmd::Screenshot { path } => {
             // Ask for a fresh frame, give the compositor a beat, then read

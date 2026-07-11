@@ -174,10 +174,11 @@ impl AppShell {
     pub(crate) fn automation_select_file(
         &mut self,
         index: usize,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) -> anyhow::Result<()> {
         match &self.active {
-            Some(ws) => ws.update(cx, |ws, cx| ws.automation_select_file(index, cx)),
+            Some(ws) => ws.update(cx, |ws, cx| ws.automation_select_file(index, window, cx)),
             None => Err(anyhow::anyhow!("no active review")),
         }
     }

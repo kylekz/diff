@@ -37,6 +37,9 @@ impl CommandBuilder {
     /// via `CommandExt::creation_flags`, or every git call flashes a console
     /// window once dv is a windowed (non-console) binary.
     pub fn command(&self, program: &str, args: &[&str]) -> Command {
+        // `mut` is only exercised by the cfg(windows) block below; keep
+        // non-Windows clippy (the macOS CI job) quiet about it.
+        #[cfg_attr(not(windows), allow(unused_mut))]
         let mut cmd = match &self.location {
             RepoLocation::Local(_) => {
                 let mut cmd = Command::new(program);

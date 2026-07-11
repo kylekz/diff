@@ -4,8 +4,6 @@ use std::path::PathBuf;
 
 use anyhow::{Result, anyhow, bail};
 
-use crate::command::decode_output;
-
 /// Location of a repository. Everything downstream (git commands, file
 /// reads) routes through [`crate::CommandBuilder`] based on this, which is
 /// what makes WSL support a command prefix instead of a parallel code path.
@@ -123,6 +121,8 @@ pub fn list_wsl_distros() -> Result<Vec<String>> {
     {
         use std::os::windows::process::CommandExt;
         use std::process::Command;
+
+        use crate::command::decode_output;
 
         let output = Command::new("wsl.exe")
             .args(["--list", "--quiet"])

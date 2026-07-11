@@ -133,6 +133,10 @@ fn stdout_json(output: &Output) -> Value {
 #[test]
 fn full_review_and_comment_lifecycle() {
     let repo = seed_repo("lifecycle");
+    // `dv.author` pins the author-resolution chain (crates/app/src/author.rs)
+    // to a deterministic value for this test — the machine's real git
+    // identity or a cached `gh` login must not leak into asserted output.
+    repo.git(&["config", "dv.author", "test-author"]);
 
     // review create
     let out = dv(&repo, &["review", "create", "--json"]);
@@ -220,7 +224,7 @@ fn full_review_and_comment_lifecycle() {
         .expect("replies array");
     assert_eq!(replies.len(), 1);
     assert_eq!(replies[0]["body"], "good question");
-    assert_eq!(replies[0]["author"], "agent");
+    assert_eq!(replies[0]["author"], "test-author");
 
     // resolve
     let out = dv(&repo, &["comment", "resolve", &comment_id, "--json"]);

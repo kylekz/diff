@@ -543,3 +543,71 @@ fn t14_merge_base() {
         "error should name the rev: {err}"
     );
 }
+
+/// `current_branch`/`default_branch`/`config` back `dv pr create`'s
+/// detached-HEAD and default-branch guards and `resolve_author`
+/// (crates/app/src/author.rs) — phase 3 additions.
+#[test]
+fn t15_current_branch_named_and_detached() {
+    let repo = TestRepo::new("t15");
+    repo.write("a.txt", b"hello\n");
+    let sha = repo.commit("seed");
+    let git_repo = open(&repo);
+
+    assert_eq!(git_repo.current_branch().unwrap(), Some("main".to_string()));
+
+    repo.git(&["checkout", "--detach", &sha]);
+    assert_eq!(git_repo.current_branch().unwrap(), None);
+}
+
+#[test]
+fn t16_default_branch_reads_origin_head_from_a_real_clone() {
+    let origin = TestRepo::new("t16-origin");
+    origin.write("a.txt", b"hello\n");
+    origin.commit("seed");
+
+    let clone_dir = std::env::temp_dir().join(format!("dv-test-{}-t16-clone", std::process::id()));
+    let _ = std::fs::remove_dir_all(&clone_dir);
+    let output = Command::new("git")
+        .args([
+            "clone",
+            origin.path().to_str().unwrap(),
+            clone_dir.to_str().unwrap(),
+        ])
+        .output()
+        .expect("failed to spawn git clone");
+    assert!(
+        output.status.success(),
+        "git clone failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let clone_repo =
+        GitRepo::open(RepoLocation::Local(clone_dir.clone())).expect("open cloned repo");
+    assert_eq!(clone_repo.default_branch(), Some("main".to_string()));
+
+    let _ = std::fs::remove_dir_all(&clone_dir);
+}
+
+#[test]
+fn t16b_default_branch_is_none_without_an_origin_remote() {
+    let repo = TestRepo::new("t16b");
+    repo.write("a.txt", b"hello\n");
+    repo.commit("seed");
+    let git_repo = open(&repo);
+
+    assert_eq!(git_repo.default_branch(), None);
+}
+
+#[test]
+fn t17_config_get_and_missing_key() {
+    let repo = TestRepo::new("t17");
+    repo.write("a.txt", b"hi\n");
+    repo.commit("seed");
+    let git_repo = open(&repo);
+
+    assert_eq!(git_repo.config("dv.author"), None);
+
+    repo.git(&["config", "dv.author", "kyle"]);
+    assert_eq!(git_repo.config("dv.author"), Some("kyle".to_string()));
+}

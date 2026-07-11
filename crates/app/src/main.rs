@@ -1,9 +1,11 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod author;
 mod automation;
 mod cli;
 mod fuzzy;
 mod highlight;
+mod pr;
 mod recent;
 mod shell;
 mod workspace;
@@ -126,14 +128,15 @@ fn apply_aura_theme(cx: &mut App) {
 }
 
 fn main() {
-    // Pure headless path: `dv review ...` / `dv comment ...` are the
-    // agent-facing CLI (docs/phase-2-review-layer.md § Agent CLI) and must
-    // never touch gpui — no window, no platform app, no theme init. Handled
-    // before anything else in `main` so a CI/agent invocation never pays for
-    // (or risks failing on) GPUI startup.
+    // Pure headless path: `dv review ...` / `dv comment ...` / `dv pr ...`
+    // are the agent-facing CLI (docs/phase-2-review-layer.md § Agent CLI,
+    // docs/phase-3-github.md) and must never touch gpui — no window, no
+    // platform app, no theme init. Handled before anything else in `main`
+    // so a CI/agent invocation never pays for (or risks failing on) GPUI
+    // startup.
     let raw_args: Vec<String> = std::env::args().collect();
     if let Some(sub) = raw_args.get(1)
-        && (sub == "review" || sub == "comment")
+        && (sub == "review" || sub == "comment" || sub == "pr")
     {
         let code = cli::run(&raw_args[1..]);
         std::process::exit(code);

@@ -120,6 +120,18 @@ to stderr always, plus `{"error":"..."}` on stdout in `--json` mode. Exit
 codes: `0` success, `1` operation error (unknown id, no repo, store
 failure), `2` usage error (bad flags).
 
+`dv pr <list|view|create|fetch>` (`crates/app/src/cli/pr_cmd.rs`) wrap `gh`
+for GitHub PRs: `list`/`view <n>` emit `{"prs":[...]}`/`{"pr":{...}}`;
+`create --title <t> [--body][--base][--draft]` emits `{"pr":{"number","url"}}`;
+`fetch <n>` fetches the PR's head/base and emits `{"pr_range":{"number",
+"base_oid","head_oid","merge_base","range"}}` — `range` is the
+`merge_base..head_oid` diff range the GUI will reuse. `dv review submit
+[<id>] --pr <n> [--verdict comment|approve|request-changes] [--body]
+[--include-resolved]` maps local comments onto a GitHub review (validating
+every anchor and line-in-diff first, aborting with the full list of
+problems on any failure) and emits `{"submission":{"review_id","pr",
+"event","comments","url"}}`.
+
 ## Status
 
 Phases 0–1 complete: read-only diff viewer (unified + split), WSL routing,

@@ -1,8 +1,10 @@
-//! `dv review …` / `dv comment …` — the agent-facing CLI
-//! (docs/phase-2-review-layer.md § Agent CLI). Pure headless path: this
-//! module must never import `gpui` or anything that touches a window.
-//! `main.rs` branches here before any gpui initialization when
-//! `argv[1]` is `"review"` or `"comment"`.
+//! `dv review …` / `dv comment …` / `dv pr …` — the agent-facing CLI
+//! (docs/phase-2-review-layer.md § Agent CLI, docs/phase-3-github.md). Pure
+//! headless path: this module must never import `gpui` or anything that
+//! touches a window. `main.rs` branches here before any gpui initialization
+//! when `argv[1]` is `"review"`, `"comment"`, or `"pr"`. `pr_cmd` (the `dv
+//! pr ...` subcommands, plus `dv review submit`) lives in its own child
+//! module — see its doc comment.
 //!
 //! `dv comment list --status open --json` is the canonical "what does the
 //! reviewer want from me" query for Claude Code — see CLAUDE.md § Review
@@ -12,6 +14,8 @@
 //! Parsing is hand-rolled (no clap), matching `main.rs`'s style: a `while
 //! let Some(arg) = iter.next()` loop per subcommand, `--flag` consuming the
 //! next token as its value.
+
+mod pr_cmd;
 
 use std::path::PathBuf;
 
@@ -44,7 +48,8 @@ pub fn run(args: &[String]) -> i32 {
     match args.first().map(String::as_str) {
         Some("review") => dispatch(&args[1..], REVIEW_USAGE, review_router),
         Some("comment") => dispatch(&args[1..], COMMENT_USAGE, comment_router),
-        _ => unreachable!("cli::run requires argv[1] in {{review, comment}}"),
+        Some("pr") => dispatch(&args[1..], pr_cmd::PR_USAGE, pr_cmd::pr_router),
+        _ => unreachable!("cli::run requires argv[1] in {{review, comment, pr}}"),
     }
 }
 
@@ -160,13 +165,16 @@ fn resolve_repo(location: Option<RepoLocation>) -> Result<GitRepo, CliError> {
 // ---------------------------------------------------------------------
 
 const REVIEW_USAGE: &str = "\
-usage: dv review <list|show|create|delete> [options]
+usage: dv review <list|show|create|delete|submit> [options]
 
   list                        all reviews in the repo
   show <id>                   one review, including its comments
   create [--source working|staged] [--range a..b|a...b] [--commit <rev>]
                                (default source: working)
   delete <id>
+  submit [<id>] --pr <number> [--verdict comment|approve|request-changes]
+               [--body <text>] [--include-resolved]
+               submit a draft review to GitHub via `gh` (docs/phase-3-github.md)
 
 global options (may appear anywhere after `review`):
   --repo <path>                local path or \\\\wsl.localhost\\<distro>\\<path> (default: .)
@@ -240,6 +248,7 @@ fn review_router(
             print_review_delete(&id, json);
             Ok(())
         }
+        "submit" => pr_cmd::cmd_review_submit(args, json, location),
         other => Err(usage_err(
             format!("unknown review subcommand: {other}"),
             REVIEW_USAGE,
@@ -348,7 +357,10 @@ struct CommentAddArgs {
     side: Side,
     body: String,
     review: Option<String>,
-    author: String,
+    /// `None` when `--author` wasn't given — resolved via
+    /// `crate::author::resolve_author` once a [`GitRepo`] is available,
+    /// rather than defaulting to a placeholder at parse time.
+    author: Option<String>,
 }
 
 fn parse_comment_add(args: &[String]) -> Result<CommentAddArgs, String> {
@@ -357,7 +369,7 @@ fn parse_comment_add(args: &[String]) -> Result<CommentAddArgs, String> {
     let mut side = Side::New;
     let mut body: Option<String> = None;
     let mut review: Option<String> = None;
-    let mut author = "agent".to_string();
+    let mut author: Option<String> = None;
 
     let mut iter = args.iter();
     while let Some(arg) = iter.next() {
@@ -367,7 +379,7 @@ fn parse_comment_add(args: &[String]) -> Result<CommentAddArgs, String> {
             "--side" => side = parse_side(iter.next().ok_or("--side requires old|new")?)?,
             "--body" => body = Some(iter.next().ok_or("--body requires text")?.clone()),
             "--review" => review = Some(iter.next().ok_or("--review requires an id")?.clone()),
-            "--author" => author = iter.next().ok_or("--author requires a name")?.clone(),
+            "--author" => author = Some(iter.next().ok_or("--author requires a name")?.clone()),
             other => return Err(format!("unknown flag: {other}")),
         }
     }
@@ -396,6 +408,9 @@ fn cmd_comment_add(
     let parsed = parse_comment_add(args).map_err(|reason| usage_err(reason, COMMENT_USAGE))?;
 
     let repo = resolve_repo(location)?;
+    let author = parsed
+        .author
+        .unwrap_or_else(|| crate::author::resolve_author(&repo));
     let store = ReviewStore::open(repo.location().clone());
     let (mut review, created) = target_review_for_add(&store, parsed.review.as_deref())?;
 
@@ -411,7 +426,7 @@ fn cmd_comment_add(
             parsed.end,
             blob_sha,
             parsed.body,
-            parsed.author,
+            author,
         )
         .map_err(op_err)?
         .clone();
@@ -459,6 +474,7 @@ fn cmd_comment_reply(
         parse_comment_reply(args).map_err(|reason| usage_err(reason, COMMENT_USAGE))?;
 
     let repo = resolve_repo(location)?;
+    let author = author.unwrap_or_else(|| crate::author::resolve_author(&repo));
     let store = ReviewStore::open(repo.location().clone());
     let mut review = find_review_for_comment(&store, review_id.as_deref(), &comment_id)?;
 
@@ -478,9 +494,12 @@ fn cmd_comment_reply(
     Ok(())
 }
 
+/// `(comment_id, body, author, review_id)` — `author` is `None` when
+/// `--author` wasn't given, resolved by the caller via
+/// `crate::author::resolve_author` once a [`GitRepo`] is available.
 fn parse_comment_reply(
     args: &[String],
-) -> Result<(String, String, String, Option<String>), String> {
+) -> Result<(String, String, Option<String>, Option<String>), String> {
     let (id, rest) = args
         .split_first()
         .ok_or("comment reply requires <comment-id>")?;
@@ -489,14 +508,14 @@ fn parse_comment_reply(
     }
 
     let mut body: Option<String> = None;
-    let mut author = "agent".to_string();
+    let mut author: Option<String> = None;
     let mut review: Option<String> = None;
 
     let mut iter = rest.iter();
     while let Some(arg) = iter.next() {
         match arg.as_str() {
             "--body" => body = Some(iter.next().ok_or("--body requires text")?.clone()),
-            "--author" => author = iter.next().ok_or("--author requires a name")?.clone(),
+            "--author" => author = Some(iter.next().ok_or("--author requires a name")?.clone()),
             "--review" => review = Some(iter.next().ok_or("--review requires an id")?.clone()),
             other => return Err(format!("unknown flag: {other}")),
         }
@@ -1077,7 +1096,9 @@ mod tests {
         assert_eq!((parsed.start, parsed.end), (10, 12));
         assert_eq!(parsed.side, Side::New); // default
         assert_eq!(parsed.body, "why?");
-        assert_eq!(parsed.author, "agent"); // default
+        // `--author` unset resolves later, via `crate::author::resolve_author`
+        // (needs a `GitRepo`), not at parse time.
+        assert!(parsed.author.is_none());
         assert!(parsed.review.is_none());
     }
 
@@ -1094,7 +1115,7 @@ mod tests {
         assert_eq!((parsed.start, parsed.end), (5, 5));
         assert_eq!(parsed.side, Side::Old);
         assert_eq!(parsed.review.as_deref(), Some("r-1-abcd"));
-        assert_eq!(parsed.author, "kyle");
+        assert_eq!(parsed.author.as_deref(), Some("kyle"));
     }
 
     #[test]
@@ -1219,7 +1240,7 @@ mod tests {
         let (id, body, author, review) = parse_comment_reply(&args).expect("should parse");
         assert_eq!(id, "c-1-abcd");
         assert_eq!(body, "hi");
-        assert_eq!(author, "agent");
+        assert!(author.is_none());
         assert!(review.is_none());
     }
 

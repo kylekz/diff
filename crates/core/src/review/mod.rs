@@ -49,6 +49,32 @@ pub struct Review {
     pub created_ms: u64,
     pub updated_ms: u64,
     pub comments: Vec<Comment>,
+    /// Linkage to a GitHub PR this review is attached to, if any — absent
+    /// for a plain local review (working tree / staged / arbitrary range).
+    /// Optional and defaulted so old on-disk JSON (written before phase 3)
+    /// still loads: [`Review`] never uses `deny_unknown_fields`, and this
+    /// field follows the same forward/backward-compat rule the module doc
+    /// describes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remote: Option<RemoteRef>,
+}
+
+/// Where a [`Review`] came from / is headed on GitHub: which PR it's
+/// reviewing, and — once submitted — the review `gh` created there.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RemoteRef {
+    /// Always `"github"` today; a field (not an assumption) so a future
+    /// second provider doesn't need a schema bump.
+    pub provider: String,
+    /// `host/owner/repo`, matching [`crate::github::RepoSlug`]'s `Display`.
+    pub slug: String,
+    pub pr: u64,
+    pub url: String,
+    /// Set once the review is actually submitted to GitHub.
+    #[serde(default)]
+    pub submitted_review_id: Option<u64>,
+    #[serde(default)]
+    pub submitted_url: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -133,6 +159,7 @@ impl Review {
             created_ms: now,
             updated_ms: now,
             comments: Vec::new(),
+            remote: None,
         }
     }
 
@@ -370,6 +397,71 @@ mod tests {
         assert_eq!(round_tripped.comments.len(), 1);
         assert_eq!(round_tripped.comments[0].replies.len(), 1);
         assert_eq!(round_tripped.state, ReviewState::Draft);
+    }
+
+    #[test]
+    fn old_review_json_without_remote_field_still_loads() {
+        // A pre-phase-3 review file, written before `remote` existed.
+        let old_json = r#"{
+            "v": 1,
+            "id": "r-1700000000000-abcd",
+            "source": "WorkingTree",
+            "state": "draft",
+            "created_ms": 1700000000000,
+            "updated_ms": 1700000000000,
+            "comments": []
+        }"#;
+        let review: Review = serde_json::from_str(old_json).unwrap();
+        assert_eq!(review.id, "r-1700000000000-abcd");
+        assert!(review.remote.is_none());
+
+        // And it must not have grown a `"remote"` key on the way back out.
+        let rewritten = serde_json::to_string(&review).unwrap();
+        assert!(!rewritten.contains("\"remote\""));
+    }
+
+    #[test]
+    fn review_with_remote_ref_round_trips() {
+        let mut review = draft();
+        review.remote = Some(RemoteRef {
+            provider: "github".to_string(),
+            slug: "github.com/kylekz/difftest".to_string(),
+            pr: 7,
+            url: "https://github.com/kylekz/difftest/pull/7".to_string(),
+            submitted_review_id: Some(123),
+            submitted_url: Some(
+                "https://github.com/kylekz/difftest/pull/7#pullrequestreview-123".to_string(),
+            ),
+        });
+
+        let json = serde_json::to_string_pretty(&review).unwrap();
+        let round_tripped: Review = serde_json::from_str(&json).unwrap();
+
+        let remote = round_tripped.remote.expect("remote should round-trip");
+        assert_eq!(remote.provider, "github");
+        assert_eq!(remote.slug, "github.com/kylekz/difftest");
+        assert_eq!(remote.pr, 7);
+        assert_eq!(remote.submitted_review_id, Some(123));
+    }
+
+    #[test]
+    fn remote_ref_with_no_submission_yet_omits_optional_fields_but_still_parses() {
+        // A review just linked to a PR, before any review has been
+        // submitted through it.
+        let mut review = draft();
+        review.remote = Some(RemoteRef {
+            provider: "github".to_string(),
+            slug: "github.com/kylekz/difftest".to_string(),
+            pr: 3,
+            url: "https://github.com/kylekz/difftest/pull/3".to_string(),
+            submitted_review_id: None,
+            submitted_url: None,
+        });
+        let json = serde_json::to_string(&review).unwrap();
+        let round_tripped: Review = serde_json::from_str(&json).unwrap();
+        let remote = round_tripped.remote.unwrap();
+        assert_eq!(remote.submitted_review_id, None);
+        assert_eq!(remote.submitted_url, None);
     }
 
     #[test]

@@ -82,9 +82,7 @@ impl CommandBuilder {
                 None => "terminated by signal".to_string(),
             };
             let mut stderr = decode_output(&output.stderr);
-            if stderr.len() > 2000 {
-                stderr.truncate(2000);
-            }
+            truncate_lossy(&mut stderr, 2000);
             bail!("{program} {joined_args} failed (exit {code}): {stderr}");
         }
 
@@ -144,14 +142,28 @@ impl CommandBuilder {
                 None => "terminated by signal".to_string(),
             };
             let mut stderr = decode_output(&output.stderr);
-            if stderr.len() > 2000 {
-                stderr.truncate(2000);
-            }
+            truncate_lossy(&mut stderr, 2000);
             bail!("{program} {joined_args} failed (exit {code}): {stderr}");
         }
 
         Ok(output.stdout)
     }
+}
+
+/// Truncate `s` to at most `max` bytes, backing up to the nearest
+/// preceding UTF-8 character boundary so a multi-byte character straddling
+/// `max` isn't split — plain `String::truncate(max)` panics in that case.
+/// Shared by [`CommandBuilder`]'s own error paths and
+/// [`crate::github::client`]'s `classify_failure`.
+pub(crate) fn truncate_lossy(s: &mut String, max: usize) {
+    if s.len() <= max {
+        return;
+    }
+    let mut boundary = max;
+    while boundary > 0 && !s.is_char_boundary(boundary) {
+        boundary -= 1;
+    }
+    s.truncate(boundary);
 }
 
 /// Decode process output that may be UTF-8 **or** UTF-16LE.
@@ -239,6 +251,24 @@ mod tests {
             args,
             ["-d", "Ubuntu", "--exec", "git", "-C", "/x", "status"]
         );
+    }
+
+    #[test]
+    fn truncate_lossy_backs_up_to_char_boundary() {
+        // Each "中" is 3 bytes in UTF-8, so byte offset 2000 (not a
+        // multiple of 3) falls mid-character; naively truncating there
+        // would panic `String::truncate`.
+        let mut s = "中".repeat(1000); // 3000 bytes, 1000 chars
+        truncate_lossy(&mut s, 2000);
+        assert_eq!(s.len(), 1998); // nearest char boundary <= 2000
+        assert!(s.chars().all(|c| c == '中'));
+    }
+
+    #[test]
+    fn truncate_lossy_is_a_noop_under_the_limit() {
+        let mut s = "short".to_string();
+        truncate_lossy(&mut s, 2000);
+        assert_eq!(s, "short");
     }
 
     #[test]

@@ -174,6 +174,96 @@ impl GitRepo {
             .with_context(|| format!("no merge base between {a} and {b}"))
     }
 
+    /// `git remote get-url <name>` — the configured URL for a remote.
+    /// [`crate::github`] uses this against `"origin"` to derive the GitHub
+    /// repo slug; `gh` itself never runs against a WSL location, but the
+    /// remote URL is read through the normal routed git layer so it works
+    /// identically for local and WSL repos.
+    pub fn remote_url(&self, name: &str) -> Result<String> {
+        self.git_text(&["remote", "get-url", name])
+            .with_context(|| format!("reading url of remote {name:?}"))
+    }
+
+    /// `git fetch origin pull/<n>/head` — fetches a PR's head commit (by
+    /// GitHub's synthetic `pull/<n>/head` ref) so its blobs exist locally,
+    /// without creating or updating any local branch. Routed, so this works
+    /// for WSL repos exactly like every other git call here.
+    pub fn fetch_pr_head(&self, number: u64) -> Result<()> {
+        let root = self.root_arg();
+        self.builder
+            .run(
+                "git",
+                &[
+                    "-C",
+                    &root,
+                    "fetch",
+                    "origin",
+                    "--",
+                    &format!("pull/{number}/head"),
+                ],
+            )
+            .with_context(|| format!("fetching pull/{number}/head from origin"))?;
+        Ok(())
+    }
+
+    /// `git fetch origin <refname>` — used to make sure a PR's base branch
+    /// tip is present locally before diffing or computing a merge-base.
+    pub fn fetch_ref(&self, refname: &str) -> Result<()> {
+        let root = self.root_arg();
+        self.builder
+            .run("git", &["-C", &root, "fetch", "origin", "--", refname])
+            .with_context(|| format!("fetching {refname} from origin"))?;
+        Ok(())
+    }
+
+    /// Whether `oid` names an object already present in the local object
+    /// database — `git cat-file -e`, which (unlike `rev-parse --verify`)
+    /// actually checks object existence rather than just revision syntax.
+    /// Used to skip a redundant fetch when the PR's head/base is already
+    /// local.
+    pub fn has_object(&self, oid: &str) -> bool {
+        let root = self.root_arg();
+        self.builder
+            .run("git", &["-C", &root, "cat-file", "-e", oid])
+            .is_ok()
+    }
+
+    /// `git rev-parse --abbrev-ref HEAD` — the current branch name, or
+    /// `None` when `HEAD` is detached (git prints the literal string
+    /// `"HEAD"` in that case). Used by `dv pr create` to refuse opening a PR
+    /// from a detached checkout.
+    pub fn current_branch(&self) -> Result<Option<String>> {
+        let name = self.git_text(&["rev-parse", "--abbrev-ref", "HEAD"])?;
+        Ok(if name == "HEAD" { None } else { Some(name) })
+    }
+
+    /// The remote's configured default branch (e.g. `"main"`), read from
+    /// `origin/HEAD`'s symbolic ref — set by `git clone` or `git remote
+    /// set-head origin -a`. `None` (rather than an `Err`) when it isn't set
+    /// (a shallow or manually-configured checkout, say): callers treat this
+    /// as best-effort, not a hard requirement.
+    pub fn default_branch(&self) -> Option<String> {
+        let full = self
+            .git_text(&["symbolic-ref", "--short", "-q", "refs/remotes/origin/HEAD"])
+            .ok()?;
+        full.strip_prefix("origin/").map(str::to_string)
+    }
+
+    /// `git config --get <key>` scoped to the repo root. `Ok(None)`
+    /// (returned as a plain `None`, not an `Err`) both when the key is
+    /// genuinely unset (git's exit 1 with empty stderr) and on any other
+    /// failure reading it — the only callers ([`crate::github`]'s author
+    /// resolution, by way of the app crate) are meant to degrade silently
+    /// through a chain of fallbacks rather than surface a config-reading
+    /// error to the user.
+    pub fn config(&self, key: &str) -> Option<String> {
+        let root = self.root_arg();
+        self.builder
+            .run_text("git", &["-C", &root, "config", "--get", key])
+            .ok()
+            .filter(|v| !v.is_empty())
+    }
+
     /// Whether `HEAD` doesn't resolve yet — a freshly `git init`ed repo with
     /// no commits. Paid unconditionally by [`Self::diff_root`]'s callers
     /// (`WorkingTree`/`Staged`): one cheap subprocess, simpler branching

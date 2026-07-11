@@ -9,15 +9,22 @@
 pub mod command;
 pub mod diff;
 pub mod git;
+pub mod github;
 pub mod location;
 pub mod review;
 
 pub use command::CommandBuilder;
 pub use diff::{DiffLine, DiffOptions, FileDiff, Hunk, LineKind};
 pub use git::{BlobSpec, ChangeStatus, ChangedFile, DiffSource, GitRepo};
+pub use github::{
+    ChecksSummary, CreatePr, CreatedPr, DraftComment, GhError, GhSide, GithubClient, PrMeta,
+    PrState, PrStatus, PrSummary, RepoSlug, ReviewDecision, ReviewEvent, ReviewSubmission,
+    SubmittedReview,
+};
 pub use location::RepoLocation;
 pub use review::{
-    Comment, CommentStatus, Reply, Review, ReviewState, ReviewStore, ReviewWatcher, Side, Verdict,
+    Comment, CommentStatus, RemoteRef, Reply, Review, ReviewState, ReviewStore, ReviewWatcher,
+    Side, Verdict,
 };
 
 pub const APP_NAME: &str = "dv";

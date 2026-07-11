@@ -1,6 +1,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod automation;
+mod fuzzy;
 mod highlight;
 mod recent;
 mod shell;

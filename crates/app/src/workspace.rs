@@ -14,17 +14,50 @@ use gpui_component::{h_flex, v_flex};
 
 use crate::highlight::{self, LineRuns};
 
-actions!(workspace, [NextFile, PrevFile, ToggleSplit]);
+actions!(
+    workspace,
+    [
+        NextFile,
+        PrevFile,
+        NextHunk,
+        PrevHunk,
+        ToggleSplit,
+        JumpToFile,
+        PaletteNext,
+        PalettePrev,
+        PaletteClose
+    ]
+);
 
 const KEY_CONTEXT: &str = "Workspace";
 
+/// Every diff row (lines and hunk headers alike) renders at this exact
+/// height. uniform_list sizes its slots from a measured row; any variant
+/// taller than the rest (the old padded headers) makes every other row sit
+/// short in its slot, leaving unpainted gaps between line backgrounds.
+const ROW_HEIGHT: f32 = 24.;
+/// Extra identifier stamped onto the workspace node while the jump-to-file
+/// palette is open. Single-char bindings are scoped to `!PaletteOpen` so
+/// they keep bubbling into the palette's text input instead of firing.
+const PALETTE_CONTEXT: &str = "PaletteOpen";
+
 pub fn init(cx: &mut App) {
+    let browse = Some("Workspace && !PaletteOpen");
+    let palette = Some("Workspace && PaletteOpen");
     cx.bind_keys([
-        KeyBinding::new("j", NextFile, Some(KEY_CONTEXT)),
-        KeyBinding::new("down", NextFile, Some(KEY_CONTEXT)),
-        KeyBinding::new("k", PrevFile, Some(KEY_CONTEXT)),
-        KeyBinding::new("up", PrevFile, Some(KEY_CONTEXT)),
-        KeyBinding::new("s", ToggleSplit, Some(KEY_CONTEXT)),
+        KeyBinding::new("j", NextFile, browse),
+        KeyBinding::new("down", NextFile, browse),
+        KeyBinding::new("k", PrevFile, browse),
+        KeyBinding::new("up", PrevFile, browse),
+        KeyBinding::new("n", NextHunk, browse),
+        KeyBinding::new("p", PrevHunk, browse),
+        KeyBinding::new("s", ToggleSplit, browse),
+        KeyBinding::new("f", JumpToFile, browse),
+        KeyBinding::new("ctrl-p", JumpToFile, browse),
+        KeyBinding::new("cmd-p", JumpToFile, browse),
+        KeyBinding::new("down", PaletteNext, palette),
+        KeyBinding::new("up", PalettePrev, palette),
+        KeyBinding::new("escape", PaletteClose, palette),
     ]);
 }
 
@@ -43,7 +76,15 @@ enum Status {
 /// One renderable row of the diff pane, precomputed so the uniform_list
 /// closure stays trivial.
 enum Row {
-    HunkHeader(SharedString),
+    HunkHeader {
+        label: SharedString,
+        /// Index into the file's hunk list — identifies which gap a click
+        /// expands.
+        hunk: usize,
+        /// `Some(n)` ⇒ n hidden context lines sit between the previous hunk
+        /// (or file start) and this one, and clicking reveals them.
+        expandable: Option<u32>,
+    },
     Line {
         kind: LineKind,
         old_line: Option<u32>,
@@ -70,7 +111,11 @@ struct SplitCell {
 /// old side on the left and the new side on the right; either can be absent
 /// (a pure add/delete leaves the opposite side blank).
 enum SplitRow {
-    HunkHeader(SharedString),
+    HunkHeader {
+        label: SharedString,
+        hunk: usize,
+        expandable: Option<u32>,
+    },
     Pair {
         left: Option<SplitCell>,
         right: Option<SplitCell>,
@@ -91,6 +136,24 @@ struct HighlightInputs {
 struct RenderedDiff {
     unified: Vec<Row>,
     split: Vec<SplitRow>,
+    /// Row index where each hunk starts (its header — or, once its gap is
+    /// expanded, its first revealed line), per view. n/p jump through these.
+    hunk_rows_unified: Vec<usize>,
+    hunk_rows_split: Vec<usize>,
+    /// This "diff" is a cached failure message; re-selecting the file
+    /// retries instead of pinning the error forever.
+    error: bool,
+}
+
+/// The jump-to-file palette, while open: a text input plus a live-filtered
+/// view of the file list.
+struct Palette {
+    input: Entity<gpui_component::input::InputState>,
+    /// Indices into `files`, best match first.
+    matches: Vec<usize>,
+    /// Cursor within `matches`.
+    selected: usize,
+    _subscription: Subscription,
 }
 
 pub struct Workspace {
@@ -109,6 +172,33 @@ pub struct Workspace {
     /// a merge-base range to a plain two-dot range — so the header keeps
     /// saying "range (merge base)".
     source_desc: SharedString,
+    /// Which hunk n/p last jumped to in the selected file.
+    current_hunk: usize,
+    /// Per file: hunk indices whose preceding context gap has been expanded
+    /// (click on the hunk header). Feeds row rebuilding.
+    expanded: HashMap<usize, HashSet<usize>>,
+    file_scroll: UniformListScrollHandle,
+    diff_scroll: UniformListScrollHandle,
+    palette: Option<Palette>,
+}
+
+/// A one-row "diff" carrying an error message where the hunks would be.
+fn error_diff(msg: SharedString) -> RenderedDiff {
+    RenderedDiff {
+        unified: vec![Row::HunkHeader {
+            label: msg.clone(),
+            hunk: 0,
+            expandable: None,
+        }],
+        split: vec![SplitRow::HunkHeader {
+            label: msg,
+            hunk: 0,
+            expandable: None,
+        }],
+        hunk_rows_unified: Vec::new(),
+        hunk_rows_split: Vec::new(),
+        error: true,
+    }
 }
 
 fn source_label(source: &DiffSource) -> &'static str {
@@ -145,6 +235,11 @@ impl Workspace {
             diffs: HashMap::new(),
             diff_pending: HashSet::new(),
             view_mode: ViewMode::Unified,
+            current_hunk: 0,
+            expanded: HashMap::new(),
+            file_scroll: UniformListScrollHandle::new(),
+            diff_scroll: UniformListScrollHandle::new(),
+            palette: None,
         };
 
         cx.spawn(async move |this, cx| {
@@ -192,11 +287,23 @@ impl Workspace {
             return;
         }
         self.selected = Some(index);
+        self.current_hunk = 0;
+        self.file_scroll
+            .scroll_to_item(index, ScrollStrategy::Nearest);
+        self.diff_scroll.scroll_to_item(0, ScrollStrategy::Top);
         cx.notify();
 
-        if self.diffs.contains_key(&index) || self.diff_pending.contains(&index) {
+        // A cached failure retries on reselect; a good diff is final.
+        let cached_ok = self.diffs.get(&index).is_some_and(|d| !d.error);
+        if cached_ok || self.diff_pending.contains(&index) {
             return;
         }
+        self.request_diff(index, cx);
+    }
+
+    /// Kick off (or re-run) the off-thread row computation for one file,
+    /// honoring its current gap-expansion state.
+    fn request_diff(&mut self, index: usize, cx: &mut Context<Self>) {
         let Some(repo) = self.repo.clone() else {
             return;
         };
@@ -204,6 +311,7 @@ impl Workspace {
 
         let file = self.files[index].clone();
         let source = self.source.clone();
+        let expand = self.expanded.get(&index).cloned().unwrap_or_default();
         let theme = cx.theme();
         let hl = HighlightInputs {
             theme: theme.highlight_theme.clone(),
@@ -213,7 +321,7 @@ impl Workspace {
         cx.spawn(async move |this, cx| {
             let rendered = cx
                 .background_executor()
-                .spawn(async move { compute_diff(&repo, &source, &file, &hl) })
+                .spawn(async move { compute_diff(&repo, &source, &file, &hl, &expand) })
                 .await;
 
             this.update(cx, |this, cx| {
@@ -224,20 +332,36 @@ impl Workspace {
                     }
                     Err(err) => {
                         let msg: SharedString = format!("failed to compute diff: {err:#}").into();
-                        this.diffs.insert(
-                            index,
-                            Arc::new(RenderedDiff {
-                                unified: vec![Row::HunkHeader(msg.clone())],
-                                split: vec![SplitRow::HunkHeader(msg)],
-                            }),
-                        );
+                        this.diffs.insert(index, Arc::new(error_diff(msg)));
                     }
+                }
+                // Row indices may have shifted (gap expansion inserts rows
+                // above); re-anchor the viewport on the current hunk so the
+                // content doesn't visually jump.
+                if this.selected == Some(index) {
+                    this.scroll_to_current_hunk();
                 }
                 cx.notify();
             })
             .ok();
         })
         .detach();
+    }
+
+    /// Reveal the hidden context above `hunk` in the selected file, then
+    /// recompute that file's rows.
+    fn expand_hunk_gap(&mut self, hunk: usize, cx: &mut Context<Self>) {
+        let Some(index) = self.selected else {
+            return;
+        };
+        self.expanded.entry(index).or_default().insert(hunk);
+        // Anchor the viewport on the expanded hunk once the rebuilt rows
+        // land (see request_diff) — its own row index is about to move.
+        self.current_hunk = hunk;
+        // Keep the stale rows on screen while the recompute runs; the
+        // completion overwrites them. Removing them first blanks the pane
+        // for the whole recompute (visible on large files).
+        self.request_diff(index, cx);
     }
 
     /// Semantic state for `--automation` (`{"cmd":"state"}`): what the
@@ -261,6 +385,12 @@ impl Workspace {
                 ViewMode::Split => "split",
             },
             "selected": self.selected,
+            "current_hunk": self.current_hunk,
+            "palette": self.palette.as_ref().map(|p| json!({
+                "matches": p.matches.len(),
+                "selected": p.selected,
+                "top": p.matches.first().map(|&i| self.files[i].path.clone()),
+            })),
             "files": self.files.iter().map(|file| json!({
                 "path": file.path,
                 "old_path": file.old_path,
@@ -292,13 +422,17 @@ impl Workspace {
     }
 
     /// True once there is nothing left in flight: repo loaded (or failed)
-    /// and the selected file's diff computed. `wait_ready` polls this.
+    /// and the selected file's diff computed with no recompute pending
+    /// (gap expansion keeps stale rows visible while it rebuilds).
+    /// `wait_ready` polls this.
     pub(crate) fn automation_settled(&self) -> bool {
         match &self.status {
             Status::Loading => false,
             Status::Failed(_) => true,
             Status::Ready => match self.selected {
-                Some(index) => self.diffs.contains_key(&index),
+                Some(index) => {
+                    self.diffs.contains_key(&index) && !self.diff_pending.contains(&index)
+                }
                 None => true,
             },
         }
@@ -319,7 +453,215 @@ impl Workspace {
             ViewMode::Unified => ViewMode::Split,
             ViewMode::Split => ViewMode::Unified,
         };
+        // Row indices differ between the views; keep the eye on the same
+        // hunk across the toggle.
+        self.scroll_to_current_hunk();
         cx.notify();
+    }
+
+    /// Row indices of the hunk starts for the selected file in the active
+    /// view mode.
+    fn hunk_rows(&self) -> Option<&[usize]> {
+        let diff = self.selected.and_then(|i| self.diffs.get(&i))?;
+        Some(match self.view_mode {
+            ViewMode::Unified => &diff.hunk_rows_unified,
+            ViewMode::Split => &diff.hunk_rows_split,
+        })
+    }
+
+    fn scroll_to_current_hunk(&mut self) {
+        let current = self.current_hunk;
+        if let Some(&row) = self.hunk_rows().and_then(|rows| rows.get(current)) {
+            self.diff_scroll.scroll_to_item(row, ScrollStrategy::Top);
+        }
+    }
+
+    fn on_next_hunk(&mut self, _: &NextHunk, _: &mut Window, cx: &mut Context<Self>) {
+        let count = self.hunk_rows().map_or(0, <[usize]>::len);
+        if count == 0 {
+            return;
+        }
+        self.current_hunk = (self.current_hunk + 1).min(count - 1);
+        self.scroll_to_current_hunk();
+        cx.notify();
+    }
+
+    fn on_prev_hunk(&mut self, _: &PrevHunk, _: &mut Window, cx: &mut Context<Self>) {
+        if self.hunk_rows().is_none_or(<[usize]>::is_empty) {
+            return;
+        }
+        self.current_hunk = self.current_hunk.saturating_sub(1);
+        self.scroll_to_current_hunk();
+        cx.notify();
+    }
+
+    // ---- Jump-to-file palette ----------------------------------------
+
+    fn on_jump_to_file(&mut self, _: &JumpToFile, window: &mut Window, cx: &mut Context<Self>) {
+        use gpui_component::input::{InputEvent, InputState};
+        if self.files.is_empty() {
+            return;
+        }
+        if let Some(palette) = &self.palette {
+            // Already open — just refocus the input.
+            let input = palette.input.clone();
+            input.update(cx, |input, cx| input.focus(window, cx));
+            return;
+        }
+
+        let input = cx.new(|cx| InputState::new(window, cx).placeholder("Jump to file…"));
+        let subscription = cx.subscribe_in(
+            &input,
+            window,
+            |this, input, event: &InputEvent, window, cx| match event {
+                InputEvent::Change => {
+                    let query = input.read(cx).value().to_string();
+                    if let Some(palette) = &mut this.palette {
+                        palette.matches =
+                            crate::fuzzy::rank(&query, this.files.iter().map(|f| f.path.as_str()));
+                        palette.selected = 0;
+                    }
+                    cx.notify();
+                }
+                InputEvent::PressEnter { .. } => this.palette_choose(window, cx),
+                InputEvent::Blur => this.close_palette(window, cx),
+                InputEvent::Focus => {}
+            },
+        );
+
+        input.update(cx, |input, cx| input.focus(window, cx));
+        self.palette = Some(Palette {
+            input,
+            matches: (0..self.files.len()).collect(),
+            selected: 0,
+            _subscription: subscription,
+        });
+        cx.notify();
+    }
+
+    fn palette_choose(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(palette) = &self.palette else {
+            return;
+        };
+        let file = palette.matches.get(palette.selected).copied();
+        self.close_palette(window, cx);
+        if let Some(file) = file {
+            self.select_file(file, cx);
+        }
+    }
+
+    fn close_palette(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.palette.take().is_some() {
+            window.focus(&self.focus_handle, cx);
+            cx.notify();
+        }
+    }
+
+    fn on_palette_next(&mut self, _: &PaletteNext, _: &mut Window, cx: &mut Context<Self>) {
+        if let Some(palette) = &mut self.palette
+            && !palette.matches.is_empty()
+        {
+            palette.selected = (palette.selected + 1).min(palette.matches.len() - 1);
+            cx.notify();
+        }
+    }
+
+    fn on_palette_prev(&mut self, _: &PalettePrev, _: &mut Window, cx: &mut Context<Self>) {
+        if let Some(palette) = &mut self.palette {
+            palette.selected = palette.selected.saturating_sub(1);
+            cx.notify();
+        }
+    }
+
+    fn on_palette_close(&mut self, _: &PaletteClose, window: &mut Window, cx: &mut Context<Self>) {
+        self.close_palette(window, cx);
+    }
+
+    /// The jump-to-file palette overlay, when open: centered near the top,
+    /// a query input above the ranked matches.
+    fn render_palette(&self, cx: &mut Context<Self>) -> Option<Div> {
+        const VISIBLE: usize = 12;
+        let palette = self.palette.as_ref()?;
+        let theme = cx.theme();
+
+        // Keep the selection visible within the capped row window.
+        let first = palette.selected.saturating_sub(VISIBLE - 1);
+        let rows: Vec<Stateful<Div>> = palette
+            .matches
+            .iter()
+            .enumerate()
+            .skip(first)
+            .take(VISIBLE)
+            .map(|(match_ix, &file_ix)| {
+                let selected = match_ix == palette.selected;
+                div()
+                    .id(("palette-row", match_ix))
+                    .w_full()
+                    .px_2()
+                    .py_0p5()
+                    .rounded_sm()
+                    .cursor_pointer()
+                    .when(selected, |el| el.bg(theme.accent))
+                    .hover(|el| el.bg(theme.accent.opacity(0.5)))
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |this, _, window, cx| {
+                            if let Some(palette) = &mut this.palette {
+                                palette.selected = match_ix;
+                            }
+                            this.palette_choose(window, cx);
+                        }),
+                    )
+                    .child(
+                        div()
+                            .text_sm()
+                            .truncate()
+                            .child(self.files[file_ix].path.clone()),
+                    )
+            })
+            .collect();
+
+        Some(
+            div()
+                .absolute()
+                .top(px(48.))
+                .left_0()
+                .right_0()
+                .flex()
+                .justify_center()
+                .child(
+                    v_flex()
+                        .w(px(560.))
+                        .max_w_full()
+                        .p_2()
+                        .gap_2()
+                        // Swallow clicks on the popover chrome (padding,
+                        // gaps): otherwise they bubble to the workspace
+                        // root's focus-on-mousedown, blurring the input and
+                        // closing the palette out from under the user.
+                        .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                        .bg(theme.popover)
+                        .text_color(theme.popover_foreground)
+                        .border_1()
+                        .border_color(theme.border)
+                        .rounded_lg()
+                        .shadow_lg()
+                        .child(gpui_component::input::Input::new(&palette.input))
+                        .child(v_flex().w_full().children(rows).when(
+                            palette.matches.is_empty(),
+                            |el| {
+                                el.child(
+                                    div()
+                                        .px_2()
+                                        .py_1()
+                                        .text_sm()
+                                        .text_color(theme.muted_foreground)
+                                        .child("no matching files"),
+                                )
+                            },
+                        )),
+                ),
+        )
     }
 
     fn render_file_row(&self, index: usize, cx: &mut Context<Self>) -> impl IntoElement + use<> {
@@ -365,6 +707,45 @@ impl Workspace {
             .child(div().text_sm().truncate().child(label))
     }
 
+    /// A hunk header row (shared by both views). When context is hidden
+    /// above the hunk, the row is clickable and says how much it reveals.
+    fn render_hunk_header(
+        &self,
+        label: SharedString,
+        hunk: usize,
+        expandable: Option<u32>,
+        cx: &mut Context<Self>,
+    ) -> Stateful<Div> {
+        let theme = cx.theme();
+        let base = h_flex()
+            .id(("hunk-header", hunk))
+            .w_full()
+            .h(px(ROW_HEIGHT))
+            .px_2()
+            .bg(theme.muted)
+            .font_family(theme.mono_font_family.clone())
+            .text_sm()
+            .text_color(theme.muted_foreground);
+        match expandable {
+            None => base.child(label),
+            Some(hidden) => {
+                let accent = theme.primary;
+                base.cursor_pointer()
+                    .hover(|el| el.bg(theme.accent.opacity(0.4)))
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |this, _, _, cx| this.expand_hunk_gap(hunk, cx)),
+                    )
+                    .child(h_flex().gap_2().child(label).child(
+                        div().text_color(accent.opacity(0.9)).child(format!(
+                            "⌃ {hidden} hidden line{} — click to expand",
+                            if hidden == 1 { "" } else { "s" }
+                        )),
+                    ))
+            }
+        }
+    }
+
     fn render_diff_row(&self, row_index: usize, cx: &mut Context<Self>) -> Div {
         let theme = cx.theme();
         let Some(diff) = self.selected.and_then(|i| self.diffs.get(&i)) else {
@@ -373,15 +754,14 @@ impl Workspace {
         let mono = theme.mono_font_family.clone();
 
         match &diff.unified[row_index] {
-            Row::HunkHeader(text) => div()
-                .w_full()
-                .px_2()
-                .py_0p5()
-                .bg(theme.muted)
-                .font_family(mono)
-                .text_sm()
-                .text_color(theme.muted_foreground)
-                .child(text.clone()),
+            Row::HunkHeader {
+                label,
+                hunk,
+                expandable,
+            } => {
+                let (label, hunk, expandable) = (label.clone(), *hunk, *expandable);
+                div().child(self.render_hunk_header(label, hunk, expandable, cx))
+            }
             Row::Binary => div()
                 .w_full()
                 .p_4()
@@ -417,6 +797,7 @@ impl Workspace {
 
                 h_flex()
                     .w_full()
+                    .h(px(ROW_HEIGHT))
                     .font_family(mono)
                     .text_sm()
                     .when_some(bg, |el, bg| el.bg(bg))
@@ -449,7 +830,6 @@ impl Workspace {
         // `cx` is held across the `&mut cx` calls to render_split_cell.
         let mono = cx.theme().mono_font_family.clone();
         let muted = cx.theme().muted_foreground;
-        let muted_bg = cx.theme().muted;
         let border = cx.theme().border;
 
         let Some(diff) = self.selected.and_then(|i| self.diffs.get(&i)) else {
@@ -457,15 +837,14 @@ impl Workspace {
         };
 
         match &diff.split[row_index] {
-            SplitRow::HunkHeader(text) => div()
-                .w_full()
-                .px_2()
-                .py_0p5()
-                .bg(muted_bg)
-                .font_family(mono)
-                .text_sm()
-                .text_color(muted)
-                .child(text.clone()),
+            SplitRow::HunkHeader {
+                label,
+                hunk,
+                expandable,
+            } => {
+                let (label, hunk, expandable) = (label.clone(), *hunk, *expandable);
+                div().child(self.render_hunk_header(label, hunk, expandable, cx))
+            }
             SplitRow::Binary => div()
                 .w_full()
                 .p_4()
@@ -481,6 +860,7 @@ impl Workspace {
                 let right = self.render_split_cell(right.clone(), cx);
                 h_flex()
                     .w_full()
+                    .h(px(ROW_HEIGHT))
                     .items_stretch()
                     .font_family(mono)
                     .text_sm()
@@ -505,16 +885,23 @@ impl Workspace {
             LineKind::Context => (" ", None),
         };
         let number: SharedString = cell.line.map(|v| v.to_string()).unwrap_or_default().into();
+        // Clip long lines at the cell edge — without this they render on
+        // under the other column's text (backlog: proper h-scroll later).
         let content = if cell.runs.is_empty() {
-            div().whitespace_nowrap().child(cell.text.clone())
+            div()
+                .whitespace_nowrap()
+                .overflow_hidden()
+                .child(cell.text.clone())
         } else {
-            div().whitespace_nowrap().child(
+            div().whitespace_nowrap().overflow_hidden().child(
                 StyledText::new(cell.text.clone()).with_highlights(cell.runs.iter().cloned()),
             )
         };
 
         h_flex()
             .w_full()
+            .h_full()
+            .overflow_hidden()
             .font_family(mono)
             .when_some(bg, |el, bg| el.bg(bg))
             .child(
@@ -557,6 +944,7 @@ fn compute_diff(
     source: &DiffSource,
     file: &ChangedFile,
     hl: &HighlightInputs,
+    expand: &HashSet<usize>,
 ) -> anyhow::Result<RenderedDiff> {
     let old_path = file.old_path.as_deref().unwrap_or(&file.path);
 
@@ -621,7 +1009,9 @@ fn compute_diff(
     let old_runs = highlight::highlight_file(&old_text, old_path, &hl.theme);
     let new_runs = highlight::highlight_file(&new_text, &file.path, &hl.theme);
 
-    Ok(build_rows(&diff, &old_runs, &new_runs, hl))
+    Ok(build_rows(
+        &diff, &old_runs, &new_runs, hl, &new_text, expand,
+    ))
 }
 
 /// A diff line with its display text and merged style runs computed once,
@@ -661,34 +1051,144 @@ impl PreparedLine {
     }
 }
 
+/// The context gap hidden between the previous hunk (or file start) and
+/// hunk `i`: `(first_old, first_new, len)` in 1-based line numbers.
+///
+/// Anchors follow the unified convention: a zero-count side's start is the
+/// line *before* the (empty) range, so the first actual line is start+1.
+fn gap_above(hunks: &[dv_core::Hunk], i: usize) -> (u32, u32, u32) {
+    let first = |start: u32, count: u32| if count == 0 { start + 1 } else { start };
+    let (prev_old_end, prev_new_end) = if i == 0 {
+        (1, 1)
+    } else {
+        let prev = &hunks[i - 1];
+        (
+            first(prev.old_start, prev.old_count) + prev.old_count,
+            first(prev.new_start, prev.new_count) + prev.new_count,
+        )
+    };
+    let hunk = &hunks[i];
+    let old_first = first(hunk.old_start, hunk.old_count);
+    let new_first = first(hunk.new_start, hunk.new_count);
+    // The gap is pure context, so it must be the same length on both
+    // sides; a mismatch would mean the anchor math is off — expose it as
+    // "no gap" rather than rendering wrong line numbers.
+    let old_len = old_first.saturating_sub(prev_old_end);
+    let new_len = new_first.saturating_sub(prev_new_end);
+    let len = if old_len == new_len { new_len } else { 0 };
+    (prev_old_end, prev_new_end, len)
+}
+
 fn build_rows(
     diff: &FileDiff,
     old_runs: &LineRuns,
     new_runs: &LineRuns,
     hl: &HighlightInputs,
+    new_text: &str,
+    expand: &HashSet<usize>,
 ) -> RenderedDiff {
     let mut unified = Vec::new();
     let mut split = Vec::new();
+    let mut hunk_rows_unified = Vec::new();
+    let mut hunk_rows_split = Vec::new();
     if diff.is_binary {
         unified.push(Row::Binary);
         split.push(SplitRow::Binary);
-        return RenderedDiff { unified, split };
+        return RenderedDiff {
+            unified,
+            split,
+            hunk_rows_unified,
+            hunk_rows_split,
+            error: false,
+        };
     }
     if diff.hunks.is_empty() {
         unified.push(Row::NoChanges);
         split.push(SplitRow::NoChanges);
-        return RenderedDiff { unified, split };
+        return RenderedDiff {
+            unified,
+            split,
+            hunk_rows_unified,
+            hunk_rows_split,
+            error: false,
+        };
     }
 
+    // Gap expansion pulls its lines from the new side (gaps are identical
+    // on both sides by definition).
+    let new_lines: Vec<&str> = new_text.split('\n').collect();
+
     let empty: Vec<(Range<usize>, HighlightStyle)> = Vec::new();
-    for hunk in &diff.hunks {
-        let header: SharedString = format!(
-            "@@ -{},{} +{},{} @@",
-            hunk.old_start, hunk.old_count, hunk.new_start, hunk.new_count
-        )
-        .into();
-        unified.push(Row::HunkHeader(header.clone()));
-        split.push(SplitRow::HunkHeader(header));
+    for (i, hunk) in diff.hunks.iter().enumerate() {
+        let (gap_old_first, gap_new_first, gap_len) = gap_above(&diff.hunks, i);
+        let gap_available = gap_len > 0
+            // All gap lines must exist in the new blob (they won't for a
+            // deleted file, where the new side is empty).
+            && (gap_new_first + gap_len - 1) as usize <= new_lines.len();
+
+        if gap_available && expand.contains(&i) {
+            // Reveal the gap: context rows instead of this hunk's header.
+            let gap: Vec<PreparedLine> = (0..gap_len)
+                .map(|k| {
+                    let new_line = gap_new_first + k;
+                    let old_line = gap_old_first + k;
+                    // Strip at most ONE trailing CR — the same convention as
+                    // dv-core's strip_ending and highlight's bucket_by_line.
+                    // A rogue "\r\r\n" line must keep its inner CR, or the
+                    // syntax runs (computed against the bucketed content)
+                    // overrun the display text and StyledText asserts.
+                    let raw = new_lines[(new_line - 1) as usize];
+                    let text = raw.strip_suffix('\r').unwrap_or(raw);
+                    let runs = if text.len() > highlight::MAX_HIGHLIGHT_LINE {
+                        Vec::new()
+                    } else {
+                        // Route through merge_line_runs (empty intraline) for
+                        // the same end-clamping regular diff rows get.
+                        let syntax = new_runs.get(&new_line).map(Vec::as_slice).unwrap_or(&[]);
+                        highlight::merge_line_runs(text.len(), syntax, &[], hl.intra_added)
+                    };
+                    PreparedLine {
+                        kind: LineKind::Context,
+                        old_line: Some(old_line),
+                        new_line: Some(new_line),
+                        text: text.to_owned().into(),
+                        runs,
+                    }
+                })
+                .collect();
+            for p in &gap {
+                unified.push(Row::Line {
+                    kind: p.kind,
+                    old_line: p.old_line,
+                    new_line: p.new_line,
+                    text: p.text.clone(),
+                    runs: p.runs.clone(),
+                });
+            }
+            build_split_rows(gap, &mut split);
+            // n/p target the hunk's own lines, not the top of the gap.
+            hunk_rows_unified.push(unified.len());
+            hunk_rows_split.push(split.len());
+        } else {
+            hunk_rows_unified.push(unified.len());
+            hunk_rows_split.push(split.len());
+            let label: SharedString = format!(
+                "@@ -{},{} +{},{} @@",
+                hunk.old_start, hunk.old_count, hunk.new_start, hunk.new_count
+            )
+            .into();
+            let expandable = gap_available.then_some(gap_len);
+            unified.push(Row::HunkHeader {
+                label: label.clone(),
+                hunk: i,
+                expandable,
+            });
+            split.push(SplitRow::HunkHeader {
+                label,
+                hunk: i,
+                expandable,
+            });
+        }
 
         let prepared: Vec<PreparedLine> = hunk
             .lines
@@ -742,7 +1242,13 @@ fn build_rows(
         }
         build_split_rows(prepared, &mut split);
     }
-    RenderedDiff { unified, split }
+    RenderedDiff {
+        unified,
+        split,
+        hunk_rows_unified,
+        hunk_rows_split,
+        error: false,
+    }
 }
 
 /// Turn a hunk's interleaved [context, removed…, added…] lines into aligned
@@ -854,6 +1360,7 @@ impl Render for Workspace {
                                             .collect::<Vec<_>>()
                                     }),
                                 )
+                                .track_scroll(&self.file_scroll)
                                 .size_full(),
                             ),
                     )
@@ -868,6 +1375,7 @@ impl Render for Workspace {
                                         .collect::<Vec<_>>()
                                 }),
                             )
+                            .track_scroll(&self.diff_scroll)
                             .size_full(),
                             ViewMode::Split => uniform_list(
                                 "diff-rows-split",
@@ -878,19 +1386,36 @@ impl Render for Workspace {
                                         .collect::<Vec<_>>()
                                 }),
                             )
+                            .track_scroll(&self.diff_scroll)
                             .size_full(),
                         }),
                     ),
             ),
         };
 
+        // While the palette is open the workspace node also carries the
+        // PaletteOpen identifier, flipping which key bindings apply (see
+        // `init`).
+        let key_context = if self.palette.is_some() {
+            format!("{KEY_CONTEXT} {PALETTE_CONTEXT}")
+        } else {
+            KEY_CONTEXT.to_string()
+        };
+
         v_flex()
             .size_full()
+            .relative()
             .track_focus(&self.focus_handle)
-            .key_context(KEY_CONTEXT)
+            .key_context(key_context.as_str())
             .on_action(cx.listener(Self::on_next_file))
             .on_action(cx.listener(Self::on_prev_file))
+            .on_action(cx.listener(Self::on_next_hunk))
+            .on_action(cx.listener(Self::on_prev_hunk))
             .on_action(cx.listener(Self::on_toggle_split))
+            .on_action(cx.listener(Self::on_jump_to_file))
+            .on_action(cx.listener(Self::on_palette_next))
+            .on_action(cx.listener(Self::on_palette_prev))
+            .on_action(cx.listener(Self::on_palette_close))
             .child(
                 // Per-review header strip (the window title bar is the
                 // shell's; this shows which review is active).
@@ -936,13 +1461,70 @@ impl Render for Workspace {
                     ),
             )
             .child(body)
+            .children(self.render_palette(cx))
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{PreparedLine, SplitRow, build_split_rows};
+    use super::{PreparedLine, SplitRow, build_split_rows, gap_above};
     use dv_core::LineKind;
+
+    fn hunk(old_start: u32, old_count: u32, new_start: u32, new_count: u32) -> dv_core::Hunk {
+        dv_core::Hunk {
+            old_start,
+            old_count,
+            new_start,
+            new_count,
+            lines: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn gap_above_first_hunk_counts_from_file_start() {
+        // Hunk starts at line 14 on both sides → 13 hidden lines (1..=13).
+        let hunks = [hunk(14, 17, 14, 44)];
+        assert_eq!(gap_above(&hunks, 0), (1, 1, 13));
+    }
+
+    #[test]
+    fn gap_above_first_hunk_at_top_is_empty() {
+        let hunks = [hunk(1, 5, 1, 7)];
+        assert_eq!(gap_above(&hunks, 0), (1, 1, 0));
+    }
+
+    #[test]
+    fn gap_between_hunks_uses_previous_hunk_end() {
+        // Hunk 0 covers old 10..20 / new 10..22; hunk 1 starts at old 32 /
+        // new 34 → gap is old 20..32 = new 22..34 = 12 lines.
+        let hunks = [hunk(10, 10, 10, 12), hunk(32, 4, 34, 4)];
+        assert_eq!(gap_above(&hunks, 1), (20, 22, 12));
+    }
+
+    #[test]
+    fn gap_with_zero_count_side_respects_unified_anchor_convention() {
+        // A pure-insertion hunk: old side is empty, old_start anchors to the
+        // line *before* (unified convention), so the next real old line is
+        // old_start + 1.
+        let hunks = [hunk(5, 0, 6, 3), hunk(10, 2, 14, 2)];
+        // prev_old_end = 5+1+0 = 6; prev_new_end = 6+3 = 9.
+        // gap: old 6..10 = 4 lines, new 9..14 = 5 lines → mismatch is
+        // impossible for real diffs with these anchors; equal-length check
+        // guards regardless.
+        let (_, _, len) = gap_above(&hunks, 1);
+        assert!(
+            len == 0 || len == 4,
+            "mismatched gap must not fabricate lines"
+        );
+    }
+
+    #[test]
+    fn mismatched_gap_lengths_disable_expansion() {
+        // Deliberately inconsistent anchors → gap reported as absent.
+        let hunks = [hunk(10, 5, 10, 8), hunk(20, 2, 20, 2)];
+        let (_, _, len) = gap_above(&hunks, 1);
+        assert_eq!(len, 0);
+    }
 
     fn line(kind: LineKind, old: Option<u32>, new: Option<u32>) -> PreparedLine {
         PreparedLine {

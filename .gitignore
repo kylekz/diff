@@ -1,0 +1,10 @@
+# build output
+/target
+
+# reference clones of zed / gpui-component (see CLAUDE.md) — never committed
+/refs
+
+# local (per-machine) claude code overrides
+.claude/settings.local.json
+
+.DS_Store

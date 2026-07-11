@@ -1,0 +1,25 @@
+[workspace]
+resolver = "3"
+members = ["crates/app", "crates/core"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[workspace.dependencies]
+# gpui must use the EXACT same git spec as gpui-component declares internally
+# (currently un-pinned zed main), or cargo resolves two incompatible copies of
+# gpui and nothing type-checks across the boundary. Reproducibility comes from
+# the committed Cargo.lock, not from a rev here. See CLAUDE.md before touching.
+gpui = { git = "https://github.com/zed-industries/zed" }
+gpui_platform = { git = "https://github.com/zed-industries/zed", features = ["font-kit"] }
+gpui-component = { git = "https://github.com/longbridge/gpui-component" }
+gpui-component-assets = { git = "https://github.com/longbridge/gpui-component" }
+anyhow = "1"
+dv-core = { path = "crates/core" }
+
+# GPUI is unusably janky fully unoptimized; optimize dependencies even in dev.
+# Our own crates stay at opt-level 0 for fast incremental builds.
+[profile.dev.package."*"]
+opt-level = 2

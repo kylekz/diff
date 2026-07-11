@@ -6,4 +6,14 @@
 //! repository does so by shelling out to `git`, never via an in-process git
 //! library, so the same code path can route through `wsl.exe`.
 
+pub mod command;
+pub mod diff;
+pub mod git;
+pub mod location;
+
+pub use command::CommandBuilder;
+pub use diff::{DiffLine, DiffOptions, FileDiff, Hunk, LineKind};
+pub use git::{BlobSpec, ChangeStatus, ChangedFile, DiffSource, GitRepo};
+pub use location::RepoLocation;
+
 pub const APP_NAME: &str = "dv";

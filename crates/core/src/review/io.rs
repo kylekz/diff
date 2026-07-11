@@ -54,6 +54,56 @@ impl StoreIo {
         }
     }
 
+    /// A cheap change digest of a directory under `.git` — file names,
+    /// sizes, and mtimes — for the WSL polling watcher (one `ls -la` per
+    /// poll instead of reading every review file). Absent dir digests to
+    /// an empty string.
+    pub(crate) fn digest_dir(&self, rel_dir: &str) -> Result<String> {
+        match &self.location {
+            RepoLocation::Local(_) => {
+                let dir = self.local_path(rel_dir)?;
+                let entries = match std::fs::read_dir(&dir) {
+                    Ok(entries) => entries,
+                    Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                        return Ok(String::new());
+                    }
+                    Err(err) => {
+                        return Err(err).with_context(|| format!("listing {}", dir.display()));
+                    }
+                };
+                let mut parts: Vec<String> = Vec::new();
+                for entry in entries.flatten() {
+                    let meta = entry.metadata();
+                    let (len, mtime) = meta
+                        .map(|m| {
+                            let mtime = m
+                                .modified()
+                                .ok()
+                                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                                .map(|d| d.as_millis())
+                                .unwrap_or_default();
+                            (m.len(), mtime)
+                        })
+                        .unwrap_or_default();
+                    parts.push(format!("{}:{len}:{mtime}", entry.file_name().display()));
+                }
+                parts.sort_unstable();
+                Ok(parts.join("\n"))
+            }
+            RepoLocation::Wsl { .. } => {
+                let dir = self.wsl_path(rel_dir)?;
+                match self
+                    .builder
+                    .run_text("ls", &["-la", "--time-style=full-iso", "--", &dir])
+                {
+                    Ok(listing) => Ok(listing),
+                    Err(err) if is_missing_path_error(&err) => Ok(String::new()),
+                    Err(err) => Err(err),
+                }
+            }
+        }
+    }
+
     /// Write `bytes` to `rel` atomically (temp file in the same directory,
     /// then rename over the destination), creating parent directories as
     /// needed.
@@ -184,7 +234,7 @@ fn tmp_name() -> String {
 /// uses these, for agent worktrees), `.git` is a *file* containing a
 /// single `gitdir: <path>` line pointing at the real per-worktree git dir
 /// (typically `<main-repo>/.git/worktrees/<name>`) — follow it.
-fn resolve_local_git_dir(root: &Path) -> Result<PathBuf> {
+pub(super) fn resolve_local_git_dir(root: &Path) -> Result<PathBuf> {
     let dot_git = root.join(".git");
     let metadata = std::fs::symlink_metadata(&dot_git)
         .with_context(|| format!("no .git at {}", dot_git.display()))?;

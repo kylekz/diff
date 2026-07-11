@@ -14,14 +14,26 @@ const REVIEWS_DIR: &str = "dv/reviews";
 
 pub struct ReviewStore {
     io: StoreIo,
+    location: RepoLocation,
 }
 
 impl ReviewStore {
     /// Cheap: no I/O happens until a method below is called.
     pub fn open(location: RepoLocation) -> Self {
         Self {
-            io: StoreIo::new(location),
+            io: StoreIo::new(location.clone()),
+            location,
         }
+    }
+
+    /// Watch the store for external changes (agent CLI, another window);
+    /// `on_change` fires from a background thread — hand off to a channel.
+    /// Dropping the returned watcher stops it. See [`super::watch`].
+    pub fn watch(
+        &self,
+        on_change: Box<dyn Fn() + Send + Sync>,
+    ) -> Result<super::watch::ReviewWatcher> {
+        super::watch::watch(self.location.clone(), on_change)
     }
 
     /// Every review in the store, newest (`created_ms`) first.

@@ -1,6 +1,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod automation;
+mod cli;
 mod fuzzy;
 mod highlight;
 mod recent;
@@ -93,7 +94,9 @@ fn parse_args() -> Result<Cli, String> {
     Ok(Cli { seed, automation })
 }
 
-fn parse_range(value: &str) -> Result<DiffSource, String> {
+/// `pub(crate)` so `cli.rs`'s `review create --range` can reuse the exact
+/// same `a..b` / `a...b` parsing instead of drifting a second copy.
+pub(crate) fn parse_range(value: &str) -> Result<DiffSource, String> {
     let (base, head, merge_base) = if let Some((b, h)) = value.split_once("...") {
         (b, h, true)
     } else if let Some((b, h)) = value.split_once("..") {
@@ -123,6 +126,19 @@ fn apply_aura_theme(cx: &mut App) {
 }
 
 fn main() {
+    // Pure headless path: `dv review ...` / `dv comment ...` are the
+    // agent-facing CLI (docs/phase-2-review-layer.md § Agent CLI) and must
+    // never touch gpui — no window, no platform app, no theme init. Handled
+    // before anything else in `main` so a CI/agent invocation never pays for
+    // (or risks failing on) GPUI startup.
+    let raw_args: Vec<String> = std::env::args().collect();
+    if let Some(sub) = raw_args.get(1)
+        && (sub == "review" || sub == "comment")
+    {
+        let code = cli::run(&raw_args[1..]);
+        std::process::exit(code);
+    }
+
     let cli = match parse_args() {
         Ok(parsed) => parsed,
         Err(message) => {

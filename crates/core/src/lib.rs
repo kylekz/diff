@@ -16,6 +16,8 @@ pub use command::CommandBuilder;
 pub use diff::{DiffLine, DiffOptions, FileDiff, Hunk, LineKind};
 pub use git::{BlobSpec, ChangeStatus, ChangedFile, DiffSource, GitRepo};
 pub use location::RepoLocation;
-pub use review::{Comment, CommentStatus, Reply, Review, ReviewState, ReviewStore, Side, Verdict};
+pub use review::{
+    Comment, CommentStatus, Reply, Review, ReviewState, ReviewStore, ReviewWatcher, Side, Verdict,
+};
 
 pub const APP_NAME: &str = "dv";

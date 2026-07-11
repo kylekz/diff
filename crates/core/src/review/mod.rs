@@ -12,6 +12,7 @@
 
 mod io;
 mod store;
+mod watch;
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -22,6 +23,7 @@ use serde::{Deserialize, Serialize};
 use crate::git::DiffSource;
 
 pub use store::ReviewStore;
+pub use watch::ReviewWatcher;
 
 /// Schema version written by this build. A file with a higher `v` is from
 /// a future dv version this build doesn't understand — refuse to load it

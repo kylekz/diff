@@ -101,9 +101,32 @@ Screenshot (reliable), and kill with `Stop-Process -Name dv`. Ad-hoc
 per-window capture via PowerShell P/Invoke has repeatedly grabbed the wrong
 window — don't trust it.
 
+## Review CLI (for agents)
+
+`dv review <list|show|create|delete>` and `dv comment <add|reply|resolve|
+unresolve|list>` (`crates/app/src/cli.rs`) are the headless, agent-facing
+side of the review layer — no gpui, no window. `dv comment list --status
+open --json` is the canonical "what does the reviewer want from me" query.
+
+Global flags, anywhere after the subcommand: `--repo <path>` (default: cwd,
+also takes `\\wsl.localhost\<distro>\<path>`), `--wsl <distro>:<posix-path>`,
+`--json`. With no `--review <id>`, `comment add` targets the most recent
+draft review (auto-creating one if none exists); `reply`/`resolve`/
+`unresolve`/`comment list` search every review for the comment id instead.
+
+Always pass `--json` for machine parsing — it's a stable schema (`review`/
+`reviews`/`comment`/`comments`/`review_id`/`comment_id` keys). Errors print
+to stderr always, plus `{"error":"..."}` on stdout in `--json` mode. Exit
+codes: `0` success, `1` operation error (unknown id, no repo, store
+failure), `2` usage error (bad flags).
+
 ## Status
 
 Phases 0–1 complete: read-only diff viewer (unified + split), WSL routing,
 review-navigator shell, keyboard nav, `--automation`, acceptance validated
 on a zed-sized diff (see docs/phase-1-diff-viewer.md § Acceptance results).
-Next: Phase 2 — review layer (docs/phase-2-review-layer.md).
+Phase 2 in progress: dv-core `ReviewStore` (reviews/comments/anchors), the
+agent CLI above, GUI inline commenting (gutter selection → editor →
+thread cards), and live store watching are done; remaining: reply
+composer in GUI, summary panel, draft verdict, sidebar badges, stale
+anchors (docs/phase-2-review-layer.md).

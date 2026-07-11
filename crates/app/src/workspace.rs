@@ -259,6 +259,9 @@ pub struct Workspace {
     /// Wall-clock of the most recent per-file diff computation (blob fetch
     /// + diff + highlight), for `--automation` perf validation.
     last_diff_ms: Option<u64>,
+    /// Keeps the review-store watcher alive; external edits (agent CLI,
+    /// another window) stream in through it. Dropped with the workspace.
+    _watcher: Option<dv_core::ReviewWatcher>,
 }
 
 /// Which blob a comment on `side` of `path` anchors to, given the review's
@@ -331,6 +334,17 @@ impl Workspace {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
+        // Watch the review store so agent-CLI (or other-window) edits show
+        // up live. The callback fires on a background thread; it only pokes
+        // a channel drained by the foreground task below.
+        let (watch_tx, mut watch_rx) = futures::channel::mpsc::unbounded::<()>();
+        let watcher = dv_core::ReviewStore::open(location.clone())
+            .watch(Box::new(move || {
+                watch_tx.unbounded_send(()).ok();
+            }))
+            .inspect_err(|err| eprintln!("review watcher unavailable: {err:#}"))
+            .ok();
+
         let this = Self {
             focus_handle: cx.focus_handle(),
             title: location.display_name().into(),
@@ -356,7 +370,44 @@ impl Workspace {
             palette: None,
             selection: None,
             last_diff_ms: None,
+            _watcher: watcher,
         };
+
+        let watch_location = location.clone();
+        cx.spawn(async move |this, cx| {
+            use futures::StreamExt as _;
+            while watch_rx.next().await.is_some() {
+                // Coalesce event bursts (temp write + rename fire separately)
+                // into one reload.
+                while watch_rx.try_recv().is_ok() {}
+                let location = watch_location.clone();
+                let review = cx
+                    .background_executor()
+                    .spawn(async move {
+                        dv_core::ReviewStore::open(location)
+                            .list()
+                            .unwrap_or_default()
+                            .into_iter()
+                            .find(|r| matches!(r.state, dv_core::ReviewState::Draft))
+                    })
+                    .await;
+                let alive = this.update(cx, |this, cx| {
+                    let fingerprint = |r: &Option<dv_core::Review>| {
+                        r.as_ref()
+                            .map(|r| (r.id.clone(), r.updated_ms, r.comments.len()))
+                    };
+                    if fingerprint(&this.review) != fingerprint(&review) {
+                        this.review = review;
+                        this.reset_diff_list(cx);
+                        cx.notify();
+                    }
+                });
+                if alive.is_err() {
+                    break; // workspace dropped
+                }
+            }
+        })
+        .detach();
 
         cx.spawn(async move |this, cx| {
             let loaded = cx
@@ -531,6 +582,7 @@ impl Workspace {
                 "open": r.comments.iter()
                     .filter(|c| c.status == dv_core::CommentStatus::Open)
                     .count(),
+                "replies": r.comments.iter().map(|c| c.replies.len()).sum::<usize>(),
             })),
             "display_rows": self.display.len(),
             "palette": self.palette.as_ref().map(|p| json!({

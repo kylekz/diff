@@ -67,6 +67,12 @@ pub enum BlobSpec {
     Working { path: String },
 }
 
+/// `git hash-object -t tree /dev/null` for a SHA-1 repo — the well-known
+/// empty-tree oid, stable across all git installs.
+const EMPTY_TREE_SHA1: &str = "4b825dc642cb6eb9a060e54bf8d69288fbee4904";
+/// Same, for a SHA-256 repo (`--object-format=sha256`).
+const EMPTY_TREE_SHA256: &str = "6ef19b41225c5369f1c104d45d8d85efa9b057b53b14b4b9b939dd74decc5321";
+
 /// An opened repository. Cheap to clone conceptually — hold it in an `Arc`.
 pub struct GitRepo {
     location: RepoLocation,
@@ -162,15 +168,61 @@ impl GitRepo {
             .with_context(|| format!("unknown revision: {rev}"))
     }
 
+    /// `git merge-base <a> <b>` → full SHA of the best common ancestor.
+    pub fn merge_base(&self, a: &str, b: &str) -> Result<String> {
+        self.git_text(&["merge-base", a, b])
+            .with_context(|| format!("no merge base between {a} and {b}"))
+    }
+
+    /// Whether `HEAD` doesn't resolve yet — a freshly `git init`ed repo with
+    /// no commits. Paid unconditionally by [`Self::diff_root`]'s callers
+    /// (`WorkingTree`/`Staged`): one cheap subprocess, simpler branching
+    /// than trying to special-case the failure of the real diff command.
+    fn head_is_unborn(&self) -> bool {
+        self.git_text(&["rev-parse", "--verify", "-q", "HEAD"])
+            .is_err()
+    }
+
+    /// The tree-ish `WorkingTree`/`Staged` diff against: `HEAD` normally,
+    /// or the empty-tree oid when `HEAD` is unborn (no commits yet) — so a
+    /// brand-new repo reports every working/staged file as `Added` instead
+    /// of failing with git's "ambiguous argument HEAD" (exit 128).
+    fn diff_root(&self) -> Result<String> {
+        if self.head_is_unborn() {
+            let format = self
+                .git_text(&["rev-parse", "--show-object-format"])
+                .context("determining object format for unborn-HEAD diff")?;
+            let oid = match format.as_str() {
+                "sha1" => EMPTY_TREE_SHA1,
+                "sha256" => EMPTY_TREE_SHA256,
+                other => return Err(anyhow!("unsupported git object format: {other}")),
+            };
+            Ok(oid.to_string())
+        } else {
+            Ok("HEAD".to_string())
+        }
+    }
+
     /// Changed files for a diff source, in git's output order, with rename
-    /// detection (`-M`) on.
+    /// detection (`-M`) on. For [`DiffSource::WorkingTree`], also appends
+    /// never-added (untracked) files as synthetic `Added` entries, since
+    /// `git diff` never reports them. `WorkingTree`/`Staged` fall back to
+    /// diffing against the empty tree when `HEAD` is unborn (no commits
+    /// yet) instead of failing.
     pub fn changed_files(&self, source: &DiffSource) -> Result<Vec<ChangedFile>> {
-        let bytes = match source {
+        match source {
             DiffSource::WorkingTree => {
-                self.git_raw(&["diff", "HEAD", "--name-status", "-z", "-M"])?
+                let root = self.diff_root()?;
+                let bytes = self.git_raw(&["diff", &root, "--name-status", "-z", "-M"])?;
+                let mut files = parse_name_status_z(&bytes)?;
+                self.append_untracked(&mut files)?;
+                Ok(files)
             }
             DiffSource::Staged => {
-                self.git_raw(&["diff", "--cached", "--name-status", "-z", "-M"])?
+                let root = self.diff_root()?;
+                let bytes =
+                    self.git_raw(&["diff", "--cached", &root, "--name-status", "-z", "-M"])?;
+                parse_name_status_z(&bytes)
             }
             DiffSource::Range {
                 base,
@@ -182,7 +234,8 @@ impl GitRepo {
                 } else {
                     format!("{base}..{head}")
                 };
-                self.git_raw(&["diff", "--name-status", "-z", "-M", range.as_str()])?
+                let bytes = self.git_raw(&["diff", "--name-status", "-z", "-M", range.as_str()])?;
+                parse_name_status_z(&bytes)
             }
             DiffSource::Commit(sha) => {
                 // The single-arg diff-tree form prints NOTHING for a merge
@@ -190,7 +243,7 @@ impl GitRepo {
                 // (matching the `{sha}^` old side the UI loads). Root
                 // commits have no parent and keep the --root form.
                 let parent = format!("{sha}^");
-                if self
+                let bytes = if self
                     .git_text(&["rev-parse", "--verify", "-q", &parent])
                     .is_ok()
                 {
@@ -215,10 +268,41 @@ impl GitRepo {
                         "-M",
                         sha.as_str(),
                     ])?
-                }
+                };
+                parse_name_status_z(&bytes)
             }
-        };
-        parse_name_status_z(&bytes)
+        }
+    }
+
+    /// Appends untracked (never-added) working-tree files — from
+    /// `git ls-files --others --exclude-standard -z` — to `files` as
+    /// synthetic `Added` entries, skipping any path already present.
+    /// Paths are NUL-separated; a trailing empty token (from the final
+    /// separator) is ignored.
+    fn append_untracked(&self, files: &mut Vec<ChangedFile>) -> Result<()> {
+        let bytes = self.git_raw(&["ls-files", "--others", "--exclude-standard", "-z"])?;
+        let text = String::from_utf8_lossy(&bytes);
+        let mut tokens: Vec<&str> = text.split('\0').collect();
+        if tokens.last() == Some(&"") {
+            tokens.pop();
+        }
+
+        // `--others` already excludes tracked paths, so overlap with the diff
+        // list is not expected — but guard against it without an O(n·m) scan.
+        let existing: std::collections::HashSet<String> =
+            files.iter().map(|f| f.path.clone()).collect();
+        for path in tokens {
+            if existing.contains(path) {
+                continue;
+            }
+            files.push(ChangedFile {
+                path: path.to_string(),
+                old_path: None,
+                status: ChangeStatus::Added,
+            });
+        }
+
+        Ok(())
     }
 
     /// Load one side's content. `Ok(None)` when the blob doesn't exist

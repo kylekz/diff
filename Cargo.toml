@@ -14,8 +14,26 @@ publish = false
 # the committed Cargo.lock, not from a rev here. See CLAUDE.md before touching.
 gpui = { git = "https://github.com/zed-industries/zed" }
 gpui_platform = { git = "https://github.com/zed-industries/zed", features = ["font-kit"] }
-gpui-component = { git = "https://github.com/longbridge/gpui-component" }
+# Enable the tree-sitter grammars we highlight diffs with. This is a curated
+# set (TypeScript-first, plus common infra/config languages); unlisted
+# extensions simply render unhighlighted. Widen the list to add languages.
+gpui-component = { git = "https://github.com/longbridge/gpui-component", features = [
+    "tree-sitter-typescript",
+    "tree-sitter-tsx",
+    "tree-sitter-javascript",
+    "tree-sitter-jsdoc",
+    "tree-sitter-rust",
+    "tree-sitter-python",
+    "tree-sitter-go",
+    "tree-sitter-css",
+    "tree-sitter-html",
+    "tree-sitter-yaml",
+    "tree-sitter-toml",
+    "tree-sitter-bash",
+    "tree-sitter-markdown",
+] }
 gpui-component-assets = { git = "https://github.com/longbridge/gpui-component" }
+ropey = "=2.0.0-beta.1"
 anyhow = "1"
 dv-core = { path = "crates/core" }
 

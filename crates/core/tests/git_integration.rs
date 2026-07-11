@@ -138,9 +138,10 @@ fn t2_working_tree_status_set() {
     repo.write("d.txt", b"new\n");
     // `git diff HEAD` (no `--cached`) does pick up unstaged modifications
     // and deletions of already-tracked files, but a brand-new path is
-    // invisible to `git diff` until it's staged — stage it here so the
-    // exact invocation in `changed_files` (`diff HEAD --name-status -z -M`,
-    // no `ls-files`/`status` fallback) reports it as Added.
+    // invisible to `git diff` itself until it's staged — stage it here so
+    // this test isolates the base `diff HEAD --name-status -z -M` behavior.
+    // The untracked-file merge (`git ls-files --others`) that also feeds
+    // `WorkingTree` is covered separately by t12.
     repo.git(&["add", "d.txt"]);
 
     let git_repo = open(&repo);
@@ -446,4 +447,99 @@ fn t11_merge_commit_diffs_against_first_parent() {
     assert_eq!(files.len(), 1);
     assert_eq!(files[0].path, "side.txt");
     assert_eq!(files[0].status, ChangeStatus::Added);
+}
+
+#[test]
+fn t12_untracked_files_in_working_tree() {
+    let repo = TestRepo::new("t12");
+    repo.write("a.txt", b"a\n");
+    repo.write(".gitignore", b"ignored.txt\n");
+    repo.commit("seed");
+
+    repo.write("b.txt", b"untracked content\n");
+    repo.write("ignored.txt", b"should not appear\n");
+
+    let git_repo = open(&repo);
+    let files = git_repo.changed_files(&DiffSource::WorkingTree).unwrap();
+
+    assert!(
+        files
+            .iter()
+            .any(|f| f.path == "b.txt" && f.status == ChangeStatus::Added && f.old_path.is_none()),
+        "expected untracked b.txt as Added: {files:?}"
+    );
+    assert!(
+        !files.iter().any(|f| f.path == "ignored.txt"),
+        "ignored.txt should be excluded by .gitignore: {files:?}"
+    );
+
+    let content = git_repo
+        .blob_bytes(&BlobSpec::Working {
+            path: "b.txt".to_string(),
+        })
+        .unwrap();
+    assert_eq!(content, Some(b"untracked content\n".to_vec()));
+}
+
+#[test]
+fn t13_unborn_head() {
+    let repo = TestRepo::new("t13");
+    // No commits yet: HEAD does not resolve.
+    repo.write("a.txt", b"a\n");
+
+    let git_repo = open(&repo);
+
+    let working = git_repo.changed_files(&DiffSource::WorkingTree).unwrap();
+    assert_eq!(working.len(), 1, "working: {working:?}");
+    assert_eq!(working[0].path, "a.txt");
+    assert_eq!(working[0].status, ChangeStatus::Added);
+
+    repo.git(&["add", "a.txt"]);
+
+    let staged = git_repo.changed_files(&DiffSource::Staged).unwrap();
+    assert_eq!(staged.len(), 1, "staged: {staged:?}");
+    assert_eq!(staged[0].path, "a.txt");
+    assert_eq!(staged[0].status, ChangeStatus::Added);
+
+    // Once staged, a.txt is no longer "untracked" (git ls-files --others),
+    // so it must surface exactly once from the diff itself — no duplicate
+    // from the untracked-file merge.
+    let working_after_stage = git_repo.changed_files(&DiffSource::WorkingTree).unwrap();
+    assert_eq!(
+        working_after_stage.len(),
+        1,
+        "no duplicate once staged: {working_after_stage:?}"
+    );
+    assert_eq!(working_after_stage[0].path, "a.txt");
+    assert_eq!(working_after_stage[0].status, ChangeStatus::Added);
+
+    assert_eq!(git_repo.head_label().unwrap(), "main");
+}
+
+#[test]
+fn t14_merge_base() {
+    let repo = TestRepo::new("t14");
+    repo.write("base.txt", b"base\n");
+    let c1 = repo.commit("c1");
+
+    repo.git(&["checkout", "-b", "branch", &c1]);
+    repo.write("branch-only.txt", b"branch only\n");
+    repo.commit("branch commit");
+
+    repo.git(&["checkout", "main"]);
+    repo.write("main-only.txt", b"main only\n");
+    repo.commit("main-only commit");
+
+    let git_repo = open(&repo);
+
+    let base = git_repo.merge_base("main", "branch").unwrap();
+    assert_eq!(base, c1, "merge base should be c1's sha");
+    assert_eq!(base.len(), 40, "sha {base:?} is not 40 hex chars");
+    assert!(base.chars().all(|c| c.is_ascii_hexdigit()));
+
+    let err = git_repo.merge_base("main", "nonexistent").unwrap_err();
+    assert!(
+        err.to_string().contains("nonexistent"),
+        "error should name the rev: {err}"
+    );
 }

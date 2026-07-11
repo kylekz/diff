@@ -1,4 +1,5 @@
 use std::collections::{HashMap, HashSet};
+use std::ops::Range;
 use std::sync::Arc;
 
 use dv_core::{
@@ -7,7 +8,11 @@ use dv_core::{
 };
 use gpui::prelude::FluentBuilder;
 use gpui::*;
-use gpui_component::{ActiveTheme, h_flex, v_flex};
+use gpui_component::ActiveTheme;
+use gpui_component::highlighter::HighlightTheme;
+use gpui_component::{h_flex, v_flex};
+
+use crate::highlight::{self, LineRuns};
 
 actions!(workspace, [NextFile, PrevFile]);
 
@@ -37,9 +42,21 @@ enum Row {
         old_line: Option<u32>,
         new_line: Option<u32>,
         text: SharedString,
+        /// Merged syntax + intraline style runs, line-relative. Empty ⇒
+        /// render the text plainly.
+        runs: Vec<(Range<usize>, HighlightStyle)>,
     },
     Binary,
     NoChanges,
+}
+
+/// Colors resolved from the live theme on the UI thread and handed to the
+/// off-thread diff computation (which has no `cx`).
+#[derive(Clone)]
+struct HighlightInputs {
+    theme: Arc<HighlightTheme>,
+    intra_added: Hsla,
+    intra_removed: Hsla,
 }
 
 struct RenderedDiff {
@@ -57,6 +74,24 @@ pub struct Workspace {
     selected: Option<usize>,
     diffs: HashMap<usize, Arc<RenderedDiff>>,
     diff_pending: HashSet<usize>,
+    /// Captured from the *original* source, before `resolve_source` rewrites
+    /// a merge-base range to a plain two-dot range — so the header keeps
+    /// saying "range (merge base)".
+    source_desc: SharedString,
+}
+
+fn source_label(source: &DiffSource) -> &'static str {
+    match source {
+        DiffSource::WorkingTree => "working tree",
+        DiffSource::Staged => "staged",
+        DiffSource::Range {
+            merge_base: false, ..
+        } => "range",
+        DiffSource::Range {
+            merge_base: true, ..
+        } => "range (merge base)",
+        DiffSource::Commit(_) => "commit",
+    }
 }
 
 impl Workspace {
@@ -69,6 +104,7 @@ impl Workspace {
         let this = Self {
             focus_handle: cx.focus_handle(),
             title: location.display_name().into(),
+            source_desc: source_label(&source).into(),
             source: source.clone(),
             status: Status::Loading,
             repo: None,
@@ -85,17 +121,24 @@ impl Workspace {
                 .spawn(async move {
                     let repo = GitRepo::open(location)?;
                     let head = repo.head_label().unwrap_or_default();
+                    // Resolve a merge-base range to a concrete two-dot range
+                    // once here, so both the file list and every per-file
+                    // old-side blob load from the merge base rather than from
+                    // `base` directly (correct when base has advanced past
+                    // the fork point). `git diff a...b` ≡ `a-merge-base..b`.
+                    let source = resolve_source(&repo, source)?;
                     let files = repo.changed_files(&source)?;
-                    anyhow::Ok((Arc::new(repo), head, files))
+                    anyhow::Ok((Arc::new(repo), head, files, source))
                 })
                 .await;
 
             this.update(cx, |this, cx| {
                 match loaded {
-                    Ok((repo, head, files)) => {
+                    Ok((repo, head, files, source)) => {
                         this.repo = Some(repo);
                         this.head = head.into();
                         this.files = files;
+                        this.source = source;
                         this.status = Status::Ready;
                         if !this.files.is_empty() {
                             this.select_file(0, cx);
@@ -129,10 +172,16 @@ impl Workspace {
 
         let file = self.files[index].clone();
         let source = self.source.clone();
+        let theme = cx.theme();
+        let hl = HighlightInputs {
+            theme: theme.highlight_theme.clone(),
+            intra_added: theme.success.opacity(0.32),
+            intra_removed: theme.danger.opacity(0.32),
+        };
         cx.spawn(async move |this, cx| {
             let rendered = cx
                 .background_executor()
-                .spawn(async move { compute_diff(&repo, &source, &file) })
+                .spawn(async move { compute_diff(&repo, &source, &file, &hl) })
                 .await;
 
             this.update(cx, |this, cx| {
@@ -167,20 +216,6 @@ impl Workspace {
     fn on_prev_file(&mut self, _: &PrevFile, _: &mut Window, cx: &mut Context<Self>) {
         let prev = self.selected.map_or(0, |i| i.saturating_sub(1));
         self.select_file(prev, cx);
-    }
-
-    fn source_label(&self) -> &'static str {
-        match &self.source {
-            DiffSource::WorkingTree => "working tree",
-            DiffSource::Staged => "staged",
-            DiffSource::Range {
-                merge_base: false, ..
-            } => "range",
-            DiffSource::Range {
-                merge_base: true, ..
-            } => "range (merge base)",
-            DiffSource::Commit(_) => "commit",
-        }
     }
 
     fn render_file_row(&self, index: usize, cx: &mut Context<Self>) -> impl IntoElement + use<> {
@@ -252,12 +287,13 @@ impl Workspace {
                 .w_full()
                 .p_4()
                 .text_color(theme.muted_foreground)
-                .child("no content changes (mode or rename only)"),
+                .child("no line changes to display (empty file, or a mode/rename-only change)"),
             Row::Line {
                 kind,
                 old_line,
                 new_line,
                 text,
+                runs,
             } => {
                 let (marker, bg) = match kind {
                     LineKind::Added => ("+", Some(theme.success.opacity(0.14))),
@@ -266,6 +302,13 @@ impl Workspace {
                 };
                 let num = |n: &Option<u32>| -> SharedString {
                     n.map(|v| v.to_string()).unwrap_or_default().into()
+                };
+                let content = if runs.is_empty() {
+                    div().whitespace_nowrap().child(text.clone())
+                } else {
+                    div()
+                        .whitespace_nowrap()
+                        .child(StyledText::new(text.clone()).with_highlights(runs.iter().cloned()))
                 };
 
                 h_flex()
@@ -292,9 +335,30 @@ impl Workspace {
                             .child(num(new_line)),
                     )
                     .child(div().w_4().flex_none().child(marker))
-                    .child(div().whitespace_nowrap().child(text.clone()))
+                    .child(content)
             }
         }
+    }
+}
+
+/// Rewrite a `base...head` (merge-base) range to a concrete two-dot range
+/// anchored at the actual merge base, resolved with one `git merge-base`
+/// call. Other sources pass through unchanged.
+fn resolve_source(repo: &GitRepo, source: DiffSource) -> anyhow::Result<DiffSource> {
+    match source {
+        DiffSource::Range {
+            base,
+            head,
+            merge_base: true,
+        } => {
+            let merged = repo.merge_base(&base, &head)?;
+            Ok(DiffSource::Range {
+                base: merged,
+                head,
+                merge_base: false,
+            })
+        }
+        other => Ok(other),
     }
 }
 
@@ -302,6 +366,7 @@ fn compute_diff(
     repo: &GitRepo,
     source: &DiffSource,
     file: &ChangedFile,
+    hl: &HighlightInputs,
 ) -> anyhow::Result<RenderedDiff> {
     let old_path = file.old_path.as_deref().unwrap_or(&file.path);
 
@@ -352,16 +417,36 @@ fn compute_diff(
         new_bytes.as_deref(),
         &DiffOptions::default(),
     );
-    Ok(render_rows(&diff))
+
+    // Syntax-highlight each side's full text once (tree-sitter needs whole-file
+    // context), then attach per-line runs while assembling rows.
+    let old_text = old_bytes
+        .as_deref()
+        .map(|b| String::from_utf8_lossy(b).into_owned())
+        .unwrap_or_default();
+    let new_text = new_bytes
+        .as_deref()
+        .map(|b| String::from_utf8_lossy(b).into_owned())
+        .unwrap_or_default();
+    let old_runs = highlight::highlight_file(&old_text, old_path, &hl.theme);
+    let new_runs = highlight::highlight_file(&new_text, &file.path, &hl.theme);
+
+    Ok(render_rows(&diff, &old_runs, &new_runs, hl))
 }
 
-fn render_rows(diff: &FileDiff) -> RenderedDiff {
+fn render_rows(
+    diff: &FileDiff,
+    old_runs: &LineRuns,
+    new_runs: &LineRuns,
+    hl: &HighlightInputs,
+) -> RenderedDiff {
     let mut rows = Vec::new();
     if diff.is_binary {
         rows.push(Row::Binary);
     } else if diff.hunks.is_empty() {
         rows.push(Row::NoChanges);
     }
+    let empty: Vec<(Range<usize>, HighlightStyle)> = Vec::new();
     for hunk in &diff.hunks {
         rows.push(Row::HunkHeader(
             format!(
@@ -371,11 +456,39 @@ fn render_rows(diff: &FileDiff) -> RenderedDiff {
             .into(),
         ));
         for line in &hunk.lines {
+            // Removed lines highlight from the old side; added and context
+            // (identical both sides) from the new side.
+            let (syntax, intra_bg) = match line.kind {
+                LineKind::Removed => (
+                    line.old_line
+                        .and_then(|n| old_runs.get(&n))
+                        .unwrap_or(&empty),
+                    hl.intra_removed,
+                ),
+                LineKind::Added => (
+                    line.new_line
+                        .and_then(|n| new_runs.get(&n))
+                        .unwrap_or(&empty),
+                    hl.intra_added,
+                ),
+                LineKind::Context => (
+                    line.new_line
+                        .and_then(|n| new_runs.get(&n))
+                        .unwrap_or(&empty),
+                    hl.intra_added,
+                ),
+            };
+            let runs = if line.text.len() > highlight::MAX_HIGHLIGHT_LINE {
+                Vec::new()
+            } else {
+                highlight::merge_line_runs(line.text.len(), syntax, &line.intraline, intra_bg)
+            };
             rows.push(Row::Line {
                 kind: line.kind,
                 old_line: line.old_line,
                 new_line: line.new_line,
                 text: line.text.clone().into(),
+                runs,
             });
         }
     }
@@ -480,7 +593,7 @@ impl Render for Workspace {
                         .child(
                             div()
                                 .text_color(cx.theme().muted_foreground)
-                                .child(self.source_label()),
+                                .child(self.source_desc.clone()),
                         ),
                 ),
             )

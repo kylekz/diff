@@ -1,5 +1,6 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod highlight;
 mod workspace;
 
 use dv_core::{DiffSource, RepoLocation};
@@ -82,6 +83,15 @@ fn parse_range(value: &str) -> Result<DiffSource, String> {
     })
 }
 
+fn apply_aura_theme(cx: &mut App) {
+    use gpui_component::{Theme, ThemeConfig, ThemeMode};
+
+    let config: ThemeConfig = serde_json::from_str(include_str!("../../../themes/aura-dark.json"))
+        .expect("themes/aura-dark.json must parse as a gpui-component ThemeConfig");
+    Theme::change(ThemeMode::Dark, None, cx);
+    Theme::global_mut(cx).apply_config(&std::rc::Rc::new(config));
+}
+
 fn main() {
     let (location, source) = match parse_args() {
         Ok(parsed) => parsed,
@@ -96,6 +106,7 @@ fn main() {
     app.run(move |cx| {
         gpui_component::init(cx);
         workspace::init(cx);
+        apply_aura_theme(cx);
 
         cx.spawn(async move |cx| {
             let options = WindowOptions {

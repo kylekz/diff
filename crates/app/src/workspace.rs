@@ -187,7 +187,7 @@ impl Workspace {
         this
     }
 
-    fn select_file(&mut self, index: usize, cx: &mut Context<Self>) {
+    pub(crate) fn select_file(&mut self, index: usize, cx: &mut Context<Self>) {
         if index >= self.files.len() {
             return;
         }
@@ -238,6 +238,70 @@ impl Workspace {
             .ok();
         })
         .detach();
+    }
+
+    /// Semantic state for `--automation` (`{"cmd":"state"}`): what the
+    /// workspace believes, independent of layout, so agents can assert on
+    /// behavior and reserve screenshots for style.
+    pub(crate) fn automation_state(&self) -> serde_json::Value {
+        use serde_json::json;
+        let status = match &self.status {
+            Status::Loading => "loading".to_string(),
+            Status::Ready => "ready".to_string(),
+            Status::Failed(err) => format!("failed: {err}"),
+        };
+        json!({
+            "title": self.title.to_string(),
+            "head": self.head.to_string(),
+            "source": self.source_desc.to_string(),
+            "status": status,
+            "settled": self.automation_settled(),
+            "view_mode": match self.view_mode {
+                ViewMode::Unified => "unified",
+                ViewMode::Split => "split",
+            },
+            "selected": self.selected,
+            "files": self.files.iter().map(|file| json!({
+                "path": file.path,
+                "old_path": file.old_path,
+                "status": format!("{:?}", file.status),
+            })).collect::<Vec<_>>(),
+            "rows": self.selected.and_then(|i| self.diffs.get(&i)).map(|diff| json!({
+                "unified": diff.unified.len(),
+                "split": diff.split.len(),
+            })),
+        })
+    }
+
+    /// Bounds-checked selection for `--automation`: unlike the UI path
+    /// (which silently ignores stale indices), scripts get a hard error so
+    /// the response never lies about what happened.
+    pub(crate) fn automation_select_file(
+        &mut self,
+        index: usize,
+        cx: &mut Context<Self>,
+    ) -> anyhow::Result<()> {
+        if index >= self.files.len() {
+            anyhow::bail!(
+                "file index {index} out of range ({} files)",
+                self.files.len()
+            );
+        }
+        self.select_file(index, cx);
+        Ok(())
+    }
+
+    /// True once there is nothing left in flight: repo loaded (or failed)
+    /// and the selected file's diff computed. `wait_ready` polls this.
+    pub(crate) fn automation_settled(&self) -> bool {
+        match &self.status {
+            Status::Loading => false,
+            Status::Failed(_) => true,
+            Status::Ready => match self.selected {
+                Some(index) => self.diffs.contains_key(&index),
+                None => true,
+            },
+        }
     }
 
     fn on_next_file(&mut self, _: &NextFile, _: &mut Window, cx: &mut Context<Self>) {

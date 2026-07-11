@@ -1,5 +1,6 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod automation;
 mod highlight;
 mod recent;
 mod shell;
@@ -21,37 +22,50 @@ options:
   --staged                      diff index vs HEAD
   --commit <rev>                diff one commit against its parent
   --range <a>..<b> | <a>...<b>  diff two revisions (... = merge base)
+  --automation                  JSON-over-stdio control channel for agents
   (default)                     working tree vs HEAD";
 
-/// Returns `None` for a bare launch (`dv` with no arguments) — the app opens
-/// to the shell's empty state. Any argument seeds an initial review.
-fn parse_args() -> Result<Option<(RepoLocation, DiffSource)>, String> {
+struct Cli {
+    /// `None` for a bare launch — the app opens to the shell's empty state.
+    seed: Option<(RepoLocation, DiffSource)>,
+    automation: bool,
+}
+
+fn parse_args() -> Result<Cli, String> {
     let raw: Vec<String> = std::env::args().skip(1).collect();
-    if raw.is_empty() {
-        return Ok(None);
-    }
 
     let mut location: Option<RepoLocation> = None;
     let mut source = DiffSource::WorkingTree;
+    let mut automation = false;
+    // `--automation` alone must behave like a bare launch, so track whether
+    // any argument actually described a repo/diff.
+    let mut seen_repo_arg = false;
 
     let mut args = raw.into_iter();
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--help" | "-h" => return Err(USAGE.to_string()),
+            "--automation" => automation = true,
             "--wsl" => {
                 let value = args.next().ok_or("--wsl requires <distro>:<posix-path>")?;
                 location = Some(RepoLocation::from_wsl_arg(&value).map_err(|e| format!("{e:#}"))?);
+                seen_repo_arg = true;
             }
-            "--staged" => source = DiffSource::Staged,
+            "--staged" => {
+                source = DiffSource::Staged;
+                seen_repo_arg = true;
+            }
             "--commit" => {
                 let value = args.next().ok_or("--commit requires a revision")?;
                 source = DiffSource::Commit(value);
+                seen_repo_arg = true;
             }
             "--range" => {
                 let value = args
                     .next()
                     .ok_or("--range requires <a>..<b> or <a>...<b>")?;
                 source = parse_range(&value)?;
+                seen_repo_arg = true;
             }
             other if other.starts_with('-') => {
                 return Err(format!("unknown option: {other}\n\n{USAGE}"));
@@ -61,15 +75,21 @@ fn parse_args() -> Result<Option<(RepoLocation, DiffSource)>, String> {
                     return Err(format!("unexpected extra argument: {path}\n\n{USAGE}"));
                 }
                 location = Some(RepoLocation::from_path_arg(path).map_err(|e| format!("{e:#}"))?);
+                seen_repo_arg = true;
             }
         }
     }
 
-    let location = match location {
-        Some(l) => l,
-        None => RepoLocation::Local(std::env::current_dir().map_err(|e| e.to_string())?),
+    let seed = if seen_repo_arg {
+        let location = match location {
+            Some(l) => l,
+            None => RepoLocation::Local(std::env::current_dir().map_err(|e| e.to_string())?),
+        };
+        Some((location, source))
+    } else {
+        None
     };
-    Ok(Some((location, source)))
+    Ok(Cli { seed, automation })
 }
 
 fn parse_range(value: &str) -> Result<DiffSource, String> {
@@ -102,7 +122,7 @@ fn apply_aura_theme(cx: &mut App) {
 }
 
 fn main() {
-    let seed = match parse_args() {
+    let cli = match parse_args() {
         Ok(parsed) => parsed,
         Err(message) => {
             eprintln!("{message}");
@@ -118,6 +138,7 @@ fn main() {
         shell::init(cx);
         apply_aura_theme(cx);
 
+        let Cli { seed, automation } = cli;
         cx.spawn(async move |cx| {
             let options = WindowOptions {
                 titlebar: Some(TitleBar::title_bar_options()),
@@ -128,11 +149,19 @@ fn main() {
                 ..Default::default()
             };
 
-            cx.open_window(options, |window, cx| {
-                let view = cx.new(|cx| AppShell::new(seed, window, cx));
-                cx.new(|cx| Root::new(view, window, cx).bg(cx.theme().background))
-            })
-            .expect("failed to open window");
+            let mut shell_slot = None;
+            let window = cx
+                .open_window(options, |window, cx| {
+                    let shell = cx.new(|cx| AppShell::new(seed, automation, window, cx));
+                    shell_slot = Some(shell.clone());
+                    cx.new(|cx| Root::new(shell, window, cx).bg(cx.theme().background))
+                })
+                .expect("failed to open window");
+
+            if automation {
+                let shell = shell_slot.expect("window builder ran");
+                cx.update(|cx| automation::start(window, shell, cx));
+            }
         })
         .detach();
     });

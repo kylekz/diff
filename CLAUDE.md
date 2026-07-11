@@ -57,16 +57,49 @@ gpui — expect many minutes. Incremental builds are fast.
 
 ## Visual verification (for agents)
 
-UI/style work must be verified by looking at the running app, not by assuming:
+UI/style work must be verified by looking at the running app, not by
+assuming. The primary loop is **`dv --automation`** (JSON-over-stdio; see
+docs/architecture.md § Testing): write a command script, pipe it through the
+app, then Read the PNG it produced and actually inspect the image.
 
-1. Launch in the background: `cargo run -p dv` (or `target/debug/dv.exe`)
-2. Screenshot the window (Windows-MCP / computer-use screenshot tools) and
-   actually inspect the image
-3. Kill it when done: `Stop-Process -Name dv`
+```bash
+# bash (preferred — PowerShell > redirects write UTF-16); one JSON per line
+cat > cmds.jsonl <<'EOF'
+{"id":1,"cmd":"wait_ready","timeout_ms":20000}
+{"id":2,"cmd":"state"}
+{"id":3,"cmd":"action","name":"ToggleSplit"}
+{"id":4,"cmd":"select_file","index":2}
+{"id":5,"cmd":"wait_ready"}
+{"id":6,"cmd":"screenshot","path":"C:/path/to/shot.png"}
+{"id":7,"cmd":"quit"}
+EOF
+./target/debug/dv.exe <repo-path> --automation < cmds.jsonl > out.jsonl
+```
 
-Phase 1 adds `dv --automation` (JSON-over-stdio: dump element tree, dispatch
-actions, click, screenshot-to-file) as the primary iteration loop — prefer it
-over desktop screenshots once it exists. See docs/architecture.md § Testing.
+Notes that save debugging time:
+- Use **forward slashes** in JSON paths (backslashes are JSON escapes).
+- Commands run strictly in order, each completing before the next; use
+  `wait_ready` after anything that loads (launch, `open`, select_file) so
+  one-shot scripts are deterministic. Stdin EOF quits the app (after the
+  in-flight command; waits are capped at 60s) — no orphan windows.
+- `state` is the semantic dump (files, selection, view mode, row counts):
+  assert behavior there, reserve screenshots for style. `actions` lists
+  every dispatchable action name. `key`/`click` exercise real input paths
+  (click coords are logical px; `state` reports the scale factor).
+- The New Review folder picker is disabled under automation (a native
+  dialog would block the executor and wedge the channel); scripts use
+  `{"cmd":"open","path":"D:/some/repo"}` instead.
+- `resize` is fire-and-forget (the OS applies it async) — poll `state`
+  until the size matches before asserting on it; `screenshot`'s built-in
+  settle delay usually covers it.
+- Screenshots are self-captures of the app's own window (PrintWindow by
+  PID) at physical resolution — immune to focus/wrong-window mixups.
+
+Fallback when automation can't answer it (window chrome, OS integration):
+launch `cargo run -p dv` in the background, use Windows-MCP full-desktop
+Screenshot (reliable), and kill with `Stop-Process -Name dv`. Ad-hoc
+per-window capture via PowerShell P/Invoke has repeatedly grabbed the wrong
+window — don't trust it.
 
 ## Status
 

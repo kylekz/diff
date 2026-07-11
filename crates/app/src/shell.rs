@@ -42,11 +42,16 @@ pub struct AppShell {
     active: Option<Entity<Workspace>>,
     /// Index into `recent.entries()` of the active review, for highlighting.
     selected: Option<usize>,
+    /// True under `--automation`: blocks the native folder picker, which
+    /// would wedge the foreground executor (and thus the whole automation
+    /// channel) until a human dismissed it.
+    automation: bool,
 }
 
 impl AppShell {
     pub fn new(
         seed: Option<(RepoLocation, DiffSource)>,
+        automation: bool,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
@@ -55,6 +60,7 @@ impl AppShell {
             recent: RecentStore::load(),
             active: None,
             selected: None,
+            automation,
         };
         match seed {
             Some((location, source)) => this.open_review(location, source, window, cx),
@@ -105,6 +111,12 @@ impl AppShell {
     /// [`RepoLocation::from_path_arg`] transparently yields a WSL location —
     /// so this one control covers both local and WSL repos.
     fn on_new_review(&mut self, _: &NewReview, window: &mut Window, cx: &mut Context<Self>) {
+        if self.automation {
+            // The dialog's Show() blocks the foreground executor, so under
+            // automation nothing — not even stdin-EOF quit — would ever run
+            // again. Scripts use `{"cmd":"open","path":...}` instead.
+            return;
+        }
         let rx = cx.prompt_for_paths(PathPromptOptions {
             files: false,
             directories: true,
@@ -134,6 +146,50 @@ impl AppShell {
         if let Ok(location) = RepoLocation::from_path_arg(&path.to_string_lossy()) {
             self.open_review(location, DiffSource::WorkingTree, window, cx);
         }
+    }
+
+    /// Semantic state for `--automation`: the sidebar plus the active
+    /// review's own dump (see [`Workspace::automation_state`]).
+    pub(crate) fn automation_state(&self, cx: &App) -> serde_json::Value {
+        use serde_json::json;
+        json!({
+            "recent": self.recent.entries().iter().map(|e| e.title.clone()).collect::<Vec<_>>(),
+            "selected": self.selected,
+            "workspace": self.active.as_ref().map(|ws| ws.read(cx).automation_state()),
+        })
+    }
+
+    /// True when nothing is loading — a bare shell counts as settled.
+    pub(crate) fn automation_settled(&self, cx: &App) -> bool {
+        match &self.active {
+            Some(ws) => ws.read(cx).automation_settled(),
+            None => true,
+        }
+    }
+
+    /// Select the nth changed file in the active review. Errors (rather
+    /// than silently no-oping) so automation responses never claim a
+    /// selection that didn't happen.
+    pub(crate) fn automation_select_file(
+        &mut self,
+        index: usize,
+        cx: &mut Context<Self>,
+    ) -> anyhow::Result<()> {
+        match &self.active {
+            Some(ws) => ws.update(cx, |ws, cx| ws.automation_select_file(index, cx)),
+            None => Err(anyhow::anyhow!("no active review")),
+        }
+    }
+
+    /// Scripted replacement for the folder picker (`{"cmd":"open"}`): open
+    /// a working-tree review of `location` directly.
+    pub(crate) fn automation_open(
+        &mut self,
+        location: RepoLocation,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.open_review(location, DiffSource::WorkingTree, window, cx);
     }
 
     fn render_recent_row(&self, index: usize, cx: &mut Context<Self>) -> impl IntoElement + use<> {

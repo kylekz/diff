@@ -1404,13 +1404,16 @@ dependencies = [
  "anyhow",
  "dirs",
  "dv-core",
+ "futures",
  "gpui",
  "gpui-component",
  "gpui-component-assets",
  "gpui_platform",
+ "png 0.17.16",
  "ropey",
  "serde",
  "serde_json",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]

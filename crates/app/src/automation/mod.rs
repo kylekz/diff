@@ -66,6 +66,10 @@ enum Cmd {
     Open { path: String },
     /// Select the nth changed file in the active review.
     SelectFile { index: usize },
+    /// Open PR `number` in the active review's workspace
+    /// (`Workspace::open_pr`) — replies once the fetch is dispatched, not
+    /// once it completes; scripts follow with `wait_ready`.
+    OpenPr { number: u64 },
     /// Write a PNG of the window to `path`; responds with physical pixel
     /// dimensions.
     Screenshot { path: PathBuf },
@@ -275,6 +279,14 @@ async fn handle(
                 shell
                     .automation_select_file(index, window, cx)
                     .map(|()| json!({"selected": index}))
+            })
+        })?,
+
+        Cmd::OpenPr { number } => cx.update_window(window, |_, window, cx| {
+            shell.update(cx, |shell, cx| {
+                shell
+                    .automation_open_pr(number, window, cx)
+                    .map(|()| json!({"opened_pr": number}))
             })
         })?,
 

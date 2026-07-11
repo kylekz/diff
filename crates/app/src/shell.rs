@@ -85,6 +85,7 @@ impl AppShell {
     pub fn new(
         seed: Option<(RepoLocation, DiffSource)>,
         automation: bool,
+        pending_pr: Option<u64>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
@@ -99,7 +100,7 @@ impl AppShell {
         };
         this.refresh_all_badges(cx);
         match seed {
-            Some((location, source)) => this.open_review(location, source, window, cx),
+            Some((location, source)) => this.open_review(location, source, pending_pr, window, cx),
             // Nothing to focus into, so hold focus on the shell — otherwise
             // the advertised Ctrl+N binding (in the shell's key context) has
             // no focused node on its dispatch path and never fires.
@@ -110,10 +111,14 @@ impl AppShell {
 
     /// Open a review for `location`/`source`: record it as most-recent,
     /// spin up a fresh Workspace, and focus it so keyboard nav is live.
+    /// `pending_pr` is only ever `Some` on the very first review a freshly
+    /// launched `dv pr <number|url>` opens — `open_recent`/`automation_open`
+    /// always pass `None`.
     fn open_review(
         &mut self,
         location: RepoLocation,
         source: DiffSource,
+        pending_pr: Option<u64>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -129,7 +134,7 @@ impl AppShell {
         });
         self.selected = Some(index);
 
-        let workspace = cx.new(|cx| Workspace::new(location, source, window, cx));
+        let workspace = cx.new(|cx| Workspace::new(location, source, pending_pr, window, cx));
         let handle = workspace.focus_handle(cx);
         window.focus(&handle, cx);
         // Keep this entry's badge live while the review is being worked on.
@@ -205,7 +210,7 @@ impl AppShell {
         let Some(entry) = self.recent.entries().get(index).cloned() else {
             return;
         };
-        self.open_review(entry.location, entry.source, window, cx);
+        self.open_review(entry.location, entry.source, None, window, cx);
     }
 
     /// The "new review" flow: a native folder picker. Because the picker can
@@ -246,7 +251,7 @@ impl AppShell {
         // be parsed is dropped silently for now; a validation surface lands
         // with Phase 2.
         if let Ok(location) = RepoLocation::from_path_arg(&path.to_string_lossy()) {
-            self.open_review(location, DiffSource::WorkingTree, window, cx);
+            self.open_review(location, DiffSource::WorkingTree, None, window, cx);
         }
     }
 
@@ -292,7 +297,26 @@ impl AppShell {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.open_review(location, DiffSource::WorkingTree, window, cx);
+        self.open_review(location, DiffSource::WorkingTree, None, window, cx);
+    }
+
+    /// `{"cmd":"open_pr","number":N}`: open PR `number` in the active
+    /// review's workspace (`Workspace::open_pr`). Errors (rather than
+    /// silently no-oping) when there's no active review, matching
+    /// `automation_select_file`'s contract.
+    pub(crate) fn automation_open_pr(
+        &mut self,
+        number: u64,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> anyhow::Result<()> {
+        match &self.active {
+            Some(ws) => {
+                ws.update(cx, |ws, cx| ws.open_pr(number, window, cx));
+                Ok(())
+            }
+            None => Err(anyhow::anyhow!("no active review")),
+        }
     }
 
     fn render_recent_row(&self, index: usize, cx: &mut Context<Self>) -> impl IntoElement + use<> {

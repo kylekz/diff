@@ -3,8 +3,8 @@ use std::ops::Range;
 use std::sync::Arc;
 
 use dv_core::{
-    BlobSpec, ChangeStatus, ChangedFile, DiffOptions, DiffSource, FileDiff, GitRepo, LineKind,
-    RepoLocation,
+    BlobSpec, ChangeStatus, ChangedFile, ChecksSummary, DiffOptions, DiffSource, FileDiff, GitRepo,
+    GithubClient, LineKind, PrMeta, PrState, PrSummary, RemoteRef, RepoLocation, ReviewDecision,
 };
 use gpui::prelude::FluentBuilder;
 use gpui::*;
@@ -27,7 +27,12 @@ actions!(
         CancelComment,
         PaletteNext,
         PalettePrev,
-        PaletteClose
+        PaletteClose,
+        OpenPrPicker,
+        PrPickerNext,
+        PrPickerPrev,
+        PrPickerClose,
+        PrPickerChoose
     ]
 );
 
@@ -46,11 +51,14 @@ const ROW_HEIGHT: f32 = 24.;
 /// palette is open. Single-char bindings are scoped to `!PaletteOpen` so
 /// they keep bubbling into the palette's text input instead of firing.
 const PALETTE_CONTEXT: &str = "PaletteOpen";
+/// Same mechanism as [`PALETTE_CONTEXT`], for the PR picker (`ctrl-g`).
+const PR_PICKER_CONTEXT: &str = "PrPickerOpen";
 
 pub fn init(cx: &mut App) {
-    let browse = Some("Workspace && !PaletteOpen && !EditorOpen");
+    let browse = Some("Workspace && !PaletteOpen && !EditorOpen && !PrPickerOpen");
     let palette = Some("Workspace && PaletteOpen");
     let editor = Some("Workspace && EditorOpen");
+    let pr_picker = Some("Workspace && PrPickerOpen");
     cx.bind_keys([KeyBinding::new("escape", CancelComment, editor)]);
     cx.bind_keys([
         KeyBinding::new("j", NextFile, browse),
@@ -64,10 +72,15 @@ pub fn init(cx: &mut App) {
         KeyBinding::new("f", JumpToFile, browse),
         KeyBinding::new("ctrl-p", JumpToFile, browse),
         KeyBinding::new("cmd-p", JumpToFile, browse),
+        KeyBinding::new("ctrl-g", OpenPrPicker, browse),
         KeyBinding::new("escape", ClearSelection, browse),
         KeyBinding::new("down", PaletteNext, palette),
         KeyBinding::new("up", PalettePrev, palette),
         KeyBinding::new("escape", PaletteClose, palette),
+        KeyBinding::new("down", PrPickerNext, pr_picker),
+        KeyBinding::new("up", PrPickerPrev, pr_picker),
+        KeyBinding::new("escape", PrPickerClose, pr_picker),
+        KeyBinding::new("enter", PrPickerChoose, pr_picker),
     ]);
 }
 
@@ -244,9 +257,55 @@ struct Palette {
     _subscription: Subscription,
 }
 
+/// Everything the PR header panel needs, cached from the [`PrMeta`]
+/// [`Workspace::open_pr`] last fetched — the workspace never re-hits `gh`
+/// just to render the band.
+struct PrHeader {
+    number: u64,
+    title: SharedString,
+    author: SharedString,
+    state: PrState,
+    is_draft: bool,
+    base_ref: SharedString,
+    head_ref: SharedString,
+    checks: ChecksSummary,
+    review_decision: Option<ReviewDecision>,
+    url: SharedString,
+    body: SharedString,
+}
+
+/// The PR picker overlay (`ctrl-g`), while open.
+struct PrPicker {
+    state: PrPickerState,
+    /// Cursor into `state`'s list, once loaded.
+    selected: usize,
+}
+
+enum PrPickerState {
+    Loading,
+    Loaded(Vec<PrSummary>),
+    Error(String),
+}
+
+/// Everything a PR's background open resolves, applied to the workspace in
+/// one shot on the UI thread once it lands.
+struct PrOpenOutcome {
+    meta: PrMeta,
+    files: Vec<ChangedFile>,
+    review: dv_core::Review,
+    source: DiffSource,
+}
+
 pub struct Workspace {
     focus_handle: FocusHandle,
     source: DiffSource,
+    /// Bumped every time [`Self::open_pr`] is dispatched — never on a plain
+    /// file switch. `open_pr` and `request_diff` completions capture the
+    /// value in force at spawn time and discard themselves (before
+    /// touching any state) if it no longer matches on completion: a stale
+    /// background fetch/diff computed against a source that's since been
+    /// replaced by a newer `open_pr` (review finding P1-a).
+    source_epoch: u64,
     status: Status,
     repo: Option<Arc<GitRepo>>,
     title: SharedString,
@@ -303,6 +362,33 @@ pub struct Workspace {
     /// Keeps the review-store watcher alive; external edits (agent CLI,
     /// another window) stream in through it. Dropped with the workspace.
     _watcher: Option<dv_core::ReviewWatcher>,
+    /// The PR this workspace's diff source was opened from, if any (set by
+    /// [`Self::open_pr`]). `None` for a plain local review.
+    pr: Option<PrHeader>,
+    /// The remote linkage (provider/slug/pr) of the currently-open PR, if
+    /// any — copied from the review [`load_pr`] found-or-created for it.
+    /// Kept separately from `pr` (which has no slug) so [`pick_review`] can
+    /// tell whether the workspace is PR-scoped and, if so, to which PR
+    /// (review finding P1-b: the watcher must not adopt an unrelated PR's
+    /// newest draft out from under an open PR).
+    pr_remote: Option<RemoteRef>,
+    /// Whether the PR header's "details" (body) toggle is expanded.
+    pr_details_open: bool,
+    /// Set (to the PR number) while [`Self::open_pr`] is fetching — reused
+    /// only for the loading caption; `Status::Loading` already gates
+    /// `--automation`'s `wait_ready`/`state`.
+    pr_loading: Option<u64>,
+    /// The most recent `open_pr` failure, if any. Deliberately separate
+    /// from `Status::Failed`: that variant blanks the whole pane, but a
+    /// failed PR fetch must leave the workspace exactly as usable as it was
+    /// on its previous source.
+    pr_error: Option<String>,
+    /// The PR-picker overlay (`ctrl-g`), when open.
+    pr_picker: Option<PrPicker>,
+    /// Comment/reply author, resolved once in the background at load
+    /// (`crate::author::resolve_author`). `None` until that resolves —
+    /// callers fall back to a placeholder rather than block on it.
+    author: Option<String>,
 }
 
 /// Which blob a comment on `side` of `path` anchors to, given the review's
@@ -336,11 +422,45 @@ fn anchor_spec(source: &DiffSource, side: dv_core::Side, path: &str) -> BlobSpec
 }
 
 /// Which review the workspace should display, from a store listing
-/// (newest-first): the latest draft (where comments accumulate — matches
-/// the CLI's targeting), else the review already on screen (so a
-/// just-submitted review doesn't vanish), else the latest review of any
-/// state (so submitted work is still visible after a restart).
-fn pick_review(reviews: Vec<dv_core::Review>, current_id: Option<&str>) -> Option<dv_core::Review> {
+/// (newest-first).
+///
+/// When the workspace has a PR open (`current_pr` is `Some`), a draft
+/// created by a completely unrelated `dv comment add` (e.g. the CLI writing
+/// against some other PR's review) must never hijack the display just for
+/// being newest — review finding P1-b, reproduced live: the watcher's old
+/// "newest draft wins" rule swapped a PR-A workspace onto PR-B's
+/// freshly-created draft, and subsequent GUI comments then saved into the
+/// wrong PR's review. So with a PR open, selection is: (1) the draft (or,
+/// failing that, any review) whose `remote` matches this PR (slug compared
+/// case-insensitively, matching main.rs's origin/URL slug comparison), else
+/// (2) keep showing whatever is already on screen (`current_id`) — never
+/// fall back to an unrelated draft.
+///
+/// With no PR open (`current_pr` is `None`), the original local-review
+/// precedence applies unchanged: the latest draft (where comments
+/// accumulate — matches the CLI's targeting), else the review already on
+/// screen (so a just-submitted review doesn't vanish), else the latest
+/// review of any state (so submitted work is still visible after a
+/// restart).
+fn pick_review(
+    reviews: Vec<dv_core::Review>,
+    current_id: Option<&str>,
+    current_pr: Option<&RemoteRef>,
+) -> Option<dv_core::Review> {
+    if let Some(pr) = current_pr {
+        let matches_pr = |r: &&dv_core::Review| {
+            r.remote.as_ref().is_some_and(|remote| {
+                remote.pr == pr.pr && remote.slug.eq_ignore_ascii_case(&pr.slug)
+            })
+        };
+        if let Some(matched) = reviews.iter().find(matches_pr) {
+            return Some(matched.clone());
+        }
+        return current_id
+            .and_then(|id| reviews.iter().find(|r| r.id == id))
+            .cloned();
+    }
+
     if let Some(draft) = reviews
         .iter()
         .find(|r| matches!(r.state, dv_core::ReviewState::Draft))
@@ -388,11 +508,114 @@ fn source_label(source: &DiffSource) -> &'static str {
     }
 }
 
+/// String forms of the GitHub types [`Workspace::automation_state`] dumps —
+/// small, deliberately duplicated copies of `cli/pr_cmd.rs`'s private
+/// equivalents (that module isn't `pub`, and these are one match arm each).
+fn pr_state_word(state: PrState) -> &'static str {
+    match state {
+        PrState::Open => "open",
+        PrState::Closed => "closed",
+        PrState::Merged => "merged",
+    }
+}
+
+fn checks_word(checks: ChecksSummary) -> &'static str {
+    match checks {
+        ChecksSummary::Passing => "passing",
+        ChecksSummary::Failing => "failing",
+        ChecksSummary::Pending => "pending",
+        ChecksSummary::None => "none",
+    }
+}
+
+fn review_decision_word(decision: ReviewDecision) -> &'static str {
+    match decision {
+        ReviewDecision::Approved => "approved",
+        ReviewDecision::ChangesRequested => "changes_requested",
+        ReviewDecision::ReviewRequired => "review_required",
+    }
+}
+
+/// Fetch a PR's metadata, make sure its diff range is available locally,
+/// reload the changed-file list against it, and find-or-create the draft
+/// review it links to — everything [`Workspace::open_pr`] needs, done
+/// off-thread in one shot so the UI only ever sees a finished outcome.
+fn load_pr(repo: &GitRepo, number: u64, location: RepoLocation) -> anyhow::Result<PrOpenOutcome> {
+    let client = GithubClient::for_repo(repo)?;
+    client.preflight()?;
+    let meta = client.pr_meta(number)?;
+    let range = crate::pr::prepare_pr(repo, &meta)?;
+    // `range.merge_base` is already the resolved merge-base tip — build the
+    // concrete two-dot source directly rather than routing back through
+    // `resolve_source`'s `merge_base: true` path (which would just
+    // recompute the same `git merge-base` call).
+    let source = DiffSource::Range {
+        base: range.merge_base.clone(),
+        head: range.head_oid.clone(),
+        merge_base: false,
+    };
+    let files = repo.changed_files(&source)?;
+
+    let store = dv_core::ReviewStore::open(location);
+    let slug = client.slug().to_string();
+    // Case-insensitive, matching main.rs's `resolve_pr_target` slug
+    // comparison — a host/owner/repo differing only in case is the same
+    // repo on GitHub.
+    let matches_this_pr = |r: &dv_core::Review| {
+        r.remote
+            .as_ref()
+            .is_some_and(|remote| remote.pr == number && remote.slug.eq_ignore_ascii_case(&slug))
+    };
+    let existing = store.list()?.into_iter().find(|r| matches_this_pr(r));
+    let review = match existing {
+        Some(review) => review,
+        None => {
+            // Re-list immediately before creating: closes the TOCTOU window
+            // against a concurrent creator (another `dv` process, or a CLI
+            // invocation racing this fetch) that also saw "no existing"
+            // from the list() above and would otherwise dupe the draft.
+            // The GUI itself can no longer race here (open_pr now refuses a
+            // second concurrent open — review finding P2-b), but this is a
+            // cheap belt-and-suspenders check against future regressions
+            // or an out-of-process writer.
+            let recheck = store.list()?.into_iter().find(|r| matches_this_pr(r));
+            match recheck {
+                Some(review) => review,
+                None => {
+                    // A fresh draft, linked to the PR from the first click —
+                    // so comments accumulate against it immediately,
+                    // matching how a local review already targets the
+                    // latest draft by default.
+                    let mut review = store.create(source.clone())?;
+                    review.remote = Some(RemoteRef {
+                        provider: "github".to_string(),
+                        slug,
+                        pr: number,
+                        url: meta.url.clone(),
+                        submitted_review_id: None,
+                        submitted_url: None,
+                    });
+                    store.save(&review)?;
+                    review
+                }
+            }
+        }
+    };
+
+    Ok(PrOpenOutcome {
+        meta,
+        files,
+        review,
+        source,
+    })
+}
+
 impl Workspace {
     pub fn new(
         location: RepoLocation,
         source: DiffSource,
-        _window: &mut Window,
+        pending_pr: Option<u64>,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
         // Watch the review store so agent-CLI (or other-window) edits show
@@ -413,6 +636,7 @@ impl Workspace {
             display: Vec::new(),
             diff_to_display: Vec::new(),
             source: source.clone(),
+            source_epoch: 0,
             status: Status::Loading,
             repo: None,
             head: "".into(),
@@ -435,6 +659,13 @@ impl Workspace {
             stale_checked: None,
             last_diff_ms: None,
             _watcher: None,
+            pr: None,
+            pr_remote: None,
+            pr_details_open: false,
+            pr_loading: None,
+            pr_error: None,
+            pr_picker: None,
+            author: None,
         };
 
         cx.spawn(async move |this, cx| {
@@ -443,13 +674,16 @@ impl Workspace {
                 // Coalesce event bursts (temp write + rename fire separately)
                 // into one reload.
                 while watch_rx.try_recv().is_ok() {}
-                // The normalized location (set by the load task), plus
-                // the review currently shown so it isn't dropped when a
-                // submit leaves no draft behind.
-                let Ok((location, current_id)) = this.update(cx, |this, _| {
+                // The normalized location (set by the load task), the
+                // review currently shown so it isn't dropped when a submit
+                // leaves no draft behind, and the PR this workspace is
+                // scoped to (if any) so a reload can't adopt some other
+                // PR's draft out from under it (review finding P1-b).
+                let Ok((location, current_id, current_pr)) = this.update(cx, |this, _| {
                     (
                         this.location.clone(),
                         this.review.as_ref().map(|r| r.id.clone()),
+                        this.pr_remote.clone(),
                     )
                 }) else {
                     break;
@@ -462,6 +696,7 @@ impl Workspace {
                                 .list()
                                 .unwrap_or_default(),
                             current_id.as_deref(),
+                            current_pr.as_ref(),
                         )
                     })
                     .await;
@@ -484,7 +719,7 @@ impl Workspace {
         })
         .detach();
 
-        cx.spawn(async move |this, cx| {
+        cx.spawn_in(window, async move |this, cx| {
             let loaded = cx
                 .background_executor()
                 .spawn(async move {
@@ -501,25 +736,43 @@ impl Workspace {
                     // normalized location, never the CLI/picker argument.
                     let store_location = repo.location().clone();
                     // The latest draft review is the one comments accumulate
-                    // into (matching the CLI's default targeting).
+                    // into (matching the CLI's default targeting). No PR is
+                    // open yet at this point in the load — even when
+                    // `pending_pr` is set, `open_pr` runs right after and
+                    // assigns its own PR-linked review, superseding this.
                     let review = pick_review(
                         dv_core::ReviewStore::open(store_location.clone())
                             .list()
                             .unwrap_or_default(),
                         None,
+                        None,
                     );
-                    anyhow::Ok((Arc::new(repo), head, files, source, review, store_location))
+                    // Resolved here (off-thread: it may hit a `gh` subprocess
+                    // on first use) so new comments/replies stamp the real
+                    // author from the very first one, not just once some
+                    // later save happens to trigger it.
+                    let author = crate::author::resolve_author(&repo);
+                    anyhow::Ok((
+                        Arc::new(repo),
+                        head,
+                        files,
+                        source,
+                        review,
+                        store_location,
+                        author,
+                    ))
                 })
                 .await;
 
-            this.update(cx, |this, cx| {
+            this.update_in(cx, |this, window, cx| {
                 match loaded {
-                    Ok((repo, head, files, source, review, store_location)) => {
+                    Ok((repo, head, files, source, review, store_location, author)) => {
                         this.repo = Some(repo);
                         this.head = head.into();
                         this.files = files;
                         this.source = source;
                         this.review = review;
+                        this.author = Some(author);
                         cx.emit(ReviewChanged);
                         this.location = store_location.clone();
                         this.status = Status::Ready;
@@ -531,7 +784,9 @@ impl Workspace {
                             }))
                             .inspect_err(|err| eprintln!("review watcher unavailable: {err:#}"))
                             .ok();
-                        if !this.files.is_empty() {
+                        if let Some(number) = pending_pr {
+                            this.open_pr(number, window, cx);
+                        } else if !this.files.is_empty() {
                             this.select_file_inner(0, cx);
                         }
                     }
@@ -613,6 +868,11 @@ impl Workspace {
 
         let file = self.files[index].clone();
         let source = self.source.clone();
+        // Captured now; checked on completion (see `source_epoch`'s doc
+        // comment) — an `open_pr` landing (or even just starting) while
+        // this computation runs means `index` will refer to a different
+        // source's file list by the time this resolves.
+        let epoch = self.source_epoch;
         let expand = self.expanded.get(&index).cloned().unwrap_or_default();
         let theme = cx.theme();
         let hl = HighlightInputs {
@@ -629,6 +889,13 @@ impl Workspace {
             let elapsed_ms = started.elapsed().as_millis() as u64;
 
             this.update(cx, |this, cx| {
+                if this.source_epoch != epoch {
+                    // Stale: computed against a source that's since been
+                    // replaced. Discard outright rather than write rows
+                    // for the wrong file into the new source's cache
+                    // under a reused index (review finding P1-a).
+                    return;
+                }
                 this.diff_pending.remove(&index);
                 this.last_diff_ms = Some(elapsed_ms);
                 match rendered {
@@ -670,6 +937,251 @@ impl Workspace {
         // completion overwrites them. Removing them first blanks the pane
         // for the whole recompute (visible on large files).
         self.request_diff(index, cx);
+    }
+
+    // ---- GitHub PR open flow ------------------------------------------
+
+    /// Open PR `number`: fetch its metadata + range (off-thread), switch
+    /// the diff source to it, reload the file list, and find-or-create the
+    /// draft review it links to (docs/phase-3-github.md deliverable 2).
+    /// Reused by the GUI PR picker, `dv pr <number|url>`'s launch path, and
+    /// the `open_pr` automation command.
+    pub(crate) fn open_pr(&mut self, number: u64, window: &mut Window, cx: &mut Context<Self>) {
+        // Same contract as `select_file`: a save in flight must never be
+        // dropped. Refuse the whole open rather than orphan it (review
+        // finding P2-a — this used to `take()` the editor unconditionally
+        // at dispatch, so a typo'd PR number cost the user their typed
+        // comment even though the fetch itself hadn't touched anything).
+        if self.editor.as_ref().is_some_and(|e| e.saving)
+            || self.thread_input.as_ref().is_some_and(|t| t.saving)
+        {
+            return;
+        }
+        // Only one PR open in flight at a time (review finding P2-b): the
+        // second of a back-to-back pair is simply ignored. Simpler UX, and
+        // it closes the find-or-create TOCTOU window in `load_pr` against
+        // a concurrent second open (belt-and-suspenders re-list there too).
+        if self.pr_loading.is_some() {
+            return;
+        }
+
+        let Some(repo) = self.repo.clone() else {
+            // The repo hasn't finished its own initial load yet — nothing
+            // to fetch against. Shouldn't happen on any of this method's
+            // real call sites (picker/automation both require an already-
+            // ready workspace; the `pending_pr` launch path only calls
+            // this once the initial load itself just succeeded).
+            self.pr_error = Some("repository is still loading — try again in a moment".into());
+            cx.notify();
+            return;
+        };
+
+        // Closing the picker here (rather than deferred to the completion
+        // below, like the rest of the teardown) is still fine: it holds no
+        // user data, and leaving it open over the "Loading" pane would
+        // just look broken.
+        if self.pr_picker.take().is_some() {
+            window.focus(&self.focus_handle, cx);
+        }
+
+        self.pr_error = None;
+        self.pr_loading = Some(number);
+        self.status = Status::Loading;
+        // Bumped before the fetch even starts, so any request_diff already
+        // in flight (and this open_pr's own completion, below) can tell a
+        // superseding open_pr apart from itself (see the field's doc
+        // comment).
+        self.source_epoch += 1;
+        let epoch = self.source_epoch;
+        cx.notify();
+
+        let location = self.location.clone();
+        cx.spawn_in(window, async move |this, cx| {
+            let outcome = cx
+                .background_executor()
+                .spawn(async move { load_pr(&repo, number, location) })
+                .await;
+
+            this.update_in(cx, |this, window, cx| {
+                if this.source_epoch != epoch {
+                    // A newer open_pr superseded this one before this
+                    // fetch finished: don't touch source/files/review/pr,
+                    // don't flip Loading back to Ready, don't tear down
+                    // whatever the newer call is showing. At most clear
+                    // our own cosmetic loading caption, and only if it's
+                    // still showing this call's number (the newer call
+                    // already overwrote it with its own otherwise).
+                    if this.pr_loading == Some(number) {
+                        this.pr_loading = None;
+                    }
+                    return;
+                }
+                this.pr_loading = None;
+                match outcome {
+                    Ok(PrOpenOutcome {
+                        meta,
+                        files,
+                        review,
+                        source,
+                    }) => {
+                        // Only now — a real, current-epoch success — is it
+                        // safe to tear down the live selection/editor/
+                        // thread-input: `Status::Loading` has had the body
+                        // pane replaced this whole time, so nothing could
+                        // have created a new one in the meantime (review
+                        // finding P2-a).
+                        this.selection = None;
+                        let dropped_editor = this.editor.take().is_some();
+                        let dropped_input = this.thread_input.take().is_some();
+                        if dropped_editor || dropped_input {
+                            window.focus(&this.focus_handle, cx);
+                        }
+                        this.source = source;
+                        this.source_desc = format!("PR #{number}").into();
+                        this.files = files;
+                        // The old file list's diffs are keyed by index into
+                        // a now-replaced list — stale caches would render
+                        // the wrong file's content under the right name.
+                        this.diffs.clear();
+                        this.diff_pending.clear();
+                        this.expanded.clear();
+                        this.stale.clear();
+                        this.stale_checked = None;
+                        this.selected = None;
+                        this.pending_jump = None;
+                        this.pr_remote = review.remote.clone();
+                        this.review = Some(review);
+                        cx.emit(ReviewChanged);
+                        this.pr = Some(PrHeader {
+                            number: meta.number,
+                            title: meta.title.into(),
+                            author: meta.author.into(),
+                            state: meta.state,
+                            is_draft: meta.is_draft,
+                            base_ref: meta.base_ref.into(),
+                            head_ref: meta.head_ref.into(),
+                            checks: meta.checks,
+                            review_decision: meta.review_decision,
+                            url: meta.url.into(),
+                            body: meta.body.into(),
+                        });
+                        this.pr_details_open = false;
+                        this.status = Status::Ready;
+                        if this.files.is_empty() {
+                            this.reset_diff_list(cx);
+                        } else {
+                            this.select_file(0, window, cx);
+                        }
+                    }
+                    Err(err) => {
+                        // Leave source/files/pr exactly as they were — the
+                        // workspace stays on whatever it was showing before
+                        // this attempt, selection/editor/thread-input
+                        // included.
+                        this.status = Status::Ready;
+                        this.pr_error = Some(format!("{err:#}"));
+                    }
+                }
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    // ---- PR picker -----------------------------------------------------
+
+    fn on_open_pr_picker(
+        &mut self,
+        _: &OpenPrPicker,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.pr_picker.is_some() {
+            return;
+        }
+        let Some(repo) = self.repo.clone() else {
+            return;
+        };
+        self.pr_picker = Some(PrPicker {
+            state: PrPickerState::Loading,
+            selected: 0,
+        });
+        cx.notify();
+
+        cx.spawn(async move |this, cx| {
+            let result = cx
+                .background_executor()
+                .spawn(async move {
+                    let client = GithubClient::for_repo(&repo).map_err(|err| err.to_string())?;
+                    client.preflight().map_err(|err| err.to_string())?;
+                    client.list_prs().map_err(|err| err.to_string())
+                })
+                .await;
+            this.update(cx, |this, cx| {
+                if let Some(picker) = &mut this.pr_picker {
+                    picker.selected = 0;
+                    picker.state = match result {
+                        Ok(prs) => PrPickerState::Loaded(prs),
+                        Err(err) => PrPickerState::Error(err),
+                    };
+                }
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    fn close_pr_picker(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.pr_picker.take().is_some() {
+            window.focus(&self.focus_handle, cx);
+            cx.notify();
+        }
+    }
+
+    fn on_pr_picker_close(
+        &mut self,
+        _: &PrPickerClose,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.close_pr_picker(window, cx);
+    }
+
+    fn on_pr_picker_next(&mut self, _: &PrPickerNext, _: &mut Window, cx: &mut Context<Self>) {
+        if let Some(picker) = &mut self.pr_picker
+            && let PrPickerState::Loaded(prs) = &picker.state
+            && !prs.is_empty()
+        {
+            picker.selected = (picker.selected + 1).min(prs.len() - 1);
+            cx.notify();
+        }
+    }
+
+    fn on_pr_picker_prev(&mut self, _: &PrPickerPrev, _: &mut Window, cx: &mut Context<Self>) {
+        if let Some(picker) = &mut self.pr_picker {
+            picker.selected = picker.selected.saturating_sub(1);
+            cx.notify();
+        }
+    }
+
+    fn on_pr_picker_choose(
+        &mut self,
+        _: &PrPickerChoose,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(picker) = &self.pr_picker else {
+            return;
+        };
+        let PrPickerState::Loaded(prs) = &picker.state else {
+            return;
+        };
+        let Some(number) = prs.get(picker.selected).map(|pr| pr.number) else {
+            return;
+        };
+        self.open_pr(number, window, cx);
     }
 
     /// Semantic state for `--automation` (`{"cmd":"state"}`): what the
@@ -735,6 +1247,31 @@ impl Workspace {
                 "unified": diff.unified.len(),
                 "split": diff.split.len(),
             })),
+            "pr": self.pr.as_ref().map(|pr| json!({
+                "number": pr.number,
+                "title": pr.title.to_string(),
+                "state": pr_state_word(pr.state),
+                "is_draft": pr.is_draft,
+                "checks": checks_word(pr.checks),
+                "review_decision": pr.review_decision.map(review_decision_word),
+                "base_ref": pr.base_ref.to_string(),
+                "head_ref": pr.head_ref.to_string(),
+                "url": pr.url.to_string(),
+            })),
+            "pr_error": self.pr_error,
+            "pr_picker_open": self.pr_picker.is_some(),
+            "pr_picker": self.pr_picker.as_ref().map(|p| json!({
+                "loading": matches!(p.state, PrPickerState::Loading),
+                "items": match &p.state {
+                    PrPickerState::Loaded(prs) => prs.len(),
+                    _ => 0,
+                },
+                "selected": p.selected,
+                "error": match &p.state {
+                    PrPickerState::Error(err) => Some(err.clone()),
+                    _ => None,
+                },
+            })),
         })
     }
 
@@ -757,11 +1294,20 @@ impl Workspace {
         Ok(())
     }
 
-    /// True once there is nothing left in flight: repo loaded (or failed)
-    /// and the selected file's diff computed with no recompute pending
-    /// (gap expansion keeps stale rows visible while it rebuilds).
-    /// `wait_ready` polls this.
+    /// True once there is nothing left in flight: repo loaded (or failed),
+    /// the selected file's diff computed with no recompute pending (gap
+    /// expansion keeps stale rows visible while it rebuilds), an in-flight
+    /// PR open settled (`open_pr` reuses `Status::Loading` for this), and
+    /// an open PR picker's `gh pr list` fetch finished loading. `wait_ready`
+    /// polls this.
     pub(crate) fn automation_settled(&self) -> bool {
+        if self
+            .pr_picker
+            .as_ref()
+            .is_some_and(|p| matches!(p.state, PrPickerState::Loading))
+        {
+            return false;
+        }
         match &self.status {
             Status::Loading => false,
             Status::Failed(_) => true,
@@ -1282,6 +1828,9 @@ impl Workspace {
         let location = self.location.clone();
         let source = self.source.clone();
         let existing = self.review.clone();
+        // Resolved once at load (`crate::author::resolve_author`); falls
+        // back to the same placeholder the CLI defaults to until it lands.
+        let author = self.author.clone().unwrap_or_else(|| "human".to_string());
 
         cx.spawn_in(window, async move |this, cx| {
             let result = cx
@@ -1315,7 +1864,7 @@ impl Workspace {
                         .blob_sha(&anchor_spec(&review.source, side, &path))
                         .ok()
                         .flatten();
-                    review.add_comment(path, side, start, end, sha, body, "human")?;
+                    review.add_comment(path, side, start, end, sha, body, author)?;
                     store.save(&review)?;
                     anyhow::Ok(review)
                 })
@@ -1509,6 +2058,7 @@ impl Workspace {
         let done_id = ti.comment_id.clone();
         let mode = ti.mode;
         let location = self.location.clone();
+        let author = self.author.clone().unwrap_or_else(|| "human".to_string());
         cx.spawn_in(window, async move |this, cx| {
             let result = cx
                 .background_executor()
@@ -1517,7 +2067,7 @@ impl Workspace {
                     let mut review = store.load(&review.id).ok().flatten().unwrap_or(review);
                     match mode {
                         ThreadInputMode::Reply => {
-                            review.reply(&comment_id, body, "human")?;
+                            review.reply(&comment_id, body, author)?;
                         }
                         ThreadInputMode::EditBody => {
                             let comment = review
@@ -1742,6 +2292,296 @@ impl Workspace {
                                 )
                             },
                         )),
+                ),
+        )
+    }
+
+    /// The compact PR header band, shown above the diff area whenever a PR
+    /// is open (docs/phase-3-github.md deliverable 2): `#N title`, author,
+    /// `base ← head`, a state chip, a CI dot, the review decision, and a
+    /// "details" toggle that expands the PR body underneath.
+    fn render_pr_header(&self, cx: &mut Context<Self>) -> Option<Div> {
+        use gpui_component::button::{Button, ButtonVariants as _};
+        let pr = self.pr.as_ref()?;
+
+        // Owned copies before any `cx.listener`/`Button` setup below — see
+        // CLAUDE.md's gpui gotcha (and `render_summary`) on why holding
+        // `&Theme` across those would be a borrow conflict.
+        let theme = cx.theme();
+        let border = theme.border;
+        let band_bg = theme.secondary;
+        let muted = theme.muted_foreground;
+        let foreground = theme.foreground;
+        let success = theme.success;
+        let danger = theme.danger;
+        let warning = theme.warning;
+        // `accent_foreground` (near-white) reads as barely distinct from
+        // DRAFT's gray chip. The Aura theme has no dedicated magenta/violet
+        // token, but `primary` (`#a277ff`, a violet) already *is* the
+        // theme's accent color and isn't used by any other chip/glyph in
+        // this header — closest match to GitHub's purple "Merged" badge.
+        let merged = theme.primary;
+
+        let (chip_label, chip_color) = if pr.is_draft {
+            ("DRAFT", muted)
+        } else {
+            match pr.state {
+                PrState::Open => ("OPEN", success),
+                PrState::Merged => ("MERGED", merged),
+                PrState::Closed => ("CLOSED", danger),
+            }
+        };
+        let checks_glyph = match pr.checks {
+            ChecksSummary::Passing => Some(("\u{2713}", success)),
+            ChecksSummary::Failing => Some(("\u{2717}", danger)),
+            ChecksSummary::Pending => Some(("\u{25cf}", warning)),
+            ChecksSummary::None => None,
+        };
+        let decision = pr.review_decision.map(|d| match d {
+            ReviewDecision::Approved => ("approved", success),
+            ReviewDecision::ChangesRequested => ("changes requested", danger),
+            ReviewDecision::ReviewRequired => ("review required", muted),
+        });
+
+        let number = pr.number;
+        let title = pr.title.clone();
+        let base_head = format!("{} \u{2190} {}", pr.base_ref, pr.head_ref);
+        let author = pr.author.clone();
+        let details_open = self.pr_details_open;
+        let body_text = pr.body.clone();
+        let url = pr.url.clone();
+
+        Some(
+            v_flex()
+                .w_full()
+                .flex_none()
+                .border_b_1()
+                .border_color(border)
+                .bg(band_bg)
+                .child(
+                    h_flex()
+                        .w_full()
+                        .items_center()
+                        .gap_2()
+                        .px_3()
+                        .py_1p5()
+                        .child(
+                            div()
+                                .flex_none()
+                                .font_semibold()
+                                .child(format!("#{number}")),
+                        )
+                        .child(div().flex_1().min_w(px(0.)).truncate().child(title))
+                        .child(
+                            div()
+                                .flex_none()
+                                .px_1p5()
+                                .rounded_full()
+                                .text_xs()
+                                .bg(chip_color.opacity(0.16))
+                                .text_color(chip_color)
+                                .child(chip_label),
+                        )
+                        .children(
+                            checks_glyph.map(|(glyph, color)| {
+                                div().flex_none().text_color(color).child(glyph)
+                            }),
+                        )
+                        .children(decision.map(|(label, color)| {
+                            div().flex_none().text_xs().text_color(color).child(label)
+                        }))
+                        .child(
+                            div()
+                                .flex_none()
+                                .text_sm()
+                                .text_color(muted)
+                                .child(base_head),
+                        )
+                        .child(div().flex_none().text_sm().text_color(muted).child(author))
+                        .child(
+                            Button::new("pr-details-toggle")
+                                .ghost()
+                                .label(if details_open {
+                                    "hide details"
+                                } else {
+                                    "details"
+                                })
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.pr_details_open = !this.pr_details_open;
+                                    cx.notify();
+                                })),
+                        ),
+                )
+                .when(details_open, |el| {
+                    el.child(
+                        v_flex()
+                            .id("pr-body")
+                            .w_full()
+                            .max_h(px(200.))
+                            .overflow_y_scroll()
+                            .px_3()
+                            .py_2()
+                            .gap_1()
+                            .border_t_1()
+                            .border_color(border)
+                            .child(
+                                div()
+                                    .text_sm()
+                                    .whitespace_normal()
+                                    .text_color(foreground)
+                                    .child(if body_text.trim().is_empty() {
+                                        SharedString::from("(no description)")
+                                    } else {
+                                        body_text
+                                    }),
+                            )
+                            .child(div().text_xs().text_color(muted).child(url)),
+                    )
+                }),
+        )
+    }
+
+    /// The PR picker overlay (`ctrl-g`), when open: same positioning/chrome
+    /// as [`Self::render_palette`], but no text input — a background `gh pr
+    /// list` call and up/down/enter/escape over whatever it returns.
+    fn render_pr_picker(&self, cx: &mut Context<Self>) -> Option<Div> {
+        let picker = self.pr_picker.as_ref()?;
+
+        let theme = cx.theme();
+        let border = theme.border;
+        let popover = theme.popover;
+        let popover_fg = theme.popover_foreground;
+        let accent = theme.accent;
+        let muted = theme.muted_foreground;
+        let danger = theme.danger;
+        let mono = theme.mono_font_family.clone();
+
+        let body: AnyElement =
+            match &picker.state {
+                PrPickerState::Loading => div()
+                    .px_2()
+                    .py_1()
+                    .text_sm()
+                    .text_color(muted)
+                    .child("loading…")
+                    .into_any_element(),
+                PrPickerState::Error(err) => div()
+                    .px_2()
+                    .py_1()
+                    .text_sm()
+                    .text_color(danger)
+                    .child(err.clone())
+                    .into_any_element(),
+                PrPickerState::Loaded(prs) if prs.is_empty() => div()
+                    .px_2()
+                    .py_1()
+                    .text_sm()
+                    .text_color(muted)
+                    .child("no open PRs")
+                    .into_any_element(),
+                PrPickerState::Loaded(prs) => {
+                    // No scroll container backs this overlay (unlike the diff
+                    // pane's virtualized list) — cap the rendered window around
+                    // the selection, same fixed-count trick `render_palette`
+                    // uses, rather than relying on CSS overflow clipping (a
+                    // `max_h` alone doesn't clip painted content in gpui; it
+                    // just bounds layout, so an unwindowed list bleeds into
+                    // whatever renders underneath it).
+                    const VISIBLE: usize = 12;
+                    let first = picker.selected.saturating_sub(VISIBLE - 1);
+                    v_flex()
+                        .w_full()
+                        .children(prs.iter().enumerate().skip(first).take(VISIBLE).map(
+                            |(i, pr)| {
+                                let selected = i == picker.selected;
+                                let number = pr.number;
+                                h_flex()
+                                    .id(("pr-picker-row", i))
+                                    .w_full()
+                                    .gap_2()
+                                    .px_2()
+                                    .py_1()
+                                    .rounded_sm()
+                                    .cursor_pointer()
+                                    .when(selected, |el| el.bg(accent))
+                                    .hover(|el| el.bg(accent.opacity(0.5)))
+                                    .on_mouse_down(
+                                        MouseButton::Left,
+                                        cx.listener(move |this, _, window, cx| {
+                                            this.open_pr(number, window, cx);
+                                        }),
+                                    )
+                                    .child(
+                                        div()
+                                            .flex_none()
+                                            .font_family(mono.clone())
+                                            .text_color(muted)
+                                            .child(format!("#{}", pr.number)),
+                                    )
+                                    .child(
+                                        div()
+                                            .flex_1()
+                                            .min_w(px(0.))
+                                            .text_sm()
+                                            .truncate()
+                                            .child(pr.title.clone()),
+                                    )
+                                    .when(pr.is_draft, |el| {
+                                        el.child(
+                                            div()
+                                                .flex_none()
+                                                .text_xs()
+                                                .text_color(muted)
+                                                .child("draft"),
+                                        )
+                                    })
+                                    .child(
+                                        div()
+                                            .flex_none()
+                                            .text_xs()
+                                            .text_color(muted)
+                                            .child(format!("by {}", pr.author)),
+                                    )
+                            },
+                        ))
+                        .into_any_element()
+                }
+            };
+
+        Some(
+            div()
+                .absolute()
+                .top(px(48.))
+                .left_0()
+                .right_0()
+                .flex()
+                .justify_center()
+                .child(
+                    v_flex()
+                        .w(px(560.))
+                        .max_w_full()
+                        .max_h(px(420.))
+                        .overflow_hidden()
+                        .p_2()
+                        .gap_2()
+                        // Same swallow-the-click-on-chrome reasoning as
+                        // `render_palette`.
+                        .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                        .bg(popover)
+                        .text_color(popover_fg)
+                        .border_1()
+                        .border_color(border)
+                        .rounded_lg()
+                        .shadow_lg()
+                        .child(
+                            div()
+                                .px_2()
+                                .pt_1()
+                                .text_xs()
+                                .text_color(muted)
+                                .child("Open PRs \u{b7} enter to open, esc to close"),
+                        )
+                        .child(body),
                 ),
         )
     }
@@ -2920,7 +3760,10 @@ impl Render for Workspace {
                 .items_center()
                 .justify_center()
                 .text_color(theme.muted_foreground)
-                .child("opening repository…"),
+                .child(match self.pr_loading {
+                    Some(number) => format!("opening PR #{number}…"),
+                    None => "opening repository…".to_string(),
+                }),
             Status::Failed(err) => div()
                 .size_full()
                 .flex()
@@ -2992,6 +3835,10 @@ impl Render for Workspace {
             key_context.push(' ');
             key_context.push_str(EDITOR_CONTEXT);
         }
+        if self.pr_picker.is_some() {
+            key_context.push(' ');
+            key_context.push_str(PR_PICKER_CONTEXT);
+        }
 
         v_flex()
             .size_full()
@@ -3010,6 +3857,11 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::on_palette_next))
             .on_action(cx.listener(Self::on_palette_prev))
             .on_action(cx.listener(Self::on_palette_close))
+            .on_action(cx.listener(Self::on_open_pr_picker))
+            .on_action(cx.listener(Self::on_pr_picker_next))
+            .on_action(cx.listener(Self::on_pr_picker_prev))
+            .on_action(cx.listener(Self::on_pr_picker_close))
+            .on_action(cx.listener(Self::on_pr_picker_choose))
             .child(
                 // Per-review header strip (the window title bar is the
                 // shell's; this shows which review is active).
@@ -3022,7 +3874,13 @@ impl Render for Workspace {
                     .border_b_1()
                     .border_color(theme.border)
                     .bg(theme.secondary)
-                    .child(self.title.clone())
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w(px(0.))
+                            .truncate()
+                            .child(self.title.clone()),
+                    )
                     .child(
                         div()
                             .text_color(theme.muted_foreground)
@@ -3033,7 +3891,41 @@ impl Render for Workspace {
                             .text_color(theme.muted_foreground)
                             .child(self.source_desc.clone()),
                     )
+                    .when_some(self.pr_error.clone(), |el, err| {
+                        el.child(
+                            div()
+                                .text_sm()
+                                .text_color(theme.danger)
+                                .truncate()
+                                .child(format!("PR: {err}")),
+                        )
+                    })
                     .child(div().flex_1())
+                    .child(
+                        h_flex()
+                            .id("pr-picker-hint")
+                            .px_2()
+                            .rounded_md()
+                            .cursor_pointer()
+                            .text_color(theme.muted_foreground)
+                            .hover(|el| el.bg(theme.accent.opacity(0.4)))
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(|this, _, window, cx| {
+                                    // Same guard the `ctrl-g` keybinding gets
+                                    // for free from its `!EditorOpen` key
+                                    // context: a click mustn't steal focus
+                                    // from a focused comment/thread input —
+                                    // the picker would open but sit
+                                    // keyboard-dead behind it.
+                                    if this.editor.is_some() || this.thread_input.is_some() {
+                                        return;
+                                    }
+                                    this.on_open_pr_picker(&OpenPrPicker, window, cx)
+                                }),
+                            )
+                            .child("PRs · ctrl-g"),
+                    )
                     .child(
                         h_flex()
                             .id("view-toggle")
@@ -3074,15 +3966,17 @@ impl Render for Workspace {
                             .child("review · r"),
                     ),
             )
+            .children(self.render_pr_header(cx))
             .child(body)
             .children(self.render_palette(cx))
+            .children(self.render_pr_picker(cx))
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{PreparedLine, SplitRow, build_split_rows, gap_above};
-    use dv_core::LineKind;
+    use super::{PreparedLine, SplitRow, build_split_rows, gap_above, pick_review};
+    use dv_core::{DiffSource, LineKind, RemoteRef, Review, ReviewState};
 
     fn hunk(old_start: u32, old_count: u32, new_start: u32, new_count: u32) -> dv_core::Hunk {
         dv_core::Hunk {
@@ -3233,5 +4127,115 @@ mod tests {
                 (true, Some(3), true, Some(3)),
             ]
         );
+    }
+
+    // ---- pick_review (review finding P1-b) ---------------------------
+
+    fn fake_review(id: &str, state: ReviewState, remote: Option<RemoteRef>) -> Review {
+        Review {
+            v: 1,
+            id: id.to_string(),
+            source: DiffSource::WorkingTree,
+            state,
+            created_ms: 0,
+            updated_ms: 0,
+            comments: Vec::new(),
+            remote,
+        }
+    }
+
+    fn fake_remote(pr: u64, slug: &str) -> RemoteRef {
+        RemoteRef {
+            provider: "github".to_string(),
+            slug: slug.to_string(),
+            pr,
+            url: String::new(),
+            submitted_review_id: None,
+            submitted_url: None,
+        }
+    }
+
+    #[test]
+    fn pick_review_with_no_pr_open_prefers_the_latest_draft() {
+        let reviews = vec![
+            fake_review(
+                "r-submitted",
+                ReviewState::Submitted {
+                    verdict: dv_core::Verdict::Approve,
+                    at_ms: 0,
+                },
+                None,
+            ),
+            fake_review("r-draft", ReviewState::Draft, None),
+        ];
+        let picked = pick_review(reviews, None, None);
+        assert_eq!(picked.map(|r| r.id), Some("r-draft".to_string()));
+    }
+
+    /// The exact P1-b repro: the workspace is on PR A's linked review, and
+    /// the store's newest entry is an unrelated PR B draft the CLI just
+    /// created (e.g. `dv comment add` with no `--review`, targeting
+    /// whatever is newest). With PR A open, the newest-draft rule must not
+    /// win.
+    #[test]
+    fn pick_review_with_pr_open_ignores_a_newer_unrelated_draft() {
+        let pr_a = fake_remote(5, "github.com/acme/widgets");
+        let reviews = vec![
+            // Newest-created (store.list() is newest-first) — but for a
+            // different PR entirely.
+            fake_review(
+                "r-b-newest",
+                ReviewState::Draft,
+                Some(fake_remote(99, "github.com/acme/widgets")),
+            ),
+            fake_review("r-a-current", ReviewState::Draft, Some(pr_a.clone())),
+        ];
+        let picked = pick_review(reviews, Some("r-a-current"), Some(&pr_a));
+        assert_eq!(picked.map(|r| r.id), Some("r-a-current".to_string()));
+    }
+
+    #[test]
+    fn pick_review_with_pr_open_matches_slug_case_insensitively() {
+        let current_pr = fake_remote(5, "GitHub.com/Acme/Widgets");
+        let reviews = vec![fake_review(
+            "r-a",
+            ReviewState::Draft,
+            Some(fake_remote(5, "github.com/acme/widgets")),
+        )];
+        let picked = pick_review(reviews, None, Some(&current_pr));
+        assert_eq!(picked.map(|r| r.id), Some("r-a".to_string()));
+    }
+
+    /// No draft (or any review) is linked to the open PR yet — must keep
+    /// showing whatever's already on screen rather than fall back to an
+    /// unrelated draft.
+    #[test]
+    fn pick_review_with_pr_open_and_no_match_keeps_current_not_unrelated_draft() {
+        let current_pr = fake_remote(5, "github.com/acme/widgets");
+        let reviews = vec![
+            fake_review("r-current", ReviewState::Draft, None),
+            fake_review(
+                "r-unrelated",
+                ReviewState::Draft,
+                Some(fake_remote(99, "github.com/other/repo")),
+            ),
+        ];
+        let picked = pick_review(reviews, Some("r-current"), Some(&current_pr));
+        assert_eq!(picked.map(|r| r.id), Some("r-current".to_string()));
+    }
+
+    /// Same, but there isn't even a current review to fall back to (e.g.
+    /// the very first watcher tick after an external store wipe) — must
+    /// come back empty rather than adopt the unrelated draft.
+    #[test]
+    fn pick_review_with_pr_open_and_no_match_and_no_current_is_none() {
+        let current_pr = fake_remote(5, "github.com/acme/widgets");
+        let reviews = vec![fake_review(
+            "r-unrelated",
+            ReviewState::Draft,
+            Some(fake_remote(99, "github.com/other/repo")),
+        )];
+        let picked = pick_review(reviews, None, Some(&current_pr));
+        assert!(picked.is_none());
     }
 }

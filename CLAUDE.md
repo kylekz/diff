@@ -32,7 +32,9 @@ gpui — expect many minutes. Incremental builds are fast.
 2. **dv-core stays headless and testable.** The UI consumes it through narrow
    interfaces so a client/server split can land without a rewrite.
 3. **GitHub goes through the `gh` CLI** (auth/SSO/enterprise for free, no token
-   storage). `gh` is not installed on this machine yet — required from Phase 3.
+   storage). Installed on this machine (2.96); if `gh auth status` fails, ask
+   the user to run `gh auth login`. Use `gh run list/view/watch` for CI —
+   the repo is private, so unauthenticated API polling does not work.
 
 ## GPUI / dependency policy
 

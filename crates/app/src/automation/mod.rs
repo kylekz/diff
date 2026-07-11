@@ -54,6 +54,9 @@ enum Cmd {
         y: f32,
         #[serde(default)]
         button: Option<String>,
+        /// Hold shift during the click (range selection etc.).
+        #[serde(default)]
+        shift: bool,
     },
     /// Resize the window content area (logical pixels).
     Resize { w: f32, h: f32 },
@@ -203,7 +206,12 @@ async fn handle(
             })
         }
 
-        Cmd::Click { x, y, button } => {
+        Cmd::Click {
+            x,
+            y,
+            button,
+            shift,
+        } => {
             let button = match button.as_deref() {
                 None | Some("left") => MouseButton::Left,
                 Some("right") => MouseButton::Right,
@@ -212,7 +220,10 @@ async fn handle(
             };
             cx.update_window(window, |_, window, cx| {
                 let position = point(px(x), px(y));
-                let modifiers = Modifiers::default();
+                let modifiers = Modifiers {
+                    shift,
+                    ..Modifiers::default()
+                };
                 // Move first so hover state matches what a real click sees.
                 window.dispatch_event(
                     PlatformInput::MouseMove(MouseMoveEvent {

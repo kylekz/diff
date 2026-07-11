@@ -23,6 +23,7 @@ actions!(
         PrevHunk,
         ToggleSplit,
         JumpToFile,
+        ClearSelection,
         PaletteNext,
         PalettePrev,
         PaletteClose
@@ -55,6 +56,7 @@ pub fn init(cx: &mut App) {
         KeyBinding::new("f", JumpToFile, browse),
         KeyBinding::new("ctrl-p", JumpToFile, browse),
         KeyBinding::new("cmd-p", JumpToFile, browse),
+        KeyBinding::new("escape", ClearSelection, browse),
         KeyBinding::new("down", PaletteNext, palette),
         KeyBinding::new("up", PalettePrev, palette),
         KeyBinding::new("escape", PaletteClose, palette),
@@ -145,6 +147,39 @@ struct RenderedDiff {
     error: bool,
 }
 
+/// Which side of the diff a line (and so a comment anchor) lives on.
+/// Mirrors dv-core's review-side notion; unified rows resolve to New when
+/// the line exists there, Old only for pure removals.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DiffSide {
+    Old,
+    New,
+}
+
+/// An in-progress line/range selection made from the gutter — the precursor
+/// to a comment. `anchor` is where the press started; `head` follows the
+/// drag (or shift-click), so the range is unordered until read.
+#[derive(Debug, Clone, Copy)]
+struct GutterSelection {
+    file: usize,
+    side: DiffSide,
+    anchor: u32,
+    head: u32,
+    /// Mouse button still down — rows extend the range on hover.
+    dragging: bool,
+}
+
+impl GutterSelection {
+    fn range(&self) -> (u32, u32) {
+        (self.anchor.min(self.head), self.anchor.max(self.head))
+    }
+
+    fn contains(&self, side: DiffSide, line: u32) -> bool {
+        let (lo, hi) = self.range();
+        self.side == side && (lo..=hi).contains(&line)
+    }
+}
+
 /// The jump-to-file palette, while open: a text input plus a live-filtered
 /// view of the file list.
 struct Palette {
@@ -183,6 +218,8 @@ pub struct Workspace {
     /// markdown needs, so row heights must be measured, not assumed.
     diff_list: ListState,
     palette: Option<Palette>,
+    /// Live gutter selection (comment anchor being chosen).
+    selection: Option<GutterSelection>,
     /// Wall-clock of the most recent per-file diff computation (blob fetch
     /// + diff + highlight), for `--automation` perf validation.
     last_diff_ms: Option<u64>,
@@ -246,6 +283,7 @@ impl Workspace {
             file_scroll: UniformListScrollHandle::new(),
             diff_list: ListState::new(0, ListAlignment::Top, px(600.)),
             palette: None,
+            selection: None,
             last_diff_ms: None,
         };
 
@@ -398,6 +436,15 @@ impl Workspace {
             "selected": self.selected,
             "current_hunk": self.current_hunk,
             "last_diff_ms": self.last_diff_ms,
+            "selection": self.selection.as_ref().map(|sel| {
+                let (start, end) = sel.range();
+                json!({
+                    "file": sel.file,
+                    "side": match sel.side { DiffSide::Old => "old", DiffSide::New => "new" },
+                    "start": start,
+                    "end": end,
+                })
+            }),
             "palette": self.palette.as_ref().map(|p| json!({
                 "matches": p.matches.len(),
                 "selected": p.selected,
@@ -525,6 +572,75 @@ impl Workspace {
         self.current_hunk = self.current_hunk.saturating_sub(1);
         self.scroll_to_current_hunk();
         cx.notify();
+    }
+
+    // ---- Gutter selection (comment anchoring) ------------------------
+
+    /// Mouse pressed on a line's gutter: start (or shift-extend) a
+    /// selection on that side.
+    fn gutter_down(&mut self, side: DiffSide, line: u32, shift: bool, cx: &mut Context<Self>) {
+        let Some(file) = self.selected else {
+            return;
+        };
+        match &mut self.selection {
+            // Shift-click with a compatible selection extends it.
+            Some(sel) if shift && sel.file == file && sel.side == side => {
+                sel.head = line;
+                sel.dragging = false;
+            }
+            _ => {
+                self.selection = Some(GutterSelection {
+                    file,
+                    side,
+                    anchor: line,
+                    head: line,
+                    dragging: true,
+                });
+            }
+        }
+        cx.notify();
+    }
+
+    /// Mouse moved over a row while dragging from the gutter: extend the
+    /// range to this row's line on the selection's side.
+    fn gutter_drag_over(&mut self, side: DiffSide, line: u32, cx: &mut Context<Self>) {
+        if let Some(sel) = &mut self.selection
+            && sel.dragging
+            && sel.side == side
+            && sel.head != line
+        {
+            sel.head = line;
+            cx.notify();
+        }
+    }
+
+    fn gutter_up(&mut self, cx: &mut Context<Self>) {
+        if let Some(sel) = &mut self.selection
+            && sel.dragging
+        {
+            sel.dragging = false;
+            cx.notify();
+        }
+    }
+
+    fn clear_selection(&mut self, cx: &mut Context<Self>) {
+        if self.selection.take().is_some() {
+            cx.notify();
+        }
+    }
+
+    fn on_clear_selection(&mut self, _: &ClearSelection, _: &mut Window, cx: &mut Context<Self>) {
+        self.clear_selection(cx);
+    }
+
+    /// The side+line a unified row anchors to: New wherever the line exists
+    /// on the new side, Old only for pure removals — matching GitHub.
+    fn row_anchor(old_line: Option<u32>, new_line: Option<u32>) -> Option<(DiffSide, u32)> {
+        match (old_line, new_line) {
+            (_, Some(n)) => Some((DiffSide::New, n)),
+            (Some(o), None) => Some((DiffSide::Old, o)),
+            (None, None) => None,
+        }
     }
 
     // ---- Jump-to-file palette ----------------------------------------
@@ -827,12 +943,31 @@ impl Workspace {
                         .child(StyledText::new(text.clone()).with_highlights(runs.iter().cloned()))
                 };
 
-                h_flex()
-                    .w_full()
-                    .h(px(ROW_HEIGHT))
-                    .font_family(mono)
-                    .text_sm()
-                    .when_some(bg, |el, bg| el.bg(bg))
+                let anchor = Self::row_anchor(*old_line, *new_line);
+                let selected_bg = anchor
+                    .filter(|&(side, line)| {
+                        self.selection
+                            .as_ref()
+                            .is_some_and(|sel| sel.contains(side, line))
+                    })
+                    .map(|_| theme.primary.opacity(0.18));
+
+                // The number gutter is the comment handle: press to start a
+                // line selection, drag/shift-click to widen it.
+                let gutter = h_flex()
+                    .id(("gutter", row_index))
+                    .flex_none()
+                    .cursor_pointer()
+                    .hover(|el| el.bg(theme.accent.opacity(0.5)))
+                    .when_some(anchor, |el, (side, line)| {
+                        el.on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(move |this, ev: &MouseDownEvent, _, cx| {
+                                this.gutter_down(side, line, ev.modifiers.shift, cx);
+                                cx.stop_propagation();
+                            }),
+                        )
+                    })
                     .child(
                         div()
                             .w_12()
@@ -850,7 +985,25 @@ impl Workspace {
                             .text_right()
                             .text_color(theme.muted_foreground.opacity(0.8))
                             .child(num(new_line)),
-                    )
+                    );
+
+                h_flex()
+                    .w_full()
+                    .h(px(ROW_HEIGHT))
+                    .font_family(mono)
+                    .text_sm()
+                    .when_some(bg, |el, bg| el.bg(bg))
+                    .when_some(selected_bg, |el, bg| el.bg(bg))
+                    .when_some(anchor, |el, (side, line)| {
+                        el.on_mouse_move(cx.listener(move |this, _, _, cx| {
+                            this.gutter_drag_over(side, line, cx);
+                        }))
+                        .on_mouse_up(
+                            MouseButton::Left,
+                            cx.listener(|this, _, _, cx| this.gutter_up(cx)),
+                        )
+                    })
+                    .child(gutter)
                     .child(div().w_4().flex_none().child(marker))
                     .child(content)
             }
@@ -888,8 +1041,8 @@ impl Workspace {
                 .text_color(muted)
                 .child("no line changes to display (empty file, or a mode/rename-only change)"),
             SplitRow::Pair { left, right } => {
-                let left = self.render_split_cell(left.clone(), cx);
-                let right = self.render_split_cell(right.clone(), cx);
+                let left = self.render_split_cell(left.clone(), DiffSide::Old, row_index, cx);
+                let right = self.render_split_cell(right.clone(), DiffSide::New, row_index, cx);
                 h_flex()
                     .w_full()
                     .h(px(ROW_HEIGHT))
@@ -905,7 +1058,15 @@ impl Workspace {
 
     /// One side of a split row. `None` renders a faint filler (no such line
     /// on this side — the opposite side was an insertion or deletion).
-    fn render_split_cell(&self, cell: Option<SplitCell>, cx: &mut Context<Self>) -> Div {
+    /// `side` is the column this cell renders in (left = old, right = new),
+    /// which is what a gutter selection anchors to.
+    fn render_split_cell(
+        &self,
+        cell: Option<SplitCell>,
+        side: DiffSide,
+        row_index: usize,
+        cx: &mut Context<Self>,
+    ) -> Div {
         let theme = cx.theme();
         let mono = theme.mono_font_family.clone();
         let Some(cell) = cell else {
@@ -916,6 +1077,14 @@ impl Workspace {
             LineKind::Removed => ("-", Some(theme.danger.opacity(0.14))),
             LineKind::Context => (" ", None),
         };
+        let selected_bg = cell
+            .line
+            .filter(|&line| {
+                self.selection
+                    .as_ref()
+                    .is_some_and(|sel| sel.contains(side, line))
+            })
+            .map(|_| theme.primary.opacity(0.18));
         let number: SharedString = cell.line.map(|v| v.to_string()).unwrap_or_default().into();
         // Clip long lines at the cell edge — without this they render on
         // under the other column's text (backlog: proper h-scroll later).
@@ -930,21 +1099,46 @@ impl Workspace {
             )
         };
 
+        let gutter = div()
+            .id((
+                "split-gutter",
+                row_index * 2 + (side == DiffSide::New) as usize,
+            ))
+            .w_12()
+            .flex_none()
+            .pr_2()
+            .text_right()
+            .text_color(theme.muted_foreground.opacity(0.8))
+            .cursor_pointer()
+            .hover(|el| el.bg(theme.accent.opacity(0.5)))
+            .when_some(cell.line, |el, line| {
+                el.on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(move |this, ev: &MouseDownEvent, _, cx| {
+                        this.gutter_down(side, line, ev.modifiers.shift, cx);
+                        cx.stop_propagation();
+                    }),
+                )
+            })
+            .child(number);
+
         h_flex()
             .w_full()
             .h_full()
             .overflow_hidden()
             .font_family(mono)
             .when_some(bg, |el, bg| el.bg(bg))
-            .child(
-                div()
-                    .w_12()
-                    .flex_none()
-                    .pr_2()
-                    .text_right()
-                    .text_color(theme.muted_foreground.opacity(0.8))
-                    .child(number),
-            )
+            .when_some(selected_bg, |el, bg| el.bg(bg))
+            .when_some(cell.line, |el, line| {
+                el.on_mouse_move(cx.listener(move |this, _, _, cx| {
+                    this.gutter_drag_over(side, line, cx);
+                }))
+                .on_mouse_up(
+                    MouseButton::Left,
+                    cx.listener(|this, _, _, cx| this.gutter_up(cx)),
+                )
+            })
+            .child(gutter)
             .child(div().w_4().flex_none().child(marker))
             .child(content)
     }
@@ -1425,6 +1619,7 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::on_prev_hunk))
             .on_action(cx.listener(Self::on_toggle_split))
             .on_action(cx.listener(Self::on_jump_to_file))
+            .on_action(cx.listener(Self::on_clear_selection))
             .on_action(cx.listener(Self::on_palette_next))
             .on_action(cx.listener(Self::on_palette_prev))
             .on_action(cx.listener(Self::on_palette_close))

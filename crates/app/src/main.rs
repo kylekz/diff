@@ -8,6 +8,7 @@ mod highlight;
 mod pr;
 mod recent;
 mod shell;
+mod submit;
 mod workspace;
 
 use dv_core::{DiffSource, GitRepo, RepoLocation, RepoSlug};

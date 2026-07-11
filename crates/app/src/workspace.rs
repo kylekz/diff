@@ -12,6 +12,7 @@ use gpui_component::highlighter::HighlightTheme;
 use gpui_component::{ActiveTheme, Disableable as _, StyledExt as _, h_flex, v_flex};
 
 use crate::highlight::{self, LineRuns};
+use crate::submit::{self, SubmissionOutcome, Violation, ViolationKind};
 
 actions!(
     workspace,
@@ -296,6 +297,141 @@ struct PrOpenOutcome {
     source: DiffSource,
 }
 
+/// Everything [`Workspace::on_submit_click`] needs to actually send the
+/// review, computed once by [`Workspace::start_submit_validation`] and
+/// carried from [`SubmitFlow::Confirming`] into the background submit task
+/// — Submit itself never re-validates, matching docs/phase-3-github.md
+/// deliverable 2 ("NOTHING is sent until Submit is clicked", not
+/// "re-checked then sent").
+#[derive(Clone)]
+struct SubmitPrep {
+    /// The review this submission was validated against, captured once
+    /// here — `on_submit_click`'s background task and the writeback always
+    /// fresh-load BY THIS id, never by whatever `self.review` happens to be
+    /// at click/completion time (review finding P1-2, traced to a real
+    /// cross-PR store corruption: a stale `self.review` read at click time
+    /// could name a *different* review — even one linked to a different
+    /// PR — than the one `submission` below was actually built from, and
+    /// the local writeback would then mark that unrelated review
+    /// Submitted/PR-linked while the review whose comments were truly just
+    /// POSTed never gets recorded as sent at all).
+    review_id: String,
+    pr_number: u64,
+    pr_url: String,
+    submission: dv_core::ReviewSubmission,
+}
+
+/// GitHub submission flow (docs/phase-3-github.md deliverable 2), live only
+/// once a verdict is clicked on a review whose [`dv_core::Review::remote`]
+/// names a PR. `None` — the field's default and its state after every
+/// terminal stage is dismissed — means "no flow active": a local-only
+/// review's verdict click always goes straight to [`Workspace::submit_review`]
+/// (the pre-existing local finish) regardless of this field.
+enum SubmitFlow {
+    /// Background validation in flight: fresh `pr_meta` + `prepare_pr` +
+    /// `crate::submit::build_submission`. No `gh` write has happened yet.
+    Validating { verdict: dv_core::Verdict },
+    /// Validation found problems — a stale/unanchored comment, or one that
+    /// fell outside the PR's diff. Nothing was sent; nothing can be until
+    /// the underlying comments (or the PR itself) change and the verdict is
+    /// clicked again.
+    Blocked {
+        verdict: dv_core::Verdict,
+        violations: Vec<Violation>,
+    },
+    /// Clean: the submission is built and waiting on an explicit
+    /// [Submit to GitHub] click. Still nothing sent.
+    Confirming {
+        verdict: dv_core::Verdict,
+        prep: SubmitPrep,
+    },
+    /// The `gh api .../reviews` POST (plus local writeback) is in flight.
+    /// Unlike every other stage, this one is not cancellable — see
+    /// [`Workspace::cancel_submit_flow`] — and blocks a source switch the
+    /// same way an in-flight comment save does (see `open_pr`/`select_file`).
+    Submitting { verdict: dv_core::Verdict },
+    /// GitHub accepted the review and the local writeback succeeded.
+    Done {
+        verdict: dv_core::Verdict,
+        url: String,
+    },
+    /// Either the `gh` submission itself failed, or (rarer, and far worse)
+    /// it succeeded but the local writeback then failed — `message` is
+    /// `crate::submit::writeback_failure_message`'s text in that case, which
+    /// warns against ever retrying.
+    Failed {
+        verdict: dv_core::Verdict,
+        message: String,
+    },
+}
+
+/// [`Workspace::start_submit_validation`]'s completion, as a pure function
+/// of what validation produced — kept separate from the `cx.spawn` plumbing
+/// around it so the three outcomes (clean/blocked/hard-error) are
+/// unit-testable without a `Context` (see the `tests` module at the bottom
+/// of this file).
+fn submit_flow_from_validation(
+    verdict: dv_core::Verdict,
+    review_id: String,
+    outcome: anyhow::Result<(PrMeta, SubmissionOutcome)>,
+) -> SubmitFlow {
+    match outcome {
+        Ok((meta, SubmissionOutcome::Ready(submission))) => SubmitFlow::Confirming {
+            verdict,
+            prep: SubmitPrep {
+                review_id,
+                pr_number: meta.number,
+                pr_url: meta.url,
+                submission,
+            },
+        },
+        Ok((_, SubmissionOutcome::Blocked(violations))) => SubmitFlow::Blocked {
+            verdict,
+            violations,
+        },
+        Err(err) => SubmitFlow::Failed {
+            verdict,
+            message: format!("{err:#}"),
+        },
+    }
+}
+
+/// [`Workspace::on_submit_click`]'s completion, as a pure function of the
+/// background submit+writeback's result — `Some(Review)` only on success
+/// (the caller applies it and emits `ReviewChanged`; a failure leaves the
+/// workspace's existing `review` alone).
+fn submit_flow_from_submission(
+    verdict: dv_core::Verdict,
+    result: Result<(dv_core::Review, String), String>,
+) -> (Option<dv_core::Review>, SubmitFlow) {
+    match result {
+        Ok((review, url)) => (Some(review), SubmitFlow::Done { verdict, url }),
+        Err(message) => (None, SubmitFlow::Failed { verdict, message }),
+    }
+}
+
+/// [`Workspace::cancel_submit_flow`]'s decision, as a pure function:
+/// `Submitting` must run to completion (returned unchanged, `changed =
+/// false`, `submit_epoch` untouched — there's nothing to invalidate);
+/// every other `Some` resets to `None` AND bumps `submit_epoch` (review
+/// finding P1-1: a `Validating` completion spawned before the bump must
+/// discard itself on landing rather than resurrect a flow the user just
+/// cancelled, or — worse — clobber a newer flow already in progress); a
+/// `None` input leaves the epoch alone too (nothing was cancelled). The
+/// caller only calls `cx.notify()` when `changed` is true.
+fn cancel_submit_flow_outcome(
+    flow: Option<SubmitFlow>,
+    epoch: u64,
+) -> (Option<SubmitFlow>, bool, u64) {
+    if matches!(flow, Some(SubmitFlow::Submitting { .. })) {
+        (flow, false, epoch)
+    } else {
+        let changed = flow.is_some();
+        let epoch = if changed { epoch + 1 } else { epoch };
+        (None, changed, epoch)
+    }
+}
+
 pub struct Workspace {
     focus_handle: FocusHandle,
     source: DiffSource,
@@ -389,6 +525,24 @@ pub struct Workspace {
     /// (`crate::author::resolve_author`). `None` until that resolves —
     /// callers fall back to a placeholder rather than block on it.
     author: Option<String>,
+    /// GitHub submission flow state (docs/phase-3-github.md deliverable 2),
+    /// live only after a verdict click on a PR-linked review. See
+    /// [`SubmitFlow`]'s doc comment.
+    submit: Option<SubmitFlow>,
+    /// Bumped on every `self.submit`-transition initiated from the UI
+    /// thread — entering the flow ([`Self::on_verdict_clicked`] via
+    /// [`Self::start_submit_validation`]), leaving it early
+    /// ([`Self::cancel_submit_flow`]), and the one internal transition
+    /// mid-flow ([`Self::on_submit_click`]'s Confirming→Submitting).
+    /// `start_submit_validation`'s and `on_submit_click`'s background
+    /// completions each capture the value in force at spawn and, before
+    /// touching any state, verify it still matches — a mismatch means a
+    /// newer transition (cancel, a later verdict click, `open_pr`) has
+    /// since superseded them, and they discard themselves rather than
+    /// resurrect a dead flow or clobber a newer one (review finding P1-1).
+    /// Mirrors `source_epoch`'s exact same pattern for `open_pr`/
+    /// `request_diff`.
+    submit_epoch: u64,
 }
 
 /// Which blob a comment on `side` of `path` anchors to, given the review's
@@ -511,7 +665,11 @@ fn source_label(source: &DiffSource) -> &'static str {
 /// String forms of the GitHub types [`Workspace::automation_state`] dumps —
 /// small, deliberately duplicated copies of `cli/pr_cmd.rs`'s private
 /// equivalents (that module isn't `pub`, and these are one match arm each).
-fn pr_state_word(state: PrState) -> &'static str {
+/// `pub(crate)` so `shell.rs`'s sidebar badge dump (deliverable 3) reuses
+/// these instead of growing a third copy — that module isn't a descendant
+/// of this one the way `cli::pr_cmd` fails to be, so plain visibility is
+/// enough.
+pub(crate) fn pr_state_word(state: PrState) -> &'static str {
     match state {
         PrState::Open => "open",
         PrState::Closed => "closed",
@@ -519,7 +677,7 @@ fn pr_state_word(state: PrState) -> &'static str {
     }
 }
 
-fn checks_word(checks: ChecksSummary) -> &'static str {
+pub(crate) fn checks_word(checks: ChecksSummary) -> &'static str {
     match checks {
         ChecksSummary::Passing => "passing",
         ChecksSummary::Failing => "failing",
@@ -528,11 +686,43 @@ fn checks_word(checks: ChecksSummary) -> &'static str {
     }
 }
 
-fn review_decision_word(decision: ReviewDecision) -> &'static str {
+pub(crate) fn review_decision_word(decision: ReviewDecision) -> &'static str {
     match decision {
         ReviewDecision::Approved => "approved",
         ReviewDecision::ChangesRequested => "changes_requested",
         ReviewDecision::ReviewRequired => "review_required",
+    }
+}
+
+/// Human-readable verdict word for UI text — the wording the "Submitted
+/// · ..." caption always used, now shared with the Phase-3 submit-flow
+/// panels too.
+fn verdict_label(verdict: dv_core::Verdict) -> &'static str {
+    match verdict {
+        dv_core::Verdict::Comment => "comment",
+        dv_core::Verdict::Approve => "approve",
+        dv_core::Verdict::RequestChanges => "request changes",
+    }
+}
+
+/// snake_case verdict word for `--automation`'s JSON, matching
+/// `cli/pr_cmd.rs`'s `event_word` convention (machine-parsed, so no space).
+fn verdict_automation_word(verdict: dv_core::Verdict) -> &'static str {
+    match verdict {
+        dv_core::Verdict::Comment => "comment",
+        dv_core::Verdict::Approve => "approve",
+        dv_core::Verdict::RequestChanges => "request_changes",
+    }
+}
+
+/// snake_case word for a [`ViolationKind`], for `--automation`'s JSON.
+fn violation_kind_word(kind: ViolationKind) -> &'static str {
+    match kind {
+        ViolationKind::StaleAnchor => "stale_anchor",
+        ViolationKind::Unanchored => "unanchored",
+        ViolationKind::RenameUnverifiable => "rename_unverifiable",
+        ViolationKind::NotInDiff => "not_in_diff",
+        ViolationKind::NothingToSubmit => "nothing_to_submit",
     }
 }
 
@@ -666,6 +856,8 @@ impl Workspace {
             pr_error: None,
             pr_picker: None,
             author: None,
+            submit: None,
+            submit_epoch: 0,
         };
 
         cx.spawn(async move |this, cx| {
@@ -708,6 +900,11 @@ impl Workspace {
                     if fingerprint(&this.review) != fingerprint(&review) {
                         this.review = review;
                         cx.emit(ReviewChanged);
+                        // A watcher-driven reload invalidates a parked
+                        // submit panel — it was built against the review
+                        // as it stood before this external change (review
+                        // finding P1-3).
+                        this.cancel_submit_flow_if_parked(cx);
                         this.reset_diff_list(cx);
                         cx.notify();
                     }
@@ -952,8 +1149,13 @@ impl Workspace {
         // finding P2-a — this used to `take()` the editor unconditionally
         // at dispatch, so a typo'd PR number cost the user their typed
         // comment even though the fetch itself hadn't touched anything).
+        // A GitHub submit POST in flight (`SubmitFlow::Submitting`) gets
+        // the same treatment (docs/phase-3-github.md deliverable 2): it
+        // must run to completion, so a source switch mid-submit is refused
+        // rather than left to race the writeback.
         if self.editor.as_ref().is_some_and(|e| e.saving)
             || self.thread_input.as_ref().is_some_and(|t| t.saving)
+            || self.submit_in_flight()
         {
             return;
         }
@@ -964,6 +1166,12 @@ impl Workspace {
         if self.pr_loading.is_some() {
             return;
         }
+        // A parked submit panel (Validating/Blocked/Confirming) is scoped
+        // to the review being left behind — surviving a PR switch is
+        // exactly the "stuck validating panel" / cross-PR corruption this
+        // fixes (review finding P1-2). `Submitting` was already refused
+        // above, so this can only cancel, never clobber an in-flight POST.
+        self.cancel_submit_flow(cx);
 
         let Some(repo) = self.repo.clone() else {
             // The repo hasn't finished its own initial load yet — nothing
@@ -1272,6 +1480,43 @@ impl Workspace {
                     _ => None,
                 },
             })),
+            "submit": self.submit.as_ref().map(|flow| match flow {
+                SubmitFlow::Validating { verdict } => json!({
+                    "stage": "validating",
+                    "verdict": verdict_automation_word(*verdict),
+                }),
+                SubmitFlow::Blocked { verdict, violations } => json!({
+                    "stage": "blocked",
+                    "verdict": verdict_automation_word(*verdict),
+                    "violations": violations.iter().map(|v| json!({
+                        "comment_id": v.comment_id,
+                        "path": v.path,
+                        "lines": v.lines,
+                        "kind": violation_kind_word(v.kind),
+                        "message": v.message,
+                    })).collect::<Vec<_>>(),
+                }),
+                SubmitFlow::Confirming { verdict, prep } => json!({
+                    "stage": "confirming",
+                    "verdict": verdict_automation_word(*verdict),
+                    "pr": prep.pr_number,
+                    "comments": prep.submission.comments.len(),
+                }),
+                SubmitFlow::Submitting { verdict } => json!({
+                    "stage": "submitting",
+                    "verdict": verdict_automation_word(*verdict),
+                }),
+                SubmitFlow::Done { verdict, url } => json!({
+                    "stage": "done",
+                    "verdict": verdict_automation_word(*verdict),
+                    "url": url,
+                }),
+                SubmitFlow::Failed { verdict, message } => json!({
+                    "stage": "failed",
+                    "verdict": verdict_automation_word(*verdict),
+                    "message": message,
+                }),
+            }),
         })
     }
 
@@ -1654,6 +1899,10 @@ impl Workspace {
 
     fn on_clear_selection(&mut self, _: &ClearSelection, _: &mut Window, cx: &mut Context<Self>) {
         self.clear_selection(cx);
+        // Escape also cancels a cancellable submit-flow stage
+        // (docs/phase-3-github.md deliverable 2) — harmless when no flow is
+        // active (`cancel_submit_flow` is a no-op then).
+        self.cancel_submit_flow(cx);
     }
 
     // ---- Inline comment editor + store operations ---------------------
@@ -1721,6 +1970,11 @@ impl Workspace {
 
     fn on_toggle_summary(&mut self, _: &ToggleSummary, _: &mut Window, cx: &mut Context<Self>) {
         self.summary_open = !self.summary_open;
+        if !self.summary_open {
+            // Closing the summary also cancels a cancellable submit-flow
+            // stage (docs/phase-3-github.md deliverable 2).
+            self.cancel_submit_flow(cx);
+        }
         cx.notify();
     }
 
@@ -1756,6 +2010,264 @@ impl Workspace {
                     }
                     Err(err) => eprintln!("finish review failed: {err:#}"),
                 }
+                this.reset_diff_list(cx);
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    // ---- GitHub submission flow (docs/phase-3-github.md deliverable 2) --
+
+    /// Whether a `gh` submit POST is currently in flight — the one
+    /// [`SubmitFlow`] stage that must run to completion (see its doc
+    /// comment): `open_pr` refuses a source switch while this is true, the
+    /// same way it already refuses one over an in-flight comment save.
+    fn submit_in_flight(&self) -> bool {
+        matches!(self.submit, Some(SubmitFlow::Submitting { .. }))
+    }
+
+    /// Reset `self.submit` back to idle. A no-op while `Submitting` (must
+    /// run to completion) or already idle; every other stage —
+    /// `Validating`/`Blocked`/`Confirming`/`Done`/`Failed` — resets
+    /// cleanly and bumps `submit_epoch` (review finding P1-1). Called from
+    /// Escape (`on_clear_selection`), from closing the summary panel
+    /// (`on_toggle_summary`), per docs/phase-3-github.md deliverable 2
+    /// ("Escape/summary-close cancels Confirming/Blocked"), and from
+    /// `open_pr` (review finding P1-2) so a PR switch can never leave a
+    /// stale panel — or a stale in-flight validation — behind. The actual
+    /// decision is [`cancel_submit_flow_outcome`], a pure function kept
+    /// separate so it's unit-testable without a `Context`.
+    fn cancel_submit_flow(&mut self, cx: &mut Context<Self>) {
+        let (next, changed, epoch) =
+            cancel_submit_flow_outcome(self.submit.take(), self.submit_epoch);
+        self.submit = next;
+        self.submit_epoch = epoch;
+        if changed {
+            cx.notify();
+        }
+    }
+
+    /// Whether `self.submit` is "parked" against a comments/verdict
+    /// snapshot that a review mutation can invalidate: `Validating` (still
+    /// building that snapshot), `Confirming` (built, waiting on the user),
+    /// `Blocked` (built, found problems). Deliberately excludes
+    /// `Submitting` (the flow's own in-flight write) and `Done`/`Failed`
+    /// (that write's own terminal result) — see
+    /// [`Self::cancel_submit_flow_if_parked`].
+    fn submit_flow_is_parked(&self) -> bool {
+        matches!(
+            self.submit,
+            Some(
+                SubmitFlow::Validating { .. }
+                    | SubmitFlow::Confirming { .. }
+                    | SubmitFlow::Blocked { .. }
+            )
+        )
+    }
+
+    /// Cancel a parked submit flow when the review it was built against
+    /// changes out from under it (review finding P1-3, reproduced live:
+    /// `Confirming` kept offering a comment that had just been resolved
+    /// externally). A no-op unless [`Self::submit_flow_is_parked`] —
+    /// `Submitting`/`Done`/`Failed` are never touched here, so the flow's
+    /// own writeback (which itself updates `self.review` and emits
+    /// `ReviewChanged` right before landing on `Done`/`Failed`) can't
+    /// immediately dismiss the very outcome panel it just produced. Called
+    /// from every site that assigns `self.review` in response to an
+    /// external or independent change: the review-store watcher pump, and
+    /// each GUI comment-mutation completion (add/status/delete/reply/edit)
+    /// — never from `open_pr`'s completion, which already went through
+    /// [`Self::cancel_submit_flow`] synchronously before its fetch even
+    /// started, and never from `on_submit_click`'s own completion (already
+    /// excluded above).
+    fn cancel_submit_flow_if_parked(&mut self, cx: &mut Context<Self>) {
+        if self.submit_flow_is_parked() {
+            self.cancel_submit_flow(cx);
+        }
+    }
+
+    /// Verdict button click on the summary panel. A local-only review (no
+    /// `remote` linkage) behaves exactly as it always has — an immediate
+    /// local finish via [`Self::submit_review`]. A PR-linked review instead
+    /// starts the GitHub submit flow: background validation, then an
+    /// explicit confirm step, before anything is ever sent (deliverable 2).
+    fn on_verdict_clicked(&mut self, verdict: dv_core::Verdict, cx: &mut Context<Self>) {
+        if self.submit.is_some() {
+            return; // a flow is already active — buttons aren't even shown then, but belt-and-suspenders
+        }
+        match self.review.as_ref().and_then(|r| r.remote.clone()) {
+            Some(remote) => self.start_submit_validation(verdict, remote, cx),
+            None => self.submit_review(verdict, cx),
+        }
+    }
+
+    /// Background validation for a PR-linked verdict click: fresh
+    /// `pr_meta` + `prepare_pr` + `crate::submit::build_submission` — no
+    /// `gh` write happens here, only reads. Lands on `Blocked` (a clear
+    /// violation list) or `Confirming` (built and waiting on an explicit
+    /// [Submit to GitHub] click). Epoch-guarded on `submit_epoch` (review
+    /// finding P1-1 — this used to check only `source_epoch`, which an
+    /// Escape-cancel never touched, so a cancelled `Validating` could
+    /// silently resurrect the panel once the background fetch finally
+    /// landed): a newer transition — cancel, a later verdict click, or an
+    /// `open_pr` (which cancels any parked flow up front, bumping this same
+    /// epoch) — while this runs means the result must be discarded rather
+    /// than resurrect a dead flow or clobber whatever supersedes it.
+    fn start_submit_validation(
+        &mut self,
+        verdict: dv_core::Verdict,
+        remote: dv_core::RemoteRef,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(review) = self.review.clone() else {
+            return;
+        };
+        let Some(repo) = self.repo.clone() else {
+            return;
+        };
+        self.submit_epoch += 1;
+        self.submit = Some(SubmitFlow::Validating { verdict });
+        cx.notify();
+
+        let epoch = self.submit_epoch;
+        let pr_number = remote.pr;
+        let review_id = review.id.clone();
+        cx.spawn(async move |this, cx| {
+            let outcome: anyhow::Result<(PrMeta, SubmissionOutcome)> = cx
+                .background_executor()
+                .spawn(async move {
+                    let client = submit::github_client(&repo)?;
+                    let meta = client.pr_meta(pr_number)?;
+                    if meta.state != dv_core::PrState::Open {
+                        anyhow::bail!(submit::pr_not_open_message(pr_number, &meta));
+                    }
+                    let pr_range = crate::pr::prepare_pr(&repo, &meta)?;
+                    let outcome = submit::build_submission(
+                        &repo,
+                        &pr_range.merge_base,
+                        &pr_range.head_oid,
+                        &review,
+                        verdict,
+                        String::new(),
+                        false,
+                    )?;
+                    anyhow::Ok((meta, outcome))
+                })
+                .await;
+
+            this.update(cx, |this, cx| {
+                if this.submit_epoch != epoch {
+                    // Superseded — discard silently before touching any
+                    // state (review finding P1-1).
+                    return;
+                }
+                this.submit = Some(submit_flow_from_validation(verdict, review_id, outcome));
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// [Submit to GitHub] click on the `Confirming` panel: the actual `gh
+    /// api .../reviews` POST, then the local writeback (fresh-load,
+    /// `Submitted` state, `remote.submitted_review_id`/`url`, emit
+    /// `ReviewChanged`) — all off-thread. This is the one step in the whole
+    /// flow that actually sends anything. Operates on `prep.review_id`
+    /// throughout — never `self.review` — so it can never target a
+    /// different review than the one actually validated (review finding
+    /// P1-2). Bumps `submit_epoch` on the Confirming→Submitting transition
+    /// like every other UI-initiated `self.submit` assignment; nothing else
+    /// can transition `self.submit` while `Submitting` is active
+    /// (`on_verdict_clicked` refuses whenever `self.submit.is_some()`,
+    /// `open_pr`/`cancel_submit_flow` both refuse/no-op on `Submitting` —
+    /// see their own comments, and Escape is blocked the same way), so this
+    /// method's own completion is the only thing that can ever land once
+    /// captured here — it still re-checks the epoch before touching state,
+    /// purely for uniformity with `start_submit_validation`'s completion
+    /// and as a regression tripwire, not because a real race is possible.
+    fn on_submit_click(&mut self, cx: &mut Context<Self>) {
+        let (verdict, prep) = match &self.submit {
+            Some(SubmitFlow::Confirming { verdict, prep }) => (*verdict, prep.clone()),
+            _ => return,
+        };
+        let Some(repo) = self.repo.clone() else {
+            return;
+        };
+        let location = self.location.clone();
+
+        self.submit_epoch += 1;
+        let epoch = self.submit_epoch;
+        self.submit = Some(SubmitFlow::Submitting { verdict });
+        cx.notify();
+
+        cx.spawn(async move |this, cx| {
+            let result: Result<(dv_core::Review, String), String> = cx
+                .background_executor()
+                .spawn(async move {
+                    let store = dv_core::ReviewStore::open(location);
+                    // Fresh-load by the id `prep` was actually validated
+                    // against, BEFORE anything is sent: missing here is a
+                    // clean, nothing-sent abort (the review vanished before
+                    // the POST), distinct from a missing review turning up
+                    // AFTER the POST inside `writeback_submitted_review`
+                    // below (GitHub already has it by then — the
+                    // duplicate-trap message, not this one).
+                    if store
+                        .load(&prep.review_id)
+                        .map_err(|err| format!("{err:#}"))?
+                        .is_none()
+                    {
+                        return Err(format!(
+                            "review {} no longer exists — nothing was sent to GitHub",
+                            prep.review_id
+                        ));
+                    }
+
+                    let client = submit::github_client(&repo).map_err(|err| format!("{err:#}"))?;
+                    let submitted = client
+                        .submit_review(prep.pr_number, &prep.submission)
+                        .map_err(|err| {
+                            format!(
+                                "{err}\n(hint: the PR may have been force-pushed since \
+                                 validation — try again to re-check)"
+                            )
+                        })?;
+                    let remote = dv_core::RemoteRef {
+                        provider: "github".to_string(),
+                        slug: client.slug().to_string(),
+                        pr: prep.pr_number,
+                        url: prep.pr_url,
+                        submitted_review_id: Some(submitted.id),
+                        submitted_url: Some(submitted.html_url.clone()),
+                    };
+                    // GitHub has now accepted the review — any failure from
+                    // here on is the duplicate-trap case
+                    // (`writeback_submitted_review`'s own message says so).
+                    let fresh = submit::writeback_submitted_review(
+                        &store,
+                        &prep.review_id,
+                        verdict,
+                        prep.pr_number,
+                        remote,
+                        &submitted,
+                    )?;
+                    Ok((fresh, submitted.html_url))
+                })
+                .await;
+
+            this.update(cx, |this, cx| {
+                if this.submit_epoch != epoch {
+                    return;
+                }
+                let (fresh_review, flow) = submit_flow_from_submission(verdict, result);
+                if let Some(fresh) = fresh_review {
+                    this.review = Some(fresh);
+                    cx.emit(ReviewChanged);
+                }
+                this.submit = Some(flow);
                 this.reset_diff_list(cx);
                 cx.notify();
             })
@@ -1875,6 +2387,10 @@ impl Workspace {
                     Ok(review) => {
                         this.review = Some(review);
                         cx.emit(ReviewChanged);
+                        // A new comment can invalidate a parked submit
+                        // panel's "nothing to submit" / comment count
+                        // (review finding P1-3).
+                        this.cancel_submit_flow_if_parked(cx);
                         this.close_editor(window, cx);
                     }
                     Err(err) => {
@@ -1923,6 +2439,9 @@ impl Workspace {
                     Ok(review) => {
                         this.review = Some(review);
                         cx.emit(ReviewChanged);
+                        // Resolving/reopening a comment can invalidate a
+                        // parked submit panel (review finding P1-3).
+                        this.cancel_submit_flow_if_parked(cx);
                     }
                     Err(err) => eprintln!("comment status update failed: {err:#}"),
                 }
@@ -1958,6 +2477,9 @@ impl Workspace {
                     Ok(review) => {
                         this.review = Some(review);
                         cx.emit(ReviewChanged);
+                        // Deleting a comment can invalidate a parked submit
+                        // panel (review finding P1-3).
+                        this.cancel_submit_flow_if_parked(cx);
                     }
                     Err(err) => eprintln!("comment delete failed: {err:#}"),
                 }
@@ -2098,6 +2620,9 @@ impl Workspace {
                     Ok(review) => {
                         this.review = Some(review);
                         cx.emit(ReviewChanged);
+                        // A reply or body edit can invalidate a parked
+                        // submit panel (review finding P1-3).
+                        this.cancel_submit_flow_if_parked(cx);
                         if same_input {
                             this.close_thread_input(window, cx);
                         }
@@ -2829,59 +3354,247 @@ impl Workspace {
                             )
                         }),
                 )
-                .child(match submitted {
-                    Some(verdict) => h_flex()
-                        .p_3()
-                        .border_t_1()
-                        .border_color(border)
-                        .gap_2()
-                        .text_sm()
-                        .child(div().text_color(success).child(format!(
-                            "Submitted \u{b7} {}",
-                            match verdict {
-                                dv_core::Verdict::Comment => "comment",
-                                dv_core::Verdict::Approve => "approve",
-                                dv_core::Verdict::RequestChanges => "request changes",
-                            }
-                        )))
-                        .into_any_element(),
-                    None => v_flex()
-                        .p_3()
-                        .gap_2()
-                        .border_t_1()
-                        .border_color(border)
-                        .child(div().text_sm().child("Finish review"))
-                        .child(
-                            h_flex()
-                                .gap_2()
-                                .child(
-                                    Button::new("verdict-comment")
-                                        .ghost()
-                                        .label("Comment")
-                                        .on_click(cx.listener(|this, _, _, cx| {
-                                            this.submit_review(dv_core::Verdict::Comment, cx)
-                                        })),
-                                )
-                                .child(
-                                    Button::new("verdict-approve")
-                                        .primary()
-                                        .label("Approve")
-                                        .on_click(cx.listener(|this, _, _, cx| {
-                                            this.submit_review(dv_core::Verdict::Approve, cx)
-                                        })),
-                                )
-                                .child(
-                                    Button::new("verdict-request")
-                                        .danger()
-                                        .label("Request changes")
-                                        .on_click(cx.listener(|this, _, _, cx| {
-                                            this.submit_review(dv_core::Verdict::RequestChanges, cx)
-                                        })),
-                                ),
-                        )
-                        .into_any_element(),
-                }),
+                .child(self.render_verdict_area(submitted, border, success, muted, cx)),
         )
+    }
+
+    /// The bottom of the summary panel: either the Phase-3 GitHub submit
+    /// flow (`self.submit`, once the review is PR-linked and a verdict was
+    /// clicked — see [`SubmitFlow`]) or the pre-existing local-only
+    /// "Finish review" verdict bar / "Submitted" caption. A local-only
+    /// review's behavior here is untouched: `self.submit` never becomes
+    /// `Some` for it (see [`Self::on_verdict_clicked`]).
+    fn render_verdict_area(
+        &self,
+        submitted: Option<dv_core::Verdict>,
+        border: Hsla,
+        success: Hsla,
+        muted: Hsla,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        use gpui_component::Sizable as _;
+        use gpui_component::button::{Button, ButtonVariants as _};
+
+        if let Some(flow) = &self.submit {
+            return self.render_submit_flow(flow, border, success, muted, cx);
+        }
+
+        match submitted {
+            Some(verdict) => h_flex()
+                .p_3()
+                .border_t_1()
+                .border_color(border)
+                .gap_2()
+                .text_sm()
+                .child(
+                    div()
+                        .text_color(success)
+                        .child(format!("Submitted \u{b7} {}", verdict_label(verdict))),
+                )
+                .into_any_element(),
+            None => v_flex()
+                .p_3()
+                .gap_2()
+                .border_t_1()
+                .border_color(border)
+                .child(div().text_sm().child("Finish review"))
+                .child(
+                    // `w_full()` + `flex_wrap()` (review finding P3-1): at
+                    // the panel's w320, three buttons — one of them
+                    // "Request changes" — don't reliably fit on one row at
+                    // the default button size; `small()` buys back most of
+                    // that width, and the wrap is a safety net so a button
+                    // spills onto a second line instead of clipping off the
+                    // right edge if it still doesn't fit (longer verdict
+                    // labels, a wider font, ...).
+                    h_flex()
+                        .w_full()
+                        .flex_wrap()
+                        .gap_2()
+                        .child(
+                            Button::new("verdict-comment")
+                                .small()
+                                .ghost()
+                                .label("Comment")
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.on_verdict_clicked(dv_core::Verdict::Comment, cx)
+                                })),
+                        )
+                        .child(
+                            Button::new("verdict-approve")
+                                .small()
+                                .primary()
+                                .label("Approve")
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.on_verdict_clicked(dv_core::Verdict::Approve, cx)
+                                })),
+                        )
+                        .child(
+                            Button::new("verdict-request")
+                                .small()
+                                .danger()
+                                .label("Request changes")
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.on_verdict_clicked(dv_core::Verdict::RequestChanges, cx)
+                                })),
+                        ),
+                )
+                .into_any_element(),
+        }
+    }
+
+    /// The six [`SubmitFlow`] stages, rendered as the summary panel's
+    /// bottom section in place of the plain local verdict bar.
+    fn render_submit_flow(
+        &self,
+        flow: &SubmitFlow,
+        border: Hsla,
+        success: Hsla,
+        muted: Hsla,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        use gpui_component::button::{Button, ButtonVariants as _};
+        let danger = cx.theme().danger;
+
+        let dismiss_button = |id: &'static str, cx: &mut Context<Self>| {
+            Button::new(id)
+                .ghost()
+                .label("Dismiss")
+                .on_click(cx.listener(|this, _, _, cx| {
+                    // Routed through `cancel_submit_flow` (not a bare
+                    // `self.submit = None`) so this also bumps
+                    // `submit_epoch` like every other UI-initiated
+                    // transition (review finding P1-1).
+                    this.cancel_submit_flow(cx);
+                }))
+        };
+
+        match flow {
+            SubmitFlow::Validating { .. } => h_flex()
+                .p_3()
+                .border_t_1()
+                .border_color(border)
+                .text_sm()
+                .text_color(muted)
+                .child("Checking the PR and your comments\u{2026}")
+                .into_any_element(),
+
+            SubmitFlow::Blocked { violations, .. } => v_flex()
+                .p_3()
+                .gap_2()
+                .border_t_1()
+                .border_color(border)
+                .child(
+                    div()
+                        .text_sm()
+                        .font_semibold()
+                        .text_color(danger)
+                        .child(format!(
+                            "Can't submit \u{2014} {} problem{} found",
+                            violations.len(),
+                            if violations.len() == 1 { "" } else { "s" },
+                        )),
+                )
+                .child(
+                    v_flex()
+                        .id("submit-violations")
+                        .gap_1()
+                        .max_h(px(160.))
+                        .overflow_y_scroll()
+                        .children(violations.iter().map(|v| {
+                            div()
+                                .text_xs()
+                                .text_color(muted)
+                                .child(format!("{}:{} \u{2014} {}", v.path, v.lines, v.message))
+                        })),
+                )
+                .child(dismiss_button("submit-dismiss-blocked", cx))
+                .into_any_element(),
+
+            SubmitFlow::Confirming { verdict, prep } => {
+                let count = prep.submission.comments.len();
+                v_flex()
+                    .p_3()
+                    .gap_2()
+                    .border_t_1()
+                    .border_color(border)
+                    .child(div().text_sm().child(format!(
+                        "Submit to GitHub: {} \u{b7} {count} comment{} to PR #{}",
+                        verdict_label(*verdict),
+                        if count == 1 { "" } else { "s" },
+                        prep.pr_number,
+                    )))
+                    .child(
+                        h_flex()
+                            .gap_2()
+                            .child(
+                                Button::new("submit-confirm")
+                                    .primary()
+                                    .label("Submit to GitHub")
+                                    .on_click(
+                                        cx.listener(|this, _, _, cx| this.on_submit_click(cx)),
+                                    ),
+                            )
+                            .child(
+                                Button::new("submit-cancel")
+                                    .ghost()
+                                    .label("Cancel")
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        // See the Dismiss button above: must
+                                        // bump `submit_epoch` too.
+                                        this.cancel_submit_flow(cx);
+                                    })),
+                            ),
+                    )
+                    .into_any_element()
+            }
+
+            SubmitFlow::Submitting { .. } => h_flex()
+                .p_3()
+                .border_t_1()
+                .border_color(border)
+                .text_sm()
+                .text_color(muted)
+                .child("Submitting to GitHub\u{2026}")
+                .into_any_element(),
+
+            SubmitFlow::Done { verdict, url } => v_flex()
+                .p_3()
+                .gap_1()
+                .border_t_1()
+                .border_color(border)
+                .text_sm()
+                .child(div().text_color(success).child(format!(
+                    "Submitted \u{b7} {} \u{2713}",
+                    verdict_label(*verdict)
+                )))
+                .child(div().text_xs().text_color(muted).child(url.clone()))
+                .into_any_element(),
+
+            SubmitFlow::Failed { message, .. } => v_flex()
+                .p_3()
+                .gap_2()
+                .border_t_1()
+                .border_color(border)
+                .child(
+                    div()
+                        .text_sm()
+                        .font_semibold()
+                        .text_color(danger)
+                        .child("Submission failed"),
+                )
+                .child(
+                    div()
+                        .id("submit-failed-message")
+                        .text_xs()
+                        .text_color(muted)
+                        .max_h(px(160.))
+                        .overflow_y_scroll()
+                        .child(message.clone()),
+                )
+                .child(dismiss_button("submit-dismiss-failed", cx))
+                .into_any_element(),
+        }
     }
 
     /// One display row: a diff row (per view mode), an inline comment
@@ -3975,7 +4688,12 @@ impl Render for Workspace {
 
 #[cfg(test)]
 mod tests {
-    use super::{PreparedLine, SplitRow, build_split_rows, gap_above, pick_review};
+    use super::{
+        ChecksSummary, PrMeta, PrState, PreparedLine, SplitRow, SubmissionOutcome, SubmitFlow,
+        SubmitPrep, Violation, ViolationKind, build_split_rows, cancel_submit_flow_outcome,
+        gap_above, pick_review, submit_flow_from_submission, submit_flow_from_validation,
+        verdict_automation_word, verdict_label, violation_kind_word,
+    };
     use dv_core::{DiffSource, LineKind, RemoteRef, Review, ReviewState};
 
     fn hunk(old_start: u32, old_count: u32, new_start: u32, new_count: u32) -> dv_core::Hunk {
@@ -4237,5 +4955,279 @@ mod tests {
         )];
         let picked = pick_review(reviews, None, Some(&current_pr));
         assert!(picked.is_none());
+    }
+
+    // --- SubmitFlow state machine (docs/phase-3-github.md deliverable 2/4) --
+    //
+    // The three completion points (`start_submit_validation`,
+    // `on_submit_click`, `cancel_submit_flow`) are thin `cx.spawn`/`Context`
+    // wrappers around the pure functions below — covered directly here
+    // since a full `Workspace` needs a running gpui `Context` this crate's
+    // test setup doesn't build. The render output of each `SubmitFlow`
+    // panel (`render_submit_flow`) is NOT covered by these tests — that's
+    // pixels, verified only by the live `--automation` acceptance run
+    // (docs/phase-3-github.md's Verification steps), a residual gap noted
+    // in the phase report.
+
+    fn dummy_pr_meta(number: u64) -> PrMeta {
+        PrMeta {
+            number,
+            title: "t".to_string(),
+            body: String::new(),
+            url: format!("https://github.com/o/r/pull/{number}"),
+            state: PrState::Open,
+            is_draft: false,
+            base_ref: "main".to_string(),
+            head_ref: "feature".to_string(),
+            base_oid: "a".repeat(40),
+            head_oid: "b".repeat(40),
+            author: "someone".to_string(),
+            review_decision: None,
+            checks: ChecksSummary::None,
+        }
+    }
+
+    fn dummy_submission(verdict: dv_core::Verdict) -> dv_core::ReviewSubmission {
+        dv_core::ReviewSubmission {
+            commit_id: "b".repeat(40),
+            body: String::new(),
+            event: match verdict {
+                dv_core::Verdict::Comment => dv_core::ReviewEvent::Comment,
+                dv_core::Verdict::Approve => dv_core::ReviewEvent::Approve,
+                dv_core::Verdict::RequestChanges => dv_core::ReviewEvent::RequestChanges,
+            },
+            comments: Vec::new(),
+        }
+    }
+
+    fn dummy_violation(comment_id: &str) -> Violation {
+        Violation {
+            comment_id: comment_id.to_string(),
+            path: "a.rs".to_string(),
+            lines: "5".to_string(),
+            kind: ViolationKind::StaleAnchor,
+            message: format!("comment {comment_id} has a stale anchor"),
+        }
+    }
+
+    // --- submit_flow_from_validation -------------------------------------
+
+    #[test]
+    fn submit_flow_from_validation_ready_becomes_confirming_with_prep() {
+        let meta = dummy_pr_meta(7);
+        let submission = dummy_submission(dv_core::Verdict::Approve);
+        let outcome: anyhow::Result<(PrMeta, SubmissionOutcome)> =
+            Ok((meta, SubmissionOutcome::Ready(submission)));
+
+        let flow =
+            submit_flow_from_validation(dv_core::Verdict::Approve, "r-1".to_string(), outcome);
+        match flow {
+            SubmitFlow::Confirming { verdict, prep } => {
+                assert_eq!(verdict, dv_core::Verdict::Approve);
+                assert_eq!(prep.review_id, "r-1");
+                assert_eq!(prep.pr_number, 7);
+                assert_eq!(prep.pr_url, "https://github.com/o/r/pull/7");
+            }
+            _ => panic!("expected Confirming, got a different SubmitFlow variant"),
+        }
+    }
+
+    #[test]
+    fn submit_flow_from_validation_blocked_carries_violations() {
+        let meta = dummy_pr_meta(7);
+        let violations = vec![dummy_violation("c-1"), dummy_violation("c-2")];
+        let outcome: anyhow::Result<(PrMeta, SubmissionOutcome)> =
+            Ok((meta, SubmissionOutcome::Blocked(violations)));
+
+        let flow =
+            submit_flow_from_validation(dv_core::Verdict::Comment, "r-1".to_string(), outcome);
+        match flow {
+            SubmitFlow::Blocked {
+                verdict,
+                violations,
+            } => {
+                assert_eq!(verdict, dv_core::Verdict::Comment);
+                assert_eq!(violations.len(), 2);
+                assert_eq!(violations[0].comment_id, "c-1");
+            }
+            _ => panic!("expected Blocked"),
+        }
+    }
+
+    #[test]
+    fn submit_flow_from_validation_hard_error_becomes_failed_with_message() {
+        let outcome: anyhow::Result<(PrMeta, SubmissionOutcome)> =
+            Err(anyhow::anyhow!("gh: not authenticated"));
+
+        let flow = submit_flow_from_validation(
+            dv_core::Verdict::RequestChanges,
+            "r-1".to_string(),
+            outcome,
+        );
+        match flow {
+            SubmitFlow::Failed { verdict, message } => {
+                assert_eq!(verdict, dv_core::Verdict::RequestChanges);
+                assert!(message.contains("not authenticated"), "message: {message}");
+            }
+            _ => panic!("expected Failed"),
+        }
+    }
+
+    // --- submit_flow_from_submission --------------------------------------
+
+    #[test]
+    fn submit_flow_from_submission_success_returns_review_and_done() {
+        let review = Review {
+            v: dv_core::review::SCHEMA_VERSION,
+            id: "r-test".to_string(),
+            source: DiffSource::WorkingTree,
+            state: ReviewState::Draft,
+            created_ms: 0,
+            updated_ms: 0,
+            comments: Vec::new(),
+            remote: None,
+        };
+        let result: Result<(Review, String), String> = Ok((
+            review,
+            "https://github.com/o/r/pull/7#pullrequestreview-1".to_string(),
+        ));
+
+        let (fresh, flow) = submit_flow_from_submission(dv_core::Verdict::Approve, result);
+        assert!(fresh.is_some(), "success must hand back the fresh review");
+        match flow {
+            SubmitFlow::Done { verdict, url } => {
+                assert_eq!(verdict, dv_core::Verdict::Approve);
+                assert_eq!(url, "https://github.com/o/r/pull/7#pullrequestreview-1");
+            }
+            _ => panic!("expected Done"),
+        }
+    }
+
+    #[test]
+    fn submit_flow_from_submission_failure_returns_no_review_and_failed() {
+        let result: Result<(Review, String), String> =
+            Err("GitHub ACCEPTED the review ... Do NOT re-run".to_string());
+
+        let (fresh, flow) = submit_flow_from_submission(dv_core::Verdict::Comment, result);
+        assert!(
+            fresh.is_none(),
+            "failure must not overwrite the workspace's review"
+        );
+        match flow {
+            SubmitFlow::Failed { verdict, message } => {
+                assert_eq!(verdict, dv_core::Verdict::Comment);
+                assert!(message.contains("Do NOT re-run"));
+            }
+            _ => panic!("expected Failed"),
+        }
+    }
+
+    // --- cancel_submit_flow_outcome (also covers submit_epoch — P1-1) ------
+
+    #[test]
+    fn cancel_submit_flow_outcome_leaves_submitting_untouched() {
+        let flow = Some(SubmitFlow::Submitting {
+            verdict: dv_core::Verdict::Approve,
+        });
+        let (next, changed, epoch) = cancel_submit_flow_outcome(flow, 5);
+        assert!(!changed, "Submitting must not be cancelled");
+        assert!(matches!(next, Some(SubmitFlow::Submitting { .. })));
+        assert_eq!(
+            epoch, 5,
+            "nothing was cancelled, so the epoch must not move"
+        );
+    }
+
+    #[test]
+    fn cancel_submit_flow_outcome_resets_confirming_and_blocked_and_bumps_epoch() {
+        let confirming = Some(SubmitFlow::Confirming {
+            verdict: dv_core::Verdict::Comment,
+            prep: SubmitPrep {
+                review_id: "r-1".to_string(),
+                pr_number: 1,
+                pr_url: "https://example.invalid/pull/1".to_string(),
+                submission: dummy_submission(dv_core::Verdict::Comment),
+            },
+        });
+        let (next, changed, epoch) = cancel_submit_flow_outcome(confirming, 5);
+        assert!(changed);
+        assert!(next.is_none());
+        assert_eq!(
+            epoch, 6,
+            "cancelling must bump the epoch so an in-flight completion discards itself"
+        );
+
+        let blocked = Some(SubmitFlow::Blocked {
+            verdict: dv_core::Verdict::Comment,
+            violations: vec![dummy_violation("c-1")],
+        });
+        let (next, changed, epoch) = cancel_submit_flow_outcome(blocked, 6);
+        assert!(changed);
+        assert!(next.is_none());
+        assert_eq!(epoch, 7);
+    }
+
+    #[test]
+    fn cancel_submit_flow_outcome_resets_done_and_failed_too_and_bumps_epoch() {
+        let done = Some(SubmitFlow::Done {
+            verdict: dv_core::Verdict::Approve,
+            url: "https://example.invalid".to_string(),
+        });
+        let (next, changed, epoch) = cancel_submit_flow_outcome(done, 1);
+        assert!(changed);
+        assert!(next.is_none());
+        assert_eq!(epoch, 2);
+
+        let failed = Some(SubmitFlow::Failed {
+            verdict: dv_core::Verdict::Approve,
+            message: "boom".to_string(),
+        });
+        let (next, changed, epoch) = cancel_submit_flow_outcome(failed, 2);
+        assert!(changed);
+        assert!(next.is_none());
+        assert_eq!(epoch, 3);
+    }
+
+    #[test]
+    fn cancel_submit_flow_outcome_noop_when_already_idle() {
+        let (next, changed, epoch) = cancel_submit_flow_outcome(None, 3);
+        assert!(!changed);
+        assert!(next.is_none());
+        assert_eq!(epoch, 3, "idle -> idle must not bump the epoch either");
+    }
+
+    // --- word helpers -------------------------------------------------------
+
+    #[test]
+    fn verdict_words_cover_every_variant() {
+        for verdict in [
+            dv_core::Verdict::Comment,
+            dv_core::Verdict::Approve,
+            dv_core::Verdict::RequestChanges,
+        ] {
+            assert!(!verdict_label(verdict).is_empty());
+            assert!(!verdict_automation_word(verdict).is_empty());
+        }
+        assert_eq!(
+            verdict_automation_word(dv_core::Verdict::RequestChanges),
+            "request_changes"
+        );
+        assert_eq!(
+            verdict_label(dv_core::Verdict::RequestChanges),
+            "request changes"
+        );
+    }
+
+    #[test]
+    fn violation_kind_words_cover_every_variant() {
+        for kind in [
+            ViolationKind::StaleAnchor,
+            ViolationKind::Unanchored,
+            ViolationKind::RenameUnverifiable,
+            ViolationKind::NotInDiff,
+            ViolationKind::NothingToSubmit,
+        ] {
+            assert!(!violation_kind_word(kind).is_empty());
+        }
     }
 }

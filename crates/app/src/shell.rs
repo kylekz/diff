@@ -4,18 +4,23 @@
 
 use std::path::PathBuf;
 
-use dv_core::{DiffSource, RepoLocation};
+use dv_core::{
+    ChecksSummary, DiffSource, GithubClient, PrState, RemoteRef, RepoLocation, RepoSlug,
+    ReviewDecision,
+};
 use gpui::prelude::FluentBuilder;
 use gpui::*;
 use gpui_component::button::{Button, ButtonVariants};
-use gpui_component::{ActiveTheme, StyledExt, TitleBar, h_flex, v_flex};
+use gpui_component::{ActiveTheme, Sizable as _, StyledExt, TitleBar, h_flex, v_flex};
 
 use std::collections::HashMap;
 
 use crate::recent::{RecentEntry, RecentStore, title_for};
-use crate::workspace::{ReviewChanged, Workspace};
+use crate::workspace::{
+    ReviewChanged, Workspace, checks_word, pr_state_word, review_decision_word,
+};
 
-actions!(shell, [NewReview]);
+actions!(shell, [NewReview, RefreshBadges]);
 
 const KEY_CONTEXT: &str = "AppShell";
 
@@ -31,9 +36,12 @@ fn absolutize(location: RepoLocation) -> RepoLocation {
     }
 }
 
-/// The latest review's badge for a repo, or None when it has no reviews
-/// (or the store is unreadable — the sidebar just shows nothing).
-fn compute_badge(location: RepoLocation) -> Option<ReviewBadge> {
+/// The latest review's badge for a repo, local fields only (no network) —
+/// `None` when it has no reviews (or the store is unreadable — the sidebar
+/// just shows nothing). Also hands back the latest review's `remote`
+/// linkage (if any), so a second pass ([`fetch_pr_badge`]) can decide
+/// whether/how to fetch PR status without re-reading the store.
+fn compute_local_badge(location: RepoLocation) -> Option<(ReviewBadge, Option<RemoteRef>)> {
     let latest = dv_core::ReviewStore::open(location)
         .list()
         .ok()?
@@ -45,7 +53,68 @@ fn compute_badge(location: RepoLocation) -> Option<ReviewBadge> {
         .filter(|c| c.status == dv_core::CommentStatus::Open)
         .count();
     let submitted = matches!(latest.state, dv_core::ReviewState::Submitted { .. });
-    Some(ReviewBadge { open, submitted })
+    Some((
+        ReviewBadge {
+            open,
+            submitted,
+            pr: None,
+        },
+        latest.remote,
+    ))
+}
+
+/// [`AppShell::refresh_badge`]'s local-recompute step, as a pure function:
+/// `fresh_local` always wins for `open`/`submitted` (it just re-read the
+/// store), but `pr` only gets clobbered when `fetch_remote` is true — a
+/// `false` call (the `ReviewChanged` subscription, review finding P3-3)
+/// instead carries over whatever `pr` badge `existing` already had, so a
+/// comment save doesn't flash the PR cluster off while a fetch it never
+/// asked for re-fetches it. Kept separate from the `cx.spawn` plumbing
+/// around it so it's unit-testable without a running `Context` (matches
+/// `workspace.rs`'s `SubmitFlow` pure-transition-function pattern).
+fn merge_local_badge(
+    existing: Option<ReviewBadge>,
+    fresh_local: ReviewBadge,
+    fetch_remote: bool,
+) -> ReviewBadge {
+    if fetch_remote {
+        return fresh_local;
+    }
+    ReviewBadge {
+        pr: existing.and_then(|b| b.pr),
+        ..fresh_local
+    }
+}
+
+/// `gh pr view --json state,isDraft,reviewDecision,statusCheckRollup` for a
+/// review's linked PR (docs/phase-3-github.md deliverable 3/5) — built
+/// straight from `remote`'s own `slug`/`pr` (no `GitRepo`/`origin` remote
+/// read needed at all, see [`GithubClient::for_slug`]). Silent `None` on
+/// any failure (gh missing, unauthenticated, network down, PR deleted,
+/// ...): a badge with no PR cluster is a perfectly good fallback, and this
+/// runs on every startup for every recent entry, so it must never surface
+/// an error the user didn't ask for.
+fn fetch_pr_badge(remote: &RemoteRef) -> Option<PrBadge> {
+    let mut parts = remote.slug.splitn(3, '/');
+    let host = parts.next()?;
+    let owner = parts.next()?;
+    let repo = parts.next()?;
+    if host.is_empty() || owner.is_empty() || repo.is_empty() {
+        return None;
+    }
+    let slug = RepoSlug {
+        host: host.to_string(),
+        owner: owner.to_string(),
+        repo: repo.to_string(),
+    };
+    let client = GithubClient::for_slug(slug).ok()?;
+    let status = client.pr_status(remote.pr).ok()?;
+    Some(PrBadge {
+        state: status.state,
+        is_draft: status.is_draft,
+        decision: status.review_decision,
+        checks: status.checks,
+    })
 }
 
 pub fn init(cx: &mut App) {
@@ -79,6 +148,20 @@ pub struct AppShell {
 struct ReviewBadge {
     open: usize,
     submitted: bool,
+    /// PR status (docs/phase-3-github.md deliverable 3/5), when the latest
+    /// review is linked to one and the network fetch succeeded — `None`
+    /// either way renders no PR cluster at all (see [`fetch_pr_badge`]).
+    pr: Option<PrBadge>,
+}
+
+/// Sidebar PR-status cluster for one repo's latest review: state glyph,
+/// review-decision marker, and CI dot (rendered in [`AppShell::render_recent_row`]).
+#[derive(Debug, Clone, Copy)]
+struct PrBadge {
+    state: PrState,
+    is_draft: bool,
+    decision: Option<ReviewDecision>,
+    checks: ChecksSummary,
 }
 
 impl AppShell {
@@ -98,7 +181,13 @@ impl AppShell {
             badges: HashMap::new(),
             _ws_subscription: None,
         };
-        this.refresh_all_badges(cx);
+        // App-open refresh (docs/phase-3-github.md deliverable 3): skip the
+        // network pr_status pass for WSL-located entries here specifically
+        // — a cold distro hasn't booted yet, and walking every WSL entry
+        // sequentially at startup would stack a wsl.exe boot behind each
+        // one. A manual refresh (`RefreshBadges`) or simply opening that
+        // review (`refresh_badge`, not WSL-skipped) still fetches it.
+        this.refresh_all_badges(true, cx);
         match seed {
             Some((location, source)) => this.open_review(location, source, pending_pr, window, cx),
             // Nothing to focus into, so hold focus on the shell — otherwise
@@ -133,6 +222,12 @@ impl AppShell {
             last_opened_ms: 0, // touch stamps the real time
         });
         self.selected = Some(index);
+        // Review-open refresh (docs/phase-3-github.md deliverable 3): not
+        // WSL-skipped — opening this specific review already implies its
+        // distro (if any) is live, so there's no cold-boot backlog hazard
+        // the way there is walking every recent entry at startup. Full
+        // refresh (local + network) — see `refresh_badge`'s doc comment.
+        self.refresh_badge(index, true, cx);
 
         let workspace = cx.new(|cx| Workspace::new(location, source, pending_pr, window, cx));
         let handle = workspace.focus_handle(cx);
@@ -142,7 +237,9 @@ impl AppShell {
             &workspace,
             move |this: &mut Self, _, _: &ReviewChanged, cx| {
                 if let Some(selected) = this.selected {
-                    this.refresh_badge(selected, cx);
+                    // Local-only, no network — see `refresh_badge`'s doc
+                    // comment (review finding P3-3).
+                    this.refresh_badge(selected, false, cx);
                 }
             },
         ));
@@ -150,33 +247,97 @@ impl AppShell {
         cx.notify();
     }
 
-    /// Recompute one entry's badge off-thread (store I/O may hit WSL).
-    fn refresh_badge(&mut self, index: usize, cx: &mut Context<Self>) {
+    /// Recompute one entry's badge off-thread (store I/O may hit WSL):
+    /// local fields first (fast — one paint), then, if `fetch_remote` and
+    /// the latest review is PR-linked, a network `pr_status` pass that
+    /// patches in `badge.pr` (docs/phase-3-github.md deliverable 3).
+    ///
+    /// `fetch_remote` is `true` only for [`Self::open_review`]'s call site
+    /// — opening a review is a deliberate, infrequent act, so paying for a
+    /// `gh` round trip there is fine. It's `false` for the workspace's
+    /// `ReviewChanged` subscription (review finding P3-3: every single
+    /// comment save/status change/reply used to run this same network pass
+    /// — a `gh` subprocess per keystroke-adjacent action — and, worse,
+    /// clobbered the existing `badge.pr` with `None` first, causing a
+    /// visible flicker before the fetch patched it back in). When
+    /// `fetch_remote` is `false`, the local recompute instead carries over
+    /// whatever `pr` badge already exists rather than clobbering it — the
+    /// network view stays exactly as fresh as the last real refresh (app
+    /// open, review open, or a manual `RefreshBadges`).
+    fn refresh_badge(&mut self, index: usize, fetch_remote: bool, cx: &mut Context<Self>) {
         let Some(entry) = self.recent.entries().get(index) else {
             return;
         };
         let location = entry.location.clone();
         cx.spawn(async move |this, cx| {
             let key = location.clone();
-            let badge = cx
+            let local = cx
                 .background_executor()
-                .spawn(async move { compute_badge(location) })
+                .spawn(async move { compute_local_badge(location) })
                 .await;
+            let remote = local.as_ref().and_then(|(_, remote)| remote.clone());
             this.update(cx, |this, cx| {
-                match badge {
-                    Some(badge) => this.badges.insert(key, badge),
-                    None => this.badges.remove(&key),
-                };
+                match local {
+                    Some((badge, _)) => {
+                        let existing = this.badges.get(&key).copied();
+                        this.badges.insert(
+                            key.clone(),
+                            merge_local_badge(existing, badge, fetch_remote),
+                        );
+                    }
+                    None => {
+                        this.badges.remove(&key);
+                    }
+                }
                 cx.notify();
             })
             .ok();
+
+            if !fetch_remote {
+                return;
+            }
+            let Some(remote) = remote else { return };
+            let pr = cx
+                .background_executor()
+                .spawn(async move { fetch_pr_badge(&remote) })
+                .await;
+            if let Some(pr) = pr {
+                this.update(cx, |this, cx| {
+                    if let Some(badge) = this.badges.get_mut(&key) {
+                        badge.pr = Some(pr);
+                    }
+                    cx.notify();
+                })
+                .ok();
+            }
         })
         .detach();
     }
 
-    /// Recompute every entry's badge (startup). One background task walks
-    /// the list sequentially — WSL entries cost a subprocess each.
-    fn refresh_all_badges(&mut self, cx: &mut Context<Self>) {
+    /// Recompute every entry's badge. Two passes, so the sidebar never
+    /// waits on the network (docs/phase-3-github.md deliverable 3):
+    /// 1. Local fields for every entry (fast), applied and painted first.
+    /// 2. `pr_status` for every entry whose latest review is PR-linked,
+    ///    sequential (one `gh` subprocess at a time — cheap, and avoids
+    ///    hammering `gh`/GitHub with a burst).
+    ///
+    /// `startup` (true only for the app-open call in `AppShell::new`) picks
+    /// between two different semantics for the local pass (review finding
+    /// P2-1 — this used to be a single merge-don't-clobber `or_insert` no
+    /// matter which caller asked, so an explicit `RefreshBadges` click
+    /// never actually updated an entry that already had a badge, nor ever
+    /// fetched PR status for one — exactly the WSL-skipped-at-startup
+    /// entries a manual refresh exists to fill in):
+    /// - `true` (startup): merge-don't-clobber — entries opened (or
+    ///   manually refreshed) while this walk ran already have fresher
+    ///   badges, so only a location this pass is the first to see gets
+    ///   queued for the network pass, and WSL-located entries are skipped
+    ///   entirely (dodges a distro-boot pile-up at cold start).
+    /// - `false` (explicit `RefreshBadges`): replace every entry's local
+    ///   fields unconditionally, and queue the network pass for every
+    ///   PR-linked entry — including WSL ones, since this is a deliberate,
+    ///   infrequent ask with no cold-boot backlog concern.
+    fn refresh_all_badges(&mut self, startup: bool, cx: &mut Context<Self>) {
         let locations: Vec<_> = self
             .recent
             .entries()
@@ -184,26 +345,71 @@ impl AppShell {
             .map(|e| e.location.clone())
             .collect();
         cx.spawn(async move |this, cx| {
-            let badges = cx
+            let local = cx
                 .background_executor()
                 .spawn(async move {
                     locations
                         .into_iter()
-                        .filter_map(|loc| compute_badge(loc.clone()).map(|b| (loc, b)))
+                        .filter_map(|loc| {
+                            compute_local_badge(loc.clone())
+                                .map(|(badge, remote)| (loc, badge, remote))
+                        })
                         .collect::<Vec<_>>()
                 })
                 .await;
+
+            let mut to_fetch = Vec::new();
             this.update(cx, |this, cx| {
-                // Merge rather than replace: entries opened while the walk
-                // ran already have fresher badges.
-                for (loc, badge) in badges {
-                    this.badges.entry(loc).or_insert(badge);
+                for (loc, badge, remote) in local {
+                    if startup {
+                        // Merge rather than replace: entries opened (or
+                        // manually refreshed) while this walk ran already
+                        // have fresher badges — only a location this pass
+                        // is the first to see gets queued for the network
+                        // pass below.
+                        let is_new = !this.badges.contains_key(&loc);
+                        this.badges.entry(loc.clone()).or_insert(badge);
+                        if is_new
+                            && let Some(remote) = remote
+                            && !matches!(loc, RepoLocation::Wsl { .. })
+                        {
+                            to_fetch.push((loc, remote));
+                        }
+                    } else {
+                        // Explicit ask: recompute unconditionally, and
+                        // fetch PR status for every linked entry — WSL
+                        // included.
+                        this.badges.insert(loc.clone(), badge);
+                        if let Some(remote) = remote {
+                            to_fetch.push((loc, remote));
+                        }
+                    }
                 }
                 cx.notify();
             })
             .ok();
+
+            for (loc, remote) in to_fetch {
+                let pr = cx
+                    .background_executor()
+                    .spawn(async move { fetch_pr_badge(&remote) })
+                    .await;
+                if let Some(pr) = pr {
+                    this.update(cx, |this, cx| {
+                        if let Some(badge) = this.badges.get_mut(&loc) {
+                            badge.pr = Some(pr);
+                        }
+                        cx.notify();
+                    })
+                    .ok();
+                }
+            }
         })
         .detach();
+    }
+
+    fn on_refresh_badges(&mut self, _: &RefreshBadges, _: &mut Window, cx: &mut Context<Self>) {
+        self.refresh_all_badges(false, cx);
     }
 
     fn open_recent(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
@@ -263,6 +469,22 @@ impl AppShell {
             "recent": self.recent.entries().iter().map(|e| e.title.clone()).collect::<Vec<_>>(),
             "selected": self.selected,
             "workspace": self.active.as_ref().map(|ws| ws.read(cx).automation_state()),
+            // Per-recent-entry badge dump (docs/phase-3-github.md
+            // deliverable 3/4), same order as `recent` above.
+            "badges": self.recent.entries().iter().map(|entry| {
+                let badge = self.badges.get(&entry.location);
+                json!({
+                    "title": entry.title,
+                    "open": badge.map(|b| b.open),
+                    "submitted": badge.map(|b| b.submitted),
+                    "pr": badge.and_then(|b| b.pr.as_ref()).map(|pr| json!({
+                        "state": pr_state_word(pr.state),
+                        "is_draft": pr.is_draft,
+                        "decision": pr.decision.map(review_decision_word),
+                        "checks": checks_word(pr.checks),
+                    })),
+                })
+            }).collect::<Vec<_>>(),
         })
     }
 
@@ -346,26 +568,80 @@ impl AppShell {
                     .child(entry.title.clone()),
             )
             .children(self.badges.get(&entry.location).map(|badge| {
-                if badge.open > 0 {
-                    div()
-                        .flex_none()
-                        .px_1p5()
-                        .rounded_full()
-                        .bg(theme.primary.opacity(0.25))
-                        .text_xs()
-                        .text_color(theme.primary)
-                        .child(format!("{}", badge.open))
-                        .into_any_element()
-                } else if badge.submitted {
-                    div()
-                        .flex_none()
-                        .text_xs()
-                        .text_color(theme.success)
-                        .child("\u{2713}")
-                        .into_any_element()
-                } else {
-                    div().into_any_element()
-                }
+                h_flex()
+                    .flex_none()
+                    .gap_2()
+                    .items_center()
+                    .child(if badge.open > 0 {
+                        div()
+                            .flex_none()
+                            .px_1p5()
+                            .rounded_full()
+                            .bg(theme.primary.opacity(0.25))
+                            .text_xs()
+                            .text_color(theme.primary)
+                            .child(format!("{}", badge.open))
+                            .into_any_element()
+                    } else if badge.submitted {
+                        div()
+                            .flex_none()
+                            .text_xs()
+                            .text_color(theme.success)
+                            .child("\u{2713}")
+                            .into_any_element()
+                    } else {
+                        div().into_any_element()
+                    })
+                    .children(badge.pr.as_ref().map(|pr| {
+                        // PR-status cluster (docs/phase-3-github.md
+                        // deliverable 3/5): state glyph, review-decision
+                        // marker, CI marker — subtle, one glyph each, kept
+                        // well inside the row's ~24px height. The state
+                        // glyph and the CI marker deliberately use different
+                        // shapes (round dot vs. small square), not just
+                        // different colors — an open PR (green ●) with
+                        // passing checks (used to also be a green ●) was
+                        // otherwise two indistinguishable dots side by side
+                        // (review finding P3-2).
+                        let (state_glyph, state_color) = if pr.is_draft {
+                            ("\u{25d0}", theme.muted_foreground) // draft
+                        } else {
+                            match pr.state {
+                                PrState::Merged => ("\u{21d7}", theme.primary), // merged
+                                PrState::Open => ("\u{25cf}", theme.success),   // open
+                                PrState::Closed => ("\u{25cf}", theme.danger),  // closed
+                            }
+                        };
+                        let decision = match pr.decision {
+                            Some(ReviewDecision::Approved) => Some(("\u{2713}", theme.success)),
+                            Some(ReviewDecision::ChangesRequested) => {
+                                Some(("\u{b1}", theme.danger))
+                            }
+                            Some(ReviewDecision::ReviewRequired) | None => None,
+                        };
+                        let ci_color = match pr.checks {
+                            ChecksSummary::Passing => Some(theme.success),
+                            ChecksSummary::Failing => Some(theme.danger),
+                            ChecksSummary::Pending => Some(theme.warning),
+                            ChecksSummary::None => None,
+                        };
+                        h_flex()
+                            .id("pr-badge")
+                            .flex_none()
+                            .gap_1()
+                            .items_center()
+                            .text_xs()
+                            .child(div().text_color(state_color).child(state_glyph))
+                            .children(
+                                decision.map(|(glyph, color)| div().text_color(color).child(glyph)),
+                            )
+                            .children(
+                                // Small square (▪), not a dot — see the
+                                // comment above on why this must not share
+                                // the state glyph's shape.
+                                ci_color.map(|color| div().text_color(color).child("\u{25aa}")),
+                            )
+                    }))
             }))
     }
 }
@@ -400,6 +676,7 @@ impl Render for AppShell {
             .track_focus(&self.focus_handle)
             .key_context(KEY_CONTEXT)
             .on_action(cx.listener(Self::on_new_review))
+            .on_action(cx.listener(Self::on_refresh_badges))
             .child(
                 TitleBar::new().child(
                     h_flex()
@@ -440,12 +717,30 @@ impl Render for AppShell {
                                 ),
                             )
                             .child(
-                                div()
+                                h_flex()
                                     .px_2()
                                     .py_1()
-                                    .text_xs()
-                                    .text_color(theme.muted_foreground)
-                                    .child("RECENT"),
+                                    .items_center()
+                                    .child(
+                                        div()
+                                            .flex_1()
+                                            .text_xs()
+                                            .text_color(theme.muted_foreground)
+                                            .child("RECENT"),
+                                    )
+                                    .child(
+                                        // Manual badge refresh (docs/phase-3-github.md
+                                        // deliverable 3) — same `refresh_all_badges`
+                                        // the app-open pass uses, but never
+                                        // WSL-skipped, since this is an explicit ask.
+                                        Button::new("refresh-badges")
+                                            .ghost()
+                                            .xsmall()
+                                            .label("\u{27f3}")
+                                            .on_click(cx.listener(|this, _, window, cx| {
+                                                this.on_refresh_badges(&RefreshBadges, window, cx)
+                                            })),
+                                    ),
                             )
                             .child(
                                 uniform_list(
@@ -474,5 +769,67 @@ impl Render for AppShell {
                             .child(main),
                     ),
             )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ChecksSummary, PrBadge, PrState, ReviewBadge, merge_local_badge};
+
+    fn badge(open: usize, pr: Option<PrBadge>) -> ReviewBadge {
+        ReviewBadge {
+            open,
+            submitted: false,
+            pr,
+        }
+    }
+
+    fn pr_badge() -> PrBadge {
+        PrBadge {
+            state: PrState::Open,
+            is_draft: false,
+            decision: None,
+            checks: ChecksSummary::Passing,
+        }
+    }
+
+    // --- merge_local_badge (review finding P3-3) ---------------------------
+
+    #[test]
+    fn merge_local_badge_fetch_remote_true_takes_fresh_local_verbatim() {
+        let existing = Some(badge(1, Some(pr_badge())));
+        let fresh_local = badge(3, None); // local pass never sets `pr` itself
+        let merged = merge_local_badge(existing, fresh_local, true);
+        assert_eq!(
+            merged.open, 3,
+            "open count must come from the fresh recompute"
+        );
+        assert!(
+            merged.pr.is_none(),
+            "fetch_remote=true means the caller is about to (re)fetch pr itself; \
+             merge must not paper over that with the old value"
+        );
+    }
+
+    #[test]
+    fn merge_local_badge_fetch_remote_false_preserves_existing_pr() {
+        let existing = Some(badge(1, Some(pr_badge())));
+        let fresh_local = badge(2, None); // local recompute, no network run
+        let merged = merge_local_badge(existing, fresh_local, false);
+        assert_eq!(merged.open, 2, "local fields still refresh");
+        assert!(
+            merged.pr.is_some(),
+            "fetch_remote=false must carry over the existing pr badge, not clobber it with None \
+             (review finding P3-3 — this used to flicker the PR cluster off on every comment save)"
+        );
+    }
+
+    #[test]
+    fn merge_local_badge_fetch_remote_false_with_no_prior_pr_stays_none() {
+        let merged = merge_local_badge(None, badge(1, None), false);
+        assert!(
+            merged.pr.is_none(),
+            "nothing to preserve when there was no existing badge at all"
+        );
     }
 }

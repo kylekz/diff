@@ -52,6 +52,17 @@ impl GithubClient {
         Self { gh_path, slug }
     }
 
+    /// Resolve `gh` and build directly from an already-known `slug` — no
+    /// [`GitRepo`] / `origin` remote read needed at all. Used by the
+    /// sidebar's PR-status badge refresh, which already has the slug from a
+    /// review's stored `RemoteRef` and would otherwise pay for an
+    /// unnecessary repo open + `git remote get-url` just to re-derive what
+    /// it already knows.
+    pub fn for_slug(slug: RepoSlug) -> Result<Self, GhError> {
+        let gh_path = resolve_gh_path()?;
+        Ok(Self { gh_path, slug })
+    }
+
     pub fn slug(&self) -> &RepoSlug {
         &self.slug
     }

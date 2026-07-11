@@ -1,25 +1,30 @@
 //! `dv pr <list|view|create|fetch>` and `dv review submit` — the
 //! GitHub-backed extensions of the headless CLI (see `super`'s module doc
 //! and docs/phase-3-github.md). A child module of `cli` purely so it can
-//! reuse `cli`'s private plumbing (`CliError`, `resolve_repo`, `line_range`,
-//! `side_word`, `print_json`, `REVIEW_USAGE`, ...) via `super::` — Rust
-//! visibility already allows a descendant module to see its ancestor's
-//! private items, so none of that needed to become `pub(crate)`.
+//! reuse `cli`'s private plumbing (`CliError`, `resolve_repo`, `print_json`,
+//! `REVIEW_USAGE`, ...) via `super::` — Rust visibility already allows a
+//! descendant module to see its ancestor's private items, so none of that
+//! needed to become `pub(crate)`.
+//!
+//! The comment→[`dv_core::DraftComment`] mapping and pre-submission
+//! validation this module used to own outright now live in
+//! `crate::submit` (a sibling of `cli`, not a descendant) — the GUI's
+//! submit flow (`workspace.rs`) needs the exact same rules, so they moved
+//! out to where both can reach them (docs/phase-3-github.md deliverable
+//! 3/5). This module keeps only CLI concerns: argument parsing, `--pr`/
+//! verdict resolution, and formatting `crate::submit::Violation`s into the
+//! CLI's text output.
 
-use std::collections::{BTreeMap, HashMap};
-
-use dv_core::diff::diff_blobs;
 use dv_core::{
-    BlobSpec, ChangeStatus, ChangedFile, ChecksSummary, Comment, CommentStatus, CreatePr,
-    CreatedPr, DiffOptions, DiffSource, DraftComment, GhError, GhSide, GitRepo, GithubClient, Hunk,
-    PrMeta, PrState, PrSummary, RemoteRef, RepoLocation, Review, ReviewDecision, ReviewEvent,
-    ReviewState, ReviewStore, ReviewSubmission, Side, SubmittedReview, Verdict,
+    ChecksSummary, CreatePr, CreatedPr, GhError, GitRepo, GithubClient, PrMeta, PrState, PrSummary,
+    RemoteRef, RepoLocation, Review, ReviewDecision, ReviewEvent, ReviewState, ReviewStore,
+    Verdict,
 };
 use serde_json::json;
 
-use super::{
-    CliError, REVIEW_USAGE, line_range, op_err, print_json, resolve_repo, side_word, usage_err,
-};
+use crate::submit::{self, SubmissionOutcome, Violation};
+
+use super::{CliError, REVIEW_USAGE, op_err, print_json, resolve_repo, usage_err};
 
 pub(super) const PR_USAGE: &str = "\
 usage: dv pr <list|view|create|fetch> [options]
@@ -54,9 +59,7 @@ pub(super) fn pr_router(
 }
 
 fn github_client(repo: &GitRepo) -> Result<GithubClient, CliError> {
-    let client = GithubClient::for_repo(repo).map_err(gh_err)?;
-    client.preflight().map_err(gh_err)?;
-    Ok(client)
+    submit::github_client(repo).map_err(op_err)
 }
 
 fn gh_err(err: GhError) -> CliError {
@@ -424,14 +427,6 @@ fn resolve_verdict(explicit: Option<Verdict>, state: &ReviewState) -> Result<Ver
     }
 }
 
-fn verdict_to_event(verdict: Verdict) -> ReviewEvent {
-    match verdict {
-        Verdict::Comment => ReviewEvent::Comment,
-        Verdict::Approve => ReviewEvent::Approve,
-        Verdict::RequestChanges => ReviewEvent::RequestChanges,
-    }
-}
-
 fn event_word(event: ReviewEvent) -> &'static str {
     match event {
         ReviewEvent::Comment => "comment",
@@ -482,325 +477,38 @@ fn target_review_for_submit(
     ))
 }
 
-fn gh_side(side: Side) -> GhSide {
-    match side {
-        Side::Old => GhSide::Left,
-        Side::New => GhSide::Right,
-    }
-}
-
-/// dv stores paths forward-slashed already (docs/architecture.md § Data
-/// model), but a stray Windows-style path — hand-edited store JSON, a
-/// future GUI path builder bug — must not silently mis-anchor a GitHub
-/// comment, so this is enforced again right before it leaves the process.
-fn normalize_path(path: &str) -> String {
-    path.replace('\\', "/")
-}
-
-/// The main body, then each reply flattened underneath as a markdown
-/// blockquote — GitHub review comments have no native reply thread, so this
-/// is the closest single-comment-body approximation.
-fn flatten_body(comment: &Comment) -> String {
-    let mut body = comment.body.clone();
-    for reply in &comment.replies {
-        body.push_str("\n\n");
-        body.push_str(&blockquote_reply(&reply.author, &reply.body));
-    }
-    body
-}
-
-/// Prefix *every* line of a reply with `> ` (a blank line gets a bare `>`),
-/// with the `> **@author:** ` label folded into the first line — markdown
-/// (GitHub's renderer included) treats a blank line as the end of a
-/// blockquote, so prefixing only the first line let any later paragraph in
-/// a multi-paragraph reply render as the top-level author's own words.
-fn blockquote_reply(author: &str, body: &str) -> String {
-    let mut lines = body.lines();
-    let mut out = format!("> **@{author}:** ");
-    if let Some(first) = lines.next() {
-        out.push_str(first);
-    }
-    for line in lines {
-        out.push('\n');
-        if line.is_empty() {
-            out.push('>');
-        } else {
-            out.push_str("> ");
-            out.push_str(line);
-        }
-    }
-    out
-}
-
-fn map_comment(comment: &Comment) -> DraftComment {
-    let path = normalize_path(&comment.path);
-    let body = flatten_body(comment);
-    let side = gh_side(comment.side);
-    if comment.start_line < comment.end_line {
-        DraftComment::range(
-            path,
-            body,
-            u64::from(comment.start_line),
-            side,
-            u64::from(comment.end_line),
-            side,
-        )
-    } else {
-        DraftComment::single_line(path, body, u64::from(comment.end_line), side)
-    }
-}
-
-/// Validate a batch of comments against the PR's current diff before
-/// submitting: every comment's anchor must still match the content it was
-/// made against ([`validate_comment_anchors`]), and every commented line
-/// must actually fall inside the PR's diff ([`validate_lines_in_diff`]).
-/// Takes only a [`GitRepo`] and the two oids bounding the diff — no `gh`,
-/// no [`PrMeta`] — so it's directly testable against a plain temp repo (see
-/// the tests below); `cmd_review_submit` is the only caller that plugs in
-/// real PR data.
-pub(super) fn validate_submission(
-    repo: &GitRepo,
-    base_oid: &str,
-    head_oid: &str,
-    comments: &[&Comment],
-) -> anyhow::Result<Vec<String>> {
-    let changed = changed_file_map(repo, base_oid, head_oid)?;
-    let mut violations = validate_comment_anchors(repo, base_oid, head_oid, &changed, comments)?;
-    violations.extend(validate_lines_in_diff(
-        repo, base_oid, head_oid, &changed, comments,
-    )?);
-    Ok(violations)
-}
-
-/// Changed-file map for `base_oid..head_oid`, keyed by each entry's
-/// new-side path — `ChangedFile::path` is documented as the new-side path
-/// (old side, for deletes), which is also always what a [`Comment::path`]
-/// records, even for an old-side anchor on a renamed file (see the
-/// docs/backlog.md caveat this fix appends). Built once per validation run
-/// so the per-comment checks below are plain map reads instead of a
-/// `git diff` per comment.
-fn changed_file_map(
-    repo: &GitRepo,
-    base_oid: &str,
-    head_oid: &str,
-) -> anyhow::Result<BTreeMap<String, ChangedFile>> {
-    let files = repo.changed_files(&DiffSource::Range {
-        base: base_oid.to_string(),
-        head: head_oid.to_string(),
-        merge_base: false,
-    })?;
-    Ok(files.into_iter().map(|f| (f.path.clone(), f)).collect())
-}
-
-/// The file's old-side path when `file` is a rename or copy — `None`
-/// (caller's own path is already correct) for every other status. Mirrors
-/// `workspace.rs::compute_diff`'s `old_path` handling for the GUI diff.
-fn rename_old_path(file: &ChangedFile) -> Option<&str> {
-    match file.status {
-        ChangeStatus::Renamed | ChangeStatus::Copied => file.old_path.as_deref(),
-        _ => None,
-    }
-}
-
-fn validate_comment_anchors(
-    repo: &GitRepo,
-    base_oid: &str,
-    head_oid: &str,
-    changed: &BTreeMap<String, ChangedFile>,
-    comments: &[&Comment],
-) -> anyhow::Result<Vec<String>> {
-    let mut violations = Vec::new();
-    // Keyed on (the path actually looked up, side), not the comment's own
-    // path — collapses repeat `blob_sha` lookups for every comment sharing
-    // a path/side (100 comments on WSL is otherwise 100 `git ls-tree`
-    // spawns just for anchor checks). `Side` has no `Hash` impl, so the
-    // side is folded in via `side_word`'s `&'static str` instead of the
-    // enum itself.
-    let mut blob_cache: HashMap<(String, &'static str), Option<String>> = HashMap::new();
-
-    for &comment in comments {
-        let path = normalize_path(&comment.path);
-        // Old-side lookups on a file renamed/copied in this PR must read
-        // the *old* path — the file never existed under its new name
-        // before the rename, so looking it up there always misses.
-        let rename_old = changed.get(&path).and_then(rename_old_path);
-        let (rev, lookup_path) = match comment.side {
-            Side::New => (head_oid, path.as_str()),
-            Side::Old => (base_oid, rename_old.unwrap_or(path.as_str())),
-        };
-
-        let cache_key = (lookup_path.to_string(), side_word(comment.side));
-        let actual = match blob_cache.get(&cache_key) {
-            Some(cached) => cached.clone(),
-            None => {
-                let value = repo.blob_sha(&BlobSpec::Rev {
-                    rev: rev.to_string(),
-                    path: lookup_path.to_string(),
-                })?;
-                blob_cache.insert(cache_key, value.clone());
-                value
-            }
-        };
-
-        let verified = comment
-            .blob_sha
-            .as_deref()
-            .is_some_and(|expected| actual.as_deref() == Some(expected));
-        if verified {
-            continue;
-        }
-
-        // Old-side comments on a renamed file were anchored by the
-        // GUI/CLI against the *new* path at comment time (docs/backlog.md)
-        // — so even once the lookup itself reads the right (old) path,
-        // the recorded `blob_sha` may be `None` or simply wrong. Say so
-        // plainly instead of the generic stale-anchor text below, which
-        // would misleadingly imply the file's *content* changed rather
-        // than the anchor never having been recorded against it.
-        if comment.side == Side::Old
-            && let Some(old_path) = rename_old
-        {
-            violations.push(format!(
-                "comment {} on {}:{} (old) is on a file renamed in the PR (previously {}) — its \
-                 anchor cannot be verified and needs re-anchoring",
-                comment.id,
-                path,
-                line_range(comment.start_line, comment.end_line),
-                old_path,
-            ));
-            continue;
-        }
-
-        if comment.blob_sha.is_none() {
-            violations.push(format!(
-                "comment {} on {}:{} has no recorded anchor (unverifiable) — cannot safely \
-                 place it",
-                comment.id,
-                path,
-                line_range(comment.start_line, comment.end_line),
-            ));
-        } else {
-            violations.push(format!(
-                "comment {} on {}:{} ({}) has a stale anchor — the file has changed since the \
-                 comment was made",
-                comment.id,
-                path,
-                line_range(comment.start_line, comment.end_line),
-                side_word(comment.side),
-            ));
-        }
-    }
-    Ok(violations)
-}
-
-fn validate_lines_in_diff(
-    repo: &GitRepo,
-    base_oid: &str,
-    head_oid: &str,
-    changed: &BTreeMap<String, ChangedFile>,
-    comments: &[&Comment],
-) -> anyhow::Result<Vec<String>> {
-    let mut violations = Vec::new();
-
-    let mut by_path: BTreeMap<String, Vec<&Comment>> = BTreeMap::new();
-    for &comment in comments {
-        by_path
-            .entry(normalize_path(&comment.path))
-            .or_default()
-            .push(comment);
-    }
-
-    for (path, path_comments) in by_path {
-        // A rename/copy's real old-side content lives at `old_path` — the
-        // *new* path is entirely missing at `base_oid`, which (before this
-        // fix) made the whole file look newly added and let every line
-        // pass regardless of whether GitHub's rename-aware diff actually
-        // covers it.
-        let old_side_path = changed
-            .get(&path)
-            .and_then(rename_old_path)
-            .unwrap_or(path.as_str());
-
-        let old_bytes = repo.blob_bytes(&BlobSpec::Rev {
-            rev: base_oid.to_string(),
-            path: old_side_path.to_string(),
-        })?;
-        let new_bytes = repo.blob_bytes(&BlobSpec::Rev {
-            rev: head_oid.to_string(),
-            path: path.clone(),
-        })?;
-        let diff = diff_blobs(
-            old_bytes.as_deref(),
-            new_bytes.as_deref(),
-            &DiffOptions::default(),
-        );
-
-        for comment in path_comments {
-            let in_diff = diff
-                .hunks
-                .iter()
-                .any(|h| line_in_hunk_span(h, comment.side, comment.start_line, comment.end_line));
-            if !in_diff {
-                violations.push(format!(
-                    "comment {} on {}:{} ({}) is not part of the PR diff",
-                    comment.id,
-                    path,
-                    line_range(comment.start_line, comment.end_line),
-                    side_word(comment.side),
-                ));
-            }
-        }
-    }
-    Ok(violations)
-}
-
-/// Whether `start..=end` (1-based, inclusive) falls entirely within
-/// `hunk`'s span on `side` — context lines included, matching unified-diff
-/// convention (`new_start..new_start+new_count`, `old_start..old_start+
-/// old_count`). A zero-length span (the side is wholly absent from this
-/// hunk — e.g. the old side of a pure insertion) never contains anything.
-fn line_in_hunk_span(hunk: &Hunk, side: Side, start: u32, end: u32) -> bool {
-    let (span_start, span_len) = match side {
-        Side::Old => (hunk.old_start, hunk.old_count),
-        Side::New => (hunk.new_start, hunk.new_count),
-    };
-    if span_len == 0 {
-        return false;
-    }
-    let span_end = span_start + span_len - 1;
-    start >= span_start && end <= span_end
-}
-
-fn format_violations(violations: &[String]) -> String {
+/// The `"cannot submit: N problems found — nothing was sent to GitHub:\n  -
+/// ..."` framing, shared by every early-refusal case in `cmd_review_submit`
+/// so they all read as one consistent style — not just
+/// [`format_violations`]'s validation failures, but also the closed/merged-
+/// PR short-circuit below (review finding P3-4: a refactor had that one
+/// case print `pr_not_open_message` bare, unwrapped, breaking the
+/// consistency this helper restores).
+fn format_problem_messages(messages: &[String]) -> String {
     let mut msg = format!(
         "cannot submit: {} problem{} found — nothing was sent to GitHub:\n",
-        violations.len(),
-        if violations.len() == 1 { "" } else { "s" }
+        messages.len(),
+        if messages.len() == 1 { "" } else { "s" }
     );
-    for v in violations {
+    for m in messages {
         msg.push_str("  - ");
-        msg.push_str(v);
+        msg.push_str(m);
         msg.push('\n');
     }
     msg
 }
 
-/// The error for when GitHub has already accepted a review submission but
-/// recording that locally then failed (the review vanished from the store
-/// between load and save, or the save itself errored). Factored out as a
-/// pure function so both the human and `--json` paths (which share
-/// `CliError::Op`'s single message, per `report_error`) get identical
-/// wording, and so the critical fact — GitHub already has this review,
-/// re-running `submit` would duplicate it — can't accidentally be dropped
-/// from one call site but not the other.
-fn writeback_failure_message(pr_number: u64, submitted: &SubmittedReview, cause: &str) -> String {
-    format!(
-        "GitHub ACCEPTED the review: submitted review #{} on PR #{pr_number} ({}), but recording \
-         it in the local review store failed: {cause}\n\
-         Do NOT re-run `dv review submit` for this — GitHub already has this review, and \
-         submitting again would create a duplicate review on the PR. Fix the local issue (see \
-         the cause above), then reconcile the review store by hand if needed.",
-        submitted.id, submitted.html_url,
+/// Turn `crate::submit::validate_submission`'s structured [`Violation`]s
+/// into the CLI's `"cannot submit: N problems found..."` text — the wire
+/// output stays byte-for-byte what it was before the validation logic
+/// moved out to `crate::submit`, since each `Violation::message` already
+/// carries the exact same sentence this used to build inline.
+fn format_violations(violations: &[Violation]) -> String {
+    format_problem_messages(
+        &violations
+            .iter()
+            .map(|v| v.message.clone())
+            .collect::<Vec<_>>(),
     )
 }
 
@@ -873,51 +581,57 @@ pub(super) fn cmd_review_submit(
 
     let verdict = resolve_verdict(parsed.verdict, &review.state)
         .map_err(|reason| usage_err(reason, REVIEW_USAGE))?;
-    let event = verdict_to_event(verdict);
-
-    let comments: Vec<&Comment> = review
-        .comments
-        .iter()
-        .filter(|c| parsed.include_resolved || c.status == CommentStatus::Open)
-        .collect();
-
     let body_text = parsed.body.clone().unwrap_or_default();
-    if comments.is_empty() && body_text.trim().is_empty() && event == ReviewEvent::Comment {
-        return Err(CliError::Op(
-            "nothing to submit: no comments (after filtering), no --body, and the verdict is \
-             a plain comment"
-                .to_string(),
-        ));
-    }
 
     let client = github_client(&repo)?;
     let meta = client.pr_meta(pr_number).map_err(gh_err)?;
-
-    let mut violations = Vec::new();
     if meta.state != PrState::Open {
-        violations.push(format!(
-            "PR #{pr_number} is {} — only an open PR can receive a review",
-            pr_state_word(meta.state)
-        ));
+        // Kept as an early short-circuit (no point building a submission
+        // against a PR that can't receive one), but formatted through the
+        // same framing every other early refusal here uses (review finding
+        // P3-4).
+        return Err(CliError::Op(format_problem_messages(&[
+            submit::pr_not_open_message(pr_number, &meta),
+        ])));
     }
 
     let pr_range = crate::pr::prepare_pr(&repo, &meta).map_err(op_err)?;
-    violations.extend(
-        validate_submission(&repo, &pr_range.merge_base, &pr_range.head_oid, &comments)
-            .map_err(op_err)?,
-    );
-
-    if !violations.is_empty() {
-        return Err(CliError::Op(format_violations(&violations)));
-    }
-
-    let draft_comments: Vec<DraftComment> = comments.iter().copied().map(map_comment).collect();
-    let submission = ReviewSubmission {
-        commit_id: pr_range.head_oid.clone(),
-        body: body_text,
-        event,
-        comments: draft_comments,
+    let outcome = submit::build_submission(
+        &repo,
+        &pr_range.merge_base,
+        &pr_range.head_oid,
+        &review,
+        verdict,
+        body_text,
+        parsed.include_resolved,
+    )
+    .map_err(op_err)?;
+    let submission = match outcome {
+        // The nothing-to-submit check moved into `build_submission` itself
+        // (review finding P2-2, shared with the GUI's validation), but this
+        // one case keeps its own original wording/framing (no other
+        // callers depend on `Violation::message`'s exact text, but this
+        // one's `--json`/exit-code output predates the move and must not
+        // change).
+        SubmissionOutcome::Blocked(violations)
+            if matches!(
+                violations.as_slice(),
+                [v] if v.kind == submit::ViolationKind::NothingToSubmit
+            ) =>
+        {
+            return Err(CliError::Op(
+                "nothing to submit: no comments (after filtering), no --body, and the verdict is \
+                 a plain comment"
+                    .to_string(),
+            ));
+        }
+        SubmissionOutcome::Blocked(violations) => {
+            return Err(CliError::Op(format_violations(&violations)));
+        }
+        SubmissionOutcome::Ready(submission) => submission,
     };
+    let comment_count = submission.comments.len();
+    let event = submission.event;
 
     let submitted = client
         .submit_review(pr_number, &submission)
@@ -928,54 +642,31 @@ pub(super) fn cmd_review_submit(
             ))
         })?;
 
-    // Fresh-load before mutating: the review may have been edited (by the
-    // GUI, another agent invocation, ...) between our load above and now —
-    // the same discipline `workspace.rs`'s store writes follow. GitHub has
-    // already accepted the review at this point, so any failure from here
-    // on must say so loudly — the natural instinct on a CLI error is "just
-    // re-run it", which here would submit a second, duplicate review.
-    let mut fresh = match store.load(&review.id) {
-        Ok(Some(r)) => r,
-        Ok(None) => {
-            return Err(CliError::Op(writeback_failure_message(
-                pr_number,
-                &submitted,
-                &format!("review {} disappeared from the local store", review.id),
-            )));
-        }
-        Err(err) => {
-            return Err(CliError::Op(writeback_failure_message(
-                pr_number,
-                &submitted,
-                &format!("{err:#}"),
-            )));
-        }
-    };
-    fresh.set_state(ReviewState::Submitted {
-        verdict,
-        at_ms: dv_core::review::now_ms(),
-    });
-    fresh.remote = Some(RemoteRef {
+    // Fresh-load before mutating (inside `writeback_submitted_review`): the
+    // review may have been edited (by the GUI, another agent invocation,
+    // ...) between our load above and now — the same discipline
+    // `workspace.rs`'s store writes follow. GitHub has already accepted the
+    // review at this point, so any failure from here on must say so loudly
+    // — the natural instinct on a CLI error is "just re-run it", which here
+    // would submit a second, duplicate review.
+    let remote = RemoteRef {
         provider: "github".to_string(),
         slug: client.slug().to_string(),
         pr: pr_number,
         url: meta.url.clone(),
         submitted_review_id: Some(submitted.id),
         submitted_url: Some(submitted.html_url.clone()),
-    });
-    if let Err(err) = store.save(&fresh) {
-        return Err(CliError::Op(writeback_failure_message(
-            pr_number,
-            &submitted,
-            &format!("{err:#}"),
-        )));
-    }
+    };
+    let fresh = submit::writeback_submitted_review(
+        &store, &review.id, verdict, pr_number, remote, &submitted,
+    )
+    .map_err(CliError::Op)?;
 
     print_submission(
         &fresh.id,
         pr_number,
         event,
-        comments.len(),
+        comment_count,
         &submitted.html_url,
         json,
     );
@@ -988,110 +679,9 @@ mod tests {
     use std::process::Command;
     use std::sync::atomic::{AtomicU64, Ordering};
 
-    use dv_core::{Reply, RepoLocation};
+    use dv_core::{DiffSource, RepoLocation};
 
     use super::*;
-
-    fn comment(
-        path: &str,
-        side: Side,
-        start: u32,
-        end: u32,
-        blob_sha: Option<&str>,
-        body: &str,
-    ) -> Comment {
-        Comment {
-            // Keyed on `body` (a unique per-case label in the test below),
-            // not `path`/`start`/`end` — several test cases deliberately
-            // share the same path/line range to isolate one violation kind
-            // from another, which would otherwise collide on this id.
-            id: format!("c-test-{body}"),
-            path: path.to_string(),
-            side,
-            start_line: start,
-            end_line: end,
-            blob_sha: blob_sha.map(str::to_string),
-            body: body.to_string(),
-            author: "kyle".to_string(),
-            status: CommentStatus::Open,
-            created_ms: 0,
-            updated_ms: 0,
-            replies: Vec::new(),
-        }
-    }
-
-    // --- map_comment -----------------------------------------------------
-
-    #[test]
-    fn map_comment_single_line_new_side() {
-        let c = comment("src/a.rs", Side::New, 5, 5, Some("sha"), "why?");
-        let draft = map_comment(&c);
-        assert_eq!(draft.path, "src/a.rs");
-        assert_eq!(draft.line, 5);
-        assert_eq!(draft.side, GhSide::Right);
-        assert!(draft.start_line.is_none());
-        assert!(draft.start_side.is_none());
-        assert_eq!(draft.body, "why?");
-    }
-
-    #[test]
-    fn map_comment_range_old_side() {
-        let c = comment("a.rs", Side::Old, 3, 7, Some("sha"), "range");
-        let draft = map_comment(&c);
-        assert_eq!(draft.start_line, Some(3));
-        assert_eq!(draft.start_side, Some(GhSide::Left));
-        assert_eq!(draft.line, 7);
-        assert_eq!(draft.side, GhSide::Left);
-    }
-
-    #[test]
-    fn map_comment_normalizes_backslash_paths() {
-        let c = comment(r"src\windows\a.rs", Side::New, 1, 1, None, "hi");
-        let draft = map_comment(&c);
-        assert_eq!(draft.path, "src/windows/a.rs");
-    }
-
-    #[test]
-    fn map_comment_flattens_replies_as_blockquotes() {
-        let mut c = comment("a.rs", Side::New, 1, 1, None, "main body");
-        c.replies.push(Reply {
-            id: "p-1".to_string(),
-            body: "a reply".to_string(),
-            author: "agent".to_string(),
-            created_ms: 0,
-        });
-        c.replies.push(Reply {
-            id: "p-2".to_string(),
-            body: "second reply".to_string(),
-            author: "kyle".to_string(),
-            created_ms: 0,
-        });
-        let draft = map_comment(&c);
-        assert_eq!(
-            draft.body,
-            "main body\n\n> **@agent:** a reply\n\n> **@kyle:** second reply"
-        );
-    }
-
-    /// A blank line inside a reply body used to end the markdown
-    /// blockquote early (only the first line was ever prefixed with
-    /// `> `), so a later paragraph rendered as the top-level author's own
-    /// words instead of part of the quoted reply.
-    #[test]
-    fn map_comment_flattens_multi_paragraph_reply_with_full_blockquote() {
-        let mut c = comment("a.rs", Side::New, 1, 1, None, "main body");
-        c.replies.push(Reply {
-            id: "p-1".to_string(),
-            body: "first paragraph\n\nsecond paragraph\nstill second".to_string(),
-            author: "agent".to_string(),
-            created_ms: 0,
-        });
-        let draft = map_comment(&c);
-        assert_eq!(
-            draft.body,
-            "main body\n\n> **@agent:** first paragraph\n>\n> second paragraph\n> still second"
-        );
-    }
 
     // --- resolve_verdict ---------------------------------------------------
 
@@ -1123,9 +713,22 @@ mod tests {
 
     // --- format_violations --------------------------------------------------
 
+    /// A minimal [`Violation`] carrying only the message text —
+    /// `format_violations` only ever reads `.message` back out, so the rest
+    /// of the fields don't matter for these tests.
+    fn violation(message: &str) -> Violation {
+        Violation {
+            comment_id: String::new(),
+            path: String::new(),
+            lines: String::new(),
+            kind: crate::submit::ViolationKind::StaleAnchor,
+            message: message.to_string(),
+        }
+    }
+
     #[test]
     fn format_violations_lists_each_one() {
-        let msg = format_violations(&["a".to_string(), "b".to_string()]);
+        let msg = format_violations(&[violation("a"), violation("b")]);
         assert!(msg.contains("2 problems"), "message: {msg}");
         assert!(msg.contains("- a"));
         assert!(msg.contains("- b"));
@@ -1133,40 +736,8 @@ mod tests {
 
     #[test]
     fn format_violations_singular_wording() {
-        let msg = format_violations(&["only one".to_string()]);
+        let msg = format_violations(&[violation("only one")]);
         assert!(msg.contains("1 problem "), "message: {msg}");
-    }
-
-    // --- writeback_failure_message ------------------------------------------
-
-    /// The one message a duplicate-review bug hides behind: if this ever
-    /// stops saying GitHub already has the review, a retry after a local
-    /// writeback failure creates a second review on the PR.
-    #[test]
-    fn writeback_failure_message_names_github_success_and_warns_against_retrying() {
-        let submitted = SubmittedReview {
-            id: 999,
-            html_url: "https://github.com/o/r/pull/42#pullrequestreview-999".to_string(),
-            state: "COMMENTED".to_string(),
-        };
-        let msg = writeback_failure_message(42, &submitted, "disk full");
-
-        assert!(msg.contains("ACCEPTED"), "message: {msg}");
-        assert!(msg.contains("999"), "message: {msg}");
-        assert!(
-            msg.contains("https://github.com/o/r/pull/42#pullrequestreview-999"),
-            "message: {msg}"
-        );
-        assert!(msg.contains("PR #42"), "message: {msg}");
-        assert!(msg.contains("disk full"), "message: {msg}");
-        assert!(
-            msg.to_lowercase().contains("duplicate"),
-            "message must warn about duplicating the review: {msg}"
-        );
-        assert!(
-            msg.contains("Do NOT re-run"),
-            "message must tell the caller not to retry: {msg}"
-        );
     }
 
     // --- arg parsing ---------------------------------------------------
@@ -1238,7 +809,7 @@ mod tests {
         assert!(parse_pr_number(&args, "pr view").is_err());
     }
 
-    // --- validate_submission: real temp repo ----------------------------
+    // --- shared real-repo test fixture -----------------------------------
 
     static COUNTER: AtomicU64 = AtomicU64::new(0);
 
@@ -1291,20 +862,6 @@ mod tests {
                 .trim_end()
                 .to_string()
         }
-
-        fn write(&self, rel_path: &str, bytes: &[u8]) {
-            let full = self.dir.join(rel_path);
-            if let Some(parent) = full.parent() {
-                std::fs::create_dir_all(parent).expect("create parent dir");
-            }
-            std::fs::write(full, bytes).expect("write fixture file");
-        }
-
-        fn commit(&self, msg: &str) -> String {
-            self.git(&["add", "-A"]);
-            self.git(&["commit", "-m", msg]);
-            self.git(&["rev-parse", "HEAD"])
-        }
     }
 
     impl Drop for TestRepo {
@@ -1313,194 +870,11 @@ mod tests {
         }
     }
 
-    /// Exercises every violation kind `validate_submission` is meant to
-    /// catch, plus the ok-case passing cleanly, in one temp repo — also
-    /// covers rename-awareness (Phase-3 round-2 review): a file renamed
-    /// *and* edited between base and head, which used to defeat both the
-    /// anchor check (old-side blob looked up under the wrong — new —
-    /// path) and the line-in-diff check (diffing "missing at base" vs
-    /// "full content at head" made every line of the new file look
-    /// added, so a comment far outside the real edited hunk used to
-    /// false-pass).
-    #[test]
-    fn validate_submission_catches_every_violation_kind_and_passes_ok_case() {
-        let repo = TestRepo::new("validate");
-        let base_lines: Vec<String> = (1..=12).map(|i| format!("line {i}\n")).collect();
-        repo.write("a.rs", base_lines.concat().as_bytes());
-        repo.write("untouched.rs", b"same on both sides\n");
-        let renamed_base_lines: Vec<String> =
-            (1..=12).map(|i| format!("renamed line {i}\n")).collect();
-        repo.write("renamed_file.rs", renamed_base_lines.concat().as_bytes());
-        let base_sha = repo.commit("base");
-
-        let mut head_lines = base_lines.clone();
-        head_lines[5] = "line 6 CHANGED\n".to_string(); // 1-based line 6
-        repo.write("a.rs", head_lines.concat().as_bytes());
-        let mut renamed_head_lines = renamed_base_lines.clone();
-        renamed_head_lines[1] = "renamed line 2 CHANGED\n".to_string(); // 1-based line 2
-        std::fs::remove_file(repo.path().join("renamed_file.rs")).expect("remove old name");
-        repo.write(
-            "renamed_file_new.rs",
-            renamed_head_lines.concat().as_bytes(),
-        );
-        let head_sha = repo.commit("head");
-
-        let git_repo =
-            GitRepo::open(RepoLocation::Local(repo.path().to_path_buf())).expect("open repo");
-
-        let correct_sha = git_repo
-            .blob_sha(&BlobSpec::Rev {
-                rev: head_sha.clone(),
-                path: "a.rs".to_string(),
-            })
-            .expect("blob_sha")
-            .expect("a.rs exists at head");
-        let untouched_sha = git_repo
-            .blob_sha(&BlobSpec::Rev {
-                rev: base_sha.clone(),
-                path: "untouched.rs".to_string(),
-            })
-            .expect("blob_sha")
-            .expect("untouched.rs exists at base");
-        let renamed_old_sha = git_repo
-            .blob_sha(&BlobSpec::Rev {
-                rev: base_sha.clone(),
-                path: "renamed_file.rs".to_string(),
-            })
-            .expect("blob_sha")
-            .expect("renamed_file.rs exists at base under its old name");
-        let renamed_new_sha = git_repo
-            .blob_sha(&BlobSpec::Rev {
-                rev: head_sha.clone(),
-                path: "renamed_file_new.rs".to_string(),
-            })
-            .expect("blob_sha")
-            .expect("renamed_file_new.rs exists at head");
-
-        // ok: correctly anchored, line 6 is within the diff's hunk.
-        let ok = comment("a.rs", Side::New, 6, 6, Some(&correct_sha), "ok");
-        // stale: blob_sha doesn't match the real content anymore.
-        let stale = comment(
-            "a.rs",
-            Side::New,
-            6,
-            6,
-            Some("0000000000000000000000000000000000000000"),
-            "stale",
-        );
-        // unanchored: no blob_sha recorded at all.
-        let unanchored = comment("untouched.rs", Side::Old, 1, 1, None, "unanchored");
-        // missing file: path doesn't exist at either oid.
-        let missing = comment(
-            "does-not-exist.rs",
-            Side::New,
-            1,
-            1,
-            Some("deadbeef"),
-            "missing",
-        );
-        // out-of-hunk: correctly anchored, but this file has no diff at
-        // all, so none of its lines are part of the PR.
-        let out_of_hunk = comment(
-            "untouched.rs",
-            Side::Old,
-            1,
-            1,
-            Some(&untouched_sha),
-            "oohunk",
-        );
-        // (a) new-side comment on a renamed file, inside the real edited
-        // hunk (line 2) — must pass.
-        let rename_new_in_hunk = comment(
-            "renamed_file_new.rs",
-            Side::New,
-            2,
-            2,
-            Some(&renamed_new_sha),
-            "rename-new-in-hunk",
-        );
-        // (b) new-side comment on a renamed file, outside the real edited
-        // hunk (line 10 is untouched by the edit) — before this fix, the
-        // rename made the whole new file look added, so this used to
-        // false-pass; must now be flagged as not-in-diff.
-        let rename_new_out_of_hunk = comment(
-            "renamed_file_new.rs",
-            Side::New,
-            10,
-            10,
-            Some(&renamed_new_sha),
-            "rename-new-out-of-hunk",
-        );
-        // (c) old-side comment on the renamed file, anchored (via
-        // `old_path`) to the correct pre-rename blob — must pass.
-        let rename_old_correct = comment(
-            "renamed_file_new.rs",
-            Side::Old,
-            2,
-            2,
-            Some(&renamed_old_sha),
-            "rename-old-correct",
-        );
-
-        let comments = vec![
-            &ok,
-            &stale,
-            &unanchored,
-            &missing,
-            &out_of_hunk,
-            &rename_new_in_hunk,
-            &rename_new_out_of_hunk,
-            &rename_old_correct,
-        ];
-        let violations = validate_submission(&git_repo, &base_sha, &head_sha, &comments)
-            .expect("validation should run without error");
-
-        assert!(
-            !violations.iter().any(|v| v.contains(&ok.id)),
-            "ok case must not be flagged: {violations:#?}"
-        );
-        assert!(
-            violations
-                .iter()
-                .any(|v| v.contains(&stale.id) && v.contains("stale")),
-            "{violations:#?}"
-        );
-        assert!(
-            violations
-                .iter()
-                .any(|v| v.contains(&unanchored.id) && v.contains("unverifiable")),
-            "{violations:#?}"
-        );
-        assert!(
-            violations.iter().any(|v| v.contains(&missing.id)),
-            "{violations:#?}"
-        );
-        assert!(
-            violations
-                .iter()
-                .any(|v| v.contains(&out_of_hunk.id) && v.contains("not part of the PR diff")),
-            "{violations:#?}"
-        );
-        assert!(
-            !violations
-                .iter()
-                .any(|v| v.contains(&rename_new_in_hunk.id)),
-            "rename (a) in-hunk new-side comment must not be flagged: {violations:#?}"
-        );
-        assert!(
-            violations
-                .iter()
-                .any(|v| v.contains(&rename_new_out_of_hunk.id)
-                    && v.contains("not part of the PR diff")),
-            "rename (b) out-of-hunk new-side comment must be flagged: {violations:#?}"
-        );
-        assert!(
-            !violations
-                .iter()
-                .any(|v| v.contains(&rename_old_correct.id)),
-            "rename (c) correctly old_path-anchored comment must not be flagged: {violations:#?}"
-        );
-    }
+    // `validate_submission`'s own coverage (every violation kind, plus the
+    // rename-awareness edge cases) now lives with the function itself in
+    // `crate::submit`'s test module — this file only keeps `TestRepo` (used
+    // below by `target_review_for_submit`/`cmd_review_submit` tests, which
+    // never touch validation directly).
 
     // --- target_review_for_submit --------------------------------------
 

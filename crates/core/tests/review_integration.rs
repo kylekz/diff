@@ -424,3 +424,44 @@ fn wsl_store_round_trip() {
     store.delete(&review.id).expect("delete over WSL");
     assert!(store.load(&review.id).expect("reload").is_none());
 }
+
+/// Phase-2 acceptance: comment anchors are blob shas, so an amend that
+/// doesn't touch the commented file leaves the anchor intact, while one
+/// that rewrites the commented content makes the stored sha diverge — the
+/// signal the GUI renders as a "stale" badge.
+#[test]
+fn r8_anchor_survives_unrelated_amend_and_flags_content_drift() {
+    let repo = TestRepo::new("r8");
+    repo.write("file.txt", b"line one\nline two\n");
+    repo.commit("base");
+
+    let git = open(&repo);
+    let spec = BlobSpec::Rev {
+        rev: "HEAD".to_string(),
+        path: "file.txt".to_string(),
+    };
+    let anchored = git
+        .blob_sha(&spec)
+        .expect("blob_sha")
+        .expect("file.txt exists at HEAD");
+
+    // Amend that does NOT touch the commented file → anchor intact.
+    repo.write("other.txt", b"unrelated\n");
+    repo.git(&["add", "other.txt"]);
+    repo.git(&["commit", "--amend", "--no-edit"]);
+    assert_eq!(
+        git.blob_sha(&spec).expect("blob_sha").as_deref(),
+        Some(anchored.as_str()),
+        "an amend not touching the file must keep the anchor"
+    );
+
+    // Amend that rewrites the commented content → anchor drifts (stale).
+    repo.write("file.txt", b"line one CHANGED\nline two\n");
+    repo.git(&["add", "file.txt"]);
+    repo.git(&["commit", "--amend", "--no-edit"]);
+    assert_ne!(
+        git.blob_sha(&spec).expect("blob_sha").as_deref(),
+        Some(anchored.as_str()),
+        "an amend rewriting the file must change the anchor"
+    );
+}

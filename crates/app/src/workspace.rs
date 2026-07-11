@@ -21,6 +21,7 @@ actions!(
         NextHunk,
         PrevHunk,
         ToggleSplit,
+        ToggleSummary,
         JumpToFile,
         ClearSelection,
         CancelComment,
@@ -59,6 +60,7 @@ pub fn init(cx: &mut App) {
         KeyBinding::new("n", NextHunk, browse),
         KeyBinding::new("p", PrevHunk, browse),
         KeyBinding::new("s", ToggleSplit, browse),
+        KeyBinding::new("r", ToggleSummary, browse),
         KeyBinding::new("f", JumpToFile, browse),
         KeyBinding::new("ctrl-p", JumpToFile, browse),
         KeyBinding::new("cmd-p", JumpToFile, browse),
@@ -206,6 +208,31 @@ struct CommentEditor {
     _subscription: Subscription,
 }
 
+/// What a thread's inline input is doing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ThreadInputMode {
+    Reply,
+    EditBody,
+}
+
+/// Which threads the summary panel lists.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SummaryFilter {
+    All,
+    Open,
+    Resolved,
+}
+
+/// A reply/edit input open inside one thread card. At most one across the
+/// workspace — opening another closes this one.
+struct ThreadInput {
+    comment_id: String,
+    mode: ThreadInputMode,
+    input: Entity<gpui_component::input::InputState>,
+    saving: bool,
+    _subscription: Subscription,
+}
+
 /// The jump-to-file palette, while open: a text input plus a live-filtered
 /// view of the file list.
 struct Palette {
@@ -246,6 +273,20 @@ pub struct Workspace {
     palette: Option<Palette>,
     /// Live gutter selection (comment anchor being chosen).
     selection: Option<GutterSelection>,
+    /// A reply/edit input open inside a thread card, if any.
+    thread_input: Option<ThreadInput>,
+    /// Review summary panel (all threads across files + verdict) open?
+    summary_open: bool,
+    summary_filter: SummaryFilter,
+    /// A comment to scroll to once its file's rows exist — set by summary
+    /// clicks, consumed by reset_diff_list.
+    pending_jump: Option<String>,
+    /// Comment ids whose anchored blob no longer matches the diff — the
+    /// content drifted (rebase/amend/edit) since the comment was made.
+    stale: HashSet<String>,
+    /// (file, review.updated_ms) the stale set was last computed for, so
+    /// repeated display rebuilds don't re-run git.
+    stale_checked: Option<(usize, u64)>,
     /// The repo location, for opening the review store off-thread.
     location: RepoLocation,
     /// The active draft review (latest draft in the store), lazily loaded.
@@ -292,6 +333,26 @@ fn anchor_spec(source: &DiffSource, side: dv_core::Side, path: &str) -> BlobSpec
             path: path.into(),
         },
     }
+}
+
+/// Which review the workspace should display, from a store listing
+/// (newest-first): the latest draft (where comments accumulate — matches
+/// the CLI's targeting), else the review already on screen (so a
+/// just-submitted review doesn't vanish), else the latest review of any
+/// state (so submitted work is still visible after a restart).
+fn pick_review(reviews: Vec<dv_core::Review>, current_id: Option<&str>) -> Option<dv_core::Review> {
+    if let Some(draft) = reviews
+        .iter()
+        .find(|r| matches!(r.state, dv_core::ReviewState::Draft))
+    {
+        return Some(draft.clone());
+    }
+    if let Some(id) = current_id
+        && let Some(current) = reviews.iter().find(|r| r.id == id)
+    {
+        return Some(current.clone());
+    }
+    reviews.into_iter().next()
 }
 
 /// A one-row "diff" carrying an error message where the hunks would be.
@@ -366,6 +427,12 @@ impl Workspace {
             diff_list: ListState::new(0, ListAlignment::Top, px(600.)),
             palette: None,
             selection: None,
+            thread_input: None,
+            summary_open: false,
+            summary_filter: SummaryFilter::All,
+            pending_jump: None,
+            stale: HashSet::new(),
+            stale_checked: None,
             last_diff_ms: None,
             _watcher: None,
         };
@@ -376,18 +443,26 @@ impl Workspace {
                 // Coalesce event bursts (temp write + rename fire separately)
                 // into one reload.
                 while watch_rx.try_recv().is_ok() {}
-                // The normalized location (set by the load task).
-                let Ok(location) = this.update(cx, |this, _| this.location.clone()) else {
+                // The normalized location (set by the load task), plus
+                // the review currently shown so it isn't dropped when a
+                // submit leaves no draft behind.
+                let Ok((location, current_id)) = this.update(cx, |this, _| {
+                    (
+                        this.location.clone(),
+                        this.review.as_ref().map(|r| r.id.clone()),
+                    )
+                }) else {
                     break;
                 };
                 let review = cx
                     .background_executor()
                     .spawn(async move {
-                        dv_core::ReviewStore::open(location)
-                            .list()
-                            .unwrap_or_default()
-                            .into_iter()
-                            .find(|r| matches!(r.state, dv_core::ReviewState::Draft))
+                        pick_review(
+                            dv_core::ReviewStore::open(location)
+                                .list()
+                                .unwrap_or_default(),
+                            current_id.as_deref(),
+                        )
                     })
                     .await;
                 let alive = this.update(cx, |this, cx| {
@@ -426,11 +501,12 @@ impl Workspace {
                     let store_location = repo.location().clone();
                     // The latest draft review is the one comments accumulate
                     // into (matching the CLI's default targeting).
-                    let review = dv_core::ReviewStore::open(store_location.clone())
-                        .list()
-                        .unwrap_or_default()
-                        .into_iter()
-                        .find(|r| matches!(r.state, dv_core::ReviewState::Draft));
+                    let review = pick_review(
+                        dv_core::ReviewStore::open(store_location.clone())
+                            .list()
+                            .unwrap_or_default(),
+                        None,
+                    );
                     anyhow::Ok((Arc::new(repo), head, files, source, review, store_location))
                 })
                 .await;
@@ -618,6 +694,7 @@ impl Workspace {
                 })
             }),
             "editor_open": self.editor.is_some(),
+            "summary_open": self.summary_open,
             "review": self.review.as_ref().map(|r| json!({
                 "id": r.id,
                 "comments": r.comments.len(),
@@ -625,6 +702,11 @@ impl Workspace {
                     .filter(|c| c.status == dv_core::CommentStatus::Open)
                     .count(),
                 "replies": r.comments.iter().map(|c| c.replies.len()).sum::<usize>(),
+                "stale": self.stale.len(),
+                "state": match &r.state {
+                    dv_core::ReviewState::Draft => "draft".to_string(),
+                    dv_core::ReviewState::Submitted { verdict, .. } => format!("submitted:{verdict:?}"),
+                },
             })),
             "display_rows": self.display.len(),
             "palette": self.palette.as_ref().map(|p| json!({
@@ -754,7 +836,7 @@ impl Workspace {
     /// Anything that changes rows, comments, selection, or the editor calls
     /// this. Threads whose anchor line isn't visible (outside hunks, stale)
     /// append at the end so they're never silently hidden.
-    fn reset_diff_list(&mut self, _cx: &mut Context<Self>) {
+    fn reset_diff_list(&mut self, cx: &mut Context<Self>) {
         let row_count = self.diff_row_count();
         let file_path = self.selected.map(|i| self.files[i].path.clone());
 
@@ -810,6 +892,95 @@ impl Workspace {
         let top = self.diff_list.logical_scroll_top();
         self.diff_list.reset(self.display.len());
         self.diff_list.scroll_to(top);
+
+        cx.emit(ReviewChanged);
+
+        // A summary-panel jump lands once its thread row exists.
+        if let Some(id) = self.pending_jump.clone()
+            && let Some(review) = &self.review
+            && let Some(ci) = review.comments.iter().position(|c| c.id == id)
+            && let Some(ix) = self
+                .display
+                .iter()
+                .position(|r| *r == DisplayRow::Thread(ci))
+        {
+            self.pending_jump = None;
+            self.diff_list.scroll_to(ListOffset {
+                item_ix: ix.saturating_sub(2), // a little context above
+                offset_in_item: px(0.),
+            });
+        }
+
+        self.refresh_stale(cx);
+    }
+
+    /// Re-check which of the selected file's comments have drifted anchors
+    /// (their stored blob sha no longer matches the diff's blob). Runs git
+    /// off-thread; keyed on (file, review.updated_ms) so display rebuilds
+    /// don't re-run it needlessly.
+    fn refresh_stale(&mut self, cx: &mut Context<Self>) {
+        let (Some(file), Some(review), Some(repo)) =
+            (self.selected, self.review.as_ref(), self.repo.clone())
+        else {
+            return;
+        };
+        let key = (file, review.updated_ms);
+        if self.stale_checked == Some(key) {
+            return;
+        }
+        self.stale_checked = Some(key);
+
+        let path = self.files[file].path.clone();
+        let source = review.source.clone();
+        let anchored: Vec<(String, dv_core::Side, Option<String>)> = review
+            .comments
+            .iter()
+            .filter(|c| c.path == path)
+            .map(|c| (c.id.clone(), c.side, c.blob_sha.clone()))
+            .collect();
+        if anchored.is_empty() {
+            return;
+        }
+
+        cx.spawn(async move |this, cx| {
+            let (checked, stale_ids) = cx
+                .background_executor()
+                .spawn(async move {
+                    // One git call per side present, not per comment.
+                    let mut current: HashMap<bool, Option<String>> = HashMap::new();
+                    let mut checked = Vec::new();
+                    let mut stale = Vec::new();
+                    for (id, side, sha) in anchored {
+                        let Some(sha) = sha else { continue }; // unverifiable
+                        let is_new = matches!(side, dv_core::Side::New);
+                        let entry = current.entry(is_new).or_insert_with(|| {
+                            repo.blob_sha(&anchor_spec(&source, side, &path))
+                                .ok()
+                                .flatten()
+                        });
+                        if entry.as_deref() != Some(sha.as_str()) {
+                            stale.push(id.clone());
+                        }
+                        checked.push(id);
+                    }
+                    (checked, stale)
+                })
+                .await;
+
+            this.update(cx, |this, cx| {
+                // Fresh verdicts for everything checked this round; other
+                // files' verdicts are left as last computed.
+                for id in &checked {
+                    this.stale.remove(id);
+                }
+                for id in stale_ids {
+                    this.stale.insert(id);
+                }
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
     }
 
     fn scroll_to_current_hunk(&mut self) {
@@ -961,7 +1132,73 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.close_editor(window, cx);
+        if self.thread_input.is_some() {
+            self.close_thread_input(window, cx);
+        } else {
+            self.close_editor(window, cx);
+        }
+    }
+
+    fn on_toggle_summary(&mut self, _: &ToggleSummary, _: &mut Window, cx: &mut Context<Self>) {
+        self.summary_open = !self.summary_open;
+        cx.notify();
+    }
+
+    /// Finish the draft review with a verdict (recorded locally; Phase 3
+    /// maps this onto GitHub submission). Fresh-loads before mutating like
+    /// every other store write.
+    fn submit_review(&mut self, verdict: dv_core::Verdict, cx: &mut Context<Self>) {
+        let Some(review) = self.review.clone() else {
+            return;
+        };
+        let location = self.location.clone();
+        cx.spawn(async move |this, cx| {
+            let result = cx
+                .background_executor()
+                .spawn(async move {
+                    let store = dv_core::ReviewStore::open(location);
+                    let mut review = store.load(&review.id).ok().flatten().unwrap_or(review);
+                    review.set_state(dv_core::ReviewState::Submitted {
+                        verdict,
+                        at_ms: dv_core::review::now_ms(),
+                    });
+                    store.save(&review)?;
+                    anyhow::Ok(review)
+                })
+                .await;
+            this.update(cx, |this, cx| {
+                match result {
+                    // Keep showing the just-submitted review; the next
+                    // comment auto-creates a fresh draft.
+                    Ok(review) => this.review = Some(review),
+                    Err(err) => eprintln!("finish review failed: {err:#}"),
+                }
+                this.reset_diff_list(cx);
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// Summary-panel click: show the comment's file and scroll its thread
+    /// into view (deferred until the file's rows exist).
+    fn jump_to_comment(&mut self, comment_id: String, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(path) = self
+            .review
+            .as_ref()
+            .and_then(|r| r.comments.iter().find(|c| c.id == comment_id))
+            .map(|c| c.path.clone())
+        else {
+            return;
+        };
+        let Some(file) = self.files.iter().position(|f| f.path == path) else {
+            return; // comment on a file outside this diff (see backlog)
+        };
+        self.pending_jump = Some(comment_id);
+        self.select_file(file, window, cx);
+        // If the diff was already cached, the jump consumed inside
+        // select_file's reset; otherwise it fires when the compute lands.
     }
 
     /// Persist the comment under composition: ensure a draft review exists,
@@ -1130,6 +1367,137 @@ impl Workspace {
                 match result {
                     Ok(review) => this.review = Some(review),
                     Err(err) => eprintln!("comment delete failed: {err:#}"),
+                }
+                this.reset_diff_list(cx);
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// Open a reply (or body-edit) input inside a thread card. Only one is
+    /// open at a time.
+    fn open_thread_input(
+        &mut self,
+        comment_id: String,
+        mode: ThreadInputMode,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        use gpui_component::input::{InputEvent, InputState};
+        let prefill = match mode {
+            ThreadInputMode::Reply => String::new(),
+            ThreadInputMode::EditBody => self
+                .review
+                .as_ref()
+                .and_then(|r| r.comments.iter().find(|c| c.id == comment_id))
+                .map(|c| c.body.clone())
+                .unwrap_or_default(),
+        };
+        let input = cx.new(|cx| {
+            let mut state = InputState::new(window, cx).multi_line(true).auto_grow(2, 8);
+            state = match mode {
+                ThreadInputMode::Reply => {
+                    state.placeholder("Reply… (ctrl-enter to send, esc to cancel)")
+                }
+                ThreadInputMode::EditBody => state,
+            };
+            state
+        });
+        if !prefill.is_empty() {
+            input.update(cx, |input, cx| input.set_value(prefill, window, cx));
+        }
+        let subscription =
+            cx.subscribe_in(&input, window, |this, _, event: &InputEvent, window, cx| {
+                if let InputEvent::PressEnter {
+                    secondary: true, ..
+                } = event
+                {
+                    this.submit_thread_input(window, cx);
+                }
+            });
+        input.update(cx, |input, cx| input.focus(window, cx));
+        self.thread_input = Some(ThreadInput {
+            comment_id,
+            mode,
+            input,
+            saving: false,
+            _subscription: subscription,
+        });
+        cx.notify();
+    }
+
+    fn close_thread_input(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.thread_input.take().is_some() {
+            window.focus(&self.focus_handle, cx);
+            cx.notify();
+        }
+    }
+
+    /// Persist the open reply/edit, fresh-loading the review first (see
+    /// submit_comment for why the UI clone can't be trusted).
+    fn submit_thread_input(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(ti) = &mut self.thread_input else {
+            return;
+        };
+        if ti.saving {
+            return;
+        }
+        let Some(review) = self.review.clone() else {
+            return;
+        };
+        let body = ti.input.read(cx).value().to_string();
+        if body.trim().is_empty() {
+            self.close_thread_input(window, cx);
+            return;
+        }
+        ti.saving = true;
+        cx.notify();
+
+        let comment_id = ti.comment_id.clone();
+        let mode = ti.mode;
+        let location = self.location.clone();
+        cx.spawn_in(window, async move |this, cx| {
+            let result = cx
+                .background_executor()
+                .spawn(async move {
+                    let store = dv_core::ReviewStore::open(location);
+                    let mut review = store.load(&review.id).ok().flatten().unwrap_or(review);
+                    match mode {
+                        ThreadInputMode::Reply => {
+                            review.reply(&comment_id, body, "human")?;
+                        }
+                        ThreadInputMode::EditBody => {
+                            let comment = review
+                                .comments
+                                .iter_mut()
+                                .find(|c| c.id == comment_id)
+                                .ok_or_else(|| {
+                                anyhow::anyhow!("comment {comment_id} is gone")
+                            })?;
+                            comment.body = body;
+                            comment.updated_ms = dv_core::review::now_ms();
+                            review.updated_ms = comment.updated_ms;
+                        }
+                    }
+                    store.save(&review)?;
+                    anyhow::Ok(review)
+                })
+                .await;
+
+            this.update_in(cx, |this, window, cx| {
+                match result {
+                    Ok(review) => {
+                        this.review = Some(review);
+                        this.close_thread_input(window, cx);
+                    }
+                    Err(err) => {
+                        eprintln!("thread input save failed: {err:#}");
+                        if let Some(ti) = &mut this.thread_input {
+                            ti.saving = false;
+                        }
+                    }
                 }
                 this.reset_diff_list(cx);
                 cx.notify();
@@ -1400,6 +1768,222 @@ impl Workspace {
         }
     }
 
+    /// The review summary panel: every thread across files, filterable,
+    /// click to jump, with the finish-review verdict at the bottom.
+    fn render_summary(&self, cx: &mut Context<Self>) -> Option<Div> {
+        use gpui_component::Selectable as _;
+        use gpui_component::button::{Button, ButtonVariants as _};
+        if !self.summary_open {
+            return None;
+        }
+        // Owned copies: holding &Theme across the &mut cx listener setups
+        // below would be a borrow conflict (same pattern as render_split_row).
+        let border = cx.theme().border;
+        let sidebar_bg = cx.theme().sidebar;
+        let muted = cx.theme().muted_foreground;
+        let success = cx.theme().success;
+        let primary = cx.theme().primary;
+        let warning = cx.theme().warning;
+        let accent = cx.theme().accent;
+        let review = self.review.as_ref();
+        let comments: Vec<(usize, &dv_core::Comment)> = review
+            .map(|r| {
+                r.comments
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, c)| match self.summary_filter {
+                        SummaryFilter::All => true,
+                        SummaryFilter::Open => c.status == dv_core::CommentStatus::Open,
+                        SummaryFilter::Resolved => c.status == dv_core::CommentStatus::Resolved,
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        let open_count = review
+            .map(|r| {
+                r.comments
+                    .iter()
+                    .filter(|c| c.status == dv_core::CommentStatus::Open)
+                    .count()
+            })
+            .unwrap_or(0);
+        let total = review.map(|r| r.comments.len()).unwrap_or(0);
+        let submitted = review.and_then(|r| match &r.state {
+            dv_core::ReviewState::Draft => None,
+            dv_core::ReviewState::Submitted { verdict, .. } => Some(*verdict),
+        });
+
+        let filter_button = |label: &'static str,
+                             value: SummaryFilter,
+                             current: SummaryFilter,
+                             cx: &mut Context<Self>| {
+            Button::new(("summary-filter", value as usize))
+                .ghost()
+                .selected(value == current)
+                .label(label)
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    this.summary_filter = value;
+                    cx.notify();
+                }))
+        };
+
+        let stale = &self.stale;
+        let rows: Vec<Stateful<Div>> = comments
+            .iter()
+            .map(|(_, comment)| {
+                let id = comment.id.clone();
+                let resolved = comment.status == dv_core::CommentStatus::Resolved;
+                let first_line = comment.body.lines().next().unwrap_or("").to_string();
+                div()
+                    .id(SharedString::from(format!("summary-{}", comment.id)))
+                    .w_full()
+                    .px_2()
+                    .py_1()
+                    .rounded_md()
+                    .cursor_pointer()
+                    .hover(|el| el.bg(accent.opacity(0.5)))
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |this, _, window, cx| {
+                            this.jump_to_comment(id.clone(), window, cx);
+                        }),
+                    )
+                    .child(
+                        h_flex()
+                            .gap_1()
+                            .text_xs()
+                            .text_color(muted)
+                            .child(
+                                div()
+                                    .text_color(if resolved { success } else { primary })
+                                    .child(if resolved { "\u{25cf}" } else { "\u{25cb}" }),
+                            )
+                            .child(
+                                div()
+                                    .truncate()
+                                    .child(format!("{}:{}", comment.path, comment.start_line)),
+                            )
+                            .when(stale.contains(&comment.id), |el| {
+                                el.child(div().text_color(warning).child("\u{26a0}"))
+                            }),
+                    )
+                    .child(div().text_sm().truncate().child(first_line))
+            })
+            .collect();
+
+        Some(
+            v_flex()
+                .h_full()
+                .w(px(320.))
+                .flex_none()
+                .border_l_1()
+                .border_color(border)
+                .bg(sidebar_bg)
+                .child(
+                    h_flex()
+                        .px_3()
+                        .py_2()
+                        .gap_2()
+                        .child(div().font_semibold().child("Review"))
+                        .child(div().text_color(muted).text_sm().child(format!(
+                            "{open_count} open \u{b7} {} resolved",
+                            total - open_count
+                        ))),
+                )
+                .child(
+                    h_flex()
+                        .px_2()
+                        .gap_1()
+                        .child(filter_button(
+                            "All",
+                            SummaryFilter::All,
+                            self.summary_filter,
+                            cx,
+                        ))
+                        .child(filter_button(
+                            "Open",
+                            SummaryFilter::Open,
+                            self.summary_filter,
+                            cx,
+                        ))
+                        .child(filter_button(
+                            "Resolved",
+                            SummaryFilter::Resolved,
+                            self.summary_filter,
+                            cx,
+                        )),
+                )
+                .child(
+                    v_flex()
+                        .flex_1()
+                        .min_h(px(0.))
+                        .overflow_hidden()
+                        .p_1()
+                        .gap_1()
+                        .children(rows)
+                        .when(comments.is_empty(), |el| {
+                            el.child(
+                                div().p_3().text_sm().text_color(muted).child(
+                                    "No comments yet \u{2014} click a line number to start.",
+                                ),
+                            )
+                        }),
+                )
+                .child(match submitted {
+                    Some(verdict) => h_flex()
+                        .p_3()
+                        .border_t_1()
+                        .border_color(border)
+                        .gap_2()
+                        .text_sm()
+                        .child(div().text_color(success).child(format!(
+                            "Submitted \u{b7} {}",
+                            match verdict {
+                                dv_core::Verdict::Comment => "comment",
+                                dv_core::Verdict::Approve => "approve",
+                                dv_core::Verdict::RequestChanges => "request changes",
+                            }
+                        )))
+                        .into_any_element(),
+                    None => v_flex()
+                        .p_3()
+                        .gap_2()
+                        .border_t_1()
+                        .border_color(border)
+                        .child(div().text_sm().child("Finish review"))
+                        .child(
+                            h_flex()
+                                .gap_2()
+                                .child(
+                                    Button::new("verdict-comment")
+                                        .ghost()
+                                        .label("Comment")
+                                        .on_click(cx.listener(|this, _, _, cx| {
+                                            this.submit_review(dv_core::Verdict::Comment, cx)
+                                        })),
+                                )
+                                .child(
+                                    Button::new("verdict-approve")
+                                        .primary()
+                                        .label("Approve")
+                                        .on_click(cx.listener(|this, _, _, cx| {
+                                            this.submit_review(dv_core::Verdict::Approve, cx)
+                                        })),
+                                )
+                                .child(
+                                    Button::new("verdict-request")
+                                        .danger()
+                                        .label("Request changes")
+                                        .on_click(cx.listener(|this, _, _, cx| {
+                                            this.submit_review(dv_core::Verdict::RequestChanges, cx)
+                                        })),
+                                ),
+                        )
+                        .into_any_element(),
+                }),
+        )
+    }
+
     /// One display row: a diff row (per view mode), an inline comment
     /// thread, or the comment editor.
     fn render_display_row(&self, display_ix: usize, cx: &mut Context<Self>) -> AnyElement {
@@ -1430,6 +2014,14 @@ impl Workspace {
         let resolved = comment.status == dv_core::CommentStatus::Resolved;
         let id = comment.id.clone();
         let id_for_delete = comment.id.clone();
+        let id_for_reply = comment.id.clone();
+        let id_for_edit = comment.id.clone();
+        // Body is editable in place; showing the input replaces the body.
+        let editing = self
+            .thread_input
+            .as_ref()
+            .filter(|ti| ti.comment_id == comment.id)
+            .map(|ti| (ti.mode, ti.saving));
         let lines = if comment.start_line == comment.end_line {
             format!("line {}", comment.start_line)
         } else {
@@ -1467,6 +2059,13 @@ impl Workspace {
                         .when(resolved, |el| {
                             el.child(div().text_color(theme.success).child("✓ resolved"))
                         })
+                        .when(self.stale.contains(&comment.id), |el| {
+                            el.child(
+                                div()
+                                    .text_color(theme.warning)
+                                    .child("⚠ stale — the anchored content changed"),
+                            )
+                        })
                         .child(div().flex_1())
                         .child(
                             Button::new(("resolve", comment_ix))
@@ -1482,6 +2081,32 @@ impl Workspace {
                                 })),
                         )
                         .child(
+                            Button::new(("reply", comment_ix))
+                                .ghost()
+                                .label("Reply")
+                                .on_click(cx.listener(move |this, _, window, cx| {
+                                    this.open_thread_input(
+                                        id_for_reply.clone(),
+                                        ThreadInputMode::Reply,
+                                        window,
+                                        cx,
+                                    );
+                                })),
+                        )
+                        .child(
+                            Button::new(("edit", comment_ix))
+                                .ghost()
+                                .label("Edit")
+                                .on_click(cx.listener(move |this, _, window, cx| {
+                                    this.open_thread_input(
+                                        id_for_edit.clone(),
+                                        ThreadInputMode::EditBody,
+                                        window,
+                                        cx,
+                                    );
+                                })),
+                        )
+                        .child(
                             Button::new(("delete", comment_ix))
                                 .ghost()
                                 .label("Delete")
@@ -1490,7 +2115,15 @@ impl Workspace {
                                 })),
                         ),
                 )
-                .child(div().text_sm().child(comment.body.clone()))
+                .map(|el| {
+                    // Editing swaps the body text for the input; otherwise
+                    // the body renders normally.
+                    if editing.is_some_and(|(mode, _)| mode == ThreadInputMode::EditBody) {
+                        el
+                    } else {
+                        el.child(div().text_sm().child(comment.body.clone()))
+                    }
+                })
                 .children(comment.replies.iter().map(|reply| {
                     h_flex()
                         .gap_2()
@@ -1500,7 +2133,35 @@ impl Workspace {
                         .text_sm()
                         .child(div().font_semibold().child(reply.author.clone()))
                         .child(div().child(reply.body.clone()))
-                })),
+                }))
+                .when_some(editing, |el, (_, saving)| {
+                    let input = self
+                        .thread_input
+                        .as_ref()
+                        .map(|ti| gpui_component::input::Input::new(&ti.input));
+                    el.children(input).child(
+                        h_flex()
+                            .gap_2()
+                            .justify_end()
+                            .child(
+                                Button::new(("ti-cancel", comment_ix))
+                                    .ghost()
+                                    .label("Cancel")
+                                    .on_click(cx.listener(|this, _, window, cx| {
+                                        this.close_thread_input(window, cx)
+                                    })),
+                            )
+                            .child(
+                                Button::new(("ti-submit", comment_ix))
+                                    .primary()
+                                    .label(if saving { "Saving…" } else { "Save" })
+                                    .disabled(saving)
+                                    .on_click(cx.listener(|this, _, window, cx| {
+                                        this.submit_thread_input(window, cx)
+                                    })),
+                            ),
+                    )
+                }),
         )
     }
 
@@ -2174,6 +2835,12 @@ fn build_split_rows(prepared: Vec<PreparedLine>, out: &mut Vec<SplitRow>) {
     flush(&mut removed, &mut added, out);
 }
 
+/// Emitted whenever the workspace's review state changes (loads, saves,
+/// watcher reloads) — the shell listens to keep sidebar badges live.
+pub struct ReviewChanged;
+
+impl EventEmitter<ReviewChanged> for Workspace {}
+
 impl Focusable for Workspace {
     fn focus_handle(&self, _cx: &App) -> FocusHandle {
         self.focus_handle.clone()
@@ -2182,6 +2849,7 @@ impl Focusable for Workspace {
 
 impl Render for Workspace {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let summary = self.render_summary(cx);
         let theme = cx.theme();
         let mode = self.view_mode;
 
@@ -2247,7 +2915,8 @@ impl Render for Workspace {
                                 .unwrap_or_else(|_| div().into_any_element())
                         })
                         .size_full()
-                    })),
+                    }))
+                    .children(summary),
             ),
         };
 
@@ -2259,7 +2928,7 @@ impl Render for Workspace {
             key_context.push(' ');
             key_context.push_str(PALETTE_CONTEXT);
         }
-        if self.editor.is_some() {
+        if self.editor.is_some() || self.thread_input.is_some() {
             key_context.push(' ');
             key_context.push_str(EDITOR_CONTEXT);
         }
@@ -2274,6 +2943,7 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::on_next_hunk))
             .on_action(cx.listener(Self::on_prev_hunk))
             .on_action(cx.listener(Self::on_toggle_split))
+            .on_action(cx.listener(Self::on_toggle_summary))
             .on_action(cx.listener(Self::on_jump_to_file))
             .on_action(cx.listener(Self::on_clear_selection))
             .on_action(cx.listener(Self::on_cancel_comment))
@@ -2322,6 +2992,26 @@ impl Render for Workspace {
                                 ViewMode::Unified => "unified · s",
                                 ViewMode::Split => "split · s",
                             }),
+                    )
+                    .child(
+                        h_flex()
+                            .id("summary-toggle")
+                            .px_2()
+                            .rounded_md()
+                            .cursor_pointer()
+                            .text_color(if self.summary_open {
+                                theme.primary
+                            } else {
+                                theme.muted_foreground
+                            })
+                            .hover(|el| el.bg(theme.accent.opacity(0.4)))
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(|this, _, window, cx| {
+                                    this.on_toggle_summary(&ToggleSummary, window, cx)
+                                }),
+                            )
+                            .child("review · r"),
                     ),
             )
             .child(body)

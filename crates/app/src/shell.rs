@@ -10,8 +10,10 @@ use gpui::*;
 use gpui_component::button::{Button, ButtonVariants};
 use gpui_component::{ActiveTheme, StyledExt, TitleBar, h_flex, v_flex};
 
+use std::collections::HashMap;
+
 use crate::recent::{RecentEntry, RecentStore, title_for};
-use crate::workspace::Workspace;
+use crate::workspace::{ReviewChanged, Workspace};
 
 actions!(shell, [NewReview]);
 
@@ -27,6 +29,23 @@ fn absolutize(location: RepoLocation) -> RepoLocation {
         }
         other => other,
     }
+}
+
+/// The latest review's badge for a repo, or None when it has no reviews
+/// (or the store is unreadable — the sidebar just shows nothing).
+fn compute_badge(location: RepoLocation) -> Option<ReviewBadge> {
+    let latest = dv_core::ReviewStore::open(location)
+        .list()
+        .ok()?
+        .into_iter()
+        .next()?;
+    let open = latest
+        .comments
+        .iter()
+        .filter(|c| c.status == dv_core::CommentStatus::Open)
+        .count();
+    let submitted = matches!(latest.state, dv_core::ReviewState::Submitted { .. });
+    Some(ReviewBadge { open, submitted })
 }
 
 pub fn init(cx: &mut App) {
@@ -46,6 +65,18 @@ pub struct AppShell {
     /// would wedge the foreground executor (and thus the whole automation
     /// channel) until a human dismissed it.
     automation: bool,
+    /// Per-recent-entry review badge (latest review's open-comment count /
+    /// submitted flag), refreshed off-thread.
+    badges: HashMap<usize, ReviewBadge>,
+    /// Keeps the active workspace's ReviewChanged subscription alive.
+    _ws_subscription: Option<Subscription>,
+}
+
+/// Sidebar badge for one repo's latest review.
+#[derive(Debug, Clone, Copy)]
+struct ReviewBadge {
+    open: usize,
+    submitted: bool,
 }
 
 impl AppShell {
@@ -61,7 +92,10 @@ impl AppShell {
             active: None,
             selected: None,
             automation,
+            badges: HashMap::new(),
+            _ws_subscription: None,
         };
+        this.refresh_all_badges(cx);
         match seed {
             Some((location, source)) => this.open_review(location, source, window, cx),
             // Nothing to focus into, so hold focus on the shell — otherwise
@@ -96,8 +130,69 @@ impl AppShell {
         let workspace = cx.new(|cx| Workspace::new(location, source, window, cx));
         let handle = workspace.focus_handle(cx);
         window.focus(&handle, cx);
+        // Keep this entry's badge live while the review is being worked on.
+        self._ws_subscription = Some(cx.subscribe(
+            &workspace,
+            move |this: &mut Self, _, _: &ReviewChanged, cx| {
+                if let Some(selected) = this.selected {
+                    this.refresh_badge(selected, cx);
+                }
+            },
+        ));
         self.active = Some(workspace);
         cx.notify();
+    }
+
+    /// Recompute one entry's badge off-thread (store I/O may hit WSL).
+    fn refresh_badge(&mut self, index: usize, cx: &mut Context<Self>) {
+        let Some(entry) = self.recent.entries().get(index) else {
+            return;
+        };
+        let location = entry.location.clone();
+        cx.spawn(async move |this, cx| {
+            let badge = cx
+                .background_executor()
+                .spawn(async move { compute_badge(location) })
+                .await;
+            this.update(cx, |this, cx| {
+                match badge {
+                    Some(badge) => this.badges.insert(index, badge),
+                    None => this.badges.remove(&index),
+                };
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// Recompute every entry's badge (startup). One background task walks
+    /// the list sequentially — WSL entries cost a subprocess each.
+    fn refresh_all_badges(&mut self, cx: &mut Context<Self>) {
+        let locations: Vec<_> = self
+            .recent
+            .entries()
+            .iter()
+            .map(|e| e.location.clone())
+            .collect();
+        cx.spawn(async move |this, cx| {
+            let badges = cx
+                .background_executor()
+                .spawn(async move {
+                    locations
+                        .into_iter()
+                        .enumerate()
+                        .filter_map(|(i, loc)| compute_badge(loc).map(|b| (i, b)))
+                        .collect::<Vec<_>>()
+                })
+                .await;
+            this.update(cx, |this, cx| {
+                this.badges = badges.into_iter().collect();
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
     }
 
     fn open_recent(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
@@ -212,7 +307,36 @@ impl AppShell {
                 MouseButton::Left,
                 cx.listener(move |this, _, window, cx| this.open_recent(index, window, cx)),
             )
-            .child(div().text_sm().truncate().child(entry.title.clone()))
+            .child(
+                div()
+                    .flex_1()
+                    .min_w(px(0.))
+                    .text_sm()
+                    .truncate()
+                    .child(entry.title.clone()),
+            )
+            .children(self.badges.get(&index).map(|badge| {
+                if badge.open > 0 {
+                    div()
+                        .flex_none()
+                        .px_1p5()
+                        .rounded_full()
+                        .bg(theme.primary.opacity(0.25))
+                        .text_xs()
+                        .text_color(theme.primary)
+                        .child(format!("{}", badge.open))
+                        .into_any_element()
+                } else if badge.submitted {
+                    div()
+                        .flex_none()
+                        .text_xs()
+                        .text_color(theme.success)
+                        .child("\u{2713}")
+                        .into_any_element()
+                } else {
+                    div().into_any_element()
+                }
+            }))
     }
 }
 

@@ -125,8 +125,9 @@ failure), `2` usage error (bad flags).
 Phases 0–1 complete: read-only diff viewer (unified + split), WSL routing,
 review-navigator shell, keyboard nav, `--automation`, acceptance validated
 on a zed-sized diff (see docs/phase-1-diff-viewer.md § Acceptance results).
-Phase 2 in progress: dv-core `ReviewStore` (reviews/comments/anchors), the
-agent CLI above, GUI inline commenting (gutter selection → editor →
-thread cards), and live store watching are done; remaining: reply
-composer in GUI, summary panel, draft verdict, sidebar badges, stale
-anchors (docs/phase-2-review-layer.md).
+Phase 2 complete: ReviewStore + agent CLI + GUI commenting (selection,
+editor, threads with reply/edit/resolve/delete), live store watching,
+summary panel with finish-review verdicts, sidebar badges, stale-anchor
+flagging — acceptance loop verified end to end (docs/phase-2-review-layer.md
+§ Acceptance results). Next: Phase 3 — GitHub via gh
+(docs/phase-3-github.md).

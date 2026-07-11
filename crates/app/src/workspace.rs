@@ -178,7 +178,10 @@ pub struct Workspace {
     /// (click on the hunk header). Feeds row rebuilding.
     expanded: HashMap<usize, HashSet<usize>>,
     file_scroll: UniformListScrollHandle,
-    diff_scroll: UniformListScrollHandle,
+    /// The diff pane is a gpui `list` (not uniform_list): comment threads
+    /// render inline under their anchor rows at whatever height their
+    /// markdown needs, so row heights must be measured, not assumed.
+    diff_list: ListState,
     palette: Option<Palette>,
     /// Wall-clock of the most recent per-file diff computation (blob fetch
     /// + diff + highlight), for `--automation` perf validation.
@@ -241,7 +244,7 @@ impl Workspace {
             current_hunk: 0,
             expanded: HashMap::new(),
             file_scroll: UniformListScrollHandle::new(),
-            diff_scroll: UniformListScrollHandle::new(),
+            diff_list: ListState::new(0, ListAlignment::Top, px(600.)),
             palette: None,
             last_diff_ms: None,
         };
@@ -294,7 +297,7 @@ impl Workspace {
         self.current_hunk = 0;
         self.file_scroll
             .scroll_to_item(index, ScrollStrategy::Nearest);
-        self.diff_scroll.scroll_to_item(0, ScrollStrategy::Top);
+        self.reset_diff_list(cx);
         cx.notify();
 
         // A cached failure retries on reselect; a good diff is final.
@@ -343,9 +346,10 @@ impl Workspace {
                     }
                 }
                 // Row indices may have shifted (gap expansion inserts rows
-                // above); re-anchor the viewport on the current hunk so the
-                // content doesn't visually jump.
+                // above); re-sync the list and re-anchor the viewport on
+                // the current hunk so the content doesn't visually jump.
                 if this.selected == Some(index) {
+                    this.reset_diff_list(cx);
                     this.scroll_to_current_hunk();
                 }
                 cx.notify();
@@ -461,8 +465,9 @@ impl Workspace {
             ViewMode::Unified => ViewMode::Split,
             ViewMode::Split => ViewMode::Unified,
         };
-        // Row indices differ between the views; keep the eye on the same
-        // hunk across the toggle.
+        // Row count and indices differ between the views; re-sync the list
+        // and keep the eye on the same hunk across the toggle.
+        self.reset_diff_list(cx);
         self.scroll_to_current_hunk();
         cx.notify();
     }
@@ -477,10 +482,29 @@ impl Workspace {
         })
     }
 
+    /// The diff pane's row count for the selected file in the active mode.
+    fn diff_row_count(&self) -> usize {
+        self.selected
+            .and_then(|i| self.diffs.get(&i))
+            .map_or(0, |d| match self.view_mode {
+                ViewMode::Unified => d.unified.len(),
+                ViewMode::Split => d.split.len(),
+            })
+    }
+
+    /// Re-sync the list's item count after anything that changes the row
+    /// set (file switch, mode toggle, recompute) and park it at the top.
+    fn reset_diff_list(&mut self, _cx: &mut Context<Self>) {
+        self.diff_list.reset(self.diff_row_count());
+    }
+
     fn scroll_to_current_hunk(&mut self) {
         let current = self.current_hunk;
         if let Some(&row) = self.hunk_rows().and_then(|rows| rows.get(current)) {
-            self.diff_scroll.scroll_to_item(row, ScrollStrategy::Top);
+            self.diff_list.scroll_to(ListOffset {
+                item_ix: row,
+                offset_in_item: px(0.),
+            });
         }
     }
 
@@ -1309,13 +1333,6 @@ impl Render for Workspace {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme();
         let mode = self.view_mode;
-        let row_count = self
-            .selected
-            .and_then(|i| self.diffs.get(&i))
-            .map_or(0, |d| match mode {
-                ViewMode::Unified => d.unified.len(),
-                ViewMode::Split => d.split.len(),
-            });
 
         let body: Div = match &self.status {
             Status::Loading => div()
@@ -1372,32 +1389,19 @@ impl Render for Workspace {
                                 .size_full(),
                             ),
                     )
-                    .child(
-                        div().h_full().flex_1().min_w(px(0.)).child(match mode {
-                            ViewMode::Unified => uniform_list(
-                                "diff-rows-unified",
-                                row_count,
-                                cx.processor(|this, range: std::ops::Range<usize>, _, cx| {
-                                    range
-                                        .map(|i| this.render_diff_row(i, cx))
-                                        .collect::<Vec<_>>()
-                                }),
-                            )
-                            .track_scroll(&self.diff_scroll)
-                            .size_full(),
-                            ViewMode::Split => uniform_list(
-                                "diff-rows-split",
-                                row_count,
-                                cx.processor(|this, range: std::ops::Range<usize>, _, cx| {
-                                    range
-                                        .map(|i| this.render_split_row(i, cx))
-                                        .collect::<Vec<_>>()
-                                }),
-                            )
-                            .track_scroll(&self.diff_scroll)
-                            .size_full(),
-                        }),
-                    ),
+                    .child(div().h_full().flex_1().min_w(px(0.)).child({
+                        let this = cx.weak_entity();
+                        list(self.diff_list.clone(), move |ix, _window, cx| {
+                            this.update(cx, |this, cx| match this.view_mode {
+                                ViewMode::Unified => {
+                                    this.render_diff_row(ix, cx).into_any_element()
+                                }
+                                ViewMode::Split => this.render_split_row(ix, cx).into_any_element(),
+                            })
+                            .unwrap_or_else(|_| div().into_any_element())
+                        })
+                        .size_full()
+                    })),
             ),
         };
 

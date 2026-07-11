@@ -7,14 +7,19 @@ mod fuzzy;
 mod highlight;
 mod pr;
 mod recent;
+mod settings;
 mod shell;
 mod submit;
+mod themes;
 mod workspace;
+
+use std::borrow::Cow;
 
 use dv_core::{DiffSource, GitRepo, RepoLocation, RepoSlug};
 use gpui::*;
-use gpui_component::{ActiveTheme as _, Root, TitleBar};
+use gpui_component::{Root, TitleBar};
 
+use crate::settings::Settings;
 use crate::shell::AppShell;
 
 const USAGE: &str = "\
@@ -313,13 +318,37 @@ pub(crate) fn parse_range(value: &str) -> Result<DiffSource, String> {
     })
 }
 
-fn apply_aura_theme(cx: &mut App) {
-    use gpui_component::{Theme, ThemeConfig, ThemeMode};
-
-    let config: ThemeConfig = serde_json::from_str(include_str!("../../../themes/aura-dark.json"))
-        .expect("themes/aura-dark.json must parse as a gpui-component ThemeConfig");
-    Theme::change(ThemeMode::Dark, None, cx);
-    Theme::global_mut(cx).apply_config(&std::rc::Rc::new(config));
+/// Embeds the bundled JetBrains Mono TTFs and registers them with gpui's
+/// text system so `mono_font_family: "JetBrains Mono"` (set uniformly by
+/// `themes::apply_theme`) resolves even on a machine that doesn't have the
+/// font installed system-wide. Must run before the first theme is applied —
+/// once something has rendered mono text with a *missing* font, gpui has
+/// already picked a fallback for that font id.
+///
+/// `-Regular`/`-Bold`/`-Italic`/`-BoldItalic` cover every style the app
+/// actually uses (diff/code text is never anything more exotic than bold or
+/// italic); the many other static weights JetBrains ships aren't bundled.
+fn register_fonts(cx: &mut App) {
+    let fonts: Vec<Cow<'static, [u8]>> = vec![
+        Cow::Borrowed(include_bytes!(
+            "../../../assets/fonts/jetbrains-mono/JetBrainsMono-Regular.ttf"
+        )),
+        Cow::Borrowed(include_bytes!(
+            "../../../assets/fonts/jetbrains-mono/JetBrainsMono-Bold.ttf"
+        )),
+        Cow::Borrowed(include_bytes!(
+            "../../../assets/fonts/jetbrains-mono/JetBrainsMono-Italic.ttf"
+        )),
+        Cow::Borrowed(include_bytes!(
+            "../../../assets/fonts/jetbrains-mono/JetBrainsMono-BoldItalic.ttf"
+        )),
+    ];
+    if let Err(err) = cx.text_system().add_fonts(fonts) {
+        // Not fatal: the app still runs, just falls back to whatever
+        // `mono_font_family` resolves to on this machine (or the platform
+        // default monospace font if JetBrains Mono isn't installed either).
+        eprintln!("warning: failed to register bundled JetBrains Mono fonts: {err:#}");
+    }
 }
 
 fn main() {
@@ -386,7 +415,14 @@ fn run_gui(cli: Cli) {
         gpui_component::init(cx);
         workspace::init(cx);
         shell::init(cx);
-        apply_aura_theme(cx);
+        register_fonts(cx);
+        // Persisted-or-default theme (settings.json missing/corrupt falls
+        // back to `themes::DEFAULT_THEME` silently — see `Settings::load`).
+        // Applied before the window opens so `Root`'s first render already
+        // sees the right theme (see the `Root::new` call below for why it
+        // gets no explicit `.bg()` of its own).
+        let settings = Settings::load();
+        themes::apply_theme(&settings.theme, None, cx);
 
         let Cli {
             seed,
@@ -406,10 +442,23 @@ fn run_gui(cli: Cli) {
             let mut shell_slot = None;
             let window = cx
                 .open_window(options, |window, cx| {
-                    let shell =
-                        cx.new(|cx| AppShell::new(seed, automation, pending_pr, window, cx));
+                    let shell = cx.new(|cx| {
+                        AppShell::new(seed, automation, pending_pr, settings, window, cx)
+                    });
                     shell_slot = Some(shell.clone());
-                    cx.new(|cx| Root::new(shell, window, cx).bg(cx.theme().background))
+                    // No `.bg(...)` override here: `Root::render()` already
+                    // paints `cx.theme().tokens.background` fresh every
+                    // frame, before applying `self.style` on top via
+                    // `refine_style`. An explicit `.bg()` at construction
+                    // time would set that `self.style`'s background once
+                    // and have it win on every subsequent render — freezing
+                    // the window at whichever theme was active at startup
+                    // and breaking the live theme picker (found by looking
+                    // at an actual Claude Light screenshot: the chrome had
+                    // switched but the diff pane was still compositing
+                    // Aura Dark's frozen root background under the new
+                    // theme's translucent row tints).
+                    cx.new(|cx| Root::new(shell, window, cx))
                 })
                 .expect("failed to open window");
 

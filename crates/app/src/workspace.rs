@@ -450,6 +450,16 @@ pub struct Workspace {
     selected: Option<usize>,
     diffs: HashMap<usize, Arc<RenderedDiff>>,
     diff_pending: HashSet<usize>,
+    /// Bumped by [`Self::on_theme_changed`]. `request_diff` resolves
+    /// `cx.theme().highlight_theme` once, off-thread, and bakes concrete
+    /// colors into the cached `RenderedDiff` rows for performance — so
+    /// unlike UI chrome (which reads `cx.theme()` fresh every render), a
+    /// cached diff does *not* pick up a new theme's syntax palette on its
+    /// own. Captured at spawn time alongside `source_epoch` and checked on
+    /// completion, so a diff computed against a theme that's since been
+    /// swapped again (two quick picker choices) never clobbers a newer
+    /// computation that already landed.
+    highlight_epoch: u64,
     view_mode: ViewMode,
     /// Captured from the *original* source, before `resolve_source` rewrites
     /// a merge-base range to a plain two-dot range — so the header keeps
@@ -827,6 +837,7 @@ impl Workspace {
             diff_to_display: Vec::new(),
             source: source.clone(),
             source_epoch: 0,
+            highlight_epoch: 0,
             status: Status::Loading,
             repo: None,
             head: "".into(),
@@ -1070,6 +1081,9 @@ impl Workspace {
         // this computation runs means `index` will refer to a different
         // source's file list by the time this resolves.
         let epoch = self.source_epoch;
+        // Same staleness trick, for a theme swap instead of a source swap
+        // (see `highlight_epoch`'s doc comment).
+        let highlight_epoch = self.highlight_epoch;
         let expand = self.expanded.get(&index).cloned().unwrap_or_default();
         let theme = cx.theme();
         let hl = HighlightInputs {
@@ -1086,11 +1100,13 @@ impl Workspace {
             let elapsed_ms = started.elapsed().as_millis() as u64;
 
             this.update(cx, |this, cx| {
-                if this.source_epoch != epoch {
+                if this.source_epoch != epoch || this.highlight_epoch != highlight_epoch {
                     // Stale: computed against a source that's since been
-                    // replaced. Discard outright rather than write rows
-                    // for the wrong file into the new source's cache
-                    // under a reused index (review finding P1-a).
+                    // replaced, or a theme that's since been swapped again.
+                    // Discard outright rather than write rows for the wrong
+                    // file/palette into the cache under a reused index
+                    // (review finding P1-a; same reasoning for the theme
+                    // case, see `highlight_epoch`).
                     return;
                 }
                 this.diff_pending.remove(&index);
@@ -1118,6 +1134,26 @@ impl Workspace {
             .ok();
         })
         .detach();
+    }
+
+    /// Called by the shell right after a live theme swap (`themes::apply_theme`
+    /// updates the *global* theme via `Theme::change`/`apply_config`, which
+    /// UI chrome picks up for free since it reads `cx.theme()` fresh every
+    /// render — but the diff pane's syntax-highlighted rows were baked with
+    /// the *old* theme's concrete colors at compute time, see
+    /// `highlight_epoch`'s doc comment). Dropping the whole cache and
+    /// recomputing only the currently selected file is what makes the swap
+    /// visually complete immediately; any other (currently unselected) file
+    /// simply recomputes lazily — under the new theme — the next time it's
+    /// picked, same as a first-ever view of it.
+    pub(crate) fn on_theme_changed(&mut self, cx: &mut Context<Self>) {
+        self.highlight_epoch += 1;
+        self.diffs.clear();
+        self.diff_pending.clear();
+        if let Some(index) = self.selected {
+            self.request_diff(index, cx);
+        }
+        cx.notify();
     }
 
     /// Reveal the hidden context above `hunk` in the selected file, then

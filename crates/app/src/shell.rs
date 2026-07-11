@@ -16,13 +16,29 @@ use gpui_component::{ActiveTheme, Sizable as _, StyledExt, TitleBar, h_flex, v_f
 use std::collections::HashMap;
 
 use crate::recent::{RecentEntry, RecentStore, title_for};
+use crate::settings::Settings;
+use crate::themes;
 use crate::workspace::{
     ReviewChanged, Workspace, checks_word, pr_state_word, review_decision_word,
 };
 
-actions!(shell, [NewReview, RefreshBadges]);
+actions!(
+    shell,
+    [
+        NewReview,
+        RefreshBadges,
+        OpenThemePicker,
+        ThemePickerNext,
+        ThemePickerPrev,
+        ThemePickerClose,
+        ThemePickerChoose
+    ]
+);
 
 const KEY_CONTEXT: &str = "AppShell";
+/// Stamped onto the shell's key context while the theme picker is open
+/// (same mechanism `workspace.rs` uses for its palette/PR-picker overlays).
+const THEME_PICKER_CONTEXT: &str = "ThemePickerOpen";
 
 /// Make a local location absolute (lexically, without touching the
 /// filesystem) so it survives being persisted and re-opened from a
@@ -118,9 +134,18 @@ fn fetch_pr_badge(remote: &RemoteRef) -> Option<PrBadge> {
 }
 
 pub fn init(cx: &mut App) {
+    let shell = Some(KEY_CONTEXT);
+    let theme_picker = Some("AppShell && ThemePickerOpen");
     cx.bind_keys([
-        KeyBinding::new("cmd-n", NewReview, Some(KEY_CONTEXT)),
-        KeyBinding::new("ctrl-n", NewReview, Some(KEY_CONTEXT)),
+        KeyBinding::new("cmd-n", NewReview, shell),
+        KeyBinding::new("ctrl-n", NewReview, shell),
+        KeyBinding::new("ctrl-shift-t", OpenThemePicker, shell),
+    ]);
+    cx.bind_keys([
+        KeyBinding::new("down", ThemePickerNext, theme_picker),
+        KeyBinding::new("up", ThemePickerPrev, theme_picker),
+        KeyBinding::new("escape", ThemePickerClose, theme_picker),
+        KeyBinding::new("enter", ThemePickerChoose, theme_picker),
     ]);
 }
 
@@ -141,6 +166,20 @@ pub struct AppShell {
     badges: HashMap<RepoLocation, ReviewBadge>,
     /// Keeps the active workspace's ReviewChanged subscription alive.
     _ws_subscription: Option<Subscription>,
+    /// Persisted app-wide settings (currently just the active theme name).
+    /// Loaded once at startup; updated and re-saved on every theme-picker
+    /// choice.
+    settings: Settings,
+    /// The theme-picker overlay (`ctrl-shift-t`), when open. Unlike the
+    /// PR picker there's nothing to load — the registry is a static list —
+    /// so this is just a cursor into `themes::names()`.
+    theme_picker: Option<ThemePicker>,
+}
+
+/// The theme picker overlay, while open.
+struct ThemePicker {
+    /// Cursor into `themes::names()`.
+    selected: usize,
 }
 
 /// Sidebar badge for one repo's latest review.
@@ -169,6 +208,7 @@ impl AppShell {
         seed: Option<(RepoLocation, DiffSource)>,
         automation: bool,
         pending_pr: Option<u64>,
+        settings: Settings,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
@@ -180,6 +220,8 @@ impl AppShell {
             automation,
             badges: HashMap::new(),
             _ws_subscription: None,
+            settings,
+            theme_picker: None,
         };
         // App-open refresh (docs/phase-3-github.md deliverable 3): skip the
         // network pr_status pass for WSL-located entries here specifically
@@ -412,6 +454,108 @@ impl AppShell {
         self.refresh_all_badges(false, cx);
     }
 
+    // ---- Theme picker ---------------------------------------------------
+
+    fn on_open_theme_picker(
+        &mut self,
+        _: &OpenThemePicker,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.theme_picker.is_some() {
+            return;
+        }
+        let selected = themes::names()
+            .position(|n| n == self.settings.theme)
+            .unwrap_or(0);
+        self.theme_picker = Some(ThemePicker { selected });
+        // Capture focus onto the shell itself while the picker is open. Its
+        // up/down/enter/escape bindings live in the shell's own key context
+        // ("AppShell && ThemePickerOpen"); if focus stayed wherever it was
+        // (typically deep inside the active workspace), that context would
+        // be a strict *ancestor* of the focused node rather than on its
+        // dispatch path — and worse, the workspace's own browse bindings
+        // for the same keys (arrows, `j`/`k`) would still be live there too.
+        // Moving focus here sidesteps the ambiguity entirely, the same way
+        // `AppShell::new`'s empty-state fallback does.
+        window.focus(&self.focus_handle, cx);
+        cx.notify();
+    }
+
+    fn close_theme_picker(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.theme_picker.take().is_some() {
+            // Restore focus to wherever it would otherwise be: the active
+            // workspace if one is open, else the shell's own handle (mirrors
+            // `AppShell::new`'s "nothing to focus into" fallback).
+            match &self.active {
+                Some(ws) => window.focus(&ws.focus_handle(cx), cx),
+                None => window.focus(&self.focus_handle, cx),
+            }
+            cx.notify();
+        }
+    }
+
+    fn on_theme_picker_close(
+        &mut self,
+        _: &ThemePickerClose,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.close_theme_picker(window, cx);
+    }
+
+    fn on_theme_picker_next(&mut self, _: &ThemePickerNext, _: &mut Window, cx: &mut Context<Self>) {
+        if let Some(picker) = &mut self.theme_picker {
+            let len = themes::names().count();
+            if len > 0 {
+                picker.selected = (picker.selected + 1).min(len - 1);
+                cx.notify();
+            }
+        }
+    }
+
+    fn on_theme_picker_prev(&mut self, _: &ThemePickerPrev, _: &mut Window, cx: &mut Context<Self>) {
+        if let Some(picker) = &mut self.theme_picker {
+            picker.selected = picker.selected.saturating_sub(1);
+            cx.notify();
+        }
+    }
+
+    fn on_theme_picker_choose(
+        &mut self,
+        _: &ThemePickerChoose,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(picker) = &self.theme_picker else {
+            return;
+        };
+        let Some(name) = themes::names().nth(picker.selected) else {
+            return;
+        };
+        self.choose_theme(name, window, cx);
+    }
+
+    /// Apply + persist `name` (a no-op re-apply when it's already the active
+    /// theme — see the doc on the picker's marker), then close the picker.
+    /// Shared by the keyboard path ([`Self::on_theme_picker_choose`]) and the
+    /// picker row's mouse click.
+    fn choose_theme(&mut self, name: &'static str, window: &mut Window, cx: &mut Context<Self>) {
+        if name != self.settings.theme {
+            themes::apply_theme(name, Some(window), cx);
+            self.settings.theme = name.to_string();
+            self.settings.save();
+            // UI chrome picks up the new theme for free (reads `cx.theme()`
+            // fresh every render), but the active workspace's diff pane
+            // cached its syntax highlighting with the *old* theme's
+            // concrete colors baked in — see `Workspace::on_theme_changed`.
+            if let Some(ws) = &self.active {
+                ws.update(cx, |ws, cx| ws.on_theme_changed(cx));
+            }
+        }
+        self.close_theme_picker(window, cx);
+    }
+
     fn open_recent(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
         let Some(entry) = self.recent.entries().get(index).cloned() else {
             return;
@@ -465,6 +609,7 @@ impl AppShell {
     /// review's own dump (see [`Workspace::automation_state`]).
     pub(crate) fn automation_state(&self, cx: &App) -> serde_json::Value {
         use serde_json::json;
+        let theme = cx.theme();
         json!({
             "recent": self.recent.entries().iter().map(|e| e.title.clone()).collect::<Vec<_>>(),
             "selected": self.selected,
@@ -485,6 +630,15 @@ impl AppShell {
                     })),
                 })
             }).collect::<Vec<_>>(),
+            // Theme deliverable: the currently-applied theme's own name
+            // (read off the live global `Theme`, not `self.settings`, so
+            // this can never lie about what's actually painted), whether
+            // the picker overlay is open, and the resolved mono font family
+            // so agents can assert JetBrains Mono is really active without
+            // eyeballing a screenshot.
+            "theme": theme.theme_name().to_string(),
+            "theme_picker_open": self.theme_picker.is_some(),
+            "mono_font": theme.mono_font_family.to_string(),
         })
     }
 
@@ -644,6 +798,90 @@ impl AppShell {
                     }))
             }))
     }
+
+    /// The theme picker overlay (`ctrl-shift-t`), when open: same
+    /// popover-over-everything chrome as `workspace.rs`'s `render_pr_picker`,
+    /// but listing the static theme registry instead — no loading/error
+    /// state, since there's no async fetch involved.
+    fn render_theme_picker(&self, cx: &mut Context<Self>) -> Option<Div> {
+        let picker = self.theme_picker.as_ref()?;
+
+        let theme = cx.theme();
+        let border = theme.border;
+        let popover = theme.popover;
+        let popover_fg = theme.popover_foreground;
+        let accent = theme.accent;
+        let muted = theme.muted_foreground;
+        let success = theme.success;
+        let active_theme = self.settings.theme.clone();
+
+        Some(
+            div()
+                .absolute()
+                .top(px(48.))
+                .left_0()
+                .right_0()
+                .flex()
+                .justify_center()
+                .child(
+                    v_flex()
+                        .w(px(360.))
+                        .max_w_full()
+                        .overflow_hidden()
+                        .p_2()
+                        .gap_2()
+                        // Same swallow-the-click-on-chrome reasoning as
+                        // `render_pr_picker`.
+                        .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                        .bg(popover)
+                        .text_color(popover_fg)
+                        .border_1()
+                        .border_color(border)
+                        .rounded_lg()
+                        .shadow_lg()
+                        .child(
+                            div()
+                                .px_2()
+                                .pt_1()
+                                .text_xs()
+                                .text_color(muted)
+                                .child("Theme \u{b7} enter to apply, esc to close"),
+                        )
+                        .child(
+                            v_flex().w_full().children(themes::names().enumerate().map(
+                                |(i, name)| {
+                                    let selected = i == picker.selected;
+                                    let is_active = name == active_theme;
+                                    h_flex()
+                                        .id(("theme-picker-row", i))
+                                        .w_full()
+                                        .gap_2()
+                                        .px_2()
+                                        .py_1()
+                                        .rounded_sm()
+                                        .cursor_pointer()
+                                        .when(selected, |el| el.bg(accent))
+                                        .hover(|el| el.bg(accent.opacity(0.5)))
+                                        .on_mouse_down(
+                                            MouseButton::Left,
+                                            cx.listener(move |this, _, window, cx| {
+                                                this.choose_theme(name, window, cx);
+                                            }),
+                                        )
+                                        .child(
+                                            div()
+                                                .flex_none()
+                                                .w(px(16.))
+                                                .text_color(success)
+                                                .child(if is_active { "\u{2713}" } else { "" }),
+                                        )
+                                        .child(div().flex_1().text_sm().child(name))
+                                },
+                            )),
+                        ),
+                ),
+        )
+    }
 }
 
 impl Render for AppShell {
@@ -671,12 +909,27 @@ impl Render for AppShell {
                 .into_any_element(),
         };
 
+        // While the theme picker is open the shell node carries an extra
+        // identifier, flipping which key bindings apply (see `init`) — same
+        // mechanism `workspace.rs` uses for its own overlays.
+        let mut key_context = KEY_CONTEXT.to_string();
+        if self.theme_picker.is_some() {
+            key_context.push(' ');
+            key_context.push_str(THEME_PICKER_CONTEXT);
+        }
+
         v_flex()
             .size_full()
+            .relative()
             .track_focus(&self.focus_handle)
-            .key_context(KEY_CONTEXT)
+            .key_context(key_context.as_str())
             .on_action(cx.listener(Self::on_new_review))
             .on_action(cx.listener(Self::on_refresh_badges))
+            .on_action(cx.listener(Self::on_open_theme_picker))
+            .on_action(cx.listener(Self::on_theme_picker_next))
+            .on_action(cx.listener(Self::on_theme_picker_prev))
+            .on_action(cx.listener(Self::on_theme_picker_close))
+            .on_action(cx.listener(Self::on_theme_picker_choose))
             .child(
                 TitleBar::new().child(
                     h_flex()
@@ -769,6 +1022,7 @@ impl Render for AppShell {
                             .child(main),
                     ),
             )
+            .children(self.render_theme_picker(cx))
     }
 }
 

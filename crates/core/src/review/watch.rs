@@ -1,7 +1,9 @@
 //! Change notification for the review store, so the GUI reflects external
 //! edits (the agent CLI, another dv window) without reload. Local repos get
-//! real file watching (`notify`); WSL repos poll a directory digest through
-//! the command layer — proper inotify arrives with the Phase-4 host process.
+//! real file watching (`notify`); a WSL repo with a live, `watch`-capable
+//! `dv-host` connection gets real inotify through it too (the `Remote`
+//! arm — plan §6); a WSL repo with no host connection falls back to
+//! polling a directory digest through the command layer.
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -12,36 +14,79 @@ use anyhow::{Context as _, Result};
 use notify::Watcher as _;
 
 use crate::location::RepoLocation;
+use crate::remote::client::HostClient;
+use crate::remote::manager;
 
 use super::io::StoreIo;
 
-/// How often the WSL fallback polls. Local watching is event-driven.
+/// How often the WSL fallback polls. Local watching (and the `Remote`
+/// host-backed arm) is event-driven.
 const POLL_INTERVAL: Duration = Duration::from_millis(1000);
 
 /// Keeps the watch alive; dropping it stops callbacks (best-effort — an
 /// in-flight callback may still complete).
-pub struct ReviewWatcher {
-    stopped: Arc<AtomicBool>,
-    /// Held for its Drop (stops the OS watcher). None in polling mode.
-    _watcher: Option<notify::RecommendedWatcher>,
+pub enum ReviewWatcher {
+    /// A local repo: a real OS file watcher (`notify`) on `.git/dv/reviews`.
+    Local {
+        stopped: Arc<AtomicBool>,
+        /// Held only for its `Drop` (stops the OS watcher).
+        _watcher: notify::RecommendedWatcher,
+    },
+    /// A WSL repo with no `watch`-capable host connection: the pre-S4
+    /// digest-poll fallback (still the only option for `DV_NO_HOST=1`, a
+    /// disabled/cooling-down/dead distro, or an older host binary).
+    Poll { stopped: Arc<AtomicBool> },
+    /// A WSL repo with a live, `watch`-capable `dv-host` connection: real
+    /// inotify via `watch/subscribe { kind: "store" }`. `Drop` unregisters
+    /// the callback and unsubscribes (best-effort).
+    ///
+    /// KNOWN S4 GAP (accepted, tracked for S5): if the host connection dies
+    /// mid-session (crash, `kill -9`, distro stopped), this variant goes
+    /// permanently silent — there's no reconnect/resubscribe-on-respawn
+    /// logic yet, unlike `CommandBuilder`'s Route, which transparently
+    /// falls back to `wsl.exe` per call. Accepted because it degrades to
+    /// "external CLI/other-window edits stop appearing live," never to
+    /// data loss or a broken GUI: every mutation this workspace makes
+    /// *itself* (the comment editor, resolve/reply, submit) applies
+    /// straight to `self.review` in the completion handler and neither
+    /// needs nor waits on this watcher at all — only cross-process
+    /// notifications are what silently stop. A future session's fresh
+    /// `HostClient` (once `manager::client_for`'s cool-down elapses) gets a
+    /// fresh working watcher again automatically; it's only the *current*
+    /// workspace instance that stays silent for the rest of its life. S5
+    /// robustness work should add resubscribe-on-respawn here.
+    Remote {
+        client: Arc<HostClient>,
+        watch_id: u64,
+    },
 }
 
 impl Drop for ReviewWatcher {
     fn drop(&mut self) {
-        self.stopped.store(true, Ordering::Relaxed);
+        match self {
+            ReviewWatcher::Local { stopped, .. } | ReviewWatcher::Poll { stopped } => {
+                stopped.store(true, Ordering::Relaxed);
+            }
+            ReviewWatcher::Remote { client, watch_id } => {
+                client.unregister_watch_callback(*watch_id);
+                let _ = client.watch_unsubscribe(*watch_id);
+            }
+        }
     }
 }
 
 /// Start watching the reviews directory for `location`, invoking
-/// `on_change` (from a background thread) whenever anything in it changes.
-/// The callback must be cheap — hand off to a channel.
+/// `on_change` (from a background thread — either `notify`'s callback
+/// thread, the poll thread, or the host client's dedicated watch-dispatch
+/// thread) whenever anything in it changes. The callback must be cheap —
+/// hand off to a channel.
 pub(super) fn watch(
     location: RepoLocation,
     on_change: Box<dyn Fn() + Send + Sync>,
 ) -> Result<ReviewWatcher> {
-    let stopped = Arc::new(AtomicBool::new(false));
     match &location {
         RepoLocation::Local(_) => {
+            let stopped = Arc::new(AtomicBool::new(false));
             let dir = local_reviews_dir(&location)?;
             // The directory must exist to be watched; creating it is what
             // the store does on first save anyway.
@@ -62,12 +107,51 @@ pub(super) fn watch(
             watcher
                 .watch(&dir, notify::RecursiveMode::NonRecursive)
                 .with_context(|| format!("watching {}", dir.display()))?;
-            Ok(ReviewWatcher {
+            Ok(ReviewWatcher::Local {
                 stopped,
-                _watcher: Some(watcher),
+                _watcher: watcher,
             })
         }
-        RepoLocation::Wsl { .. } => {
+        RepoLocation::Wsl { distro, path } => {
+            // Third arm (plan §6/§8 S4): a live host connection that
+            // advertises the `watch` cap gets real inotify instead of the
+            // 1s digest poll below. Any failure here (spawn/connect
+            // trouble, the host rejecting the subscribe, ...) falls
+            // straight through to the poll fallback rather than erroring
+            // the whole watcher — "never worse than not having a host",
+            // same posture as `CommandBuilder`'s Route selection.
+            if let Some(client) = manager::client_for(distro)
+                && client.has_cap("watch")
+            {
+                match client.watch_subscribe(path, "store") {
+                    Ok(watch_id) => {
+                        client.register_watch_callback(watch_id, move |_params| on_change());
+                        return Ok(ReviewWatcher::Remote { client, watch_id });
+                    }
+                    Err(err) => {
+                        eprintln!(
+                            "review watcher: dv-host watch/subscribe failed, falling back \
+                             to polling: {err:#}"
+                        );
+                    }
+                }
+            }
+
+            // Plan §8 S4 gate ("verify the digest-poll thread is ABSENT
+            // when the host watch is active"): this line is the runtime
+            // proof a test can grep dv's stderr for — the Remote arm above
+            // `return`s before ever reaching here, so its absence in a
+            // session's log is direct evidence the poll thread never
+            // started, not just a code-trace argument. Same
+            // `DV_HOST_DEBUG`-gated convention as
+            // `remote::manager::note_spawn_fallback`.
+            if std::env::var("DV_HOST_DEBUG").as_deref() == Ok("1") {
+                eprintln!(
+                    "[dv review watcher] starting WSL digest-poll thread for {}",
+                    location.display_name()
+                );
+            }
+            let stopped = Arc::new(AtomicBool::new(false));
             let io = StoreIo::new(location);
             let stop = stopped.clone();
             std::thread::Builder::new()
@@ -84,10 +168,7 @@ pub(super) fn watch(
                     }
                 })
                 .context("spawning review poll thread")?;
-            Ok(ReviewWatcher {
-                stopped,
-                _watcher: None,
-            })
+            Ok(ReviewWatcher::Poll { stopped })
         }
     }
 }

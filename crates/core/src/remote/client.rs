@@ -19,7 +19,8 @@ use crate::command::decode_output;
 
 use super::proto::{
     self, BlobGetParams, BlobGetResult, ExecParams, ExecResult, Hello, Notification, PROTO_VERSION,
-    Request, RpcError, RpcResult,
+    Request, RpcError, RpcResult, WatchEventParams, WatchSubscribeParams, WatchSubscribeResult,
+    WatchUnsubscribeParams,
 };
 
 /// Handshake read must complete within this long — covers a cold WSL
@@ -41,6 +42,12 @@ const SHUTDOWN_GRACE: Duration = Duration::from_millis(2000);
 
 type NotificationHandler = Arc<dyn Fn(Notification) + Send + Sync>;
 
+/// A `watch/event` callback, registered against a `watch_id` by
+/// [`HostClient::register_watch_callback`] — see that method's doc for the
+/// threading contract (never the reader thread; always the dedicated
+/// watch-dispatch thread this client owns).
+type WatchCallback = Arc<dyn Fn(WatchEventParams) + Send + Sync>;
+
 /// A live connection to a `dv-host` process. Every method takes `&self`
 /// and is safe to call concurrently from multiple threads — dv-core's
 /// callers are gpui background-executor tasks, always plural and
@@ -53,6 +60,9 @@ pub struct HostClient {
     alive: Arc<AtomicBool>,
     stderr_ring: Arc<Mutex<Vec<u8>>>,
     notification_handler: Arc<Mutex<NotificationHandler>>,
+    /// `watch_id -> callback`, consulted only by [`spawn_watch_dispatcher`]'s
+    /// dedicated thread (see [`Self::register_watch_callback`]).
+    watch_registry: Arc<Mutex<HashMap<u64, WatchCallback>>>,
     hello: Hello,
 }
 
@@ -248,12 +258,24 @@ impl HostClient {
             |_notification: Notification| {},
         )
             as NotificationHandler));
+        let watch_registry: Arc<Mutex<HashMap<u64, WatchCallback>>> =
+            Arc::new(Mutex::new(HashMap::new()));
+
+        // The reader thread only ever needs to hand a parsed `watch/event`
+        // off cheaply (an unbounded `Sender::send` never blocks) — the
+        // actual registry lookup and callback invocation happen on this
+        // SEPARATE dedicated thread, so a slow or panicking watch callback
+        // can never stall the reader thread that every in-flight
+        // `HostClient::request` caller is blocked waiting on.
+        let (watch_tx, watch_rx) = mpsc::channel::<WatchEventParams>();
+        spawn_watch_dispatcher(watch_rx, Arc::clone(&watch_registry));
 
         spawn_reader_thread(
             reader,
             Arc::clone(&pending),
             Arc::clone(&alive),
             Arc::clone(&notification_handler),
+            watch_tx,
         );
 
         Ok(Self {
@@ -264,6 +286,7 @@ impl HostClient {
             alive,
             stderr_ring,
             notification_handler,
+            watch_registry,
             hello,
         })
     }
@@ -295,10 +318,14 @@ impl HostClient {
         String::from_utf8_lossy(&ring).into_owned()
     }
 
-    /// Register a callback for id-less (`event`/`params`) lines. Only one
-    /// handler at a time; the default (set at spawn) silently drops them.
-    /// No host emits any notifications yet (`watch/*` is S4) — the seam
-    /// exists now so S4 is a pure addition here, not a signature change.
+    /// Register a callback for id-less (`event`/`params`) lines whose
+    /// `event` is NOT [`proto::WATCH_EVENT`] — those are routed separately
+    /// (see [`Self::register_watch_callback`]) through the dedicated
+    /// registry+dispatch-thread mechanism S4 added, since a per-`watch_id`
+    /// callback is what every real caller actually wants. This generic
+    /// handler is the fallback for any OTHER notification kind a future
+    /// host version might push; only one handler at a time, and the default
+    /// (set at spawn) silently drops them.
     ///
     /// Runs on [`spawn_reader_thread`]'s dedicated reader thread — the SAME
     /// thread that demuxes every response and must keep looping to unblock
@@ -306,7 +333,9 @@ impl HostClient {
     /// never block and never call back into this `HostClient` (a `request`
     /// call from inside the handler would deadlock waiting on the very
     /// thread it's running on). Hand off to a channel/queue if the real
-    /// handler needs to do either.
+    /// handler needs to do either — exactly what [`Self::register_watch_callback`]'s
+    /// callbacks get for free, by running on the separate dispatch thread
+    /// instead of this one.
     pub fn set_notification_handler(&self, handler: impl Fn(Notification) + Send + Sync + 'static) {
         *self.notification_handler.lock().unwrap() = Arc::new(handler);
     }
@@ -444,6 +473,88 @@ impl HostClient {
             .context("decoding blob/get bytes_b64")?;
         Ok(Some(bytes))
     }
+
+    /// Whether `cap` is one of the host's advertised capabilities (the
+    /// `hello` handshake's `caps` array, plan §2) — the gate
+    /// [`crate::review::watch::watch`]'s and
+    /// [`crate::remote::worktree::watch_worktree`]'s Remote arms both check
+    /// before ever calling [`Self::watch_subscribe`], so an older host
+    /// binary (built before S4) that doesn't list `"watch"` falls back to
+    /// the pre-existing behavior instead of getting a `bad_request` for an
+    /// unrecognized method.
+    pub fn has_cap(&self, cap: &str) -> bool {
+        self.caps().iter().any(|c| c == cap)
+    }
+
+    /// `watch/subscribe`: ask the host to start watching `root` (an
+    /// absolute in-distro path) for `kind` (`"store"` or `"worktree"` —
+    /// plan §6) changes, returning the `watch_id` that correlates every
+    /// future `watch/event` notification. Register a callback for it via
+    /// [`Self::register_watch_callback`] as soon as possible afterward:
+    /// there is no event buffering for a not-yet-registered id, so an
+    /// event landing in the narrow window between this call returning and
+    /// the registration running is silently dropped (logged, not queued) —
+    /// acceptable because both call sites do the registration on the very
+    /// next line, and a dropped event here just means one fewer redundant
+    /// reload trigger, never a correctness problem (the caller's own
+    /// completion of whatever triggered the change already refreshes its
+    /// state through its normal path).
+    pub fn watch_subscribe(&self, root: &str, kind: &str) -> Result<u64> {
+        let params = WatchSubscribeParams {
+            root: root.to_string(),
+            kind: kind.to_string(),
+        };
+        let value = self.request(
+            proto::method::WATCH_SUBSCRIBE,
+            serde_json::to_value(params).context("serializing watch/subscribe params")?,
+        )?;
+        let result: WatchSubscribeResult =
+            serde_json::from_value(value).context("decoding watch/subscribe result")?;
+        Ok(result.watch_id)
+    }
+
+    /// `watch/unsubscribe`. Callers (`ReviewWatcher::Remote`'s and
+    /// `WorktreeWatcher`'s `Drop`) treat this as best-effort — a connection
+    /// that's already dead (or dying) has nothing to unsubscribe FROM, and
+    /// dropping the error is the same "never worse than not having a host"
+    /// posture the rest of the remote layer takes.
+    pub fn watch_unsubscribe(&self, watch_id: u64) -> Result<()> {
+        let params = WatchUnsubscribeParams { watch_id };
+        self.request(
+            proto::method::WATCH_UNSUBSCRIBE,
+            serde_json::to_value(params).context("serializing watch/unsubscribe params")?,
+        )?;
+        Ok(())
+    }
+
+    /// Register `callback` to run — on the dedicated watch-dispatch thread
+    /// this client owns, never the reader thread — whenever a `watch/event`
+    /// for `watch_id` arrives. Overwrites any previous registration for the
+    /// same id (never expected in practice: `watch_id`s are host-assigned
+    /// and never reused within a connection's lifetime).
+    pub fn register_watch_callback(
+        &self,
+        watch_id: u64,
+        callback: impl Fn(WatchEventParams) + Send + Sync + 'static,
+    ) {
+        self.watch_registry
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(watch_id, Arc::new(callback));
+    }
+
+    /// Stop routing `watch/event`s for `watch_id` to any callback. A stray
+    /// event that was already in flight (queued in the dispatcher's channel,
+    /// or mid-coalesce host-side) when this runs may still be dropped
+    /// harmlessly by [`spawn_watch_dispatcher`] logging "unknown or
+    /// unregistered watch_id" rather than delivered — never a correctness
+    /// problem, since the caller unsubscribing means it no longer cares.
+    pub fn unregister_watch_callback(&self, watch_id: u64) {
+        self.watch_registry
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&watch_id);
+    }
 }
 
 impl Drop for HostClient {
@@ -556,6 +667,7 @@ fn spawn_reader_thread(
     pending: Arc<Mutex<HashMap<u64, SyncSender<RpcResult>>>>,
     alive: Arc<AtomicBool>,
     notification_handler: Arc<Mutex<NotificationHandler>>,
+    watch_tx: mpsc::Sender<WatchEventParams>,
 ) {
     std::thread::Builder::new()
         .name("dv-host-reader".into())
@@ -577,7 +689,7 @@ fn spawn_reader_thread(
                     Ok(_) => {
                         let trimmed = line.trim_end_matches(['\n', '\r']);
                         if !trimmed.is_empty() {
-                            dispatch_line(trimmed, &pending, &notification_handler);
+                            dispatch_line(trimmed, &pending, &notification_handler, &watch_tx);
                         }
                     }
                     Err(_) => break,
@@ -585,6 +697,10 @@ fn spawn_reader_thread(
             }
             // `_death_guard` drops here on the clean path — same cleanup
             // code as the panic path, just reached via `Drop` either way.
+            // `watch_tx` drops here too, which is what lets
+            // `spawn_watch_dispatcher`'s thread notice (via a disconnected
+            // `recv`) that nothing more will ever arrive and exit on its
+            // own — it's the only `Sender` clone in existence.
         })
         .expect("failed to spawn dv-host reader thread");
 }
@@ -593,6 +709,7 @@ fn dispatch_line(
     line: &str,
     pending: &Arc<Mutex<HashMap<u64, SyncSender<RpcResult>>>>,
     notification_handler: &Arc<Mutex<NotificationHandler>>,
+    watch_tx: &mpsc::Sender<WatchEventParams>,
 ) {
     let value: Value = match serde_json::from_str(line) {
         Ok(value) => value,
@@ -603,6 +720,23 @@ fn dispatch_line(
     };
     if value.get("id").is_none() {
         match serde_json::from_value::<Notification>(value) {
+            Ok(notification) if notification.event == proto::WATCH_EVENT => {
+                // Routed to the registry+dispatch-thread mechanism instead
+                // of the generic handler below — see
+                // `HostClient::register_watch_callback`. `send` on an
+                // unbounded channel never blocks (the one documented way it
+                // can fail is a disconnected receiver, which only happens
+                // once `spawn_watch_dispatcher`'s thread has already exited
+                // — nothing left to hand this to either way).
+                match serde_json::from_value::<WatchEventParams>(notification.params) {
+                    Ok(params) => {
+                        let _ = watch_tx.send(params);
+                    }
+                    Err(err) => {
+                        eprintln!("[dv-host client] malformed watch/event params, skipping: {err}")
+                    }
+                }
+            }
             Ok(notification) => {
                 // Clone the `Arc<dyn Fn>` out and drop the lock BEFORE
                 // calling it — the handler contract (see
@@ -631,6 +765,36 @@ fn dispatch_line(
         },
         Err(err) => eprintln!("[dv-host client] malformed response, skipping: {err}"),
     }
+}
+
+/// The dedicated thread [`WatchCallback`]s actually run on (never the
+/// reader thread — see [`HostClient::register_watch_callback`]'s doc).
+/// Fed by `dispatch_line`'s cheap, non-blocking `Sender::send`; exits once
+/// `rx.recv()` reports every `Sender` (just the reader thread's one clone)
+/// has dropped, i.e. once the connection itself is done for good.
+fn spawn_watch_dispatcher(
+    rx: mpsc::Receiver<WatchEventParams>,
+    registry: Arc<Mutex<HashMap<u64, WatchCallback>>>,
+) {
+    std::thread::Builder::new()
+        .name("dv-host-watch-dispatch".into())
+        .spawn(move || {
+            while let Ok(event) = rx.recv() {
+                let callback = registry
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .get(&event.watch_id)
+                    .cloned();
+                match callback {
+                    Some(callback) => callback(event),
+                    None => eprintln!(
+                        "[dv-host client] watch/event for unknown or unregistered watch_id {}",
+                        event.watch_id
+                    ),
+                }
+            }
+        })
+        .expect("failed to spawn dv-host watch dispatch thread");
 }
 
 /// Forward the host's stderr to our own (prefixed, so multi-host output is
@@ -757,5 +921,128 @@ mod tests {
         );
         let rpc = RequestFailure::Rpc(RpcError::new("bad_request", "missing \"program\""));
         assert_eq!(rpc.to_string(), "bad_request: missing \"program\"");
+    }
+
+    // --- dispatch_line: watch/event routing (plan §8 S4) -----------------
+    //
+    // These call `dispatch_line` directly with hand-built channels/handlers
+    // — no real process or `HostClient` needed, since the routing decision
+    // ("is this a watch/event, and if so, hand it to the watch channel
+    // instead of the generic notification handler") is pure once a
+    // already-framed line is in hand.
+
+    fn empty_pending() -> Arc<Mutex<HashMap<u64, SyncSender<RpcResult>>>> {
+        Arc::new(Mutex::new(HashMap::new()))
+    }
+
+    fn counting_handler() -> (Arc<Mutex<NotificationHandler>>, Arc<Mutex<u32>>) {
+        let calls = Arc::new(Mutex::new(0u32));
+        let calls_clone = Arc::clone(&calls);
+        let handler: Arc<Mutex<NotificationHandler>> =
+            Arc::new(Mutex::new(Arc::new(move |_notification: Notification| {
+                *calls_clone.lock().unwrap() += 1;
+            }) as NotificationHandler));
+        (handler, calls)
+    }
+
+    #[test]
+    fn dispatch_line_routes_watch_event_to_the_watch_channel_not_the_generic_handler() {
+        let pending = empty_pending();
+        let (notification_handler, generic_calls) = counting_handler();
+        let (watch_tx, watch_rx) = mpsc::channel();
+
+        let line = r#"{"event":"watch/event","params":{"watch_id":3,"kind":"store","paths":["a.json"],"overflow":false}}"#;
+        dispatch_line(line, &pending, &notification_handler, &watch_tx);
+
+        let received = watch_rx
+            .try_recv()
+            .expect("watch/event should have been forwarded to the watch channel");
+        assert_eq!(received.watch_id, 3);
+        assert_eq!(received.kind, "store");
+        assert_eq!(received.paths, vec!["a.json".to_string()]);
+        assert!(
+            *generic_calls.lock().unwrap() == 0,
+            "a watch/event must not also reach the generic notification handler"
+        );
+    }
+
+    #[test]
+    fn dispatch_line_routes_non_watch_notification_to_the_generic_handler() {
+        let pending = empty_pending();
+        let (notification_handler, generic_calls) = counting_handler();
+        let (watch_tx, watch_rx) = mpsc::channel();
+
+        dispatch_line(
+            r#"{"event":"some/other-event","params":{}}"#,
+            &pending,
+            &notification_handler,
+            &watch_tx,
+        );
+
+        assert_eq!(*generic_calls.lock().unwrap(), 1);
+        assert!(
+            watch_rx.try_recv().is_err(),
+            "a non-watch notification must not reach the watch channel"
+        );
+    }
+
+    #[test]
+    fn dispatch_line_malformed_watch_event_params_is_dropped_not_forwarded() {
+        let pending = empty_pending();
+        let (notification_handler, generic_calls) = counting_handler();
+        let (watch_tx, watch_rx) = mpsc::channel();
+
+        // "watch_id" is a required field on `WatchEventParams` — missing it
+        // must log-and-drop, never panic or forward a half-built value.
+        dispatch_line(
+            r#"{"event":"watch/event","params":{"kind":"store"}}"#,
+            &pending,
+            &notification_handler,
+            &watch_tx,
+        );
+
+        assert!(watch_rx.try_recv().is_err());
+        assert_eq!(*generic_calls.lock().unwrap(), 0);
+    }
+
+    // --- spawn_watch_dispatcher: registry lookup + delivery --------------
+
+    #[test]
+    fn watch_dispatcher_delivers_only_to_the_registered_watch_id() {
+        let registry: Arc<Mutex<HashMap<u64, WatchCallback>>> =
+            Arc::new(Mutex::new(HashMap::new()));
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let seen_clone = Arc::clone(&seen);
+        registry.lock().unwrap().insert(
+            1,
+            Arc::new(move |params: WatchEventParams| {
+                seen_clone.lock().unwrap().push(params.watch_id);
+            }) as WatchCallback,
+        );
+
+        let (tx, rx) = mpsc::channel();
+        spawn_watch_dispatcher(rx, Arc::clone(&registry));
+
+        let event = |watch_id: u64| WatchEventParams {
+            watch_id,
+            kind: "store".to_string(),
+            paths: Vec::new(),
+            overflow: false,
+        };
+        tx.send(event(1)).unwrap();
+        // Never registered — must be logged and skipped, not panic or
+        // deliver to the wrong callback.
+        tx.send(event(99)).unwrap();
+        drop(tx); // lets the dispatcher's `rx.recv()` observe disconnect and exit
+
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while seen.lock().unwrap().is_empty() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(
+            *seen.lock().unwrap(),
+            vec![1],
+            "only the registered watch_id's callback should have fired"
+        );
     }
 }

@@ -234,7 +234,15 @@ fn tmp_name() -> String {
 /// uses these, for agent worktrees), `.git` is a *file* containing a
 /// single `gitdir: <path>` line pointing at the real per-worktree git dir
 /// (typically `<main-repo>/.git/worktrees/<name>`) — follow it.
-pub(super) fn resolve_local_git_dir(root: &Path) -> Result<PathBuf> {
+///
+/// `pub` (re-exported as [`crate::review::resolve_local_git_dir`]) rather
+/// than the module-private helper it started as: `crates/host/src/watch.rs`
+/// (S4) needs the exact same gitdir resolution — the host process runs
+/// LOCAL to whatever repo it's serving, so this is the correct helper to
+/// reuse there too rather than hand-rolling a second copy. Everything else
+/// in this module (`StoreIo` itself, the WSL-side `resolve_wsl_git_dir`)
+/// stays private — see the module doc for why.
+pub fn resolve_local_git_dir(root: &Path) -> Result<PathBuf> {
     let dot_git = root.join(".git");
     let metadata = std::fs::symlink_metadata(&dot_git)
         .with_context(|| format!("no .git at {}", dot_git.display()))?;

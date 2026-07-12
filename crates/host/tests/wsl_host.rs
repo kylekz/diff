@@ -9,21 +9,58 @@
 //!
 //! Then run:
 //!
-//!   cargo test -p dv-host --test wsl_host -- --ignored --nocapture
+//!   cargo test -p dv-host --test wsl_host -- --ignored --nocapture --test-threads=1
+//!
+//! `--test-threads=1` matters here (found the hard way while validating S4):
+//! this file's default (parallel) test runner spawns several `wsl.exe`
+//! processes at once, and a loaded WSL distro can flake under that —
+//! `spawn_wsl`'s 15s handshake timing out, or a plain setup `wsl.exe --exec
+//! sh -c ...` failing outright — for reasons that have nothing to do with
+//! the actual behavior under test. Serialized, all 9 tests here pass
+//! reliably.
 //!
 //! `DV_HOST_PATH` overrides the default built-binary path below (must be
 //! an absolute POSIX path INSIDE the distro).
 
 use std::sync::Arc;
+use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 use dv_core::remote::client::HostClient;
+use dv_core::remote::proto::WatchEventParams;
 
 const DEFAULT_HOST_PATH: &str = "/home/kyle/.cache/dv-target/debug/dv-host";
 const DISTRO: &str = "Ubuntu";
 
 fn host_path() -> String {
     std::env::var("DV_HOST_PATH").unwrap_or_else(|_| DEFAULT_HOST_PATH.to_string())
+}
+
+/// Run `sh -c script` INSIDE the distro via a plain `wsl.exe --exec` —
+/// deliberately NOT routed through the `dv-host` connection under test, so
+/// setup/mutation here simulates a genuinely external actor (another dv
+/// window, the agent CLI) the way the real watch feature needs to react to.
+fn wsl_sh(script: &str) {
+    let output = std::process::Command::new("wsl.exe")
+        .args(["-d", DISTRO, "--exec", "sh", "-c", script])
+        .output()
+        .expect("wsl.exe --exec sh -c");
+    assert!(
+        output.status.success(),
+        "wsl sh -c {script:?} failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+/// A fresh, throwaway repo path inside the distro — never `~/zed-perf`
+/// (that fixture is read/list-only elsewhere; this slice's tests create
+/// AND delete their own temp repos so they can't leave anything behind).
+fn temp_repo_path(label: &str) -> String {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    format!("/tmp/dv-watch-e2e-{label}-{nanos}-{}", std::process::id())
 }
 
 #[test]
@@ -141,4 +178,148 @@ fn wsl_drop_leaves_no_orphan() {
         running.trim().is_empty(),
         "dv-host still running inside the distro after drop: {running}"
     );
+}
+
+// --- watch/subscribe over a REAL `wsl.exe`-spawned host (plan §8 S4) -----
+
+#[test]
+#[ignore = "requires WSL Ubuntu with dv-host built inside it — see module docs"]
+fn wsl_store_watch_event_within_1s_then_unsubscribe_silences_it() {
+    let repo = temp_repo_path("store");
+    wsl_sh(&format!("mkdir -p '{repo}' && cd '{repo}' && git init -q"));
+
+    let client = HostClient::spawn_wsl(DISTRO, &host_path()).expect("spawn_wsl");
+    assert!(
+        client.caps().iter().any(|cap| cap == "watch"),
+        "caps: {:?}",
+        client.caps()
+    );
+
+    let (tx, rx) = mpsc::channel::<WatchEventParams>();
+    let watch_id = client
+        .watch_subscribe(&repo, "store")
+        .expect("watch/subscribe store");
+    client.register_watch_callback(watch_id, move |params| {
+        let _ = tx.send(params);
+    });
+
+    // An external actor (a separate `wsl.exe --exec`, not this
+    // connection) writing a review file — exactly the "agent CLI in one
+    // process, GUI watching in another" shape this whole feature exists
+    // for.
+    let started = Instant::now();
+    wsl_sh(&format!(
+        "mkdir -p '{repo}/.git/dv/reviews' && echo '{{}}' > '{repo}/.git/dv/reviews/r-test.json'"
+    ));
+    let event = rx
+        .recv_timeout(Duration::from_secs(1))
+        .expect("expected a store watch/event within 1s of an external write");
+    eprintln!("store watch event latency: {:?}", started.elapsed());
+    assert_eq!(event.watch_id, watch_id);
+    assert_eq!(event.kind, "store");
+
+    client
+        .watch_unsubscribe(watch_id)
+        .expect("watch/unsubscribe");
+    while rx.try_recv().is_ok() {} // drain anything already in flight
+    wsl_sh(&format!(
+        "echo '{{}}' > '{repo}/.git/dv/reviews/r-test-2.json'"
+    ));
+    assert!(
+        rx.recv_timeout(Duration::from_millis(1500)).is_err(),
+        "must not receive watch/event after unsubscribe"
+    );
+
+    wsl_sh(&format!("rm -rf '{repo}'"));
+}
+
+#[test]
+#[ignore = "requires WSL Ubuntu with dv-host built inside it — see module docs"]
+fn wsl_worktree_watch_event_on_tracked_file_edit() {
+    let repo = temp_repo_path("worktree");
+    wsl_sh(&format!(
+        "mkdir -p '{repo}' && cd '{repo}' && git init -q && echo hello > a.txt && \
+         git add a.txt && git -c user.email=t@t.com -c user.name=t commit -q -m seed"
+    ));
+
+    let client = HostClient::spawn_wsl(DISTRO, &host_path()).expect("spawn_wsl");
+
+    let (tx, rx) = mpsc::channel::<WatchEventParams>();
+    let watch_id = client
+        .watch_subscribe(&repo, "worktree")
+        .expect("watch/subscribe worktree");
+    client.register_watch_callback(watch_id, move |params| {
+        let _ = tx.send(params);
+    });
+
+    let started = Instant::now();
+    wsl_sh(&format!("echo 'hello again' >> '{repo}/a.txt'"));
+    let event = rx
+        .recv_timeout(Duration::from_secs(1))
+        .expect("expected a worktree watch/event within 1s of an external edit");
+    eprintln!("worktree watch event latency: {:?}", started.elapsed());
+    assert_eq!(event.watch_id, watch_id);
+    assert_eq!(event.kind, "worktree");
+
+    client.watch_unsubscribe(watch_id).ok();
+    wsl_sh(&format!("rm -rf '{repo}'"));
+}
+
+#[test]
+#[ignore = "requires WSL Ubuntu with dv-host built inside it — see module docs"]
+fn wsl_kill_9_host_then_respawn_still_supports_a_fresh_watch() {
+    // Plan §8 S1's "kill -9 → errors surface → respawn works" gate,
+    // extended to prove a FRESH watch_subscribe on the respawned
+    // connection still works — a stale watcher from the killed process
+    // obviously can't (its whole process is gone), so this is really
+    // about confirming the NEW `HostClient` (a plain fresh `spawn_wsl`,
+    // same as `remote::manager`'s real respawn path) gets a working watch
+    // from scratch.
+    let repo = temp_repo_path("respawn");
+    wsl_sh(&format!("mkdir -p '{repo}' && cd '{repo}' && git init -q"));
+
+    let client = HostClient::spawn_wsl(DISTRO, &host_path()).expect("spawn_wsl (first)");
+    let pid = client.pid();
+    let kill = std::process::Command::new("wsl.exe")
+        .args(["-d", DISTRO, "--exec", "kill", "-9", &pid.to_string()])
+        .output()
+        .expect("kill -9 inside the distro");
+    eprintln!(
+        "kill -9 {pid}: status={:?} stderr={:?}",
+        kill.status,
+        String::from_utf8_lossy(&kill.stderr)
+    );
+    assert!(
+        wait_until(Duration::from_secs(5), || !client.is_alive()),
+        "reader thread should observe EOF after kill -9"
+    );
+
+    let respawned = HostClient::spawn_wsl(DISTRO, &host_path()).expect("spawn_wsl (respawn)");
+    let (tx, rx) = mpsc::channel::<WatchEventParams>();
+    let watch_id = respawned
+        .watch_subscribe(&repo, "store")
+        .expect("watch/subscribe on the respawned connection");
+    respawned.register_watch_callback(watch_id, move |params| {
+        let _ = tx.send(params);
+    });
+    wsl_sh(&format!(
+        "mkdir -p '{repo}/.git/dv/reviews' && echo '{{}}' > '{repo}/.git/dv/reviews/r-test.json'"
+    ));
+    rx.recv_timeout(Duration::from_secs(1))
+        .expect("respawned connection's watch/subscribe should still receive events");
+
+    wsl_sh(&format!("rm -rf '{repo}'"));
+}
+
+fn wait_until(timeout: Duration, mut condition: impl FnMut() -> bool) -> bool {
+    let deadline = Instant::now() + timeout;
+    loop {
+        if condition() {
+            return true;
+        }
+        if Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
 }

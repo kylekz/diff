@@ -598,6 +598,14 @@ pub struct Workspace {
     /// Keeps the review-store watcher alive; external edits (agent CLI,
     /// another window) stream in through it. Dropped with the workspace.
     _watcher: Option<dv_core::ReviewWatcher>,
+    /// Keeps a worktree watch alive (plan §6/S4) — a HOST-ONLY capability,
+    /// so `None` for a `Local` repo, a disabled/no-host WSL session, or
+    /// once the source has switched away from `WorkingTree` (`open_pr`
+    /// tears it down explicitly; there's no natural way back to
+    /// `WorkingTree` from a PR in this codebase today, so nothing re-sets
+    /// it). See [`Self::automation_state`]'s `worktree_watch` bool for the
+    /// automation-visible signal this exists.
+    _worktree_watcher: Option<dv_core::remote::WorktreeWatcher>,
     /// The PR this workspace's diff source was opened from, if any (set by
     /// [`Self::open_pr`]). `None` for a plain local review.
     pr: Option<PrHeader>,
@@ -938,6 +946,45 @@ fn load_pr(repo: &GitRepo, number: u64, location: RepoLocation) -> anyhow::Resul
     })
 }
 
+/// Worktree-watch reconciliation (review finding P1-1): a `changed_files`
+/// refresh driven by the worktree watcher may return a file list that has
+/// shrunk, grown, or simply reordered relative to what's on screen — and
+/// `selected`/`diffs`/`diff_pending`/`expanded` are all keyed by INDEX into
+/// that list, not by path. Blindly swapping the list in without remapping
+/// the selected index either panics (`self.files[old_index]` once the list
+/// has shrunk past it — the original crash: an external `git commit`
+/// emptying a 3-file list while file 2 was selected) or silently renders
+/// the wrong file's cached diff (a new file sorting earlier shifts every
+/// later index up by one, so the SAME index now names a DIFFERENT file).
+///
+/// Returns `(new_selected, needs_invalidation)`:
+/// - `new_selected` is the old selection's path, relocated in `new_files`,
+///   or `None` if that file no longer exists there (the caller falls back
+///   to index 0 when the list is non-empty, or clears the diff area
+///   cleanly when it's empty).
+/// - `needs_invalidation` is `false` only in the genuinely unchanged case
+///   (same paths in the same order — every existing index still names the
+///   same file, so cached per-index state stays valid); `true` any other
+///   time an index might now point at a different file than it used to.
+fn reconcile_file_selection(
+    old_files: &[ChangedFile],
+    new_files: &[ChangedFile],
+    old_selected: Option<usize>,
+) -> (Option<usize>, bool) {
+    let stable = old_files.len() == new_files.len()
+        && old_files
+            .iter()
+            .zip(new_files)
+            .all(|(a, b)| a.path == b.path);
+    if stable {
+        return (old_selected, false);
+    }
+    let new_selected = old_selected
+        .and_then(|i| old_files.get(i))
+        .and_then(|old| new_files.iter().position(|f| f.path == old.path));
+    (new_selected, true)
+}
+
 impl Workspace {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
@@ -958,6 +1005,12 @@ impl Workspace {
         // dv was pointed at — otherwise the GUI and CLI silently use two
         // different stores.
         let (watch_tx, mut watch_rx) = futures::channel::mpsc::unbounded::<()>();
+        // Same "channel now, watcher once the repo's loaded" shape as
+        // `watch_tx`/`watch_rx` above, for the worktree watch (plan §6/S4)
+        // — only ever actually subscribed for a WSL repo with a
+        // watch-capable host and a `WorkingTree` source (see the load
+        // completion below and `_worktree_watcher`'s doc comment).
+        let (worktree_tx, mut worktree_rx) = futures::channel::mpsc::unbounded::<()>();
 
         let this = Self {
             focus_handle: cx.focus_handle(),
@@ -997,6 +1050,7 @@ impl Workspace {
             stale_checked: None,
             last_diff_ms: None,
             _watcher: None,
+            _worktree_watcher: None,
             pr: None,
             pr_remote: None,
             pr_details_open: false,
@@ -1056,6 +1110,120 @@ impl Workspace {
                         this.reset_diff_list(cx);
                         cx.notify();
                     }
+                });
+                if alive.is_err() {
+                    break; // workspace dropped
+                }
+            }
+        })
+        .detach();
+
+        // Worktree watch consumer (plan §6/S4): reacts to a `_worktree_watcher`
+        // event by re-running `changed_files` for a `WorkingTree` source and
+        // forcing a fresh staleness check — the "backlogged staleness
+        // refresh" this watch exists for (a worktree edit can drift a
+        // comment's anchor without the review itself ever changing, which
+        // is otherwise invisible to `refresh_stale`'s
+        // `(file, review.updated_ms)` cache key). No-op for every session
+        // that never gets a live `_worktree_watcher` in the first place —
+        // this loop simply never receives anything then.
+        cx.spawn(async move |this, cx| {
+            use futures::StreamExt as _;
+            while worktree_rx.next().await.is_some() {
+                // Coalesce a burst, then apply the client-side debounce on
+                // top of the host's own 200ms coalesce (plan §6) — an
+                // editor's atomic save is a write+rename pair, and `git`
+                // touching the index during a stage/commit fires several
+                // more.
+                while worktree_rx.try_recv().is_ok() {}
+                cx.background_executor()
+                    .timer(std::time::Duration::from_millis(500))
+                    .await;
+                while worktree_rx.try_recv().is_ok() {}
+
+                let Ok((repo, source, epoch)) = this.update(cx, |this, _| {
+                    (this.repo.clone(), this.source.clone(), this.source_epoch)
+                }) else {
+                    break;
+                };
+                let Some(repo) = repo else { continue };
+                if !matches!(source, DiffSource::WorkingTree) {
+                    // The source has since moved on to a PR/range (open_pr
+                    // already tears the watcher down when that happens —
+                    // this just guards the narrow window before that takes
+                    // effect).
+                    continue;
+                }
+
+                let files = cx
+                    .background_executor()
+                    .spawn(async move { repo.changed_files(&source) })
+                    .await;
+
+                let alive = this.update(cx, |this, cx| {
+                    // Epoch alone isn't sufficient (review finding P2-1):
+                    // `open_pr` bumps `source_epoch` BEFORE its fetch even
+                    // starts, so a worktree event landing while a PR load is
+                    // still in flight could pass an epoch-only check even
+                    // though `this.source` has already moved off
+                    // `WorkingTree` — re-check the source's actual type too.
+                    if this.source_epoch != epoch || !matches!(this.source, DiffSource::WorkingTree)
+                    {
+                        return; // superseded — discard rather than clobber newer state
+                    }
+                    if let Ok(files) = files {
+                        let old_files = std::mem::replace(&mut this.files, files);
+                        // `selected`/`diffs`/`diff_pending`/`expanded` are
+                        // all keyed by INDEX into `this.files`, not by path
+                        // — a naive replace either panics once the list has
+                        // shrunk past the old selected index (review
+                        // finding P1-1: an external `git commit` emptying
+                        // the list while file 2 was selected) or silently
+                        // re-renders the wrong file's cached diff under a
+                        // reused index once a new file sorts in earlier.
+                        let (new_selected, needs_invalidation) =
+                            reconcile_file_selection(&old_files, &this.files, this.selected);
+                        if needs_invalidation {
+                            this.diffs.clear();
+                            this.diff_pending.clear();
+                            this.expanded.clear();
+                            this.pending_jump = None;
+                            match new_selected {
+                                Some(index) => {
+                                    // Same file as before, just relocated —
+                                    // preserve `current_hunk` and the diff
+                                    // list's scroll position (reset_diff_list,
+                                    // called below, keeps the current offset).
+                                    this.selected = Some(index);
+                                    this.request_diff(index, cx);
+                                }
+                                None if !this.files.is_empty() => {
+                                    // The previously selected file is gone
+                                    // (or nothing was selected yet) — this is
+                                    // genuinely a different file, so reset
+                                    // hunk navigation same as a normal
+                                    // `select_file`.
+                                    this.selected = Some(0);
+                                    this.current_hunk = 0;
+                                    this.request_diff(0, cx);
+                                }
+                                None => {
+                                    // Nothing left to show — clear cleanly
+                                    // rather than leave a dangling index (the
+                                    // original crash: `self.files[2]` after
+                                    // an external commit emptied the list).
+                                    this.selected = None;
+                                }
+                            }
+                        }
+                    }
+                    // Force `refresh_stale` (called at the tail of
+                    // `reset_diff_list` below) to actually re-run its git
+                    // check even though neither the review nor the
+                    // selection changed.
+                    this.stale_checked = None;
+                    this.reset_diff_list(cx);
+                    cx.notify();
                 });
                 if alive.is_err() {
                     break; // workspace dropped
@@ -1129,6 +1297,25 @@ impl Workspace {
                             }))
                             .inspect_err(|err| eprintln!("review watcher unavailable: {err:#}"))
                             .ok();
+                        // Worktree watching (plan §6/S4) is a HOST-ONLY
+                        // capability, and only worth it for a working-tree
+                        // source — a PR/range/commit view's file list is
+                        // fixed by its endpoints, not by what's on disk
+                        // right now. Skipped entirely when `pending_pr` is
+                        // set: `open_pr` right below immediately replaces
+                        // `this.source` with a `Range` anyway, so setting
+                        // this up here just to tear it down again a moment
+                        // later would be wasted work (its own completion
+                        // handles the teardown for the later, user-driven
+                        // case instead — see its `_worktree_watcher = None`).
+                        if pending_pr.is_none() && matches!(this.source, DiffSource::WorkingTree) {
+                            this._worktree_watcher = dv_core::remote::watch_worktree(
+                                this.location.clone(),
+                                Box::new(move || {
+                                    worktree_tx.unbounded_send(()).ok();
+                                }),
+                            );
+                        }
                         if let Some(number) = pending_pr {
                             this.open_pr(number, window, cx);
                         } else if !this.files.is_empty() {
@@ -1496,6 +1683,15 @@ impl Workspace {
                         }
                         this.source = source;
                         this.source_desc = format!("PR #{number}").into();
+                        // A PR's file list is fixed by its endpoints, not
+                        // by the working tree — worktree watching (plan
+                        // §6/S4) only ever applies to a `WorkingTree`
+                        // source (see where it's set up, in the initial
+                        // load completion above). There's no path back to
+                        // `WorkingTree` from a PR in this codebase today,
+                        // so nothing ever needs to re-create it once torn
+                        // down here.
+                        this._worktree_watcher = None;
                         this.files = files;
                         // The old file list's diffs are keyed by index into
                         // a now-replaced list — stale caches would render
@@ -1727,6 +1923,10 @@ impl Workspace {
                 })
             }),
             "editor_open": self.editor.is_some(),
+            // Plan §8 S4 gate: whether a live host-backed worktree watch
+            // (plan §6) is active this session — `false` for every Local
+            // repo, a disabled/no-host WSL session, or a PR/range source.
+            "worktree_watch": self._worktree_watcher.is_some(),
             "summary_open": self.summary_open,
             // Drag-to-resize deliverable (Phase 4 deliverable 5): the
             // summary panel's own live width (the sidebar's mirror-image
@@ -5158,11 +5358,13 @@ mod tests {
     use super::{
         ChecksSummary, PrHeader, PrMeta, PrState, PreparedLine, SplitRow, SubmissionOutcome,
         SubmitFlow, SubmitPrep, Violation, ViolationKind, build_split_rows,
-        cancel_submit_flow_outcome, gap_above, pick_review, review_adopts_pr,
-        submit_flow_from_submission, submit_flow_from_validation, trim_trailing_newlines,
-        verdict_automation_word, verdict_label, violation_kind_word,
+        cancel_submit_flow_outcome, gap_above, pick_review, reconcile_file_selection,
+        review_adopts_pr, submit_flow_from_submission, submit_flow_from_validation,
+        trim_trailing_newlines, verdict_automation_word, verdict_label, violation_kind_word,
     };
-    use dv_core::{DiffSource, LineKind, RemoteRef, Review, ReviewState};
+    use dv_core::{
+        ChangeStatus, ChangedFile, DiffSource, LineKind, RemoteRef, Review, ReviewState,
+    };
 
     fn hunk(old_start: u32, old_count: u32, new_start: u32, new_count: u32) -> dv_core::Hunk {
         dv_core::Hunk {
@@ -5848,5 +6050,82 @@ mod tests {
         ] {
             assert!(!violation_kind_word(kind).is_empty());
         }
+    }
+
+    // --- reconcile_file_selection (review finding P1-1) --------------------
+
+    fn cf(path: &str) -> ChangedFile {
+        ChangedFile {
+            path: path.to_string(),
+            old_path: None,
+            status: ChangeStatus::Modified,
+        }
+    }
+
+    #[test]
+    fn reconcile_stable_when_paths_and_order_are_unchanged() {
+        let old = [cf("a.txt"), cf("b.txt"), cf("c.txt")];
+        let new = [cf("a.txt"), cf("b.txt"), cf("c.txt")];
+        assert_eq!(
+            reconcile_file_selection(&old, &new, Some(1)),
+            (Some(1), false)
+        );
+        // Even with nothing selected, an unchanged list needs no invalidation.
+        assert_eq!(reconcile_file_selection(&old, &new, None), (None, false));
+    }
+
+    #[test]
+    fn reconcile_empty_new_list_clears_selection_and_invalidates() {
+        // The original crash repro: 3 files, the third (index 2) selected,
+        // an external commit empties the list entirely.
+        let old = [cf("a.txt"), cf("b.txt"), cf("c.txt")];
+        let new: [ChangedFile; 0] = [];
+        assert_eq!(reconcile_file_selection(&old, &new, Some(2)), (None, true));
+    }
+
+    #[test]
+    fn reconcile_shrink_drops_selection_when_selected_file_is_removed() {
+        let old = [cf("a.txt"), cf("b.txt"), cf("c.txt")];
+        let new = [cf("a.txt"), cf("b.txt")];
+        assert_eq!(reconcile_file_selection(&old, &new, Some(2)), (None, true));
+        // An unrelated file's removal that leaves the selected file in
+        // place still needs invalidation (the list itself changed).
+        assert_eq!(
+            reconcile_file_selection(&old, &new, Some(0)),
+            (Some(0), true)
+        );
+    }
+
+    #[test]
+    fn reconcile_shift_relocates_the_same_file_to_its_new_index() {
+        // A new file ("aa.txt") sorts in before the previously selected
+        // "c.txt", pushing it from index 2 to index 3.
+        let old = [cf("a.txt"), cf("b.txt"), cf("c.txt")];
+        let new = [cf("a.txt"), cf("aa.txt"), cf("b.txt"), cf("c.txt")];
+        assert_eq!(
+            reconcile_file_selection(&old, &new, Some(2)),
+            (Some(3), true)
+        );
+    }
+
+    #[test]
+    fn reconcile_shift_at_same_length_still_invalidates_reused_indices() {
+        // Same length, but a different file occupies index 0 now — even
+        // though the selected file ("z.txt") is still at index 1, index 0's
+        // cached diff (if any) is now for a DIFFERENT file and must not be
+        // reused silently.
+        let old = [cf("b.txt"), cf("z.txt")];
+        let new = [cf("a.txt"), cf("z.txt")];
+        assert_eq!(
+            reconcile_file_selection(&old, &new, Some(1)),
+            (Some(1), true)
+        );
+    }
+
+    #[test]
+    fn reconcile_nothing_selected_falls_through_to_none() {
+        let old = [cf("a.txt")];
+        let new = [cf("a.txt"), cf("b.txt")];
+        assert_eq!(reconcile_file_selection(&old, &new, None), (None, true));
     }
 }

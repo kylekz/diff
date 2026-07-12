@@ -9,18 +9,20 @@ build = "build.rs"
 name = "dv-host"
 path = "src/main.rs"
 
-# Deliberately minimal: this binary must compile on every CI platform (only
-# meaningfully deployed on Linux) and must NOT pull in dv-core's heavier
-# deps (imara-diff, notify) that S1's handshake+proc/exec scope doesn't
-# need. NO gpui here, ever — see CLAUDE.md.
+# S1-S3 kept dv-core out of this binary's real deps (only reached it via
+# [dev-dependencies], to drive the shipped binary through the real
+# HostClient in tests/) — S4 (watching) changes that: crates/host/src/watch.rs
+# reuses dv-core's `resolve_local_git_dir` (review/io.rs, re-exported as
+# `dv_core::review::resolve_local_git_dir`) instead of hand-rolling gitdir
+# resolution a second time. The plan always allowed this ("Dependencies:
+# dv-core, anyhow, serde, serde_json, base64, notify" — plan §1); dv-core
+# itself has no gpui import (ever — see CLAUDE.md) and everything it pulls
+# in (imara-diff, notify, sha2, base64, serde) is pure Rust, so this stays
+# musl-friendly. NO gpui in this crate, ever, regardless.
 [dependencies]
 anyhow.workspace = true
 base64.workspace = true
+dv-core.workspace = true
+notify.workspace = true
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.150"
-
-# Test-only: the integration tests in tests/ drive the real binary through
-# dv-core's HostClient (the actual production client), so this is a
-# dev-dependency — it never reaches the shipped dv-host binary itself.
-[dev-dependencies]
-dv-core.workspace = true

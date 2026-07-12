@@ -1,15 +1,22 @@
 //! `dv-host`: a headless stdio server that speaks the wire protocol
 //! described in `dv_core::remote::proto` (docs/phase-5-implementation-plan.md
-//! §2) over stdin/stdout. S1 scope: handshake + `proc/exec` only — no
-//! git/review handlers, no watching (§8 S1).
+//! §2) over stdin/stdout. S1 shipped handshake + `proc/exec`; S2 added
+//! `blob/get`; S4 adds `watch/subscribe`|`watch/unsubscribe` (see
+//! `watch.rs`) plus the outbound `watch/event` notifications a live
+//! subscription pushes.
 //!
-//! This binary deliberately does NOT depend on dv-core (see Cargo.toml):
-//! it hand-writes the same JSON shapes proto.rs defines, verified by the
-//! cross-process tests in tests/ that speak the REAL
-//! `dv_core::remote::client::HostClient` against this REAL binary. NO
-//! gpui anywhere in this crate, ever — see CLAUDE.md.
+//! This binary's OWN wire shapes are still hand-written rather than built
+//! on `dv_core::remote::proto` (see that module's doc for why: the
+//! cross-process tests in tests/ are what actually hold the two to the
+//! same schema, by speaking it over a real pipe, not shared types) — but
+//! S4 does add dv-core as a real (non-dev) dependency for `watch.rs`'s
+//! reuse of `resolve_local_git_dir` (see that module's doc and this
+//! crate's Cargo.toml comment for why that's fine: dv-core has no gpui
+//! import, ever, and everything else it pulls in is pure Rust/musl-safe).
+//! NO gpui anywhere in this crate, ever — see CLAUDE.md.
 
 mod blob;
+mod watch;
 
 use std::io::{BufRead as _, Read as _, Write as _};
 use std::process::{Command, Stdio};
@@ -38,7 +45,7 @@ fn main() {
         "proto": PROTO_VERSION,
         "version": env!("DV_HOST_VERSION"),
         "pid": std::process::id(),
-        "caps": ["exec", "blob"],
+        "caps": ["exec", "blob", "watch"],
     });
     write_line(&stdout, &hello);
 
@@ -120,12 +127,12 @@ fn worker_loop(job_rx: &Arc<Mutex<mpsc::Receiver<Job>>>, stdout: &Arc<Mutex<std:
             Ok(job) => job,
             Err(_) => return, // sender dropped (stdin loop exited) — done
         };
-        let response = dispatch(job);
+        let response = dispatch(job, stdout);
         write_line(stdout, &response);
     }
 }
 
-fn dispatch(job: Job) -> Value {
+fn dispatch(job: Job, stdout: &Arc<Mutex<std::io::Stdout>>) -> Value {
     let Job { id, method, params } = job;
     match method.as_str() {
         "proc/exec" => match handle_exec(params) {
@@ -133,6 +140,20 @@ fn dispatch(job: Job) -> Value {
             Err(err) => json!({"id": id, "err": {"code": err.code, "message": err.message}}),
         },
         "blob/get" => match handle_blob_get(params) {
+            Ok(result) => json!({"id": id, "ok": result}),
+            Err(err) => json!({"id": id, "err": {"code": err.code, "message": err.message}}),
+        },
+        // `watch/subscribe` is the one handler that needs `stdout` itself
+        // (not just its own return value): a live subscription pushes
+        // `watch/event` notifications asynchronously, from the coalescer's
+        // own timer thread, long after this response has already gone out
+        // (plan §2: "Notifications write through the same mutex'd stdout as
+        // responses").
+        "watch/subscribe" => match handle_watch_subscribe(params, stdout) {
+            Ok(result) => json!({"id": id, "ok": result}),
+            Err(err) => json!({"id": id, "err": {"code": err.code, "message": err.message}}),
+        },
+        "watch/unsubscribe" => match handle_watch_unsubscribe(params) {
             Ok(result) => json!({"id": id, "ok": result}),
             Err(err) => json!({"id": id, "err": {"code": err.code, "message": err.message}}),
         },
@@ -171,6 +192,49 @@ impl HostError {
             message: message.into(),
         }
     }
+
+    /// An OS/filesystem-level failure (plan §2's `io` code) — `watch.rs`'s
+    /// gitdir-resolution and watcher-creation failures land here rather
+    /// than `internal`, since they're squarely "something about the
+    /// filesystem/OS didn't cooperate" rather than a bug in this process.
+    fn io(message: impl Into<String>) -> Self {
+        Self {
+            code: "io",
+            message: message.into(),
+        }
+    }
+}
+
+/// `watch/subscribe`.
+fn handle_watch_subscribe(
+    params: Value,
+    stdout: &Arc<Mutex<std::io::Stdout>>,
+) -> Result<Value, HostError> {
+    let root = params
+        .get("root")
+        .and_then(Value::as_str)
+        .ok_or_else(|| HostError::bad_request("watch/subscribe: missing \"root\""))?;
+    let kind = params
+        .get("kind")
+        .and_then(Value::as_str)
+        .ok_or_else(|| HostError::bad_request("watch/subscribe: missing \"kind\""))?;
+
+    match watch::subscribe(root, kind, Arc::clone(stdout)) {
+        Ok(watch_id) => Ok(json!({"watch_id": watch_id})),
+        Err(watch::SubscribeError::BadRequest(message)) => Err(HostError::bad_request(message)),
+        Err(watch::SubscribeError::Io(message)) => Err(HostError::io(message)),
+    }
+}
+
+/// `watch/unsubscribe`. Idempotent — an unknown `watch_id` is not an
+/// error (see `watch::unsubscribe`'s doc).
+fn handle_watch_unsubscribe(params: Value) -> Result<Value, HostError> {
+    let watch_id = params
+        .get("watch_id")
+        .and_then(Value::as_u64)
+        .ok_or_else(|| HostError::bad_request("watch/unsubscribe: missing \"watch_id\""))?;
+    watch::unsubscribe(watch_id);
+    Ok(json!({}))
 }
 
 /// `proc/exec`: run `program(args)` with `stdin_b64` (if present) written

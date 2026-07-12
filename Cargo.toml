@@ -41,6 +41,11 @@ dv-core = { path = "crates/core" }
 # client-side sidecar hash verification).
 base64 = "0.22"
 sha2 = "0.10"
+# Real file watching (crates/core/src/review/watch.rs's local arm; S4 adds
+# crates/host/src/watch.rs, which watches INSIDE the distro over inotify).
+# Declared once here so dv-core and dv-host can't drift onto different
+# `notify` versions.
+notify = "8"
 
 # GPUI is unusably janky fully unoptimized; optimize dependencies even in dev.
 # Our own crates stay at opt-level 0 for fast incremental builds.

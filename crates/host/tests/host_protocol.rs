@@ -6,18 +6,37 @@
 //! byte-for-byte — no WSL required (see tests/wsl_host.rs for the real
 //! `wsl.exe` path, which is #[ignore]d).
 //!
-//! dv-core is a dev-dependency only (see Cargo.toml) — it never reaches
-//! the shipped `dv-host` binary, just this test binary. S2 extends this
-//! file with `blob/get` coverage and the cross-process Spawn/Host error-
-//! text identity proof (plan §8 S2 gate).
+//! dv-core reaches the shipped `dv-host` binary itself as of S4 (see
+//! Cargo.toml's comment — `watch.rs`'s gitdir resolution reuses
+//! `dv_core::review::resolve_local_git_dir`), on top of already being this
+//! test binary's own dependency (driving the real `HostClient`). S2 added
+//! `blob/get` coverage and the cross-process Spawn/Host error-text identity
+//! proof (plan §8 S2 gate); S4 adds `watch/subscribe`|`watch/unsubscribe`
+//! coverage (real `notify`/inotify-equivalent watching, not WSL-specific —
+//! runs on every CI platform).
 
 use std::io::Write as _;
 use std::process::Command;
+use std::sync::mpsc;
 use std::sync::{Arc, Barrier};
 use std::time::{Duration, Instant};
 
 use dv_core::remote::client::HostClient;
+use dv_core::remote::proto::WatchEventParams;
 use dv_core::{CommandBuilder, RepoLocation};
+
+/// Blocks for up to `timeout` waiting for a `watch/event` on `rx` (fed by a
+/// callback registered via [`HostClient::register_watch_callback`]).
+/// `None` on timeout — the "prove silence after unsubscribe" tests below
+/// use that to assert a NEGATIVE (no event arrived), so this deliberately
+/// returns an `Option` rather than panicking on timeout the way `expect`
+/// would.
+fn recv_watch_event(
+    rx: &mpsc::Receiver<WatchEventParams>,
+    timeout: Duration,
+) -> Option<WatchEventParams> {
+    rx.recv_timeout(timeout).ok()
+}
 
 fn spawn_host() -> HostClient {
     HostClient::spawn_command(Command::new(env!("CARGO_BIN_EXE_dv-host")))
@@ -383,6 +402,153 @@ fn connection_failure_still_falls_back_to_spawn() {
         "fallback output should be the local `git --version`, got {:?}",
         String::from_utf8_lossy(&out)
     );
+}
+
+// --- watch/subscribe, watch/unsubscribe, watch/event (plan §8 S4) --------
+//
+// Real `notify` watching (inotify on Linux, ReadDirectoryChangesW on
+// Windows, FSEvents on macOS) — not WSL-specific, so these run on every CI
+// platform, same posture as `blob::tests` above. `HostClient::has_cap`
+// isn't asserted directly here (that's `handshake_reports_proto_1_and_exec_cap`'s
+// job to extend) but every test below only works AT ALL if the real host's
+// hello advertised "watch", so a regression there would fail loudly here
+// too.
+
+#[test]
+fn handshake_advertises_watch_cap() {
+    let client = spawn_host();
+    assert!(
+        client.caps().iter().any(|cap| cap == "watch"),
+        "caps: {:?}",
+        client.caps()
+    );
+}
+
+#[test]
+fn watch_store_touch_fires_event_then_unsubscribe_silences_it() {
+    let client = spawn_host();
+    let dir = temp_dir("dv-host-watch-store");
+    run_git(&["init", "-q"], &dir);
+    let root = dir.to_str().unwrap();
+
+    let (tx, rx) = mpsc::channel::<WatchEventParams>();
+    let watch_id = client
+        .watch_subscribe(root, "store")
+        .expect("watch/subscribe store");
+    client.register_watch_callback(watch_id, move |params| {
+        let _ = tx.send(params);
+    });
+
+    // `subscribe` create_dir_all's this before returning, so it exists by
+    // the time watch_subscribe's response comes back.
+    let reviews_dir = dir.join(".git").join("dv").join("reviews");
+    std::fs::write(reviews_dir.join("r-test.json"), b"{}").expect("write review file");
+
+    let event = recv_watch_event(&rx, Duration::from_secs(5))
+        .expect("expected a watch/event after touching a file under dv/reviews");
+    assert_eq!(event.watch_id, watch_id);
+    assert_eq!(event.kind, "store");
+
+    client
+        .watch_unsubscribe(watch_id)
+        .expect("watch/unsubscribe");
+    // Drain anything already in flight from the write above (coalescing
+    // means there's at most one, but don't assume), then prove silence: a
+    // FRESH write after unsubscribing must produce nothing more.
+    while rx.try_recv().is_ok() {}
+    std::fs::write(reviews_dir.join("r-test-2.json"), b"{}").expect("write second review file");
+    assert!(
+        recv_watch_event(&rx, Duration::from_millis(800)).is_none(),
+        "must not receive watch/event after unsubscribe"
+    );
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn watch_worktree_ignores_dot_git_but_sees_tracked_file_edits() {
+    let client = spawn_host();
+    let dir = temp_dir("dv-host-watch-worktree");
+    run_git(&["init", "-q"], &dir);
+    std::fs::write(dir.join("a.txt"), b"hello\n").unwrap();
+    let root = dir.to_str().unwrap();
+
+    let (tx, rx) = mpsc::channel::<WatchEventParams>();
+    let watch_id = client
+        .watch_subscribe(root, "worktree")
+        .expect("watch/subscribe worktree");
+    client.register_watch_callback(watch_id, move |params| {
+        let _ = tx.send(params);
+    });
+
+    // An edit under `.git/` must NOT produce a worktree event.
+    std::fs::write(dir.join(".git").join("dv-host-test-marker"), b"x").unwrap();
+    assert!(
+        recv_watch_event(&rx, Duration::from_millis(800)).is_none(),
+        "an edit under .git/ must not fire a worktree watch/event"
+    );
+
+    // A tracked-file edit must.
+    std::fs::write(dir.join("a.txt"), b"hello again\n").unwrap();
+    let event = recv_watch_event(&rx, Duration::from_secs(5))
+        .expect("expected a watch/event after editing a tracked file");
+    assert_eq!(event.watch_id, watch_id);
+    assert_eq!(event.kind, "worktree");
+
+    client.watch_unsubscribe(watch_id).ok();
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn watch_overflow_flag_set_beyond_1000_coalesced_paths() {
+    // 1500 plain sequential `fs::write` calls routinely take WELL over
+    // 200ms wall clock (~700ms measured on a Windows dev machine — NTFS
+    // per-file create overhead, antivirus, whatever) — comfortably longer
+    // than the real `COALESCE_WINDOW`, which would just split the burst
+    // across several under-1000 batches and never actually exercise the
+    // overflow path. `DV_HOST_WATCH_COALESCE_MS` (a test-only override —
+    // see `crates/host/src/watch.rs`'s `coalesce_window`) widens the
+    // window enough that the whole loop below reliably lands in ONE
+    // batch, so the overflow flag itself — not incidental write-loop
+    // timing — is what's under test.
+    let client = HostClient::spawn_command({
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_dv-host"));
+        cmd.env("DV_HOST_WATCH_COALESCE_MS", "5000");
+        cmd
+    })
+    .expect("spawning dv-host with a widened coalesce window");
+    let dir = temp_dir("dv-host-watch-overflow");
+    run_git(&["init", "-q"], &dir);
+    let root = dir.to_str().unwrap();
+
+    let (tx, rx) = mpsc::channel::<WatchEventParams>();
+    let watch_id = client
+        .watch_subscribe(root, "store")
+        .expect("watch/subscribe store");
+    client.register_watch_callback(watch_id, move |params| {
+        let _ = tx.send(params);
+    });
+
+    let reviews_dir = dir.join(".git").join("dv").join("reviews");
+    for i in 0..1500 {
+        std::fs::write(reviews_dir.join(format!("r-overflow-{i}.json")), b"{}")
+            .unwrap_or_else(|err| panic!("write {i}: {err}"));
+    }
+
+    let event = recv_watch_event(&rx, Duration::from_secs(10))
+        .expect("expected at least one coalesced watch/event for the burst");
+    assert!(
+        event.overflow,
+        "1500 paths in one burst must set overflow (host caps a batch at 1000)"
+    );
+    assert!(
+        event.paths.len() <= 1000,
+        "capped batch must carry at most 1000 paths, got {}",
+        event.paths.len()
+    );
+
+    client.watch_unsubscribe(watch_id).ok();
+    std::fs::remove_dir_all(&dir).ok();
 }
 
 fn local_hash_object(bytes: &[u8]) -> String {

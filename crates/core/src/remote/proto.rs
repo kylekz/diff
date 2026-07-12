@@ -19,12 +19,20 @@ use serde_json::Value;
 /// once; still bad → hard error" — S1 implements the kill+error half only).
 pub const PROTO_VERSION: u32 = 1;
 
-/// Method names. S1 shipped `proc/exec`; S2 adds `blob/get`. `watch/*` and
-/// `fs/*` from plan §2 arrive in S4/S5.
+/// Method names. S1 shipped `proc/exec`; S2 adds `blob/get`; S4 adds
+/// `watch/subscribe`|`watch/unsubscribe` (see [`WATCH_EVENT`] for the
+/// id-less notification a live subscription pushes). `fs/*` from plan §2
+/// arrives in S5.
 pub mod method {
     pub const PROC_EXEC: &str = "proc/exec";
     pub const BLOB_GET: &str = "blob/get";
+    pub const WATCH_SUBSCRIBE: &str = "watch/subscribe";
+    pub const WATCH_UNSUBSCRIBE: &str = "watch/unsubscribe";
 }
+
+/// [`Notification::event`] value for a live `watch/subscribe`'s pushed
+/// change events (plan §2/§6) — see [`WatchEventParams`].
+pub const WATCH_EVENT: &str = "watch/event";
 
 /// `err.code` values the protocol defines (plan §2). Plain string
 /// constants rather than a closed enum: codes travel as JSON strings, and
@@ -238,6 +246,51 @@ pub struct BlobGetResult {
     pub bytes_b64: String,
 }
 
+/// `watch/subscribe` params (plan §2/§6). `root` is the absolute in-distro
+/// path — the repo root for `kind: "worktree"`, or the same root
+/// `resolve_local_git_dir` will be run against for `kind: "store"` (the
+/// host resolves the real `.git`/`dv/reviews` location itself; the client
+/// never has to know it). `kind` is `"store"` or `"worktree"`; an
+/// unrecognized value is a `bad_request` error, not a silent no-op.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct WatchSubscribeParams {
+    pub root: String,
+    pub kind: String,
+}
+
+/// `watch/subscribe` result — `watch_id` correlates every future
+/// [`WatchEventParams`] notification (and is the handle
+/// `watch/unsubscribe` takes back).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct WatchSubscribeResult {
+    pub watch_id: u64,
+}
+
+/// `watch/unsubscribe` params.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct WatchUnsubscribeParams {
+    pub watch_id: u64,
+}
+
+/// Params of a [`Notification`] whose `event` is [`WATCH_EVENT`] — pushed
+/// by the host, unprompted, for as long as `watch_id`'s subscription is
+/// alive. `paths` and `overflow` are carried for forward-compat/diagnostics
+/// but ignored by the v1 client (plan §2: "callback is `Box<dyn Fn()>`") —
+/// every event, regardless of contents, means "something changed, go
+/// reload"; `overflow: true` (more than 1000 paths coalesced into one
+/// event, or the host's own watcher hit an error — see
+/// `crates/host/src/watch.rs`'s errors-fire-callback convention) is
+/// informational only; it never suppresses the reload.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct WatchEventParams {
+    pub watch_id: u64,
+    pub kind: String,
+    #[serde(default)]
+    pub paths: Vec<String>,
+    #[serde(default)]
+    pub overflow: bool,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -406,5 +459,63 @@ mod tests {
         let line = serde_json::to_string(&result).unwrap();
         assert!(line.contains(r#""found":false"#));
         assert!(line.contains(r#""bytes_b64":"""#));
+    }
+
+    #[test]
+    fn watch_subscribe_params_and_result_round_trip() {
+        let params = WatchSubscribeParams {
+            root: "/home/kyle/proj".into(),
+            kind: "store".into(),
+        };
+        let line = serde_json::to_string(&params).unwrap();
+        let parsed: WatchSubscribeParams = serde_json::from_str(&line).unwrap();
+        assert_eq!(parsed, params);
+
+        let result = WatchSubscribeResult { watch_id: 42 };
+        let line = serde_json::to_string(&result).unwrap();
+        assert_eq!(line, r#"{"watch_id":42}"#);
+        let parsed: WatchSubscribeResult = serde_json::from_str(&line).unwrap();
+        assert_eq!(parsed, result);
+    }
+
+    #[test]
+    fn watch_unsubscribe_params_round_trip() {
+        let params = WatchUnsubscribeParams { watch_id: 7 };
+        let line = serde_json::to_string(&params).unwrap();
+        assert_eq!(line, r#"{"watch_id":7}"#);
+        let parsed: WatchUnsubscribeParams = serde_json::from_str(&line).unwrap();
+        assert_eq!(parsed, params);
+    }
+
+    #[test]
+    fn watch_event_params_round_trip_as_a_notification() {
+        let notification = Notification {
+            event: WATCH_EVENT.to_string(),
+            params: serde_json::to_value(WatchEventParams {
+                watch_id: 3,
+                kind: "worktree".into(),
+                paths: vec!["src/main.rs".into()],
+                overflow: false,
+            })
+            .unwrap(),
+        };
+        let line = serde_json::to_string(&notification).unwrap();
+        let parsed: Notification = serde_json::from_str(&line).unwrap();
+        assert_eq!(parsed.event, WATCH_EVENT);
+        let params: WatchEventParams = serde_json::from_value(parsed.params).unwrap();
+        assert_eq!(params.watch_id, 3);
+        assert_eq!(params.kind, "worktree");
+        assert_eq!(params.paths, vec!["src/main.rs".to_string()]);
+        assert!(!params.overflow);
+    }
+
+    #[test]
+    fn watch_event_params_default_paths_and_overflow_when_absent() {
+        // The store arm's events (and any minimal/older host) may omit
+        // these — must still parse rather than error.
+        let line = r#"{"watch_id":9,"kind":"store"}"#;
+        let params: WatchEventParams = serde_json::from_str(line).unwrap();
+        assert!(params.paths.is_empty());
+        assert!(!params.overflow);
     }
 }

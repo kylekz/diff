@@ -13,8 +13,10 @@ pub mod client;
 pub mod install;
 pub mod manager;
 pub mod proto;
+pub mod worktree;
 
 pub use client::{ExecOutcome, HostClient, RequestFailure};
 pub use install::{HostBinary, HostBinarySource, InstallError};
 pub use manager::enable_hosts;
 pub use proto::{BlobGetParams, BlobGetResult, Hello, Notification, PROTO_VERSION, RpcError};
+pub use worktree::{WorktreeWatcher, watch_worktree};

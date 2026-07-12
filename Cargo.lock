@@ -1436,6 +1436,7 @@ dependencies = [
  "anyhow",
  "base64",
  "dv-core",
+ "notify 8.2.0",
  "serde",
  "serde_json",
 ]

@@ -409,6 +409,13 @@ fn main() {
 /// The GPUI launch path, shared by a plain `dv [<repo-path>]` invocation and
 /// `dv pr <number|url>`'s GUI launch.
 fn run_gui(cli: Cli) {
+    // Route WSL repo operations through a persistent `dv-host` process when
+    // one is available (docs/phase-5-implementation-plan.md §3). The
+    // headless CLI dispatch in `main` above returns before this function is
+    // ever reached, so `dv review`/`dv comment`/`dv pr <list|view|create|
+    // fetch>` stay on today's per-command `wsl.exe` spawns untouched.
+    dv_core::remote::enable_hosts();
+
     let app = gpui_platform::application().with_assets(gpui_component_assets::Assets);
 
     app.run(move |cx| {

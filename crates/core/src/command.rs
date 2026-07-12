@@ -7,28 +7,92 @@ use std::io::Write;
 #[cfg(windows)]
 use std::os::windows::process::CommandExt;
 use std::process::{Command, Stdio};
+use std::sync::Arc;
 
 use anyhow::{Context, Result, bail};
 
 use crate::location::RepoLocation;
+use crate::remote::client::{HostClient, RequestFailure};
+use crate::remote::manager;
 
 /// `CREATE_NO_WINDOW` — suppresses the console flash every subprocess would
 /// otherwise cause once dv is a windowed (non-console) binary.
 #[cfg(windows)]
 pub(crate) const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
+/// Where a command actually runs (docs/phase-5-implementation-plan.md §3):
+/// either the Stage-A `wsl.exe -d <distro> --exec` spawn every command has
+/// always used, or a live `dv-host` connection for this location's distro.
+/// Decided once, in [`CommandBuilder::new`] — nothing downstream of that
+/// (`run`/`run_text`/`run_with_stdin`) has a different signature depending
+/// on which arm is live.
+#[derive(Clone)]
+enum Route {
+    Spawn,
+    Host(Arc<HostClient>),
+}
+
+impl std::fmt::Debug for Route {
+    // Manual impl: `HostClient` doesn't (and shouldn't) implement `Debug`,
+    // so deriving here isn't an option.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Route::Spawn => f.write_str("Route::Spawn"),
+            Route::Host(client) => write!(f, "Route::Host(pid={})", client.pid()),
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct CommandBuilder {
     location: RepoLocation,
+    route: Route,
 }
 
 impl CommandBuilder {
+    /// Wsl locations consult [`manager::client_for`] for a live host
+    /// connection; anything it doesn't hand back (disabled, no
+    /// `DV_HOST_PATH`, cooling down after a failure, ...) falls back to
+    /// `Route::Spawn` — the existing, always-correct behavior. Local
+    /// locations never consult the manager at all.
     pub fn new(location: RepoLocation) -> Self {
-        Self { location }
+        let route = match &location {
+            RepoLocation::Wsl { distro, .. } => manager::client_for(distro)
+                .map(Route::Host)
+                .unwrap_or(Route::Spawn),
+            RepoLocation::Local(_) => Route::Spawn,
+        };
+        Self { location, route }
+    }
+
+    /// Force this builder to route every call through an already-connected
+    /// host client, bypassing [`manager::client_for`] entirely. Real,
+    /// non-test API (a caller that already holds a client and wants to use
+    /// it directly), but its primary consumer today is the cross-process
+    /// test in `crates/host/tests/` that proves the Host and Spawn arms
+    /// produce byte-identical error text for the same failing command —
+    /// that test spins up a REAL `dv-host` binary locally (not via
+    /// `wsl.exe`) and has no `RepoLocation::Wsl` to route through
+    /// `client_for` with.
+    pub fn with_host(location: RepoLocation, client: Arc<HostClient>) -> Self {
+        Self {
+            location,
+            route: Route::Host(client),
+        }
     }
 
     pub fn location(&self) -> &RepoLocation {
         &self.location
+    }
+
+    /// The live host client this builder routes through, if any — consulted
+    /// by [`crate::git::GitRepo::batch_request`] to pick between `blob/get`
+    /// and the local `BlobStore` child.
+    pub(crate) fn host_client(&self) -> Option<Arc<HostClient>> {
+        match &self.route {
+            Route::Host(client) => Some(Arc::clone(client)),
+            Route::Spawn => None,
+        }
     }
 
     /// Construct (but do not run) a [`Command`] for `program` with `args`,
@@ -69,24 +133,52 @@ impl CommandBuilder {
     /// carrying the program, args, exit code, and (decoded, truncated)
     /// stderr. Stdout is returned as raw bytes, untouched — blob content
     /// must never pass through text decoding.
+    ///
+    /// For a `Route::Host` builder this sends `proc/exec` instead of
+    /// spawning `wsl.exe`. Only a CONNECTION-level host failure (the
+    /// client channel itself is dead — see
+    /// [`RequestFailure::is_connection`]) is hidden from the caller: it's
+    /// logged and this call transparently falls back to the Spawn arm,
+    /// which RE-EXECUTES `program` from scratch. A `Timeout` surfaces as an
+    /// `Err` instead — the host-side command is almost certainly still
+    /// running, so falling back would run it a SECOND time, concurrently
+    /// with the still-in-flight original (ref-lock contention on a fetch,
+    /// e.g.). An `Rpc` error (the host answered with a structured failure —
+    /// its own spawn of `program` failing, say) is likewise surfaced as-is:
+    /// a completed round trip with a definitive result, exactly as final as
+    /// a successful response with a non-zero exit code.
+    ///
+    /// The real contract this implies: every command that flows through
+    /// `CommandBuilder` must tolerate being RE-EXECUTED after a connection
+    /// failure, because that's the one case that transparently retries.
+    /// Today's inventory qualifies — reads, convergent fetches (`git fetch`
+    /// of a ref that already matches is a no-op), and same-bytes atomic
+    /// writes (the review store's WSL write path: write-to-tmp + rename,
+    /// safe to redo) — reviewed 2026-07-12. Anyone adding a non-idempotent
+    /// command (anything that appends, increments, or has a side effect
+    /// outside the repo) through this layer must revisit this contract.
     pub fn run(&self, program: &str, args: &[&str]) -> Result<Vec<u8>> {
-        let output = self
-            .command(program, args)
-            .output()
-            .with_context(|| format!("failed to run {program}: spawn failed"))?;
-
-        if !output.status.success() {
-            let joined_args = args.join(" ");
-            let code = match output.status.code() {
-                Some(code) => code.to_string(),
-                None => "terminated by signal".to_string(),
-            };
-            let mut stderr = decode_output(&output.stderr);
-            truncate_lossy(&mut stderr, 2000);
-            bail!("{program} {joined_args} failed (exit {code}): {stderr}");
+        if let Route::Host(client) = &self.route {
+            match client.exec(program, args, None) {
+                Ok(outcome) => {
+                    return finish(
+                        program,
+                        args,
+                        outcome.exit_code == 0,
+                        Some(outcome.exit_code),
+                        outcome.stdout,
+                        &outcome.stderr,
+                    );
+                }
+                Err(err) if RequestFailure::is_connection_failure(&err) => {
+                    self.note_host_failure(client, &format!("proc/exec: {err:#}"));
+                }
+                Err(err) => return Err(err),
+            }
+        } else {
+            manager::note_spawn_fallback(&self.location, "no host route available");
         }
-
-        Ok(output.stdout)
+        self.run_spawn(program, args)
     }
 
     /// [`Self::run`] + [`decode_output`] + trailing-whitespace trim, for
@@ -99,14 +191,86 @@ impl CommandBuilder {
     /// Like [`Self::run`], but writes `stdin_bytes` to the child's stdin
     /// before collecting output. Used by the review store's WSL write path
     /// (`sh -c 'mkdir -p … && cat > tmp && mv tmp final'`), which has no
-    /// other way to get bytes into the pipeline.
+    /// other way to get bytes into the pipeline. Routes through
+    /// `Route::Host` the same way [`Self::run`] does — including the same
+    /// "only a Connection-kind failure falls back; Timeout/Rpc surface
+    /// as-is" contract documented there.
+    pub fn run_with_stdin(
+        &self,
+        program: &str,
+        args: &[&str],
+        stdin_bytes: &[u8],
+    ) -> Result<Vec<u8>> {
+        if let Route::Host(client) = &self.route {
+            match client.exec(program, args, Some(stdin_bytes)) {
+                Ok(outcome) => {
+                    return finish(
+                        program,
+                        args,
+                        outcome.exit_code == 0,
+                        Some(outcome.exit_code),
+                        outcome.stdout,
+                        &outcome.stderr,
+                    );
+                }
+                Err(err) if RequestFailure::is_connection_failure(&err) => {
+                    self.note_host_failure(client, &format!("proc/exec: {err:#}"));
+                }
+                Err(err) => return Err(err),
+            }
+        } else {
+            manager::note_spawn_fallback(&self.location, "no host route available");
+        }
+        self.run_with_stdin_spawn(program, args, stdin_bytes)
+    }
+
+    /// A live `Route::Host` request just failed with a CONNECTION-level
+    /// error — callers must never call this for a `Timeout` or an `Rpc`
+    /// result the host successfully answered with (see [`RequestFailure`]
+    /// and [`RequestFailure::is_connection_failure`], which both call sites
+    /// guard on before reaching here). Logs the fallback (the plan §8 S2
+    /// gate counter) and, for a `Wsl` location, tells the manager to start
+    /// this distro's cool-down clock immediately rather than waiting for
+    /// some unrelated future `CommandBuilder::new` to notice via
+    /// `is_alive()` — passing `client`'s own identity through so a stale
+    /// client this `CommandBuilder` still holds can never downgrade a
+    /// FRESH client that has since replaced it in the registry (see
+    /// [`manager::mark_dead`]'s doc comment). A no-op for the
+    /// `with_host`-on-a-Local-location test seam, which has no distro to
+    /// mark dead.
+    fn note_host_failure(&self, client: &Arc<HostClient>, reason: &str) {
+        manager::note_spawn_fallback(&self.location, reason);
+        if let RepoLocation::Wsl { distro, .. } = &self.location {
+            manager::mark_dead(distro, client);
+        }
+    }
+
+    /// The Stage-A path: build the `wsl.exe`-prefixed (or bare, for Local)
+    /// [`Command`] and run it directly. Shared error formatting with the
+    /// Host arm lives in [`finish`], not here — see its doc comment.
+    fn run_spawn(&self, program: &str, args: &[&str]) -> Result<Vec<u8>> {
+        let output = self
+            .command(program, args)
+            .output()
+            .with_context(|| format!("failed to run {program}: spawn failed"))?;
+        finish(
+            program,
+            args,
+            output.status.success(),
+            output.status.code(),
+            output.stdout,
+            &output.stderr,
+        )
+    }
+
+    /// The Stage-A path for [`Self::run_with_stdin`].
     ///
     /// The stdin handle is closed (dropped) before `wait_with_output`, not
     /// after: a child that consumes all of stdin before it starts writing
     /// stdout would otherwise deadlock (child blocked on a full stdout pipe
     /// no one is draining yet, us blocked on a `wait` that needs the child
     /// to exit) — same hazard `std::process::Command` docs warn about.
-    pub fn run_with_stdin(
+    fn run_with_stdin_spawn(
         &self,
         program: &str,
         args: &[&str],
@@ -134,20 +298,44 @@ impl CommandBuilder {
         let output = child
             .wait_with_output()
             .with_context(|| format!("failed waiting for {program}"))?;
-
-        if !output.status.success() {
-            let joined_args = args.join(" ");
-            let code = match output.status.code() {
-                Some(code) => code.to_string(),
-                None => "terminated by signal".to_string(),
-            };
-            let mut stderr = decode_output(&output.stderr);
-            truncate_lossy(&mut stderr, 2000);
-            bail!("{program} {joined_args} failed (exit {code}): {stderr}");
-        }
-
-        Ok(output.stdout)
+        finish(
+            program,
+            args,
+            output.status.success(),
+            output.status.code(),
+            output.stdout,
+            &output.stderr,
+        )
     }
+}
+
+/// Shared success/failure formatting for BOTH routes — the single reason
+/// `CommandBuilder::run`'s error text is byte-identical whether it ran via
+/// `wsl.exe` spawn or a `dv-host` `proc/exec` response (plan §8 S2: "the
+/// error strings on non-zero exit must be byte-identical to today's
+/// format"). `code` is `Option` to preserve the Spawn arm's existing
+/// "terminated by signal" text for a `None` `ExitStatus::code()`; the Host
+/// arm always has a definite `i32` (the wire's `ExecResult::exit_code`), so
+/// it always passes `Some`.
+fn finish(
+    program: &str,
+    args: &[&str],
+    success: bool,
+    code: Option<i32>,
+    stdout: Vec<u8>,
+    stderr: &[u8],
+) -> Result<Vec<u8>> {
+    if success {
+        return Ok(stdout);
+    }
+    let joined_args = args.join(" ");
+    let code_str = match code {
+        Some(code) => code.to_string(),
+        None => "terminated by signal".to_string(),
+    };
+    let mut stderr_text = decode_output(stderr);
+    truncate_lossy(&mut stderr_text, 2000);
+    bail!("{program} {joined_args} failed (exit {code_str}): {stderr_text}");
 }
 
 /// Truncate `s` to at most `max` bytes, backing up to the nearest
@@ -278,5 +466,91 @@ mod tests {
         assert_eq!(cmd.get_program(), "git");
         let args: Vec<_> = cmd.get_args().map(|a| a.to_str().unwrap()).collect();
         assert_eq!(args, ["-C", "D:\\x", "status"]);
+    }
+
+    // --- Route selection (plan §8 S2: "Route selection logic
+    // (enabled/disabled/... states)") ------------------------------------
+    //
+    // Nothing in this crate's test suite ever calls the real, process-
+    // global `manager::enable_hosts()` (that's load-bearing: it lets every
+    // test here rely on hosts being ambiently disabled, with no ordering
+    // hazard against other tests in the same binary). So a fresh
+    // `CommandBuilder` for a Wsl location always resolves through
+    // `manager::client_for`'s disabled-by-default path and lands on
+    // `Route::Spawn` here, exactly like it would in the real headless CLI
+    // (which never calls `enable_hosts()` either).
+
+    #[test]
+    fn route_for_local_is_always_spawn() {
+        let builder = CommandBuilder::new(RepoLocation::Local(PathBuf::from("D:\\x")));
+        assert!(matches!(builder.route, Route::Spawn));
+        assert!(builder.host_client().is_none());
+    }
+
+    #[test]
+    fn route_for_wsl_falls_back_to_spawn_when_hosts_disabled() {
+        let builder = CommandBuilder::new(RepoLocation::Wsl {
+            distro: "Ubuntu".to_string(),
+            path: "/x".to_string(),
+        });
+        assert!(matches!(builder.route, Route::Spawn));
+        assert!(builder.host_client().is_none());
+    }
+
+    #[test]
+    fn route_debug_does_not_require_host_client_debug() {
+        // Compiles at all only because `Route`'s `Debug` impl is manual —
+        // this is mostly a "does it build" assertion.
+        let builder = CommandBuilder::new(RepoLocation::Local(PathBuf::from("D:\\x")));
+        assert_eq!(format!("{:?}", builder.route), "Route::Spawn");
+    }
+
+    // --- finish(): the shared Spawn/Host error formatter -----------------
+
+    #[test]
+    fn finish_success_returns_stdout_untouched() {
+        let out = finish("git", &["status"], true, Some(0), b"ok".to_vec(), b"").unwrap();
+        assert_eq!(out, b"ok");
+    }
+
+    #[test]
+    fn finish_failure_format_matches_documented_shape() {
+        let err = finish(
+            "git",
+            &["-C", "/x", "status"],
+            false,
+            Some(128),
+            Vec::new(),
+            b"fatal: not a git repository",
+        )
+        .unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "git -C /x status failed (exit 128): fatal: not a git repository"
+        );
+    }
+
+    #[test]
+    fn finish_none_code_reads_terminated_by_signal() {
+        let err = finish("git", &["status"], false, None, Vec::new(), b"").unwrap_err();
+        assert!(err.to_string().contains("terminated by signal"));
+    }
+
+    #[test]
+    fn finish_truncates_and_decodes_stderr_identically_to_the_old_inline_logic() {
+        let long_stderr = "e".repeat(3000);
+        let err = finish(
+            "git",
+            &["status"],
+            false,
+            Some(1),
+            Vec::new(),
+            long_stderr.as_bytes(),
+        )
+        .unwrap_err();
+        let text = err.to_string();
+        // 2000-byte cap (see `truncate_lossy`) plus the surrounding format.
+        assert!(text.len() < long_stderr.len());
+        assert!(text.contains("failed (exit 1):"));
     }
 }

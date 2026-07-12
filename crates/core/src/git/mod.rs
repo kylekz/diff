@@ -10,6 +10,8 @@ use anyhow::{Context, Result, anyhow};
 
 use crate::command::CommandBuilder;
 use crate::location::RepoLocation;
+use crate::remote::client::RequestFailure;
+use crate::remote::manager;
 use batch::BlobStore;
 
 /// What two states a diff compares. Maps 1:1 onto git invocations — see
@@ -88,6 +90,16 @@ fn dash_c_arg(location: &RepoLocation) -> String {
         RepoLocation::Local(path) => path.to_string_lossy().into_owned(),
         RepoLocation::Wsl { path, .. } => path.clone(),
     }
+}
+
+/// Whether a connected host advertises `blob/get` support (`Hello.caps`
+/// contains `"blob"`) — a stale pre-S2 `dv-host` binary predates
+/// `blob/get` entirely and would otherwise draw a `bad_request` per blob
+/// lookup instead of a clean fallback (plan §8 S2 review finding P3-5).
+/// Factored out as a pure predicate over `&[String]` so it's unit-testable
+/// without a real `HostClient`/transport.
+fn client_supports_blob_get(caps: &[String]) -> bool {
+    caps.iter().any(|cap| cap == "blob")
 }
 
 impl GitRepo {
@@ -407,7 +419,46 @@ impl GitRepo {
         }
     }
 
+    /// Route to `blob/get` when a host is connected AND advertises the
+    /// `blob` capability — a stale pre-S2 `dv-host` binary predates
+    /// `blob/get` entirely and would otherwise draw a `bad_request` per
+    /// blob lookup instead of a clean fallback (plan §8 S2 review finding
+    /// P3-5). Any failure — Connection, Timeout, or a structured Rpc error
+    /// alike — falls back transparently to [`Self::batch_request_local`]
+    /// for THIS call only: unlike `CommandBuilder::run`'s stricter "only a
+    /// Connection-level failure falls back" rule (a `proc/exec` command
+    /// might not be idempotent), a blob READ is always safe to retry via
+    /// the local path no matter why the host attempt failed. Downgrading
+    /// the host to `Dead`, though, is gated exactly the way
+    /// `CommandBuilder` gates it: only a Connection-level failure from the
+    /// SAME client instance currently registered as alive does that (see
+    /// `manager::mark_dead`'s doc comment) — a structured Rpc error from a
+    /// healthy host, or a stale client a long-lived `GitRepo` still holds,
+    /// must never downgrade the connection.
     fn batch_request(&self, spec: &str) -> Result<Option<Vec<u8>>> {
+        if let Some(client) = self.builder.host_client() {
+            if client_supports_blob_get(client.caps()) {
+                match client.blob_get(&self.root_arg(), spec) {
+                    Ok(result) => return Ok(result),
+                    Err(err) => {
+                        manager::note_spawn_fallback(&self.location, &format!("blob/get: {err:#}"));
+                        if RequestFailure::is_connection_failure(&err)
+                            && let RepoLocation::Wsl { distro, .. } = &self.location
+                        {
+                            manager::mark_dead(distro, &client);
+                        }
+                    }
+                }
+            } else {
+                manager::note_spawn_fallback(&self.location, "host lacks blob capability");
+            }
+        }
+        self.batch_request_local(spec)
+    }
+
+    /// The Stage-A path: a persistent `git cat-file --batch` child, one per
+    /// repo, respawned on any protocol error.
+    fn batch_request_local(&self, spec: &str) -> Result<Option<Vec<u8>>> {
         let mut guard = self.blob_store.lock().unwrap_or_else(|e| e.into_inner());
 
         if guard.is_none() {
@@ -703,5 +754,28 @@ mod tests {
     #[test]
     fn empty_ls_files_output_is_none() {
         assert_eq!(parse_ls_files_stage0_sha(""), None);
+    }
+
+    // --- client_supports_blob_get: the blob/get caps gate -----------------
+    // (plan §8 S2 review finding P3-5)
+
+    #[test]
+    fn client_supports_blob_get_true_when_cap_present() {
+        assert!(client_supports_blob_get(&[
+            "exec".to_string(),
+            "blob".to_string()
+        ]));
+    }
+
+    #[test]
+    fn client_supports_blob_get_false_for_a_stale_pre_s2_host() {
+        // A pre-S2 dv-host binary only ever advertised "exec" — no
+        // "blob" cap, since blob/get didn't exist yet.
+        assert!(!client_supports_blob_get(&["exec".to_string()]));
+    }
+
+    #[test]
+    fn client_supports_blob_get_false_for_no_caps_at_all() {
+        assert!(!client_supports_blob_get(&[]));
     }
 }

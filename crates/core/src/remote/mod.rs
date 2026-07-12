@@ -2,14 +2,16 @@
 //! over a `wsl.exe --exec` stdio channel — see
 //! docs/phase-5-implementation-plan.md and docs/phase-5-wsl.md.
 //!
-//! S1 scope only (handshake + `proc/exec`, real `wsl.exe` spawn + a test
-//! seam for any process speaking the protocol). `manager.rs` (per-distro
-//! registry) and `install.rs` (sidecar install/upgrade) land in S2/S3 —
-//! nothing in dv-core wires this module in yet; it is not called from
-//! anywhere else in the crate.
+//! S1 shipped handshake + `proc/exec` (real `wsl.exe` spawn + a test seam
+//! for any process speaking the protocol). S2 adds `manager.rs` (the
+//! per-distro `HostEntry` registry, consulted by
+//! [`crate::command::CommandBuilder::new`]) and `blob/get`. `install.rs`
+//! (sidecar install/upgrade) lands in S3.
 
 pub mod client;
+pub mod manager;
 pub mod proto;
 
-pub use client::{ExecOutcome, HostClient};
-pub use proto::{Hello, Notification, PROTO_VERSION, RpcError};
+pub use client::{ExecOutcome, HostClient, RequestFailure};
+pub use manager::enable_hosts;
+pub use proto::{BlobGetParams, BlobGetResult, Hello, Notification, PROTO_VERSION, RpcError};

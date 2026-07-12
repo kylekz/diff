@@ -9,6 +9,8 @@
 //! `dv_core::remote::client::HostClient` against this REAL binary. NO
 //! gpui anywhere in this crate, ever — see CLAUDE.md.
 
+mod blob;
+
 use std::io::{BufRead as _, Read as _, Write as _};
 use std::process::{Command, Stdio};
 use std::sync::mpsc;
@@ -36,7 +38,7 @@ fn main() {
         "proto": PROTO_VERSION,
         "version": env!("DV_HOST_VERSION"),
         "pid": std::process::id(),
-        "caps": ["exec"],
+        "caps": ["exec", "blob"],
     });
     write_line(&stdout, &hello);
 
@@ -127,6 +129,10 @@ fn dispatch(job: Job) -> Value {
     let Job { id, method, params } = job;
     match method.as_str() {
         "proc/exec" => match handle_exec(params) {
+            Ok(result) => json!({"id": id, "ok": result}),
+            Err(err) => json!({"id": id, "err": {"code": err.code, "message": err.message}}),
+        },
+        "blob/get" => match handle_blob_get(params) {
             Ok(result) => json!({"id": id, "ok": result}),
             Err(err) => json!({"id": id, "err": {"code": err.code, "message": err.message}}),
         },
@@ -239,6 +245,19 @@ fn handle_exec(params: Value) -> Result<Value, HostError> {
         // A child that exits before reading all of stdin (e.g. `git
         // rev-parse` ignoring stdin entirely) makes this a broken-pipe
         // write error — expected, not a failure of the exec itself.
+        //
+        // Deliberate drift from Stage-A's `run_with_stdin_spawn`
+        // (crates/core/src/command.rs): that path propagates a stdin write
+        // failure as ITS OWN `Err` (via `?`, before ever calling
+        // `wait_with_output`), which masks whatever the child's real exit
+        // code/stderr would have said. Swallowing the write error here and
+        // falling through to `child.wait()` below instead is strictly MORE
+        // informative — the caller gets the program's actual exit code and
+        // stderr rather than an opaque "failed writing to stdin". Not
+        // unified with Stage-A because that would change today's
+        // `CommandBuilder` error text for local/Spawn-arm callers (plan §8:
+        // error strings must stay byte-identical) — left as a known,
+        // reviewed gap (plan §8 S2 review finding P3-7).
         let _ = stdin.write_all(&bytes);
     }
     // Ensure stdin is closed (EOF) before waiting, whether or not we wrote
@@ -261,6 +280,30 @@ fn handle_exec(params: Value) -> Result<Value, HostError> {
         "stdout_b64": BASE64.encode(&stdout),
         "stderr_b64": BASE64.encode(&stderr),
     }))
+}
+
+/// `blob/get`: one `git cat-file --batch` request against `blob::get`'s
+/// per-root pool. `found: false` (empty `bytes_b64`) is a normal `ok`
+/// result — only a pool/spawn-level failure is a wire `err`.
+fn handle_blob_get(params: Value) -> Result<Value, HostError> {
+    let root = params
+        .get("root")
+        .and_then(Value::as_str)
+        .ok_or_else(|| HostError::bad_request("blob/get: missing \"root\""))?;
+    let spec = params
+        .get("spec")
+        .and_then(Value::as_str)
+        .ok_or_else(|| HostError::bad_request("blob/get: missing \"spec\""))?;
+
+    match blob::get(root, spec) {
+        Ok((found, bytes)) => Ok(json!({
+            "found": found,
+            "bytes_b64": BASE64.encode(&bytes),
+        })),
+        Err(err) => Err(HostError::internal(format!(
+            "blob/get failed for root={root:?} spec={spec:?}: {err:#}"
+        ))),
+    }
 }
 
 fn write_line(stdout: &Arc<Mutex<std::io::Stdout>>, value: &Value) {

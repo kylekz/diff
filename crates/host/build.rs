@@ -20,6 +20,38 @@ fn main() {
     // reruns to the one thing this script actually reads besides CARGO_*.
     println!("cargo:rerun-if-env-changed=GITHUB_SHA");
     println!("cargo:rerun-if-changed=../../.git/HEAD");
+    // `.git/HEAD` alone only changes on checkout/detach. The single most
+    // common dev-loop case — committing on the branch you're already on —
+    // instead updates `.git/refs/heads/<branch>`, which `.git/HEAD` merely
+    // POINTS AT ("ref: refs/heads/main") without itself changing. Without
+    // also watching that file, this build script wouldn't re-run and
+    // DV_HOST_VERSION would go stale after same-branch commits (plan §8 S2
+    // review finding P3-6).
+    if let Some(ref_path) = current_branch_ref_path() {
+        println!("cargo:rerun-if-changed={ref_path}");
+    }
+}
+
+/// Resolves the ref file `.git/HEAD` points at for the current branch
+/// (`"ref: refs/heads/main"` -> `../../.git/refs/heads/main`). `None` for a
+/// detached HEAD (no `ref: ` line — `.git/HEAD` itself already holds the
+/// raw sha, so watching it alone is already sufficient there) or if
+/// `.git/HEAD` can't be read at all.
+///
+/// Doesn't handle a branch tip that lives ONLY in `.git/packed-refs`
+/// (never checked out to loose-ref form) — the `.exists()` check below
+/// just skips emitting a rerun-if-changed for those, same as if this
+/// function had never been called. Worst case is a stale embedded sha,
+/// which is diagnostic-only (the handshake's `version` field), never
+/// correctness-affecting, so staying best-effort here is fine.
+fn current_branch_ref_path() -> Option<String> {
+    let head = std::fs::read_to_string("../../.git/HEAD").ok()?;
+    let branch = head.trim().strip_prefix("ref: ")?;
+    // `branch` is POSIX-style ("refs/heads/main") even on a Windows
+    // checkout — git always writes it that way — so a plain `/` join is
+    // safe on every platform this builds on.
+    let ref_path = format!("../../.git/{branch}");
+    std::path::Path::new(&ref_path).exists().then_some(ref_path)
 }
 
 fn github_sha() -> Option<String> {

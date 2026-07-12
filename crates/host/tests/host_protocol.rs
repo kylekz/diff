@@ -7,7 +7,9 @@
 //! `wsl.exe` path, which is #[ignore]d).
 //!
 //! dv-core is a dev-dependency only (see Cargo.toml) — it never reaches
-//! the shipped `dv-host` binary, just this test binary.
+//! the shipped `dv-host` binary, just this test binary. S2 extends this
+//! file with `blob/get` coverage and the cross-process Spawn/Host error-
+//! text identity proof (plan §8 S2 gate).
 
 use std::io::Write as _;
 use std::process::Command;
@@ -15,6 +17,7 @@ use std::sync::{Arc, Barrier};
 use std::time::{Duration, Instant};
 
 use dv_core::remote::client::HostClient;
+use dv_core::{CommandBuilder, RepoLocation};
 
 fn spawn_host() -> HostClient {
     HostClient::spawn_command(Command::new(env!("CARGO_BIN_EXE_dv-host")))
@@ -193,6 +196,193 @@ fn kill_fails_pending_and_future_requests_promptly() {
     );
     result.expect("exec loop should observe an error after kill(), not run forever");
     assert!(!client.is_alive());
+}
+
+#[test]
+fn blob_get_found_by_rev_path() {
+    let client = spawn_host();
+    let dir = temp_dir("dv-host-blob-get");
+    run_git(&["init", "-q"], &dir);
+    std::fs::write(dir.join("a.txt"), b"hello blob\n").unwrap();
+    run_git(&["add", "a.txt"], &dir);
+    run_git(
+        &[
+            "-c",
+            "user.email=t@t.com",
+            "-c",
+            "user.name=t",
+            "commit",
+            "-q",
+            "-m",
+            "seed",
+        ],
+        &dir,
+    );
+
+    let root = dir.to_str().unwrap();
+    let bytes = client
+        .blob_get(root, "HEAD:a.txt")
+        .expect("blob_get")
+        .expect("blob must be found");
+    assert_eq!(bytes, b"hello blob\n");
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn blob_get_missing_spec_returns_none() {
+    let client = spawn_host();
+    let dir = temp_dir("dv-host-blob-get-missing");
+    run_git(&["init", "-q"], &dir);
+    run_git(
+        &[
+            "-c",
+            "user.email=t@t.com",
+            "-c",
+            "user.name=t",
+            "commit",
+            "-q",
+            "--allow-empty",
+            "-m",
+            "seed",
+        ],
+        &dir,
+    );
+
+    let root = dir.to_str().unwrap();
+    let result = client
+        .blob_get(root, "HEAD:does-not-exist.txt")
+        .expect("blob_get");
+    assert!(
+        result.is_none(),
+        "missing path must report None, not an error"
+    );
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn blob_get_binary_blob_by_raw_oid_round_trips() {
+    let client = spawn_host();
+    let dir = temp_dir("dv-host-blob-get-binary");
+    run_git(&["init", "-q"], &dir);
+
+    let mut bytes: Vec<u8> = (0..=255u8).collect();
+    for i in 0..4096u32 {
+        bytes.push(i.wrapping_mul(2_654_435_761).wrapping_add(i) as u8);
+    }
+    let write = client
+        .exec(
+            "git",
+            &["-C", dir.to_str().unwrap(), "hash-object", "-w", "--stdin"],
+            Some(&bytes),
+        )
+        .expect("hash-object");
+    assert_eq!(write.exit_code, 0);
+    let oid = String::from_utf8(write.stdout).unwrap().trim().to_string();
+
+    let got = client
+        .blob_get(dir.to_str().unwrap(), &oid)
+        .expect("blob_get")
+        .expect("blob must be found");
+    assert_eq!(got, bytes, "binary blob must round-trip byte-identical");
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// The plan §8 S2 gate: `CommandBuilder::run`'s error text for a failing
+/// command must be byte-identical whether it ran via the Stage-A `wsl.exe`
+/// spawn (here: a plain local spawn, since this test isn't run inside WSL)
+/// or via a `dv-host` `proc/exec` response. `CommandBuilder::with_host`
+/// (a real, non-test-gated constructor — see its doc comment) is what lets
+/// this test force the Host route without a `RepoLocation::Wsl` to route
+/// `manager::client_for` through.
+#[test]
+fn spawn_and_host_routes_produce_byte_identical_error_text() {
+    let dir = temp_dir("dv-host-error-identity");
+    run_git(&["init", "-q"], &dir);
+    let dir_str = dir.to_str().unwrap().to_string();
+    let fail_args = [
+        "-C",
+        dir_str.as_str(),
+        "rev-parse",
+        "--verify",
+        "nonexistent-ref-xyz",
+    ];
+
+    let spawn_builder = CommandBuilder::new(RepoLocation::Local(dir.clone()));
+    let spawn_err = spawn_builder
+        .run("git", &fail_args)
+        .expect_err("unknown ref must fail");
+
+    let client = Arc::new(spawn_host());
+    let host_builder = CommandBuilder::with_host(RepoLocation::Local(dir.clone()), client);
+    let host_err = host_builder
+        .run("git", &fail_args)
+        .expect_err("unknown ref must fail via the host route too");
+
+    assert_eq!(
+        format!("{spawn_err:#}"),
+        format!("{host_err:#}"),
+        "Spawn and Host routes must produce byte-identical error text for the same failing command"
+    );
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// Plan §8 S2 review findings P2-1/P2-2 regression: a structured RPC error
+/// the host itself answered with (here, `exec_spawn_failed` — the host's
+/// OWN attempt to spawn a nonexistent program failing) must NOT trigger
+/// `CommandBuilder::run`'s transparent Spawn-arm fallback. Before this fix,
+/// ANY `Err` from `client.exec` fell back silently, masking the host's
+/// answer behind a differently-shaped local "spawn failed" error (and,
+/// separately, would have marked the host `Dead` for a failure that says
+/// nothing about the CONNECTION's health). Asserting the host's own
+/// `exec_spawn_failed` code string survives verbatim proves neither
+/// happened.
+#[test]
+fn rpc_error_from_host_is_not_masked_by_spawn_fallback() {
+    let dir = temp_dir("dv-host-rpc-not-masked");
+    let client = Arc::new(spawn_host());
+    let builder = CommandBuilder::with_host(RepoLocation::Local(dir.clone()), client);
+
+    let err = builder
+        .run("dv-test-nonexistent-program-xyz", &[])
+        .expect_err("a program the host can't spawn must fail");
+    let message = format!("{err:#}");
+    eprintln!("error message: {message}");
+    assert!(
+        message.contains("exec_spawn_failed"),
+        "expected the host's own exec_spawn_failed RPC error to surface verbatim, not a \
+         Spawn-arm 'spawn failed' message: {message:?}"
+    );
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// Positive-case counterpart to the test above: a genuine CONNECTION-level
+/// failure (the host process killed out from under an in-flight
+/// `CommandBuilder`) must still get the transparent Spawn-arm fallback —
+/// proving the P2-2 fix (Timeout/Rpc no longer fall back) didn't
+/// accidentally take Connection-kind fallback down with it.
+#[test]
+fn connection_failure_still_falls_back_to_spawn() {
+    let client = Arc::new(spawn_host());
+    client.kill();
+    assert!(
+        wait_until(Duration::from_secs(5), || !client.is_alive()),
+        "reader thread should observe EOF and flip alive to false after kill()"
+    );
+
+    let builder = CommandBuilder::with_host(RepoLocation::Local(std::env::temp_dir()), client);
+    let out = builder
+        .run("git", &["--version"])
+        .expect("a connection-level failure must still fall back to a local spawn");
+    assert!(
+        String::from_utf8_lossy(&out).starts_with("git version"),
+        "fallback output should be the local `git --version`, got {:?}",
+        String::from_utf8_lossy(&out)
+    );
 }
 
 fn local_hash_object(bytes: &[u8]) -> String {

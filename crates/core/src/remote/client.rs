@@ -10,7 +10,7 @@ use std::sync::mpsc::{self, RecvTimeoutError, SyncSender};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use anyhow::{Context, Result, anyhow, bail};
+use anyhow::{Context, Result, bail};
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64;
 use serde_json::Value;
@@ -18,7 +18,8 @@ use serde_json::Value;
 use crate::command::decode_output;
 
 use super::proto::{
-    self, ExecParams, ExecResult, Hello, Notification, PROTO_VERSION, Request, RpcError, RpcResult,
+    self, BlobGetParams, BlobGetResult, ExecParams, ExecResult, Hello, Notification, PROTO_VERSION,
+    Request, RpcError, RpcResult,
 };
 
 /// Handshake read must complete within this long — covers a cold WSL
@@ -38,7 +39,7 @@ const STDERR_RING_CAP: usize = 64 * 1024;
 /// before reaching for `kill`.
 const SHUTDOWN_GRACE: Duration = Duration::from_millis(2000);
 
-type NotificationHandler = Box<dyn Fn(Notification) + Send + Sync>;
+type NotificationHandler = Arc<dyn Fn(Notification) + Send + Sync>;
 
 /// A live connection to a `dv-host` process. Every method takes `&self`
 /// and is safe to call concurrently from multiple threads — dv-core's
@@ -65,6 +66,84 @@ pub struct ExecOutcome {
     pub stdout: Vec<u8>,
     pub stderr: Vec<u8>,
 }
+
+/// The classification of a [`HostClient::request`]/[`HostClient::exec`]/
+/// [`HostClient::blob_get`] failure. Every `anyhow::Error` those methods
+/// return carries one of these as its root cause — retrievable via
+/// `err.downcast_ref::<RequestFailure>()`, or [`Self::is_connection_failure`]
+/// as the ready-made helper — so callers (`CommandBuilder`,
+/// `GitRepo::batch_request`) can act on the KIND of failure instead of
+/// string-matching the message (plan §8 S2 review findings P2-1/P2-2).
+///
+/// Only [`Self::Connection`] means the client CHANNEL ITSELF is no longer
+/// usable — that is the one and only condition under which a caller should
+/// downgrade a [`super::manager`] registry entry to `Dead` or fall back to
+/// the Stage-A `Route::Spawn` path. The other two are both, in their own
+/// way, a COMPLETED round trip:
+///   - [`Self::Timeout`]: the host is presumably still alive and still
+///     working on it — the request just hasn't come back yet. Re-running
+///     the same command via Spawn would run it a SECOND time, concurrently
+///     with the still-in-flight first attempt (ref-lock contention on a
+///     fetch, e.g.) — never safe to do transparently.
+///   - [`Self::Rpc`]: the host received the request and answered with a
+///     structured error. Routing worked; this is the result, exactly as
+///     final as a successful response with a non-zero exit code.
+#[derive(Debug, Clone, PartialEq)]
+pub enum RequestFailure {
+    /// The client channel is dead: already known dead before this request
+    /// was even sent, the stdin write itself failed, or the reader
+    /// thread's reply channel hung up while a reply was still pending.
+    Connection(String),
+    /// [`REQUEST_TIMEOUT`] elapsed with no reply to `method`.
+    Timeout { method: String, secs: u64 },
+    /// The host replied with a structured RPC error.
+    Rpc(RpcError),
+}
+
+impl RequestFailure {
+    fn connection(message: impl Into<String>) -> Self {
+        RequestFailure::Connection(message.into())
+    }
+
+    /// Whether this is the one kind of failure that means the client
+    /// channel itself is unusable — see the type doc for why only this
+    /// kind should ever downgrade a host entry to `Dead` or trigger the
+    /// transparent `Route::Spawn` fallback.
+    pub fn is_connection(&self) -> bool {
+        matches!(self, RequestFailure::Connection(_))
+    }
+
+    /// Whether this failure was a request timeout — the host-side command
+    /// may still be running; callers must never re-run it via a fallback
+    /// path.
+    pub fn is_timeout(&self) -> bool {
+        matches!(self, RequestFailure::Timeout { .. })
+    }
+
+    /// The shared classification helper: does `err`'s root cause name a
+    /// [`RequestFailure::Connection`]? `false` for a `Timeout`, an `Rpc`
+    /// error, or any error that isn't a `RequestFailure` at all (a
+    /// serialization/deserialization bug, say) — none of those should ever
+    /// downgrade a host entry or trigger a Spawn-arm fallback.
+    pub fn is_connection_failure(err: &anyhow::Error) -> bool {
+        err.downcast_ref::<RequestFailure>()
+            .is_some_and(Self::is_connection)
+    }
+}
+
+impl std::fmt::Display for RequestFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            RequestFailure::Connection(message) => write!(f, "{message}"),
+            RequestFailure::Timeout { method, secs } => {
+                write!(f, "dv-host request {method:?} timed out after {secs}s")
+            }
+            RequestFailure::Rpc(err) => write!(f, "{err}"),
+        }
+    }
+}
+
+impl std::error::Error for RequestFailure {}
 
 impl HostClient {
     /// Spawn `wsl.exe -d <distro> --exec <host_path>` and complete the
@@ -150,8 +229,10 @@ impl HostClient {
         let pending: Arc<Mutex<HashMap<u64, SyncSender<RpcResult>>>> =
             Arc::new(Mutex::new(HashMap::new()));
         let alive = Arc::new(AtomicBool::new(true));
-        let notification_handler: Arc<Mutex<NotificationHandler>> =
-            Arc::new(Mutex::new(Box::new(|_notification: Notification| {})));
+        let notification_handler: Arc<Mutex<NotificationHandler>> = Arc::new(Mutex::new(Arc::new(
+            |_notification: Notification| {},
+        )
+            as NotificationHandler));
 
         spawn_reader_thread(
             reader,
@@ -203,8 +284,16 @@ impl HostClient {
     /// handler at a time; the default (set at spawn) silently drops them.
     /// No host emits any notifications yet (`watch/*` is S4) — the seam
     /// exists now so S4 is a pure addition here, not a signature change.
+    ///
+    /// Runs on [`spawn_reader_thread`]'s dedicated reader thread — the SAME
+    /// thread that demuxes every response and must keep looping to unblock
+    /// whichever caller is blocked in [`Self::request`]. It must therefore
+    /// never block and never call back into this `HostClient` (a `request`
+    /// call from inside the handler would deadlock waiting on the very
+    /// thread it's running on). Hand off to a channel/queue if the real
+    /// handler needs to do either.
     pub fn set_notification_handler(&self, handler: impl Fn(Notification) + Send + Sync + 'static) {
-        *self.notification_handler.lock().unwrap() = Box::new(handler);
+        *self.notification_handler.lock().unwrap() = Arc::new(handler);
     }
 
     /// Force-kill the child — the test seam for "host connection lost"
@@ -217,11 +306,14 @@ impl HostClient {
     }
 
     /// Send `method`/`params`, block until the matching response arrives
-    /// (or [`REQUEST_TIMEOUT`] elapses), and return its `ok` payload — an
-    /// `err` becomes an `Err` via [`RpcError`]'s `Display`.
-    pub fn request(&self, method: &str, params: Value) -> Result<Value> {
+    /// (or [`REQUEST_TIMEOUT`] elapses), and return its `ok` payload. An
+    /// `err` is a [`RequestFailure`] (via `anyhow`'s blanket conversion, so
+    /// it's still a plain `anyhow::Error` to callers, but its root cause is
+    /// always downcastable back to one) — see that type's doc for what
+    /// each variant means and how callers should react to it.
+    pub fn request(&self, method: &str, params: Value) -> Result<Value, RequestFailure> {
         if !self.is_alive() {
-            bail!("host connection lost");
+            return Err(RequestFailure::connection("host connection lost"));
         }
 
         let id = self.next_id.fetch_add(1, Ordering::SeqCst);
@@ -229,32 +321,63 @@ impl HostClient {
         self.pending.lock().unwrap().insert(id, tx);
 
         let line = Request::new(id, method, params).to_line();
-        let send_result: Result<()> = (|| {
+        let send_result: Result<(), RequestFailure> = (|| {
             let mut guard = self.stdin.lock().unwrap();
             let stdin = guard
                 .as_mut()
-                .ok_or_else(|| anyhow!("host connection lost"))?;
-            stdin.write_all(line.as_bytes())?;
-            stdin.write_all(b"\n")?;
-            stdin.flush()?;
+                .ok_or_else(|| RequestFailure::connection("host connection lost"))?;
+            stdin.write_all(line.as_bytes()).map_err(|err| {
+                RequestFailure::connection(format!("writing request to dv-host: {err}"))
+            })?;
+            stdin.write_all(b"\n").map_err(|err| {
+                RequestFailure::connection(format!("writing request to dv-host: {err}"))
+            })?;
+            stdin.flush().map_err(|err| {
+                RequestFailure::connection(format!("writing request to dv-host: {err}"))
+            })?;
             Ok(())
         })();
         if let Err(err) = send_result {
             self.pending.lock().unwrap().remove(&id);
-            return Err(err.context("writing request to dv-host"));
+            return Err(err);
+        }
+
+        // Post-insert liveness re-check (plan §8 S2 review finding P3-3): a
+        // write CAN succeed into a pipe whose other end (the host's
+        // stdout) is already closed without our stdin noticing yet — the
+        // reader thread is what actually notices, asynchronously. Without
+        // this, that case would block for the FULL `REQUEST_TIMEOUT`
+        // waiting on a reply that will never come, instead of failing
+        // fast. `rx.try_recv()` first because the reader thread may have
+        // ALREADY delivered our answer and then hit EOF in the very next
+        // read — a blind "dead therefore fail" here would silently discard
+        // a perfectly good, already-buffered reply.
+        if !self.is_alive() {
+            match rx.try_recv() {
+                Ok(RpcResult::Ok(value)) => return Ok(value),
+                Ok(RpcResult::Err(err)) => return Err(RequestFailure::Rpc(err)),
+                Err(_) => {
+                    self.pending.lock().unwrap().remove(&id);
+                    return Err(RequestFailure::connection(
+                        "host connection lost (after send)",
+                    ));
+                }
+            }
         }
 
         match rx.recv_timeout(REQUEST_TIMEOUT) {
             Ok(RpcResult::Ok(value)) => Ok(value),
-            Ok(RpcResult::Err(err)) => Err(anyhow!(err)),
+            Ok(RpcResult::Err(err)) => Err(RequestFailure::Rpc(err)),
             Err(RecvTimeoutError::Timeout) => {
                 self.pending.lock().unwrap().remove(&id);
-                bail!(
-                    "dv-host request {method:?} timed out after {}s",
-                    REQUEST_TIMEOUT.as_secs()
-                );
+                Err(RequestFailure::Timeout {
+                    method: method.to_string(),
+                    secs: REQUEST_TIMEOUT.as_secs(),
+                })
             }
-            Err(RecvTimeoutError::Disconnected) => bail!("host connection lost"),
+            Err(RecvTimeoutError::Disconnected) => {
+                Err(RequestFailure::connection("host connection lost"))
+            }
         }
     }
 
@@ -281,6 +404,30 @@ impl HostClient {
                 .decode(&result.stderr_b64)
                 .context("decoding proc/exec stderr_b64")?,
         })
+    }
+
+    /// Typed `blob/get` wrapper: base64 decode, `found: false` becomes
+    /// `Ok(None)` — matching `BlobStore::request`'s existing "missing
+    /// object" contract so `GitRepo::batch_request`'s Host arm is a drop-in
+    /// replacement for the Spawn arm's `BlobStore` (plan §3).
+    pub fn blob_get(&self, root: &str, spec: &str) -> Result<Option<Vec<u8>>> {
+        let params = BlobGetParams {
+            root: root.to_string(),
+            spec: spec.to_string(),
+        };
+        let value = self.request(
+            proto::method::BLOB_GET,
+            serde_json::to_value(params).context("serializing blob/get params")?,
+        )?;
+        let result: BlobGetResult =
+            serde_json::from_value(value).context("decoding blob/get result")?;
+        if !result.found {
+            return Ok(None);
+        }
+        let bytes = BASE64
+            .decode(&result.bytes_b64)
+            .context("decoding blob/get bytes_b64")?;
+        Ok(Some(bytes))
     }
 }
 
@@ -349,9 +496,44 @@ fn read_hello_line(
     }
 }
 
+/// Ensures the "mark dead + drain pending" cleanup in
+/// [`spawn_reader_thread`] runs on EVERY way the reader thread's closure can
+/// exit — not just the two clean `break`s. Rust runs local destructors
+/// during a panicking unwind too (e.g. `dispatch_line` hitting a poisoned
+/// lock), so a plain `Drop` guard constructed before the read loop covers
+/// that path for free; the ORIGINAL inline-after-the-loop code did not —
+/// a panic there would skip the cleanup entirely, leaving `alive` stuck at
+/// `true` forever (every future [`HostClient::request`] would then block
+/// for the full [`REQUEST_TIMEOUT`] instead of failing fast, and whatever
+/// was already pending would do the same, since nothing would ever answer
+/// or drain it).
+struct ReaderDeathGuard {
+    pending: Arc<Mutex<HashMap<u64, SyncSender<RpcResult>>>>,
+    alive: Arc<AtomicBool>,
+}
+
+impl Drop for ReaderDeathGuard {
+    fn drop(&mut self) {
+        self.alive.store(false, Ordering::SeqCst);
+        let lost: Vec<_> = self
+            .pending
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .drain()
+            .collect();
+        for (_, tx) in lost {
+            let _ = tx.send(RpcResult::Err(RpcError::new(
+                proto::error_code::INTERNAL,
+                "host connection lost",
+            )));
+        }
+    }
+}
+
 /// The long-lived reader: demuxes response lines by id into the pending
 /// map's per-request channel, and routes id-less lines to the
-/// notification handler. On EOF/I/O error, fails every still-pending
+/// notification handler. On EOF/I/O error (or a panic unwinding out of
+/// `dispatch_line` — see [`ReaderDeathGuard`]), fails every still-pending
 /// request and marks the client dead so subsequent [`HostClient::request`]
 /// calls fail fast instead of blocking.
 fn spawn_reader_thread(
@@ -363,6 +545,15 @@ fn spawn_reader_thread(
     std::thread::Builder::new()
         .name("dv-host-reader".into())
         .spawn(move || {
+            // Constructed before the read loop so it's in scope for the
+            // whole closure body: its `Drop` fires on the clean `break`
+            // paths below AND on a panic unwinding through them, which is
+            // exactly the "any exit path" coverage inline cleanup code
+            // placed after the loop could never give us.
+            let _death_guard = ReaderDeathGuard {
+                pending: Arc::clone(&pending),
+                alive: Arc::clone(&alive),
+            };
             let mut line = String::new();
             loop {
                 line.clear();
@@ -377,14 +568,8 @@ fn spawn_reader_thread(
                     Err(_) => break,
                 }
             }
-            alive.store(false, Ordering::SeqCst);
-            let lost: Vec<_> = pending.lock().unwrap().drain().collect();
-            for (_, tx) in lost {
-                let _ = tx.send(RpcResult::Err(RpcError::new(
-                    proto::error_code::INTERNAL,
-                    "host connection lost",
-                )));
-            }
+            // `_death_guard` drops here on the clean path — same cleanup
+            // code as the panic path, just reached via `Drop` either way.
         })
         .expect("failed to spawn dv-host reader thread");
 }
@@ -403,7 +588,18 @@ fn dispatch_line(
     };
     if value.get("id").is_none() {
         match serde_json::from_value::<Notification>(value) {
-            Ok(notification) => (notification_handler.lock().unwrap())(notification),
+            Ok(notification) => {
+                // Clone the `Arc<dyn Fn>` out and drop the lock BEFORE
+                // calling it — the handler contract (see
+                // `HostClient::set_notification_handler`) forbids it from
+                // blocking or calling back into this client, but holding
+                // the mutex across the call would make even a well-behaved
+                // handler that merely takes a moment stall every future
+                // `set_notification_handler` caller too, and a panicking
+                // handler would poison the lock for good measure.
+                let handler = Arc::clone(&notification_handler.lock().unwrap());
+                handler(notification);
+            }
             Err(err) => eprintln!("[dv-host client] malformed notification, skipping: {err}"),
         }
         return;
@@ -453,4 +649,80 @@ fn spawn_stderr_forwarder(
             }
         })
         .expect("failed to spawn dv-host stderr forwarder thread");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // --- RequestFailure classification (plan §8 S2 review P2-1/P2-2) ----
+    //
+    // These construct `RequestFailure` values directly and check
+    // classification through `anyhow::Error` the same way real callers
+    // (`CommandBuilder::run`, `GitRepo::batch_request`) do — no real
+    // `HostClient`/transport needed, since the decision this type exists to
+    // make is pure data once the failure has already happened.
+
+    #[test]
+    fn connection_is_the_only_kind_classified_as_a_connection_failure() {
+        let err: anyhow::Error = RequestFailure::connection("host connection lost").into();
+        assert!(RequestFailure::is_connection_failure(&err));
+    }
+
+    #[test]
+    fn timeout_is_not_a_connection_failure() {
+        // The P2-2 regression this guards: a 300s recv timeout means the
+        // host-side command is almost certainly still running — it must
+        // NOT be classified the same as a dead channel, or
+        // `CommandBuilder::run` would transparently re-run it via Spawn
+        // concurrently with the still-in-flight original.
+        let failure = RequestFailure::Timeout {
+            method: "proc/exec".to_string(),
+            secs: 300,
+        };
+        assert!(!failure.is_connection());
+        assert!(failure.is_timeout());
+        let err: anyhow::Error = failure.into();
+        assert!(!RequestFailure::is_connection_failure(&err));
+    }
+
+    #[test]
+    fn rpc_error_the_host_answered_with_is_not_a_connection_failure() {
+        // The P2-1 regression this guards: a structured RpcError from a
+        // HEALTHY host (blob/get against a submodule path, a bad_request
+        // from a stale binary, ...) must never downgrade the connection —
+        // only a channel-level failure may.
+        let failure = RequestFailure::Rpc(RpcError::new("internal", "blob/get: not a blob"));
+        assert!(!failure.is_connection());
+        let err: anyhow::Error = failure.into();
+        assert!(!RequestFailure::is_connection_failure(&err));
+    }
+
+    #[test]
+    fn an_unrelated_error_is_not_classified_as_a_connection_failure() {
+        // Anything that isn't a `RequestFailure` at all (a serialization
+        // bug, say) must classify as "not connection" too, rather than
+        // panicking or false-positiving — `downcast_ref` returning `None`
+        // is the expected, safe outcome.
+        let err = anyhow::anyhow!("some unrelated error");
+        assert!(!RequestFailure::is_connection_failure(&err));
+    }
+
+    #[test]
+    fn request_failure_display_is_readable_for_every_variant() {
+        assert_eq!(
+            RequestFailure::connection("host connection lost").to_string(),
+            "host connection lost"
+        );
+        assert_eq!(
+            RequestFailure::Timeout {
+                method: "proc/exec".to_string(),
+                secs: 300,
+            }
+            .to_string(),
+            "dv-host request \"proc/exec\" timed out after 300s"
+        );
+        let rpc = RequestFailure::Rpc(RpcError::new("bad_request", "missing \"program\""));
+        assert_eq!(rpc.to_string(), "bad_request: missing \"program\"");
+    }
 }

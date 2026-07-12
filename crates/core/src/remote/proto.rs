@@ -19,10 +19,11 @@ use serde_json::Value;
 /// once; still bad → hard error" — S1 implements the kill+error half only).
 pub const PROTO_VERSION: u32 = 1;
 
-/// Method names. S1 implements `proc/exec` only; the rest of the table in
-/// plan §2 (`blob/get`, `watch/*`, `fs/*`) arrives in later slices.
+/// Method names. S1 shipped `proc/exec`; S2 adds `blob/get`. `watch/*` and
+/// `fs/*` from plan §2 arrive in S4/S5.
 pub mod method {
     pub const PROC_EXEC: &str = "proc/exec";
+    pub const BLOB_GET: &str = "blob/get";
 }
 
 /// `err.code` values the protocol defines (plan §2). Plain string
@@ -218,6 +219,25 @@ pub struct ExecResult {
     pub stderr_b64: String,
 }
 
+/// `blob/get` params — `root` is the absolute in-distro repo root (the
+/// same string [`crate::command::CommandBuilder`]'s `-C` argument carries),
+/// `spec` is anything `git cat-file --batch` accepts on a line
+/// (`<rev>:<path>`, `:0:<path>`, a raw oid, …) — see
+/// `crates/core/src/git/batch.rs`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct BlobGetParams {
+    pub root: String,
+    pub spec: String,
+}
+
+/// `blob/get` result. `bytes_b64` is empty when `!found`, mirroring
+/// `BlobStore::request`'s `Ok(None)` contract for a missing object.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct BlobGetResult {
+    pub found: bool,
+    pub bytes_b64: String,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -356,5 +376,35 @@ mod tests {
         };
         let line = serde_json::to_string(&params).unwrap();
         assert!(!line.contains("stdin_b64"));
+    }
+
+    #[test]
+    fn blob_get_params_and_result_round_trip() {
+        let params = BlobGetParams {
+            root: "/home/kyle/proj".into(),
+            spec: "HEAD:src/main.rs".into(),
+        };
+        let line = serde_json::to_string(&params).unwrap();
+        let parsed: BlobGetParams = serde_json::from_str(&line).unwrap();
+        assert_eq!(parsed, params);
+
+        let result = BlobGetResult {
+            found: true,
+            bytes_b64: "aGVsbG8=".into(),
+        };
+        let line = serde_json::to_string(&result).unwrap();
+        let parsed: BlobGetResult = serde_json::from_str(&line).unwrap();
+        assert_eq!(parsed, result);
+    }
+
+    #[test]
+    fn blob_get_result_missing_has_empty_bytes() {
+        let result = BlobGetResult {
+            found: false,
+            bytes_b64: String::new(),
+        };
+        let line = serde_json::to_string(&result).unwrap();
+        assert!(line.contains(r#""found":false"#));
+        assert!(line.contains(r#""bytes_b64":"""#));
     }
 }

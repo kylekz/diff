@@ -23,7 +23,7 @@ pub use github::{
     SubmittedReview,
 };
 pub use location::RepoLocation;
-pub use remote::HostClient;
+pub use remote::{HostClient, RequestFailure};
 pub use review::{
     Comment, CommentStatus, RemoteRef, Reply, Review, ReviewState, ReviewStore, ReviewWatcher,
     Side, Verdict,

@@ -145,6 +145,21 @@ impl std::fmt::Display for RequestFailure {
 
 impl std::error::Error for RequestFailure {}
 
+/// Whether `err` (as returned by [`HostClient::spawn_wsl`]) is specifically
+/// the proto-version-mismatch `bail!` in [`HostClient::spawn_internal`] —
+/// the one handshake failure [`crate::remote::manager`]'s `client_for`
+/// responds to by forcing a reinstall (plan §2) rather than just cooling
+/// down like every other spawn failure. Substring match on the exact
+/// message `spawn_internal` bails with, same style as
+/// [`crate::review::io`]'s `is_missing_path_error` stderr sniffing — there's
+/// no structured error type here because `spawn_wsl`'s return type is a bare
+/// `anyhow::Result<Self>` and every other failure inside it (spawn failure,
+/// handshake timeout, wsl.exe's own UTF-16 error text) is equally terminal,
+/// so a whole enum just for this one case isn't worth the churn.
+pub(crate) fn is_proto_mismatch(err: &anyhow::Error) -> bool {
+    err.to_string().contains("dv-host proto mismatch")
+}
+
 impl HostClient {
     /// Spawn `wsl.exe -d <distro> --exec <host_path>` and complete the
     /// handshake. `host_path` is an absolute POSIX path to an
@@ -706,6 +721,24 @@ mod tests {
         // is the expected, safe outcome.
         let err = anyhow::anyhow!("some unrelated error");
         assert!(!RequestFailure::is_connection_failure(&err));
+    }
+
+    // --- is_proto_mismatch (plan §8 S3: force-reinstall-once trigger) ----
+
+    #[test]
+    fn is_proto_mismatch_matches_the_exact_spawn_internal_bail_text() {
+        let err = anyhow::anyhow!("dv-host proto mismatch: host speaks 2, dv expects 1");
+        assert!(is_proto_mismatch(&err));
+    }
+
+    #[test]
+    fn is_proto_mismatch_false_for_unrelated_spawn_failures() {
+        assert!(!is_proto_mismatch(&anyhow::anyhow!(
+            "failed to spawn dv-host process"
+        )));
+        assert!(!is_proto_mismatch(&anyhow::anyhow!(
+            "dv-host: handshake timed out after 15s"
+        )));
     }
 
     #[test]

@@ -81,6 +81,23 @@ impl CommandBuilder {
         }
     }
 
+    /// Force `Route::Spawn`, never consulting [`manager::client_for`] — the
+    /// seam [`crate::remote::install`] uses for its bootstrap commands
+    /// (checking/streaming the sidecar) before any `dv-host` connection
+    /// exists to route through. This is load-bearing, not just a
+    /// convenience: `client_for` holds a per-distro lock across its whole
+    /// spawn attempt (see that function's doc comment), and
+    /// `install::ensure_installed` runs INSIDE that attempt — a
+    /// `CommandBuilder::new` call from there would re-enter `client_for` for
+    /// the same distro on the same thread and deadlock on its own
+    /// (non-reentrant) `Mutex`.
+    pub(crate) fn new_spawn_only(location: RepoLocation) -> Self {
+        Self {
+            location,
+            route: Route::Spawn,
+        }
+    }
+
     pub fn location(&self) -> &RepoLocation {
         &self.location
     }
@@ -490,6 +507,20 @@ mod tests {
     #[test]
     fn route_for_wsl_falls_back_to_spawn_when_hosts_disabled() {
         let builder = CommandBuilder::new(RepoLocation::Wsl {
+            distro: "Ubuntu".to_string(),
+            path: "/x".to_string(),
+        });
+        assert!(matches!(builder.route, Route::Spawn));
+        assert!(builder.host_client().is_none());
+    }
+
+    #[test]
+    fn new_spawn_only_is_always_spawn_even_for_a_wsl_location() {
+        // Unlike `CommandBuilder::new`, this must never touch
+        // `manager::client_for` at all — see this constructor's doc comment
+        // for why (install.rs calls it from inside `client_for`'s own
+        // per-distro lock, so re-entering would deadlock).
+        let builder = CommandBuilder::new_spawn_only(RepoLocation::Wsl {
             distro: "Ubuntu".to_string(),
             path: "/x".to_string(),
         });

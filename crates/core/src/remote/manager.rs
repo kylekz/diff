@@ -11,7 +11,8 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
-use super::client::HostClient;
+use super::client::{self, HostClient};
+use super::install;
 
 /// Default per-distro cool-down between a dead/failed host and the next
 /// respawn attempt — avoids hammering `wsl.exe` in a spawn-fail loop.
@@ -92,9 +93,14 @@ fn hosts_enabled_given(no_host_env: Option<&str>, enabled_flag: bool) -> bool {
     enabled_flag
 }
 
-/// The in-distro POSIX path to an already-installed `dv-host` binary.
-/// `DV_HOST_PATH` is the only source for S2 — no installer/sidecar until
-/// S3 (plan §8 S3), so without it host routing is a no-op everywhere.
+/// `DV_HOST_PATH` read directly — the dev-loop override. As of S3,
+/// [`client_for`]'s own spawn path no longer calls this: it always goes
+/// through [`install::ensure_installed`], which checks the very same env
+/// var itself (first, before ever touching a sidecar) and returns it
+/// straight through. This function survives only as
+/// [`should_count_spawn_fallback`]'s "is *anything* configured" probe for
+/// [`note_spawn_fallback`]'s gate — see that function's doc for why it
+/// still only recognizes the env var and not sidecar-based configuration.
 fn host_path() -> Option<String> {
     host_path_given(std::env::var("DV_HOST_PATH").ok())
 }
@@ -145,16 +151,17 @@ pub(crate) fn decide_respawn(
     }
 }
 
-/// A connected host client for `distro`, or `None` if hosts are disabled,
-/// no host binary path is configured, the distro is cooling down after a
-/// recent failure, or a fresh spawn attempt itself fails. Callers
-/// (`CommandBuilder::new`) fall back to `Route::Spawn` on `None` — this
-/// function's whole contract is "never worse than not having a host".
+/// A connected host client for `distro`, or `None` if hosts are disabled, no
+/// `dv-host` binary is configured/installable (no `DV_HOST_PATH`, no
+/// sidecar — see [`install::ensure_installed`]'s [`install::InstallError::NoSidecar`]),
+/// the distro is cooling down after a recent failure, or a fresh spawn
+/// attempt itself fails. Callers (`CommandBuilder::new`) fall back to
+/// `Route::Spawn` on `None` — this function's whole contract is "never
+/// worse than not having a host".
 pub(crate) fn client_for(distro: &str) -> Option<Arc<HostClient>> {
     if !hosts_enabled() {
         return None;
     }
-    let host_path = host_path()?;
 
     let slot: Slot = {
         registry()
@@ -166,9 +173,23 @@ pub(crate) fn client_for(distro: &str) -> Option<Arc<HostClient>> {
     };
 
     // Holding this per-distro lock across the (possibly multi-second) spawn
-    // is the point of the two-tier locking: a second concurrent caller for
-    // the SAME distro blocks here and then reuses whatever the first caller
-    // produced, instead of racing it to spawn a second `wsl.exe`.
+    // — which, as of S3, now includes `install::ensure_installed`'s own WSL
+    // round trips (resolving $HOME, checking the marker, streaming the
+    // binary) — is the point of the two-tier locking: a second concurrent
+    // caller for the SAME distro blocks here and then reuses whatever the
+    // first caller produced, instead of racing it to install/spawn a second
+    // `dv-host`. `install::ensure_installed` MUST route every subprocess
+    // through `CommandBuilder::new_spawn_only` rather than `::new` for
+    // exactly this reason — `::new` would re-enter this function for the
+    // same distro and deadlock on the very lock held right here.
+    //
+    // KNOWN LIMIT (S3 review P2, deferred to S5 robustness): the install
+    // round trips run under this lock with NO subprocess timeout — a
+    // wedged `wsl.exe` (stuck distro boot) blocks every future
+    // `CommandBuilder::new` for THIS distro indefinitely (other distros
+    // unaffected; the outer registry lock is never held here). S5 should
+    // bound these bootstrap commands with a wait_timeout so a wedged boot
+    // degrades to Failed + cool-down instead of a pile-up.
     let mut guard = slot.lock().unwrap_or_else(|e| e.into_inner());
     let now = Instant::now();
 
@@ -194,18 +215,76 @@ pub(crate) fn client_for(distro: &str) -> Option<Arc<HostClient>> {
             _ => unreachable!("decide_respawn only returns Reuse for EntryKind::Alive"),
         },
         RespawnDecision::CoolingDown => None,
-        RespawnDecision::Spawn => match HostClient::spawn_wsl(distro, &host_path) {
-            Ok(client) => {
-                let client = Arc::new(client);
-                *guard = Some(HostEntry::Alive(Arc::clone(&client)));
-                Some(client)
+        RespawnDecision::Spawn => {
+            // `ensure_installed` itself checks `DV_HOST_PATH` first (dev
+            // loop: skips sidecar/hash/install entirely, same as S1/S2's
+            // behavior) before ever falling to the sidecar install flow.
+            let binary = match install::ensure_installed(distro) {
+                Ok(binary) => binary,
+                // Unconfigured (no env var, no sidecar next to dv.exe) —
+                // silent, no `Failed` entry, so a sidecar that appears
+                // later (or a `DV_HOST_PATH` set later) works on the very
+                // next call instead of waiting out a stale cool-down.
+                Err(install::InstallError::NoSidecar) => return None,
+                Err(err) => {
+                    eprintln!("[dv-host manager] failed to install dv-host for {distro}: {err}");
+                    *guard = Some(HostEntry::Failed { since: now });
+                    return None;
+                }
+            };
+
+            match HostClient::spawn_wsl(distro, &binary.path) {
+                Ok(client) => {
+                    let client = Arc::new(client);
+                    *guard = Some(HostEntry::Alive(Arc::clone(&client)));
+                    Some(client)
+                }
+                // Proto mismatch against an install-managed binary (plan
+                // §2): force exactly one reinstall (delete the marker so
+                // `ensure_installed` can't just see a stale-but-matching
+                // hash and skip the reinstall) and respawn. A `DevOverride`
+                // path never reaches this arm — there's no marker to
+                // invalidate for an arbitrary dev-supplied binary, so it
+                // falls straight to the generic failure arm below instead.
+                Err(err)
+                    if binary.source == install::HostBinarySource::Managed
+                        && client::is_proto_mismatch(&err) =>
+                {
+                    eprintln!(
+                        "[dv-host manager] proto mismatch for {distro} ({err:#}); forcing one reinstall"
+                    );
+                    let reinstalled = match install::force_reinstall(distro) {
+                        Ok(binary) => binary,
+                        Err(reinstall_err) => {
+                            eprintln!(
+                                "[dv-host manager] reinstall failed for {distro}: {reinstall_err}"
+                            );
+                            *guard = Some(HostEntry::Failed { since: now });
+                            return None;
+                        }
+                    };
+                    match HostClient::spawn_wsl(distro, &reinstalled.path) {
+                        Ok(client) => {
+                            let client = Arc::new(client);
+                            *guard = Some(HostEntry::Alive(Arc::clone(&client)));
+                            Some(client)
+                        }
+                        Err(respawn_err) => {
+                            eprintln!(
+                                "[dv-host manager] still failing for {distro} after reinstall: {respawn_err:#}"
+                            );
+                            *guard = Some(HostEntry::Failed { since: now });
+                            None
+                        }
+                    }
+                }
+                Err(err) => {
+                    eprintln!("[dv-host manager] failed to spawn host for {distro}: {err:#}");
+                    *guard = Some(HostEntry::Failed { since: now });
+                    None
+                }
             }
-            Err(err) => {
-                eprintln!("[dv-host manager] failed to spawn host for {distro}: {err:#}");
-                *guard = Some(HostEntry::Failed { since: now });
-                None
-            }
-        },
+        }
     }
 }
 
@@ -277,6 +356,18 @@ pub(crate) fn mark_dead(distro: &str, failing: &Arc<HostClient>) {
 /// AND a host path configured) means "count and log this"; hosts enabled
 /// with no `host_path` is the "every dev session until S3" unconfigured
 /// state, not route loss, and must stay silent.
+///
+/// Known S3 gap, left as-is deliberately: `host_path` here still only ever
+/// reflects `DV_HOST_PATH` (see [`host_path`]), not "a sidecar successfully
+/// resolved through `install::ensure_installed`". In the now-normal S3
+/// world (no `DV_HOST_PATH`, a sidecar auto-installs instead), a
+/// [`HostEntry::Failed`] distro from a persistently broken install would
+/// stay silent here forever instead of counting as route loss. Widening
+/// this gate to "sidecar present OR env var set" is a reasonable follow-up,
+/// but it's outside this slice's explicit wiring list and this function's
+/// existing unit tests pin the current (env-var-only) contract — revisit
+/// alongside S4/S5 if the silent-Failed-loop turns out to matter in
+/// practice.
 fn should_count_spawn_fallback(
     is_wsl_location: bool,
     enabled: bool,

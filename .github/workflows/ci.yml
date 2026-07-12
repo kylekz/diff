@@ -51,3 +51,30 @@ jobs:
             target/release/dv.exe
             target/release/dv
           if-no-files-found: error
+
+  # Builds the Linux `dv-host` sidecar dv.exe/dv looks for next to itself
+  # (docs/phase-5-implementation-plan.md §5, §8 S3). musl (not the native
+  # ubuntu-latest gnu target) for a static binary with no glibc-version
+  # floor — closes the "other distros" risk without a matrix of them. Tests
+  # still run against the native gnu target: real inotify coverage is S4's
+  # job (dv-host's S1-scope handlers don't touch it yet), this just proves
+  # the crate's own test suite passes on Linux.
+  host-linux:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: Swatinem/rust-cache@v2
+      - name: Add musl target
+        run: rustup target add x86_64-unknown-linux-musl
+      - name: Install musl-tools
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+      - name: Build (release, musl)
+        run: cargo build --release -p dv-host --target x86_64-unknown-linux-musl
+      - name: Test
+        run: cargo test -p dv-host
+      - name: Upload dv-host sidecar
+        uses: actions/upload-artifact@v4
+        with:
+          name: dv-host-linux-x64
+          path: target/x86_64-unknown-linux-musl/release/dv-host
+          if-no-files-found: error

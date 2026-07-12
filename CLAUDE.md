@@ -135,6 +135,43 @@ every anchor and line-in-diff first, aborting with the full list of
 problems on any failure) and emits `{"submission":{"review_id","pr",
 "event","comments","url"}}`.
 
+## WSL host (dv-host)
+
+`crates/host` (`dv-host`) is a headless stdio server, spawned per WSL distro
+via `wsl.exe -d <distro> --exec`, that runs git/fs work distro-side instead
+of one `wsl.exe` per command (docs/phase-5-implementation-plan.md). Only
+`RepoLocation::Wsl` repos ever route through it; local repos never touch
+`crates/core/src/remote/`.
+
+Dev loop — build inside Ubuntu (NOT under `/mnt/d/...`'s 9P; keep the target
+dir on ext4 or the build itself is punishingly slow):
+
+```
+wsl.exe -d Ubuntu --exec bash -lc "cd /mnt/d/Software/diff && \
+  CARGO_TARGET_DIR=\$HOME/.cache/dv-target cargo build -p dv-host"
+```
+
+then point dv at the freshly built binary and skip the sidecar/install flow
+and hash check entirely (the handshake itself — proto version — still
+validates):
+
+```
+DV_HOST_PATH=/home/kyle/.cache/dv-target/debug/dv-host cargo run -p dv
+```
+
+`DV_NO_HOST=1` force-disables host routing for the process regardless of
+`DV_HOST_PATH`/sidecar — the A/B lever for comparing against Stage-A
+(`wsl.exe`-per-command) behavior without a separate build.
+
+Without `DV_HOST_PATH`, `dv` looks for a `dv-host-linux-x64` sidecar next to
+`dv.exe` (`current_exe()`-adjacent — `DV_HOST_SIDECAR` overrides the search
+path, a test seam) and auto-installs it into
+`~/.local/share/dv/host/<sidecar-sha256-prefix>/` inside the distro (content
+hash, not a version string — see `crates/core/src/remote/install.rs`'s
+module doc for why), verified via a client-side sha256 + marker file. No
+sidecar next to `dv.exe` means this whole path is silently inert — today's
+per-command `wsl.exe` spawns keep working exactly as before.
+
 ## Status
 
 Phases 0–1 complete: read-only diff viewer (unified + split), WSL routing,

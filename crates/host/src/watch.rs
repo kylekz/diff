@@ -243,12 +243,21 @@ fn subscribe_worktree(
     stdout: Arc<Mutex<std::io::Stdout>>,
 ) -> Result<RecommendedWatcher, SubscribeError> {
     let root_path = PathBuf::from(root);
+    // Canonicalize the filter prefixes: notify's backends report CANONICAL
+    // event paths on some platforms (macOS FSEvents resolves /var ->
+    // /private/var), so a symlinked root would make every starts_with
+    // filter silently miss and .git churn would leak through as worktree
+    // events (caught by the macOS CI run of
+    // watch_worktree_ignores_dot_git_but_sees_tracked_file_edits).
+    let root_path = root_path.canonicalize().unwrap_or(root_path);
     let dot_git = root_path.join(".git");
     // Best-effort: if this repo is somehow unresolvable (shouldn't happen —
     // `root` is a repo dv-core's own GitRepo::open already validated
     // earlier in the session), fall back to just the naive `.git` filter
     // rather than failing the whole worktree subscribe over it.
-    let real_gitdir = dv_core::review::resolve_local_git_dir(&root_path).ok();
+    let real_gitdir = dv_core::review::resolve_local_git_dir(&root_path)
+        .ok()
+        .map(|g| g.canonicalize().unwrap_or(g));
 
     let coalescer = Coalescer::new(watch_id, "worktree", stdout);
     let mut watcher = notify::recommended_watcher(move |event: notify::Result<notify::Event>| {

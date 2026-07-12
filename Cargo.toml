@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/app", "crates/core"]
+members = ["crates/app", "crates/core", "crates/host"]
 
 [workspace.package]
 version = "0.1.0"
@@ -36,6 +36,10 @@ gpui-component-assets = { git = "https://github.com/longbridge/gpui-component" }
 ropey = "=2.0.0-beta.1"
 anyhow = "1"
 dv-core = { path = "crates/core" }
+# dv-host's RPC channel (crates/core/src/remote/): payloads ride base64 in
+# JSON so binary bytes need no raw-frame protocol. sha2 (S3, sidecar hash
+# verification) is NOT added yet — don't add it ahead of the slice that uses it.
+base64 = "0.22"
 
 # GPUI is unusably janky fully unoptimized; optimize dependencies even in dev.
 # Our own crates stay at opt-level 0 for fast incremental builds.

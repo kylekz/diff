@@ -1421,8 +1421,20 @@ name = "dv-core"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "base64",
  "imara-diff",
  "notify 8.2.0",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "dv-host"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "base64",
+ "dv-core",
  "serde",
  "serde_json",
 ]

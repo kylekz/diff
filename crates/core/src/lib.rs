@@ -11,6 +11,7 @@ pub mod diff;
 pub mod git;
 pub mod github;
 pub mod location;
+pub mod remote;
 pub mod review;
 
 pub use command::CommandBuilder;
@@ -22,6 +23,7 @@ pub use github::{
     SubmittedReview,
 };
 pub use location::RepoLocation;
+pub use remote::HostClient;
 pub use review::{
     Comment, CommentStatus, RemoteRef, Reply, Review, ReviewState, ReviewStore, ReviewWatcher,
     Side, Verdict,

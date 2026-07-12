@@ -1,0 +1,26 @@
+[package]
+name = "dv-host"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+build = "build.rs"
+
+[[bin]]
+name = "dv-host"
+path = "src/main.rs"
+
+# Deliberately minimal: this binary must compile on every CI platform (only
+# meaningfully deployed on Linux) and must NOT pull in dv-core's heavier
+# deps (imara-diff, notify) that S1's handshake+proc/exec scope doesn't
+# need. NO gpui here, ever — see CLAUDE.md.
+[dependencies]
+anyhow.workspace = true
+base64.workspace = true
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.150"
+
+# Test-only: the integration tests in tests/ drive the real binary through
+# dv-core's HostClient (the actual production client), so this is a
+# dev-dependency — it never reaches the shipped dv-host binary itself.
+[dev-dependencies]
+dv-core.workspace = true

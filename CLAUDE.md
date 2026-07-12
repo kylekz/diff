@@ -192,4 +192,15 @@ Claude Light) with ctrl-shift-t picker + follow-OS, settings.json +
 ctrl-, panel (view mode, context lines, fonts with row-height scaling),
 drag-to-resize sidebar/summary with persisted widths, thread-card/button
 polish pass (docs/phase-4-settings-and-theming.md § Acceptance results).
-Next: Phase 5 — WSL host process (docs/phase-5-wsl.md).
+Phase 5 (WSL host, docs/phase-5-wsl.md) IN PROGRESS — slices 1–4 of 5
+shipped per docs/phase-5-implementation-plan.md: protocol + HostClient
+(S1), transport swap with zero per-command wsl.exe spawns + blob/get
+(S2), sidecar auto-install with content-hash upgrade + CI musl artifact
+(S3), inotify store/worktree watching replacing the 1s digest poll —
+CLI comment → GUI measured at 139ms (S4). Each slice Fable-reviewed and
+live-verified against the real Ubuntu distro. REMAINING: slice S5
+(robustness: fs/* store methods off sh -c, badge-walk running-host-only
+policy, wedged-wsl.exe timeouts, resubscribe-on-respawn, stderr ring
+surfacing) + the acceptance benchmark vs the Phase-1 numbers (plan §7)
++ the phase's Acceptance results doc section. Backlog carries the
+deferred S3/S4 review P3s.

@@ -20,12 +20,13 @@ use std::collections::HashMap;
 
 use crate::recent::{RecentEntry, RecentStore, title_for};
 use crate::settings::{
-    CONTEXT_LINES_MAX, CONTEXT_LINES_MIN, MONO_FONT_SIZE_MAX, MONO_FONT_SIZE_MIN, Settings,
-    ViewModeSetting,
+    CONTEXT_LINES_MAX, CONTEXT_LINES_MIN, DEFAULT_SIDEBAR_WIDTH, MONO_FONT_SIZE_MAX,
+    MONO_FONT_SIZE_MIN, SIDEBAR_WIDTH_MAX, SIDEBAR_WIDTH_MIN, SUMMARY_WIDTH_MAX, SUMMARY_WIDTH_MIN,
+    Settings, ViewModeSetting,
 };
 use crate::themes;
 use crate::workspace::{
-    ReviewChanged, Workspace, checks_word, pr_state_word, review_decision_word,
+    ReviewChanged, SummaryWidthChanged, Workspace, checks_word, pr_state_word, review_decision_word,
 };
 
 actions!(
@@ -182,8 +183,22 @@ pub struct AppShell {
     /// index — the recent list shifts when new entries insert at the top
     /// (review finding: index keys wore the wrong rows' badges).
     badges: HashMap<RepoLocation, ReviewBadge>,
+    /// True while a sidebar-handle drag is in progress (set by the first
+    /// drag-move frame). `on_mouse_up_out` fires on ANY left release outside
+    /// the handle's hitbox — without this gate every click in the window
+    /// would rewrite settings.json.
+    sidebar_dragging: bool,
     /// Keeps the active workspace's ReviewChanged subscription alive.
     _ws_subscription: Option<Subscription>,
+    /// Keeps the active workspace's `SummaryWidthChanged` subscription
+    /// alive — the summary panel's own drag handle lives inside
+    /// `Workspace`'s render tree and live-updates its width directly, but
+    /// `Settings` (and thus persistence) lives here, so a drag-release
+    /// emits this event rather than reaching back into the shell directly
+    /// (see `render_sidebar_resize_handle`'s doc comment for the mirror-image
+    /// sidebar case, which needs no such round trip since it's shell-owned
+    /// end to end).
+    _ws_summary_subscription: Option<Subscription>,
     /// Persisted app-wide settings. Loaded once at startup; updated and
     /// re-saved on every theme-picker / settings-panel change (and by
     /// `--automation`'s `set_setting`).
@@ -220,6 +235,18 @@ struct SettingsPanel {
     mono_font_input: Entity<InputState>,
     _subscription: Subscription,
 }
+
+/// Zero-sized `on_drag`/`on_drag_move` payload tag for the sidebar's resize
+/// handle (see `AppShell::render_sidebar_resize_handle`). `on_drag_move`
+/// only fires for a listener whose type parameter matches the *currently
+/// active* drag's payload type (checked via `TypeId`, not per-element) — a
+/// process-global `cx.active_drag` slot, not scoped to one handle. Giving
+/// the sidebar and the review-summary panel (`workspace::SummaryResizeDrag`)
+/// distinct tag types is load-bearing: with a single shared tag, dragging
+/// either handle would also fire the other's `on_drag_move` listener,
+/// resizing both panels from one drag.
+#[derive(Clone)]
+struct SidebarResizeDrag;
 
 /// Sidebar badge for one repo's latest review.
 #[derive(Debug, Clone, Copy)]
@@ -258,7 +285,9 @@ impl AppShell {
             selected: None,
             automation,
             badges: HashMap::new(),
+            sidebar_dragging: false,
             _ws_subscription: None,
+            _ws_summary_subscription: None,
             settings,
             theme_picker: None,
             settings_panel: None,
@@ -334,6 +363,7 @@ impl AppShell {
         let view_mode_default = self.settings.view_mode_default;
         let context_lines = self.settings.context_lines;
         let font_size = self.settings.mono_font_size;
+        let summary_width = self.settings.summary_width;
         let workspace = cx.new(|cx| {
             Workspace::new(
                 location,
@@ -342,6 +372,7 @@ impl AppShell {
                 view_mode_default,
                 context_lines,
                 font_size,
+                summary_width,
                 window,
                 cx,
             )
@@ -357,6 +388,15 @@ impl AppShell {
                     // comment (review finding P3-3).
                     this.refresh_badge(selected, false, cx);
                 }
+            },
+        ));
+        // Summary-panel drag-release persistence (Phase 4 deliverable 5) —
+        // see `_ws_summary_subscription`'s doc comment.
+        self._ws_summary_subscription = Some(cx.subscribe(
+            &workspace,
+            move |this: &mut Self, _, event: &SummaryWidthChanged, _cx| {
+                this.settings.summary_width = event.0;
+                this.settings.save();
             },
         ));
         self.active = Some(workspace);
@@ -800,6 +840,13 @@ impl AppShell {
                     ViewModeSetting::Unified => "unified",
                     ViewModeSetting::Split => "split",
                 },
+                // Drag-to-resize deliverable (Phase 4 deliverable 5): the
+                // sidebar's own live width. The summary panel's mirror-image
+                // `summary_width` lives on the *workspace*, not here — see
+                // `Workspace::automation_state`, since it's per-workspace
+                // render state, not a shell-level layout knob.
+                "sidebar_width": self.settings.sidebar_width,
+                "summary_width": self.settings.summary_width,
             }),
             "settings_open": self.settings_panel.is_some(),
         })
@@ -928,6 +975,20 @@ impl AppShell {
                 };
                 self.set_view_mode_default(mode, cx);
             }
+            "sidebar_width" => {
+                let width = value
+                    .as_f64()
+                    .ok_or_else(|| anyhow::anyhow!("sidebar_width must be a number"))?
+                    as f32;
+                self.set_sidebar_width(width, cx);
+            }
+            "summary_width" => {
+                let width = value
+                    .as_f64()
+                    .ok_or_else(|| anyhow::anyhow!("summary_width must be a number"))?
+                    as f32;
+                self.set_summary_width(width, cx);
+            }
             other => anyhow::bail!("unknown setting: {other}"),
         }
         Ok(())
@@ -1039,6 +1100,32 @@ impl AppShell {
         self.settings.save();
         if let Some(ws) = &self.active {
             ws.update(cx, |ws, cx| ws.set_font_size(size, cx));
+        }
+        cx.notify();
+    }
+
+    /// Sidebar width — `set_setting`'s entry point (the drag handle itself,
+    /// [`Self::render_sidebar_resize_handle`], writes `self.settings.sidebar_width`
+    /// directly on every drag-move frame and only calls `Settings::save`
+    /// on release, so it doesn't route through here — this is for the
+    /// discrete, already-final values `set_setting`/a hand-edited settings
+    /// panel control would supply).
+    fn set_sidebar_width(&mut self, width: f32, cx: &mut Context<Self>) {
+        self.settings.sidebar_width = width.clamp(SIDEBAR_WIDTH_MIN, SIDEBAR_WIDTH_MAX);
+        self.settings.save();
+        cx.notify();
+    }
+
+    /// Review-summary panel width — pushes the new width down into the
+    /// active workspace (which owns the live render-time value; see
+    /// `Workspace::summary_width`) and persists. Mirrors `set_sidebar_width`
+    /// above, but for the workspace-owned panel.
+    fn set_summary_width(&mut self, width: f32, cx: &mut Context<Self>) {
+        let width = width.clamp(SUMMARY_WIDTH_MIN, SUMMARY_WIDTH_MAX);
+        self.settings.summary_width = width;
+        self.settings.save();
+        if let Some(ws) = &self.active {
+            ws.update(cx, |ws, cx| ws.set_summary_width_external(width, cx));
         }
         cx.notify();
     }
@@ -1207,6 +1294,94 @@ impl AppShell {
                             )
                     }))
             }))
+    }
+
+    /// The sidebar's inner-edge drag handle (Phase 4 deliverable 5): a 6px
+    /// invisible-until-hover strip straddling the sidebar/main-content
+    /// boundary, showing a slim accent line on hover and a col-resize
+    /// cursor. Dragging computes the new width directly from the cursor's
+    /// absolute window-space x — the sidebar is flush against the window's
+    /// left edge, so `mouse.x` *is* the new width, no start-position
+    /// bookkeeping needed. Live-updates `self.settings.sidebar_width` on
+    /// every drag-move frame (for immediate visual feedback); persists via
+    /// `Settings::save` only on release or a double-click reset — never
+    /// per-pixel (docs/phase-4-settings-and-theming.md deliverable 5).
+    ///
+    /// Built on gpui's `on_drag`/`on_drag_move` (see `Div::on_drag_move`'s
+    /// doc comment: "useful for implementing draggable UIs that don't
+    /// conform to a drag and drop style interaction, like resizing") rather
+    /// than gpui-component's `resizable` module (`refs/pr-test-gpui-component`'s
+    /// `crates/ui/src/resizable/`, the same commit this workspace's
+    /// `gpui-component` is pinned to) — that module's `ResizablePanelGroup`
+    /// is built for N-way docked panel layouts (serialized sizes, a shared
+    /// `ResizableState` entity, a dedicated full-bounds paint-time element
+    /// for its `window.on_mouse_event` registration); adopting it here would
+    /// mean restructuring the whole sidebar/main-content split around it for
+    /// a single fixed handle. `on_drag`/`on_drag_move` is the primitive that
+    /// component itself is built on, without the panel-group machinery.
+    fn render_sidebar_resize_handle(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let accent = cx.theme().primary;
+        div()
+            .id("sidebar-resize-handle")
+            .absolute()
+            .top_0()
+            .bottom_0()
+            .right(px(-3.))
+            .w(px(6.))
+            .occlude()
+            .cursor_col_resize()
+            .group("sidebar-resize-handle")
+            .on_drag(SidebarResizeDrag, |_, _, _, cx| cx.new(|_| EmptyView))
+            .on_drag_move::<SidebarResizeDrag>(cx.listener(
+                |this, event: &DragMoveEvent<SidebarResizeDrag>, _, cx| {
+                    let width = f32::from(event.event.position.x)
+                        .clamp(SIDEBAR_WIDTH_MIN, SIDEBAR_WIDTH_MAX);
+                    this.sidebar_dragging = true;
+                    this.settings.sidebar_width = width;
+                    cx.notify();
+                },
+            ))
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, event: &MouseDownEvent, _, cx| {
+                    // Double-click resets to the default width.
+                    if event.click_count >= 2 {
+                        this.settings.sidebar_width = DEFAULT_SIDEBAR_WIDTH;
+                        this.settings.save();
+                        cx.notify();
+                    }
+                }),
+            )
+            .on_mouse_up(
+                MouseButton::Left,
+                cx.listener(|this, _, _, cx| {
+                    if std::mem::take(&mut this.sidebar_dragging) {
+                        this.settings.save();
+                        cx.notify();
+                    }
+                }),
+            )
+            .on_mouse_up_out(
+                MouseButton::Left,
+                cx.listener(|this, _, _, cx| {
+                    // The common case: a drag almost always ends with the
+                    // cursor well outside this 6px strip. Gated on the drag
+                    // flag — up_out fires for EVERY outside release.
+                    if std::mem::take(&mut this.sidebar_dragging) {
+                        this.settings.save();
+                        cx.notify();
+                    }
+                }),
+            )
+            .child(
+                div()
+                    .absolute()
+                    .top_0()
+                    .bottom_0()
+                    .left(px(2.))
+                    .w(px(2.))
+                    .group_hover("sidebar-resize-handle", move |el| el.bg(accent)),
+            )
     }
 
     /// The theme picker overlay (`ctrl-shift-t`), when open: same
@@ -1720,8 +1895,9 @@ impl Render for AppShell {
                     .child(
                         v_flex()
                             .h_full()
-                            .w(px(280.))
+                            .w(px(self.settings.sidebar_width))
                             .flex_none()
+                            .relative()
                             .border_r_1()
                             .border_color(theme.border)
                             .bg(theme.sidebar)
@@ -1776,7 +1952,8 @@ impl Render for AppShell {
                                 )
                                 .flex_1()
                                 .px_1(),
-                            ),
+                            )
+                            .child(self.render_sidebar_resize_handle(cx)),
                     )
                     .child(
                         div()

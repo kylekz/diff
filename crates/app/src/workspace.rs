@@ -12,7 +12,7 @@ use gpui_component::highlighter::HighlightTheme;
 use gpui_component::{ActiveTheme, Disableable as _, StyledExt as _, h_flex, v_flex};
 
 use crate::highlight::{self, LineRuns};
-use crate::settings::ViewModeSetting;
+use crate::settings::{SUMMARY_WIDTH_MAX, SUMMARY_WIDTH_MIN, ViewModeSetting};
 use crate::submit::{self, SubmissionOutcome, Violation, ViolationKind};
 
 actions!(
@@ -270,6 +270,13 @@ enum SummaryFilter {
     Open,
     Resolved,
 }
+
+/// Zero-sized `on_drag`/`on_drag_move` payload tag for the review-summary
+/// panel's resize handle (see `render_summary_resize_handle`) — see
+/// `shell::SidebarResizeDrag`'s doc comment for why the sidebar's handle
+/// needs its own distinct tag rather than sharing this one.
+#[derive(Clone)]
+struct SummaryResizeDrag;
 
 /// A reply/edit input open inside one thread card. At most one across the
 /// workspace — opening another closes this one.
@@ -553,6 +560,19 @@ pub struct Workspace {
     /// Review summary panel (all threads across files + verdict) open?
     summary_open: bool,
     summary_filter: SummaryFilter,
+    /// Summary panel width, in px — from `settings::Settings::summary_width`,
+    /// live during a drag of `render_summary_resize_handle`'s handle (which
+    /// mutates this directly, for immediate visual feedback) and pushed
+    /// down externally by [`Self::set_summary_width_external`] (settings
+    /// panel / `set_setting`). Persistence is the *shell's* job (it owns
+    /// `Settings`) — a drag-release emits [`SummaryWidthChanged`] rather
+    /// than writing settings.json from here.
+    summary_width: f32,
+    /// True while a summary-handle drag is in progress (set by the first
+    /// drag-move frame). Gates the mouse-up emit — `on_mouse_up_out` fires
+    /// on ANY outside left release, which would otherwise persist settings
+    /// on every click in the window.
+    summary_dragging: bool,
     /// A comment to scroll to once its file's rows exist — set by summary
     /// clicks, consumed by reset_diff_list.
     pending_jump: Option<String>,
@@ -927,6 +947,7 @@ impl Workspace {
         view_mode_default: ViewModeSetting,
         context_lines: u32,
         font_size: f32,
+        summary_width: f32,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
@@ -969,6 +990,8 @@ impl Workspace {
             thread_input: None,
             summary_open: false,
             summary_filter: SummaryFilter::All,
+            summary_width,
+            summary_dragging: false,
             pending_jump: None,
             stale: HashSet::new(),
             stale_checked: None,
@@ -1309,6 +1332,22 @@ impl Workspace {
         }
         self.font_size = font_size;
         self.diff_list.remeasure();
+        cx.notify();
+    }
+
+    /// External (top-down) update for "Summary panel width" — the settings
+    /// panel or `set_setting`'s `"summary_width"` case, routed through
+    /// `AppShell::set_summary_width`. The handle's own live drag
+    /// (`render_summary_resize_handle`) writes `self.summary_width` directly
+    /// instead of calling this, since it already owns the render-time value
+    /// and just needs `cx.notify()` per frame — no `Settings` round trip
+    /// mid-drag.
+    pub(crate) fn set_summary_width_external(&mut self, width: f32, cx: &mut Context<Self>) {
+        let width = width.clamp(SUMMARY_WIDTH_MIN, SUMMARY_WIDTH_MAX);
+        if self.summary_width == width {
+            return;
+        }
+        self.summary_width = width;
         cx.notify();
     }
 
@@ -1689,6 +1728,11 @@ impl Workspace {
             }),
             "editor_open": self.editor.is_some(),
             "summary_open": self.summary_open,
+            // Drag-to-resize deliverable (Phase 4 deliverable 5): the
+            // summary panel's own live width (the sidebar's mirror-image
+            // `sidebar_width` lives on the shell — see
+            // `AppShell::automation_state`).
+            "summary_width": self.summary_width,
             "review": self.review.as_ref().map(|r| json!({
                 "id": r.id,
                 "comments": r.comments.len(),
@@ -3126,6 +3170,7 @@ impl Workspace {
     /// `base ← head`, a state chip, a CI dot, the review decision, and a
     /// "details" toggle that expands the PR body underneath.
     fn render_pr_header(&self, cx: &mut Context<Self>) -> Option<Div> {
+        use gpui_component::Sizable as _;
         use gpui_component::button::{Button, ButtonVariants as _};
         let pr = self.pr.as_ref()?;
 
@@ -3226,6 +3271,7 @@ impl Workspace {
                         .child(
                             Button::new("pr-details-toggle")
                                 .ghost()
+                                .small()
                                 .label(if details_open {
                                     "hide details"
                                 } else {
@@ -3497,6 +3543,7 @@ impl Workspace {
     /// click to jump, with the finish-review verdict at the bottom.
     fn render_summary(&self, cx: &mut Context<Self>) -> Option<Div> {
         use gpui_component::Selectable as _;
+        use gpui_component::Sizable as _;
         use gpui_component::button::{Button, ButtonVariants as _};
         if !self.summary_open {
             return None;
@@ -3544,6 +3591,7 @@ impl Workspace {
                              cx: &mut Context<Self>| {
             Button::new(("summary-filter", value as usize))
                 .ghost()
+                .small()
                 .selected(value == current)
                 .label(label)
                 .on_click(cx.listener(move |this, _, _, cx| {
@@ -3599,8 +3647,9 @@ impl Workspace {
         Some(
             v_flex()
                 .h_full()
-                .w(px(320.))
+                .w(px(self.summary_width))
                 .flex_none()
+                .relative()
                 .border_l_1()
                 .border_color(border)
                 .bg(sidebar_bg)
@@ -3654,8 +3703,86 @@ impl Workspace {
                             )
                         }),
                 )
-                .child(self.render_verdict_area(submitted, border, success, muted, cx)),
+                .child(self.render_verdict_area(submitted, border, success, muted, cx))
+                .child(self.render_summary_resize_handle(cx)),
         )
+    }
+
+    /// The review-summary panel's inner (*left*) edge drag handle (Phase 4
+    /// deliverable 5) — mirror image of `shell.rs`'s sidebar handle (see its
+    /// doc comment for why gpui's `on_drag`/`on_drag_move` was chosen over
+    /// gpui-component's `resizable` module), but computing width off the
+    /// panel's distance from the *right* edge of the window
+    /// (`viewport_width - mouse.x`) since the panel is flush against the
+    /// window's right edge, whereas the sidebar is flush against its left.
+    ///
+    /// Live-updates `self.summary_width` directly on every drag-move frame
+    /// (immediate visual feedback, no `Settings` round trip mid-drag);
+    /// release (or a double-click reset) emits [`SummaryWidthChanged`] so
+    /// the shell — which owns `Settings` — can persist it (this workspace
+    /// has no access to the settings store itself).
+    fn render_summary_resize_handle(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let accent = cx.theme().primary;
+        div()
+            .id("summary-resize-handle")
+            .absolute()
+            .top_0()
+            .bottom_0()
+            .left(px(-3.))
+            .w(px(6.))
+            .occlude()
+            .cursor_col_resize()
+            .group("summary-resize-handle")
+            .on_drag(SummaryResizeDrag, |_, _, _, cx| cx.new(|_| EmptyView))
+            .on_drag_move::<SummaryResizeDrag>(cx.listener(
+                |this, event: &DragMoveEvent<SummaryResizeDrag>, window, cx| {
+                    let viewport_w = f32::from(window.viewport_size().width);
+                    let mouse_x = f32::from(event.event.position.x);
+                    this.summary_dragging = true;
+                    this.summary_width =
+                        (viewport_w - mouse_x).clamp(SUMMARY_WIDTH_MIN, SUMMARY_WIDTH_MAX);
+                    cx.notify();
+                },
+            ))
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, event: &MouseDownEvent, _, cx| {
+                    // Double-click resets to the default width.
+                    if event.click_count >= 2 {
+                        this.summary_width = crate::settings::DEFAULT_SUMMARY_WIDTH;
+                        cx.emit(SummaryWidthChanged(this.summary_width));
+                        cx.notify();
+                    }
+                }),
+            )
+            .on_mouse_up(
+                MouseButton::Left,
+                cx.listener(|this, _, _, cx| {
+                    if std::mem::take(&mut this.summary_dragging) {
+                        cx.emit(SummaryWidthChanged(this.summary_width));
+                    }
+                }),
+            )
+            .on_mouse_up_out(
+                MouseButton::Left,
+                cx.listener(|this, _, _, cx| {
+                    // The common case: a drag almost always ends with the
+                    // cursor well outside this 6px strip. Gated on the drag
+                    // flag — up_out fires for EVERY outside release.
+                    if std::mem::take(&mut this.summary_dragging) {
+                        cx.emit(SummaryWidthChanged(this.summary_width));
+                    }
+                }),
+            )
+            .child(
+                div()
+                    .absolute()
+                    .top_0()
+                    .bottom_0()
+                    .left(px(2.))
+                    .w(px(2.))
+                    .group_hover("summary-resize-handle", move |el| el.bg(accent)),
+            )
     }
 
     /// The bottom of the summary panel: either the Phase-3 GitHub submit
@@ -3753,12 +3880,14 @@ impl Workspace {
         muted: Hsla,
         cx: &mut Context<Self>,
     ) -> AnyElement {
+        use gpui_component::Sizable as _;
         use gpui_component::button::{Button, ButtonVariants as _};
         let danger = cx.theme().danger;
 
         let dismiss_button = |id: &'static str, cx: &mut Context<Self>| {
             Button::new(id)
                 .ghost()
+                .small()
                 .label("Dismiss")
                 .on_click(cx.listener(|this, _, _, cx| {
                     // Routed through `cancel_submit_flow` (not a bare
@@ -3830,6 +3959,7 @@ impl Workspace {
                             .child(
                                 Button::new("submit-confirm")
                                     .primary()
+                                    .small()
                                     .label("Submit to GitHub")
                                     .on_click(
                                         cx.listener(|this, _, _, cx| this.on_submit_click(cx)),
@@ -3838,6 +3968,7 @@ impl Workspace {
                             .child(
                                 Button::new("submit-cancel")
                                     .ghost()
+                                    .small()
                                     .label("Cancel")
                                     .on_click(cx.listener(|this, _, _, cx| {
                                         // See the Dismiss button above: must
@@ -3915,6 +4046,7 @@ impl Workspace {
 
     /// An inline comment thread card under its anchor line.
     fn render_thread(&self, comment_ix: usize, cx: &mut Context<Self>) -> Div {
+        use gpui_component::Sizable as _;
         use gpui_component::button::{Button, ButtonVariants as _};
         let theme = cx.theme();
         let Some(comment) = self
@@ -3945,12 +4077,12 @@ impl Workspace {
             dv_core::Side::New => "new",
         };
 
-        div().w_full().px_4().py_1().child(
+        div().w_full().px_4().py_3().child(
             v_flex()
                 .w_full()
                 .max_w(px(720.))
                 .p_3()
-                .gap_2()
+                .gap_3()
                 .bg(theme.popover)
                 .border_1()
                 .border_color(if resolved {
@@ -3961,7 +4093,16 @@ impl Workspace {
                 .rounded_lg()
                 .child(
                     h_flex()
+                        .items_center()
                         .gap_2()
+                        // Safety net for a narrow summary/thread column (same
+                        // reasoning as `render_verdict_area`'s own
+                        // `.flex_wrap()`: "Unresolve" is long enough that the
+                        // action-button group can outgrow what's left of the
+                        // row next to the author/status text) — the group
+                        // spills onto its own line instead of clipping off
+                        // the right edge.
+                        .flex_wrap()
                         .text_sm()
                         .child(div().font_semibold().child(comment.author.clone()))
                         .child(
@@ -3980,52 +4121,66 @@ impl Workspace {
                             )
                         })
                         .child(div().flex_1())
+                        // Action-button group: tighter internal spacing than
+                        // the metadata cluster to its left, so the four
+                        // actions read as one cohesive group (GitHub's
+                        // thread-card action-row feel) rather than just more
+                        // items on the same row.
                         .child(
-                            Button::new(("resolve", comment_ix))
-                                .ghost()
-                                .label(if resolved { "Unresolve" } else { "Resolve" })
-                                .on_click(cx.listener(move |this, _, _, cx| {
-                                    let status = if resolved {
-                                        dv_core::CommentStatus::Open
-                                    } else {
-                                        dv_core::CommentStatus::Resolved
-                                    };
-                                    this.set_comment_status(id.clone(), status, cx);
-                                })),
-                        )
-                        .child(
-                            Button::new(("reply", comment_ix))
-                                .ghost()
-                                .label("Reply")
-                                .on_click(cx.listener(move |this, _, window, cx| {
-                                    this.open_thread_input(
-                                        id_for_reply.clone(),
-                                        ThreadInputMode::Reply,
-                                        window,
-                                        cx,
-                                    );
-                                })),
-                        )
-                        .child(
-                            Button::new(("edit", comment_ix))
-                                .ghost()
-                                .label("Edit")
-                                .on_click(cx.listener(move |this, _, window, cx| {
-                                    this.open_thread_input(
-                                        id_for_edit.clone(),
-                                        ThreadInputMode::EditBody,
-                                        window,
-                                        cx,
-                                    );
-                                })),
-                        )
-                        .child(
-                            Button::new(("delete", comment_ix))
-                                .ghost()
-                                .label("Delete")
-                                .on_click(cx.listener(move |this, _, _, cx| {
-                                    this.delete_comment(id_for_delete.clone(), cx);
-                                })),
+                            h_flex()
+                                .flex_none()
+                                .gap_1()
+                                .child(
+                                    Button::new(("resolve", comment_ix))
+                                        .ghost()
+                                        .small()
+                                        .label(if resolved { "Unresolve" } else { "Resolve" })
+                                        .on_click(cx.listener(move |this, _, _, cx| {
+                                            let status = if resolved {
+                                                dv_core::CommentStatus::Open
+                                            } else {
+                                                dv_core::CommentStatus::Resolved
+                                            };
+                                            this.set_comment_status(id.clone(), status, cx);
+                                        })),
+                                )
+                                .child(
+                                    Button::new(("reply", comment_ix))
+                                        .ghost()
+                                        .small()
+                                        .label("Reply")
+                                        .on_click(cx.listener(move |this, _, window, cx| {
+                                            this.open_thread_input(
+                                                id_for_reply.clone(),
+                                                ThreadInputMode::Reply,
+                                                window,
+                                                cx,
+                                            );
+                                        })),
+                                )
+                                .child(
+                                    Button::new(("edit", comment_ix))
+                                        .ghost()
+                                        .small()
+                                        .label("Edit")
+                                        .on_click(cx.listener(move |this, _, window, cx| {
+                                            this.open_thread_input(
+                                                id_for_edit.clone(),
+                                                ThreadInputMode::EditBody,
+                                                window,
+                                                cx,
+                                            );
+                                        })),
+                                )
+                                .child(
+                                    Button::new(("delete", comment_ix))
+                                        .danger()
+                                        .small()
+                                        .label("Delete")
+                                        .on_click(cx.listener(move |this, _, _, cx| {
+                                            this.delete_comment(id_for_delete.clone(), cx);
+                                        })),
+                                ),
                         ),
                 )
                 .map(|el| {
@@ -4037,16 +4192,27 @@ impl Workspace {
                         el.child(div().text_sm().child(comment.body.clone()))
                     }
                 })
-                .children(comment.replies.iter().map(|reply| {
-                    h_flex()
-                        .gap_2()
-                        .pl_3()
-                        .border_l_2()
-                        .border_color(theme.border)
-                        .text_sm()
-                        .child(div().font_semibold().child(reply.author.clone()))
-                        .child(div().child(reply.body.clone()))
-                }))
+                .when(!comment.replies.is_empty(), |el| {
+                    // One indentation rail + tighter internal spacing for
+                    // the whole reply run, distinct from the looser
+                    // header/body/replies/editor rhythm above (`gap_3`) —
+                    // consecutive replies are more tightly related to each
+                    // other than to the sections around them.
+                    el.child(
+                        v_flex()
+                            .gap_2()
+                            .pl_3()
+                            .border_l_2()
+                            .border_color(theme.border)
+                            .children(comment.replies.iter().map(|reply| {
+                                h_flex()
+                                    .gap_2()
+                                    .text_sm()
+                                    .child(div().font_semibold().child(reply.author.clone()))
+                                    .child(div().child(reply.body.clone()))
+                            })),
+                    )
+                })
                 .when_some(editing, |el, (_, saving)| {
                     let input = self
                         .thread_input
@@ -4059,6 +4225,7 @@ impl Workspace {
                             .child(
                                 Button::new(("ti-cancel", comment_ix))
                                     .ghost()
+                                    .small()
                                     .label("Cancel")
                                     .on_click(cx.listener(|this, _, window, cx| {
                                         this.close_thread_input(window, cx)
@@ -4067,6 +4234,7 @@ impl Workspace {
                             .child(
                                 Button::new(("ti-submit", comment_ix))
                                     .primary()
+                                    .small()
                                     .label(if saving { "Saving…" } else { "Save" })
                                     .disabled(saving)
                                     .on_click(cx.listener(|this, _, window, cx| {
@@ -4080,6 +4248,7 @@ impl Workspace {
 
     /// The inline comment editor card.
     fn render_editor(&self, cx: &mut Context<Self>) -> Div {
+        use gpui_component::Sizable as _;
         use gpui_component::button::{Button, ButtonVariants as _};
         let theme = cx.theme();
         let Some(editor) = &self.editor else {
@@ -4087,12 +4256,12 @@ impl Workspace {
         };
         let saving = editor.saving;
 
-        div().w_full().px_4().py_1().child(
+        div().w_full().px_4().py_3().child(
             v_flex()
                 .w_full()
                 .max_w(px(720.))
                 .p_3()
-                .gap_2()
+                .gap_3()
                 .bg(theme.popover)
                 .border_1()
                 .border_color(theme.primary.opacity(0.7))
@@ -4105,6 +4274,7 @@ impl Workspace {
                         .child(
                             Button::new("cancel-comment")
                                 .ghost()
+                                .small()
                                 .label("Cancel")
                                 .on_click(
                                     cx.listener(|this, _, window, cx| {
@@ -4115,6 +4285,7 @@ impl Workspace {
                         .child(
                             Button::new("submit-comment")
                                 .primary()
+                                .small()
                                 .label(if saving { "Saving…" } else { "Comment" })
                                 .disabled(saving)
                                 .on_click(cx.listener(|this, _, window, cx| {
@@ -4758,6 +4929,18 @@ pub struct ReviewChanged;
 
 impl EventEmitter<ReviewChanged> for Workspace {}
 
+/// Emitted once, carrying the final clamped width, when the review-summary
+/// panel's resize handle (`render_summary_resize_handle`) releases a drag
+/// or resets via double-click — the shell listens (`AppShell::open_review`)
+/// to persist it into `Settings`, which the workspace itself has no access
+/// to (Phase 4 deliverable 5). Deliberately *not* emitted per drag-move
+/// frame — only `self.summary_width` (and `cx.notify()`) update live during
+/// the drag itself, matching "write settings.json on release, not
+/// per-pixel".
+pub struct SummaryWidthChanged(pub f32);
+
+impl EventEmitter<SummaryWidthChanged> for Workspace {}
+
 impl Focusable for Workspace {
     fn focus_handle(&self, _cx: &App) -> FocusHandle {
         self.focus_handle.clone()
@@ -4766,6 +4949,9 @@ impl Focusable for Workspace {
 
 impl Render for Workspace {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        use gpui_component::Selectable as _;
+        use gpui_component::Sizable as _;
+        use gpui_component::button::{Button, ButtonVariants as _};
         let summary = self.render_summary(cx);
         let theme = cx.theme();
         let mode = self.view_mode;
@@ -4920,68 +5106,44 @@ impl Render for Workspace {
                     })
                     .child(div().flex_1())
                     .child(
-                        h_flex()
-                            .id("pr-picker-hint")
-                            .px_2()
-                            .rounded_md()
-                            .cursor_pointer()
-                            .text_color(theme.muted_foreground)
-                            .hover(|el| el.bg(theme.accent.opacity(0.4)))
-                            .on_mouse_down(
-                                MouseButton::Left,
-                                cx.listener(|this, _, window, cx| {
-                                    // Same guard the `ctrl-g` keybinding gets
-                                    // for free from its `!EditorOpen` key
-                                    // context: a click mustn't steal focus
-                                    // from a focused comment/thread input —
-                                    // the picker would open but sit
-                                    // keyboard-dead behind it.
-                                    if this.editor.is_some() || this.thread_input.is_some() {
-                                        return;
-                                    }
-                                    this.on_open_pr_picker(&OpenPrPicker, window, cx)
-                                }),
-                            )
-                            .child("PRs · ctrl-g"),
+                        Button::new("pr-picker-hint")
+                            .ghost()
+                            .small()
+                            .label("PRs · ctrl-g")
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                // Same guard the `ctrl-g` keybinding gets
+                                // for free from its `!EditorOpen` key
+                                // context: a click mustn't steal focus
+                                // from a focused comment/thread input —
+                                // the picker would open but sit
+                                // keyboard-dead behind it.
+                                if this.editor.is_some() || this.thread_input.is_some() {
+                                    return;
+                                }
+                                this.on_open_pr_picker(&OpenPrPicker, window, cx)
+                            })),
                     )
                     .child(
-                        h_flex()
-                            .id("view-toggle")
-                            .px_2()
-                            .rounded_md()
-                            .cursor_pointer()
-                            .text_color(theme.muted_foreground)
-                            .hover(|el| el.bg(theme.accent.opacity(0.4)))
-                            .on_mouse_down(
-                                MouseButton::Left,
-                                cx.listener(|this, _, window, cx| {
-                                    this.on_toggle_split(&ToggleSplit, window, cx)
-                                }),
-                            )
-                            .child(match mode {
+                        Button::new("view-toggle")
+                            .ghost()
+                            .small()
+                            .label(match mode {
                                 ViewMode::Unified => "unified · s",
                                 ViewMode::Split => "split · s",
-                            }),
+                            })
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.on_toggle_split(&ToggleSplit, window, cx)
+                            })),
                     )
                     .child(
-                        h_flex()
-                            .id("summary-toggle")
-                            .px_2()
-                            .rounded_md()
-                            .cursor_pointer()
-                            .text_color(if self.summary_open {
-                                theme.primary
-                            } else {
-                                theme.muted_foreground
-                            })
-                            .hover(|el| el.bg(theme.accent.opacity(0.4)))
-                            .on_mouse_down(
-                                MouseButton::Left,
-                                cx.listener(|this, _, window, cx| {
-                                    this.on_toggle_summary(&ToggleSummary, window, cx)
-                                }),
-                            )
-                            .child("review · r"),
+                        Button::new("summary-toggle")
+                            .ghost()
+                            .small()
+                            .selected(self.summary_open)
+                            .label("review · r")
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.on_toggle_summary(&ToggleSummary, window, cx)
+                            })),
                     ),
             )
             .children(self.render_pr_header(cx))

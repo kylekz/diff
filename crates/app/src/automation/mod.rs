@@ -60,6 +60,20 @@ enum Cmd {
     },
     /// Resize the window content area (logical pixels).
     Resize { w: f32, h: f32 },
+    /// Synthesize a click-drag from `from` to `to` (window coordinates,
+    /// logical pixels) through the real input path — mouse-down at `from`,
+    /// several incremental moves out to `to`, then mouse-up — so gpui's
+    /// `on_drag`/`on_drag_move` machinery (drag handles: sidebar/summary
+    /// panel resize, Phase 4 deliverable 5) actually engages. A single
+    /// straight jump from `from` to `to` isn't enough: gpui only starts
+    /// treating a mouse-down + move as a "drag" once the move exceeds a 2px
+    /// threshold (see gpui's `elements/div.rs`, `DRAG_THRESHOLD`), and the
+    /// very frame that crosses that threshold is the one that flips
+    /// `cx.active_drag` on — it isn't itself delivered to `on_drag_move`
+    /// listeners (those only fire once a drag is *already* active). Several
+    /// intermediate steps sidesteps both: the first step reliably crosses
+    /// the threshold, and every later one lands on an `on_drag_move` frame.
+    Drag { from: (f32, f32), to: (f32, f32) },
     /// Open a working-tree review of a repo path (the scripted stand-in for
     /// the New Review folder picker, which is disabled under automation
     /// because the native dialog would block the foreground executor).
@@ -268,6 +282,62 @@ async fn handle(
         Cmd::Resize { w, h } => cx.update_window(window, |_, window, _| {
             window.resize(size(px(w), px(h)));
             json!({"requested": {"w": w, "h": h}})
+        }),
+
+        Cmd::Drag { from, to } => cx.update_window(window, |_, window, cx| {
+            let (fx, fy) = from;
+            let (tx, ty) = to;
+            let modifiers = Modifiers::default();
+            let start = point(px(fx), px(fy));
+            let end = point(px(tx), px(ty));
+            // Hover onto the handle first (matches Click's own "move before
+            // mouse-down" so hover-gated styles/cursors are already right),
+            // then press.
+            window.dispatch_event(
+                PlatformInput::MouseMove(MouseMoveEvent {
+                    position: start,
+                    pressed_button: None,
+                    modifiers,
+                }),
+                cx,
+            );
+            window.dispatch_event(
+                PlatformInput::MouseDown(MouseDownEvent {
+                    button: MouseButton::Left,
+                    position: start,
+                    modifiers,
+                    click_count: 1,
+                    first_mouse: false,
+                }),
+                cx,
+            );
+            // Step toward `to` rather than jumping straight there — see
+            // `Cmd::Drag`'s own doc comment for why a single move isn't
+            // enough to both cross gpui's drag threshold *and* land an
+            // `on_drag_move` frame.
+            const STEPS: i32 = 8;
+            for step in 1..=STEPS {
+                let t = step as f32 / STEPS as f32;
+                let position = point(px(fx + (tx - fx) * t), px(fy + (ty - fy) * t));
+                window.dispatch_event(
+                    PlatformInput::MouseMove(MouseMoveEvent {
+                        position,
+                        pressed_button: Some(MouseButton::Left),
+                        modifiers,
+                    }),
+                    cx,
+                );
+            }
+            window.dispatch_event(
+                PlatformInput::MouseUp(MouseUpEvent {
+                    button: MouseButton::Left,
+                    position: end,
+                    modifiers,
+                    click_count: 1,
+                }),
+                cx,
+            );
+            json!({"dragged": {"from": [fx, fy], "to": [tx, ty]}})
         }),
 
         Cmd::Open { path } => {

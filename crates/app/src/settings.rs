@@ -51,6 +51,25 @@ pub const MONO_FONT_SIZE_MAX: f32 = 24.;
 pub const CONTEXT_LINES_MIN: u32 = 0;
 pub const CONTEXT_LINES_MAX: u32 = 20;
 
+/// Today's hardcoded sidebar width (`shell.rs`'s recent-review navigator) —
+/// kept as the default so a settings.json that never sets `sidebar_width`
+/// renders byte-identical to before drag-to-resize existed (Phase 4
+/// deliverable 5).
+pub const DEFAULT_SIDEBAR_WIDTH: f32 = 280.;
+/// Today's hardcoded review-summary panel width (`workspace.rs`'s
+/// `render_summary`) — same "byte-identical until touched" reasoning as
+/// `DEFAULT_SIDEBAR_WIDTH`.
+pub const DEFAULT_SUMMARY_WIDTH: f32 = 320.;
+/// Clamp for `sidebar_width`, shared by the drag handle
+/// (`shell.rs`'s `render_sidebar_resize_handle`), `set_setting`, and
+/// [`Settings::load`] — same pattern as the font-size/context-lines clamps
+/// above.
+pub const SIDEBAR_WIDTH_MIN: f32 = 180.;
+pub const SIDEBAR_WIDTH_MAX: f32 = 480.;
+/// Clamp for `summary_width` (`workspace.rs`'s `render_summary_resize_handle`).
+pub const SUMMARY_WIDTH_MIN: f32 = 240.;
+pub const SUMMARY_WIDTH_MAX: f32 = 560.;
+
 /// Which diff layout a freshly opened review starts in.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -97,6 +116,15 @@ pub struct Settings {
     pub context_lines: u32,
     /// View mode (unified/split) a freshly opened review starts in.
     pub view_mode_default: ViewModeSetting,
+    /// Sidebar (review navigator) width, in px — `shell.rs`'s drag handle on
+    /// its inner edge (docs/phase-4-settings-and-theming.md deliverable 5).
+    /// Clamped to `SIDEBAR_WIDTH_MIN..=SIDEBAR_WIDTH_MAX`, same re-clamp
+    /// posture as `mono_font_size`/`context_lines` (see [`Settings::load`]).
+    pub sidebar_width: f32,
+    /// Review-summary panel width, in px — `workspace.rs`'s drag handle on
+    /// its inner (left) edge. Clamped to
+    /// `SUMMARY_WIDTH_MIN..=SUMMARY_WIDTH_MAX`.
+    pub summary_width: f32,
 }
 
 impl Default for Settings {
@@ -110,6 +138,8 @@ impl Default for Settings {
             mono_font_size: DEFAULT_MONO_FONT_SIZE,
             context_lines: DEFAULT_CONTEXT_LINES,
             view_mode_default: ViewModeSetting::Unified,
+            sidebar_width: DEFAULT_SIDEBAR_WIDTH,
+            summary_width: DEFAULT_SUMMARY_WIDTH,
         }
     }
 }
@@ -119,21 +149,35 @@ impl Settings {
     /// Missing file, unreadable file, or unparseable JSON all fall back to
     /// [`Settings::default`] silently — settings are a nicety, not
     /// something worth surfacing an error dialog over. Numeric fields are
-    /// re-clamped after parsing (same bounds the panel's own steppers
-    /// enforce) so a hand-edited settings.json can't sneak an out-of-range
-    /// `mono_font_size`/`context_lines` past both.
+    /// re-clamped after parsing (same bounds the panel's own steppers /
+    /// drag handles enforce) so a hand-edited settings.json can't sneak an
+    /// out-of-range value past both — see [`Self::clamp_numeric_fields`].
     pub fn load() -> Self {
         let mut settings = default_path()
             .and_then(|p| std::fs::read(p).ok())
             .and_then(|bytes| serde_json::from_slice::<Settings>(&bytes).ok())
             .unwrap_or_default();
-        settings.mono_font_size = settings
+        settings.clamp_numeric_fields();
+        settings
+    }
+
+    /// Pull every numeric field back into its documented range. Shared by
+    /// [`Self::load`] (a hand-edited or stale settings.json) and the drag
+    /// handles / `set_setting`'s own clamps, and exercised directly by
+    /// tests below without touching the real data dir.
+    pub(crate) fn clamp_numeric_fields(&mut self) {
+        self.mono_font_size = self
             .mono_font_size
             .clamp(MONO_FONT_SIZE_MIN, MONO_FONT_SIZE_MAX);
-        settings.context_lines = settings
+        self.context_lines = self
             .context_lines
             .clamp(CONTEXT_LINES_MIN, CONTEXT_LINES_MAX);
-        settings
+        self.sidebar_width = self
+            .sidebar_width
+            .clamp(SIDEBAR_WIDTH_MIN, SIDEBAR_WIDTH_MAX);
+        self.summary_width = self
+            .summary_width
+            .clamp(SUMMARY_WIDTH_MIN, SUMMARY_WIDTH_MAX);
     }
 
     /// Best-effort save; silently does nothing if the data dir can't be
@@ -190,6 +234,8 @@ mod tests {
         assert_eq!(s.mono_font_size, 14.0);
         assert_eq!(s.context_lines, 3);
         assert_eq!(s.view_mode_default, ViewModeSetting::Unified);
+        assert_eq!(s.sidebar_width, 280.0);
+        assert_eq!(s.summary_width, 320.0);
     }
 
     #[test]
@@ -203,6 +249,8 @@ mod tests {
             mono_font_size: 18.0,
             context_lines: 5,
             view_mode_default: ViewModeSetting::Split,
+            sidebar_width: 340.0,
+            summary_width: 400.0,
         };
         let json = serde_json::to_string(&settings).unwrap();
         let back: Settings = serde_json::from_str(&json).unwrap();
@@ -238,6 +286,55 @@ mod tests {
         assert_eq!(parsed.mono_font_size, DEFAULT_MONO_FONT_SIZE);
         assert_eq!(parsed.context_lines, Settings::default().context_lines);
         assert_eq!(parsed.view_mode_default, ViewModeSetting::Unified);
+        assert_eq!(parsed.sidebar_width, DEFAULT_SIDEBAR_WIDTH);
+        assert_eq!(parsed.summary_width, DEFAULT_SUMMARY_WIDTH);
+    }
+
+    // --- clamp_numeric_fields (Phase 4 deliverable 5: sidebar/summary drag
+    // handles share this clamp with `mono_font_size`/`context_lines`) -------
+
+    #[test]
+    fn clamp_numeric_fields_pulls_high_values_down_to_max() {
+        let mut s = Settings {
+            mono_font_size: 999.,
+            context_lines: 999,
+            sidebar_width: 999.,
+            summary_width: 9999.,
+            ..Settings::default()
+        };
+        s.clamp_numeric_fields();
+        assert_eq!(s.mono_font_size, MONO_FONT_SIZE_MAX);
+        assert_eq!(s.context_lines, CONTEXT_LINES_MAX);
+        assert_eq!(s.sidebar_width, SIDEBAR_WIDTH_MAX);
+        assert_eq!(s.summary_width, SUMMARY_WIDTH_MAX);
+    }
+
+    #[test]
+    fn clamp_numeric_fields_pulls_low_values_up_to_min() {
+        let mut s = Settings {
+            mono_font_size: -5.,
+            context_lines: 0, // already at CONTEXT_LINES_MIN — exercised for symmetry
+            sidebar_width: 0.,
+            summary_width: -100.,
+            ..Settings::default()
+        };
+        s.clamp_numeric_fields();
+        assert_eq!(s.mono_font_size, MONO_FONT_SIZE_MIN);
+        assert_eq!(s.context_lines, CONTEXT_LINES_MIN);
+        assert_eq!(s.sidebar_width, SIDEBAR_WIDTH_MIN);
+        assert_eq!(s.summary_width, SUMMARY_WIDTH_MIN);
+    }
+
+    #[test]
+    fn clamp_numeric_fields_leaves_in_range_values_untouched() {
+        let mut s = Settings {
+            sidebar_width: 300.,
+            summary_width: 350.,
+            ..Settings::default()
+        };
+        s.clamp_numeric_fields();
+        assert_eq!(s.sidebar_width, 300.);
+        assert_eq!(s.summary_width, 350.);
     }
 
     #[test]

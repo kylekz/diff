@@ -335,6 +335,7 @@ fn marker_delete_script(dir: &str) -> String {
 ///   closes the pipe, which `cat` treats as clean EOF, and without the gate
 ///   the chain completes into a TORN binary behind a matching marker that
 ///   the marker-only mismatch check can never detect.
+///
 /// `hash` is a lowercase hex sha256 digest (fixed charset, no shell
 /// metacharacters) so it's embedded as-is inside its own single quotes
 /// without needing [`sh_escape`].

@@ -149,8 +149,10 @@ view/create/fetch + GUI launch), PR picker + header, validated review
 submission from both CLI and GUI (blob anchors, rename-aware paths,
 line-in-diff), sidebar PR status icons, comment author = GitHub login —
 live-accepted against kylekz/difftest (docs/phase-3-github.md § Acceptance
-results). Phase 4 in progress — settings & appearance
-(docs/phase-4-settings-and-theming.md): slice 1 shipped (JetBrains Mono
-bundled, four themes incl. Claude Dark/Light + Dracula, ctrl-shift-t
-picker, settings.json). Next: settings panel, drag-to-resize panels,
-UI polish pass.
+results). Phase 4 complete: settings & appearance —
+JetBrains Mono bundled, four themes (Aura Dark, Dracula, Claude Dark,
+Claude Light) with ctrl-shift-t picker + follow-OS, settings.json +
+ctrl-, panel (view mode, context lines, fonts with row-height scaling),
+drag-to-resize sidebar/summary with persisted widths, thread-card/button
+polish pass (docs/phase-4-settings-and-theming.md § Acceptance results).
+Next: Phase 5 — WSL host process (docs/phase-5-wsl.md).

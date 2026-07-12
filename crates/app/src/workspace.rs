@@ -12,6 +12,7 @@ use gpui_component::highlighter::HighlightTheme;
 use gpui_component::{ActiveTheme, Disableable as _, StyledExt as _, h_flex, v_flex};
 
 use crate::highlight::{self, LineRuns};
+use crate::settings::ViewModeSetting;
 use crate::submit::{self, SubmissionOutcome, Violation, ViolationKind};
 
 actions!(
@@ -44,11 +45,34 @@ const KEY_CONTEXT: &str = "Workspace";
 /// fire while the user types a comment.
 const EDITOR_CONTEXT: &str = "EditorOpen";
 
-/// Every diff row (lines and hunk headers alike) renders at this exact
-/// height. uniform_list sizes its slots from a measured row; any variant
-/// taller than the rest (the old padded headers) makes every other row sit
-/// short in its slot, leaving unpainted gaps between line backgrounds.
-const ROW_HEIGHT: f32 = 24.;
+/// Every diff row (lines and hunk headers alike) renders at exactly
+/// [`row_height`] for the active `mono_font_size` setting. A uniform height
+/// across row *kinds* is what keeps line backgrounds/thread-anchor
+/// alignment gap-free — a variant taller than the rest (the old padded
+/// headers) makes every other row sit short in its slot, leaving unpainted
+/// gaps between line backgrounds.
+///
+/// This used to be a bare `24.` constant. Scaling it with `mono_font_size`
+/// preserves the *exact* ratio that constant had against the old fixed
+/// 14px diff text size (`settings::DEFAULT_MONO_FONT_SIZE`) — `24. / 14.`
+/// — so a user who never touches the font-size setting sees byte-identical
+/// layout to before this slice existed. `.max(16.)` keeps a row from
+/// getting vanishingly short at the bottom of the settings panel's 8..=24
+/// clamp.
+fn row_height(font_size: f32) -> f32 {
+    (font_size * (24. / 14.)).round().max(16.)
+}
+/// Width of each line-number gutter column — unified rows have two
+/// (old/new), split cells have one per side. This used to be a bare
+/// `w_12()` (Tailwind's `12 * 4px` = 48px), tuned for the old fixed 14px
+/// diff text size but fixed regardless of the font-size setting — so a
+/// 4-digit line number clipped at larger sizes (review finding). `3.5`
+/// keeps size-14 visually unchanged for practical purposes (49px vs. the
+/// old 48px) while giving size-24 enough room (84px) for 4 digits plus the
+/// column's own padding.
+fn gutter_width(font_size: f32) -> f32 {
+    font_size * 3.5
+}
 /// Extra identifier stamped onto the workspace node while the jump-to-file
 /// palette is open. Single-char bindings are scoped to `!PaletteOpen` so
 /// they keep bubbling into the palette's text input instead of firing.
@@ -90,6 +114,15 @@ pub fn init(cx: &mut App) {
 enum ViewMode {
     Unified,
     Split,
+}
+
+impl From<ViewModeSetting> for ViewMode {
+    fn from(setting: ViewModeSetting) -> Self {
+        match setting {
+            ViewModeSetting::Unified => ViewMode::Unified,
+            ViewModeSetting::Split => ViewMode::Split,
+        }
+    }
 }
 
 enum Status {
@@ -474,17 +507,30 @@ pub struct Workspace {
     selected: Option<usize>,
     diffs: HashMap<usize, Arc<RenderedDiff>>,
     diff_pending: HashSet<usize>,
-    /// Bumped by [`Self::on_theme_changed`]. `request_diff` resolves
+    /// Bumped by [`Self::invalidate_diff_cache`] (theme swaps via
+    /// [`Self::on_theme_changed`], and context-lines changes via
+    /// [`Self::set_context_lines`] — anything that requires a full
+    /// recompute, not just a re-render). `request_diff` resolves
     /// `cx.theme().highlight_theme` once, off-thread, and bakes concrete
     /// colors into the cached `RenderedDiff` rows for performance — so
     /// unlike UI chrome (which reads `cx.theme()` fresh every render), a
-    /// cached diff does *not* pick up a new theme's syntax palette on its
-    /// own. Captured at spawn time alongside `source_epoch` and checked on
-    /// completion, so a diff computed against a theme that's since been
-    /// swapped again (two quick picker choices) never clobbers a newer
-    /// computation that already landed.
+    /// cached diff does *not* pick up a new theme's syntax palette (or a
+    /// new context-lines count) on its own. Captured at spawn time alongside
+    /// `source_epoch` and checked on completion, so a diff computed against
+    /// settings that have since changed again (two quick picker/panel
+    /// choices) never clobbers a newer computation that already landed.
     highlight_epoch: u64,
     view_mode: ViewMode,
+    /// Context lines shown around each hunk (`dv_core::DiffOptions`'s
+    /// existing knob) — from `settings::Settings::context_lines`, live via
+    /// [`Self::set_context_lines`].
+    context_lines: u32,
+    /// Mono/code text size in px — from `settings::Settings::mono_font_size`,
+    /// live via [`Self::set_font_size`]. Also drives row height (see
+    /// `row_height`); never baked into a cached [`RenderedDiff`] (only
+    /// colors are), so a change just needs a re-measure + re-render, not a
+    /// recompute.
+    font_size: f32,
     /// Captured from the *original* source, before `resolve_source` rewrites
     /// a merge-base range to a plain two-dot range — so the header keeps
     /// saying "range (merge base)".
@@ -873,10 +919,14 @@ fn load_pr(repo: &GitRepo, number: u64, location: RepoLocation) -> anyhow::Resul
 }
 
 impl Workspace {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         location: RepoLocation,
         source: DiffSource,
         pending_pr: Option<u64>,
+        view_mode_default: ViewModeSetting,
+        context_lines: u32,
+        font_size: f32,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
@@ -907,7 +957,9 @@ impl Workspace {
             selected: None,
             diffs: HashMap::new(),
             diff_pending: HashSet::new(),
-            view_mode: ViewMode::Unified,
+            view_mode: view_mode_default.into(),
+            context_lines,
+            font_size,
             current_hunk: 0,
             expanded: HashMap::new(),
             file_scroll: UniformListScrollHandle::new(),
@@ -1147,6 +1199,7 @@ impl Workspace {
         // (see `highlight_epoch`'s doc comment).
         let highlight_epoch = self.highlight_epoch;
         let expand = self.expanded.get(&index).cloned().unwrap_or_default();
+        let context_lines = self.context_lines;
         let theme = cx.theme();
         let hl = HighlightInputs {
             theme: theme.highlight_theme.clone(),
@@ -1157,7 +1210,9 @@ impl Workspace {
             let started = std::time::Instant::now();
             let rendered = cx
                 .background_executor()
-                .spawn(async move { compute_diff(&repo, &source, &file, &hl, &expand) })
+                .spawn(
+                    async move { compute_diff(&repo, &source, &file, &hl, &expand, context_lines) },
+                )
                 .await;
             let elapsed_ms = started.elapsed().as_millis() as u64;
 
@@ -1209,12 +1264,70 @@ impl Workspace {
     /// simply recomputes lazily — under the new theme — the next time it's
     /// picked, same as a first-ever view of it.
     pub(crate) fn on_theme_changed(&mut self, cx: &mut Context<Self>) {
+        self.invalidate_diff_cache(cx);
+    }
+
+    /// Drop every cached [`RenderedDiff`] and recompute the currently
+    /// selected file — shared by [`Self::on_theme_changed`] (colors baked
+    /// stale) and [`Self::set_context_lines`] (hunk structure itself
+    /// changed, so the cache is stale in a much more literal sense). Any
+    /// other (currently unselected) file simply recomputes lazily under the
+    /// new settings the next time it's picked, same as a first-ever view.
+    fn invalidate_diff_cache(&mut self, cx: &mut Context<Self>) {
         self.highlight_epoch += 1;
         self.diffs.clear();
         self.diff_pending.clear();
         if let Some(index) = self.selected {
             self.request_diff(index, cx);
         }
+        cx.notify();
+    }
+
+    /// Settings-panel/`set_setting` live update for "Context lines" — see
+    /// `settings::Settings::context_lines`. A no-op when unchanged, so a
+    /// stepper click that hits a clamp boundary doesn't pay for a recompute.
+    pub(crate) fn set_context_lines(&mut self, context_lines: u32, cx: &mut Context<Self>) {
+        if self.context_lines == context_lines {
+            return;
+        }
+        self.context_lines = context_lines;
+        self.invalidate_diff_cache(cx);
+    }
+
+    /// Settings-panel/`set_setting` live update for "Font size" — see
+    /// `settings::Settings::mono_font_size`. Unlike a theme/context-lines
+    /// change, nothing here is baked into the [`RenderedDiff`] cache (only
+    /// colors and hunk structure are — see `highlight.rs`'s `HighlightStyle`
+    /// runs, which carry no size), so this only needs to re-measure the
+    /// list's cached row heights (`ListState::remeasure`, built for exactly
+    /// this: "item heights may have changed... but the number and identity
+    /// of items remains the same") and repaint — no recompute, no epoch
+    /// bump.
+    pub(crate) fn set_font_size(&mut self, font_size: f32, cx: &mut Context<Self>) {
+        if self.font_size == font_size {
+            return;
+        }
+        self.font_size = font_size;
+        self.diff_list.remeasure();
+        cx.notify();
+    }
+
+    /// Settings-panel/`set_setting` live update for "Default view" — applies
+    /// to the workspace that's open right now, not just future ones (the
+    /// setting only picks what a *freshly opened* review starts in).
+    pub(crate) fn set_view_mode_setting(&mut self, mode: ViewModeSetting, cx: &mut Context<Self>) {
+        self.set_view_mode(mode.into(), cx);
+    }
+
+    fn set_view_mode(&mut self, mode: ViewMode, cx: &mut Context<Self>) {
+        if self.view_mode == mode {
+            return;
+        }
+        self.view_mode = mode;
+        // Row count and indices differ between the views; re-sync the list
+        // and keep the eye on the same hunk across the toggle.
+        self.reset_diff_list(cx);
+        self.scroll_to_current_hunk();
         cx.notify();
     }
 
@@ -1556,6 +1669,12 @@ impl Workspace {
                 ViewMode::Unified => "unified",
                 ViewMode::Split => "split",
             },
+            // Diff-display metrics (docs/phase-4-settings-and-theming.md
+            // deliverable 3/7): lets a script assert row pitch scales with
+            // `mono_font_size` without pixel-measuring a screenshot.
+            "context_lines": self.context_lines,
+            "font_size": self.font_size,
+            "row_height": row_height(self.font_size),
             "selected": self.selected,
             "current_hunk": self.current_hunk,
             "last_diff_ms": self.last_diff_ms,
@@ -1720,15 +1839,11 @@ impl Workspace {
     }
 
     fn on_toggle_split(&mut self, _: &ToggleSplit, _: &mut Window, cx: &mut Context<Self>) {
-        self.view_mode = match self.view_mode {
+        let next = match self.view_mode {
             ViewMode::Unified => ViewMode::Split,
             ViewMode::Split => ViewMode::Unified,
         };
-        // Row count and indices differ between the views; re-sync the list
-        // and keep the eye on the same hunk across the toggle.
-        self.reset_diff_list(cx);
-        self.scroll_to_current_hunk();
-        cx.notify();
+        self.set_view_mode(next, cx);
     }
 
     /// Row indices of the hunk starts for the selected file in the active
@@ -3352,11 +3467,11 @@ impl Workspace {
         let base = h_flex()
             .id(("hunk-header", hunk))
             .w_full()
-            .h(px(ROW_HEIGHT))
+            .h(px(row_height(self.font_size)))
             .px_2()
             .bg(theme.muted)
             .font_family(theme.mono_font_family.clone())
-            .text_sm()
+            .text_size(px(self.font_size))
             .text_color(theme.muted_foreground);
         match expandable {
             None => base.child(label),
@@ -4086,7 +4201,7 @@ impl Workspace {
                     })
                     .child(
                         div()
-                            .w_12()
+                            .w(px(gutter_width(self.font_size)))
                             .flex_none()
                             .pr_1()
                             .text_right()
@@ -4095,7 +4210,7 @@ impl Workspace {
                     )
                     .child(
                         div()
-                            .w_12()
+                            .w(px(gutter_width(self.font_size)))
                             .flex_none()
                             .pr_2()
                             .text_right()
@@ -4105,9 +4220,9 @@ impl Workspace {
 
                 h_flex()
                     .w_full()
-                    .h(px(ROW_HEIGHT))
+                    .h(px(row_height(self.font_size)))
                     .font_family(mono)
-                    .text_sm()
+                    .text_size(px(self.font_size))
                     .when_some(bg, |el, bg| el.bg(bg))
                     .when_some(selected_bg, |el, bg| el.bg(bg))
                     .when_some(anchor, |el, (side, line)| {
@@ -4161,10 +4276,10 @@ impl Workspace {
                 let right = self.render_split_cell(right.clone(), DiffSide::New, row_index, cx);
                 h_flex()
                     .w_full()
-                    .h(px(ROW_HEIGHT))
+                    .h(px(row_height(self.font_size)))
                     .items_stretch()
                     .font_family(mono)
-                    .text_sm()
+                    .text_size(px(self.font_size))
                     .child(left.flex_1().min_w(px(0.)))
                     .child(div().w(px(1.)).flex_none().bg(border))
                     .child(right.flex_1().min_w(px(0.)))
@@ -4220,7 +4335,7 @@ impl Workspace {
                 "split-gutter",
                 row_index * 2 + (side == DiffSide::New) as usize,
             ))
-            .w_12()
+            .w(px(gutter_width(self.font_size)))
             .flex_none()
             .pr_2()
             .text_right()
@@ -4287,6 +4402,7 @@ fn compute_diff(
     file: &ChangedFile,
     hl: &HighlightInputs,
     expand: &HashSet<usize>,
+    context_lines: u32,
 ) -> anyhow::Result<RenderedDiff> {
     let old_path = file.old_path.as_deref().unwrap_or(&file.path);
 
@@ -4335,7 +4451,10 @@ fn compute_diff(
     let diff = dv_core::diff::diff_blobs(
         old_bytes.as_deref(),
         new_bytes.as_deref(),
-        &DiffOptions::default(),
+        &DiffOptions {
+            context_lines,
+            ..DiffOptions::default()
+        },
     );
 
     // Syntax-highlight each side's full text once (tree-sitter needs whole-file

@@ -11,12 +11,18 @@ use dv_core::{
 use gpui::prelude::FluentBuilder;
 use gpui::*;
 use gpui_component::button::{Button, ButtonVariants};
-use gpui_component::{ActiveTheme, Sizable as _, StyledExt, TitleBar, h_flex, v_flex};
+use gpui_component::input::{Input, InputEvent, InputState};
+use gpui_component::{
+    ActiveTheme, Selectable as _, Sizable as _, StyledExt, TitleBar, h_flex, v_flex,
+};
 
 use std::collections::HashMap;
 
 use crate::recent::{RecentEntry, RecentStore, title_for};
-use crate::settings::Settings;
+use crate::settings::{
+    CONTEXT_LINES_MAX, CONTEXT_LINES_MIN, MONO_FONT_SIZE_MAX, MONO_FONT_SIZE_MIN, Settings,
+    ViewModeSetting,
+};
 use crate::themes;
 use crate::workspace::{
     ReviewChanged, Workspace, checks_word, pr_state_word, review_decision_word,
@@ -31,7 +37,9 @@ actions!(
         ThemePickerNext,
         ThemePickerPrev,
         ThemePickerClose,
-        ThemePickerChoose
+        ThemePickerChoose,
+        OpenSettings,
+        SettingsClose
     ]
 );
 
@@ -39,6 +47,13 @@ const KEY_CONTEXT: &str = "AppShell";
 /// Stamped onto the shell's key context while the theme picker is open
 /// (same mechanism `workspace.rs` uses for its palette/PR-picker overlays).
 const THEME_PICKER_CONTEXT: &str = "ThemePickerOpen";
+/// Same mechanism, for the settings panel (`ctrl-,`).
+const SETTINGS_PANEL_CONTEXT: &str = "SettingsPanelOpen";
+
+// Font-size/context-lines clamp bounds (`MONO_FONT_SIZE_MIN`/`_MAX`,
+// `CONTEXT_LINES_MIN`/`_MAX`) live in `settings.rs` now — shared with
+// `Settings::load`'s own re-clamp of a hand-edited settings.json, see its
+// doc comment.
 
 /// Make a local location absolute (lexically, without touching the
 /// filesystem) so it survives being persisted and re-opened from a
@@ -136,10 +151,12 @@ fn fetch_pr_badge(remote: &RemoteRef) -> Option<PrBadge> {
 pub fn init(cx: &mut App) {
     let shell = Some(KEY_CONTEXT);
     let theme_picker = Some("AppShell && ThemePickerOpen");
+    let settings_panel = Some("AppShell && SettingsPanelOpen");
     cx.bind_keys([
         KeyBinding::new("cmd-n", NewReview, shell),
         KeyBinding::new("ctrl-n", NewReview, shell),
         KeyBinding::new("ctrl-shift-t", OpenThemePicker, shell),
+        KeyBinding::new("ctrl-,", OpenSettings, shell),
     ]);
     cx.bind_keys([
         KeyBinding::new("down", ThemePickerNext, theme_picker),
@@ -147,6 +164,7 @@ pub fn init(cx: &mut App) {
         KeyBinding::new("escape", ThemePickerClose, theme_picker),
         KeyBinding::new("enter", ThemePickerChoose, theme_picker),
     ]);
+    cx.bind_keys([KeyBinding::new("escape", SettingsClose, settings_panel)]);
 }
 
 pub struct AppShell {
@@ -166,20 +184,41 @@ pub struct AppShell {
     badges: HashMap<RepoLocation, ReviewBadge>,
     /// Keeps the active workspace's ReviewChanged subscription alive.
     _ws_subscription: Option<Subscription>,
-    /// Persisted app-wide settings (currently just the active theme name).
-    /// Loaded once at startup; updated and re-saved on every theme-picker
-    /// choice.
+    /// Persisted app-wide settings. Loaded once at startup; updated and
+    /// re-saved on every theme-picker / settings-panel change (and by
+    /// `--automation`'s `set_setting`).
     settings: Settings,
     /// The theme-picker overlay (`ctrl-shift-t`), when open. Unlike the
     /// PR picker there's nothing to load — the registry is a static list —
     /// so this is just a cursor into `themes::names()`.
     theme_picker: Option<ThemePicker>,
+    /// The settings panel (`ctrl-,`), when open.
+    settings_panel: Option<SettingsPanel>,
+    /// Keeps the window's OS-appearance observer alive — re-resolves the
+    /// active theme on every live OS light/dark flip while
+    /// `follow_os_appearance` is on (see `Self::resolve_follow_os`).
+    /// Startup's own resolution happens in `main.rs` (via `cx.window_appearance()`,
+    /// before any window/shell exists), *not* through this subscription —
+    /// `Window::observe_window_appearance`'s registration never invokes the
+    /// callback itself (see its construction site in `Self::new`), so
+    /// startup needed its own resolution anyway.
+    _appearance_subscription: Option<Subscription>,
 }
 
 /// The theme picker overlay, while open.
 struct ThemePicker {
     /// Cursor into `themes::names()`.
     selected: usize,
+}
+
+/// The settings panel overlay, while open. Mouse-first (no arrow-key
+/// cursor like the theme/PR pickers — every control is a button/stepper/
+/// text-input the user clicks directly), so all this holds is the one text
+/// input's live state.
+struct SettingsPanel {
+    /// "Mono font" free-text field, pre-filled with the current setting.
+    mono_font_input: Entity<InputState>,
+    _subscription: Subscription,
 }
 
 /// Sidebar badge for one repo's latest review.
@@ -222,7 +261,28 @@ impl AppShell {
             _ws_subscription: None,
             settings,
             theme_picker: None,
+            settings_panel: None,
+            _appearance_subscription: None,
         };
+        // Live follow-OS updates (docs/phase-4-settings-and-theming.md
+        // deliverable 2): `Window::observe_window_appearance`'s registration
+        // only records the callback and activates the subscription (see its
+        // definition in `window.rs`) — it never invokes the callback itself,
+        // synchronously or otherwise. The callback only ever runs later, off
+        // a genuine platform appearance-change event (on Windows, a
+        // `WM_SETTINGCHANGE`/`ImmersiveColorSet` message, itself deduped
+        // against the platform window's last-seen appearance before it's
+        // dispatched — see `gpui_windows`'s `handle_system_theme_changed`).
+        // `resolve_follow_os` is idempotent (a no-op when follow-OS is off,
+        // and `apply_resolved_theme` no-ops when the resolved name is
+        // already the live theme), so it's safe to call unconditionally on
+        // every event with no first-call skip.
+        let weak = cx.weak_entity();
+        this._appearance_subscription =
+            Some(window.observe_window_appearance(move |window, cx| {
+                weak.update(cx, |this, cx| this.resolve_follow_os(window, cx))
+                    .ok();
+            }));
         // App-open refresh (docs/phase-3-github.md deliverable 3): skip the
         // network pr_status pass for WSL-located entries here specifically
         // — a cold distro hasn't booted yet, and walking every WSL entry
@@ -271,7 +331,21 @@ impl AppShell {
         // refresh (local + network) — see `refresh_badge`'s doc comment.
         self.refresh_badge(index, true, cx);
 
-        let workspace = cx.new(|cx| Workspace::new(location, source, pending_pr, window, cx));
+        let view_mode_default = self.settings.view_mode_default;
+        let context_lines = self.settings.context_lines;
+        let font_size = self.settings.mono_font_size;
+        let workspace = cx.new(|cx| {
+            Workspace::new(
+                location,
+                source,
+                pending_pr,
+                view_mode_default,
+                context_lines,
+                font_size,
+                window,
+                cx,
+            )
+        });
         let handle = workspace.focus_handle(cx);
         window.focus(&handle, cx);
         // Keep this entry's badge live while the review is being worked on.
@@ -487,7 +561,7 @@ impl AppShell {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if self.theme_picker.is_some() {
+        if self.theme_picker.is_some() || self.settings_panel.is_some() {
             return;
         }
         let selected = themes::names()
@@ -571,24 +645,58 @@ impl AppShell {
         self.choose_theme(name, window, cx);
     }
 
-    /// Apply + persist `name` (a no-op re-apply when it's already the active
-    /// theme — see the doc on the picker's marker), then close the picker.
-    /// Shared by the keyboard path ([`Self::on_theme_picker_choose`]) and the
-    /// picker row's mouse click.
+    /// Explicit theme pick (`name` is always one of `themes::names()`):
+    /// persist it as the manual `theme` and turn `follow_os_appearance`
+    /// off — explicit beats automatic (docs/phase-4-settings-and-theming.md
+    /// deliverable 2). Applies live, then closes the picker (a no-op if it
+    /// wasn't open — the settings panel's Theme row calls this too, with no
+    /// picker involved). Shared by the keyboard path
+    /// ([`Self::on_theme_picker_choose`]), the picker row's mouse click, and
+    /// the settings panel.
     fn choose_theme(&mut self, name: &'static str, window: &mut Window, cx: &mut Context<Self>) {
-        if name != self.settings.theme {
-            themes::apply_theme(name, Some(window), cx);
-            self.settings.theme = name.to_string();
-            self.settings.save();
-            // UI chrome picks up the new theme for free (reads `cx.theme()`
-            // fresh every render), but the active workspace's diff pane
-            // cached its syntax highlighting with the *old* theme's
-            // concrete colors baked in — see `Workspace::on_theme_changed`.
-            if let Some(ws) = &self.active {
-                ws.update(cx, |ws, cx| ws.on_theme_changed(cx));
-            }
-        }
+        self.settings.theme = name.to_string();
+        self.settings.follow_os_appearance = false;
+        self.settings.save();
+        self.apply_resolved_theme(name, window, cx);
         self.close_theme_picker(window, cx);
+    }
+
+    /// Apply `name` live iff it isn't already the active theme (comparing
+    /// against the *live* global theme, not `self.settings.theme` — while
+    /// follow-OS is on, those two can legitimately differ). Deliberately
+    /// takes no position on `self.settings.theme`/`follow_os_appearance`:
+    /// the caller ([`Self::choose_theme`] for an explicit pick,
+    /// [`Self::resolve_follow_os`] for an automatic one) owns that.
+    fn apply_resolved_theme(&mut self, name: &str, window: &mut Window, cx: &mut Context<Self>) {
+        if *cx.theme().theme_name() == *name {
+            return;
+        }
+        themes::apply_theme(name, &self.settings.mono_font, Some(window), cx);
+        // UI chrome picks up the new theme for free (reads `cx.theme()`
+        // fresh every render), but the active workspace's diff pane cached
+        // its syntax highlighting with the *old* theme's concrete colors
+        // baked in — see `Workspace::on_theme_changed`.
+        if let Some(ws) = &self.active {
+            ws.update(cx, |ws, cx| ws.on_theme_changed(cx));
+        }
+    }
+
+    /// Re-resolve the active theme from `follow_os_appearance`'s light/dark
+    /// pair against the window's live OS appearance — called by the
+    /// `observe_window_appearance` subscription set up in [`Self::new`] on
+    /// every genuine OS light/dark change while follow-OS is on. A no-op
+    /// when follow-OS is off (the observer stays registered regardless, so
+    /// turning follow-OS back on doesn't need to re-register anything).
+    fn resolve_follow_os(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.settings.follow_os_appearance {
+            return;
+        }
+        let os_is_dark = matches!(
+            window.appearance(),
+            WindowAppearance::Dark | WindowAppearance::VibrantDark
+        );
+        let name = self.settings.effective_theme(os_is_dark).to_string();
+        self.apply_resolved_theme(&name, window, cx);
     }
 
     fn open_recent(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
@@ -674,6 +782,26 @@ impl AppShell {
             "theme": theme.theme_name().to_string(),
             "theme_picker_open": self.theme_picker.is_some(),
             "mono_font": theme.mono_font_family.to_string(),
+            // Settings deliverable (docs/phase-4-settings-and-theming.md
+            // deliverable 7): the whole persisted struct, plus whether the
+            // panel is open. Note this can legitimately disagree with the
+            // top-level `theme`/`mono_font` above while follow-OS is on —
+            // those two report what's actually painted; `settings.theme` is
+            // the last *explicit* pick (see `Settings::effective_theme`).
+            "settings": json!({
+                "theme": self.settings.theme,
+                "follow_os_appearance": self.settings.follow_os_appearance,
+                "light_theme": self.settings.light_theme,
+                "dark_theme": self.settings.dark_theme,
+                "mono_font": self.settings.mono_font,
+                "mono_font_size": self.settings.mono_font_size,
+                "context_lines": self.settings.context_lines,
+                "view_mode_default": match self.settings.view_mode_default {
+                    ViewModeSetting::Unified => "unified",
+                    ViewModeSetting::Split => "split",
+                },
+            }),
+            "settings_open": self.settings_panel.is_some(),
         })
     }
 
@@ -728,6 +856,253 @@ impl AppShell {
             }
             None => Err(anyhow::anyhow!("no active review")),
         }
+    }
+
+    /// `{"cmd":"set_setting","key":"...","value":...}`: apply one setting
+    /// change through the exact same helper methods the settings panel's
+    /// own controls call — so a script exercises the real live-apply +
+    /// persist path, not a parallel one. `key` matches `Settings`'s JSON
+    /// field names one-to-one.
+    pub(crate) fn automation_set_setting(
+        &mut self,
+        key: &str,
+        value: serde_json::Value,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> anyhow::Result<()> {
+        match key {
+            "theme" => {
+                let requested = value
+                    .as_str()
+                    .ok_or_else(|| anyhow::anyhow!("theme must be a string"))?;
+                let name = themes::names()
+                    .find(|n| *n == requested)
+                    .ok_or_else(|| anyhow::anyhow!("unknown theme: {requested}"))?;
+                self.choose_theme(name, window, cx);
+            }
+            "follow_os_appearance" => {
+                let on = value
+                    .as_bool()
+                    .ok_or_else(|| anyhow::anyhow!("follow_os_appearance must be a bool"))?;
+                self.set_follow_os_appearance(on, window, cx);
+            }
+            "light_theme" => {
+                let name = value
+                    .as_str()
+                    .ok_or_else(|| anyhow::anyhow!("light_theme must be a string"))?
+                    .to_string();
+                self.set_light_theme(name, window, cx)?;
+            }
+            "dark_theme" => {
+                let name = value
+                    .as_str()
+                    .ok_or_else(|| anyhow::anyhow!("dark_theme must be a string"))?
+                    .to_string();
+                self.set_dark_theme(name, window, cx)?;
+            }
+            "mono_font" => {
+                let family = value
+                    .as_str()
+                    .ok_or_else(|| anyhow::anyhow!("mono_font must be a string"))?
+                    .to_string();
+                self.set_mono_font(family, window, cx);
+            }
+            "mono_font_size" => {
+                let size = value
+                    .as_f64()
+                    .ok_or_else(|| anyhow::anyhow!("mono_font_size must be a number"))?
+                    as f32;
+                self.set_mono_font_size(size, cx);
+            }
+            "context_lines" => {
+                let n = value.as_u64().ok_or_else(|| {
+                    anyhow::anyhow!("context_lines must be a non-negative integer")
+                })? as u32;
+                self.set_context_lines(n, cx);
+            }
+            "view_mode_default" => {
+                let mode = match value.as_str() {
+                    Some("unified") => ViewModeSetting::Unified,
+                    Some("split") => ViewModeSetting::Split,
+                    _ => anyhow::bail!("view_mode_default must be \"unified\" or \"split\""),
+                };
+                self.set_view_mode_default(mode, cx);
+            }
+            other => anyhow::bail!("unknown setting: {other}"),
+        }
+        Ok(())
+    }
+
+    // ---- Settings panel ---------------------------------------------------
+
+    fn on_open_settings(&mut self, _: &OpenSettings, window: &mut Window, cx: &mut Context<Self>) {
+        if self.settings_panel.is_some() || self.theme_picker.is_some() {
+            return;
+        }
+        let input =
+            cx.new(|cx| InputState::new(window, cx).default_value(self.settings.mono_font.clone()));
+        let subscription = cx.subscribe_in(
+            &input,
+            window,
+            |this, input, event: &InputEvent, window, cx| {
+                if let InputEvent::Change = event {
+                    let family = input.read(cx).value().to_string();
+                    this.set_mono_font(family, window, cx);
+                }
+            },
+        );
+        self.settings_panel = Some(SettingsPanel {
+            mono_font_input: input,
+            _subscription: subscription,
+        });
+        // Capture focus onto the shell itself while the panel is open — same
+        // reasoning as the theme picker's `window.focus` call (its escape
+        // binding lives in the shell's own key context, and this sidesteps
+        // ambiguity with whatever the active workspace's own bindings are).
+        window.focus(&self.focus_handle, cx);
+        cx.notify();
+    }
+
+    fn close_settings_panel(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.settings_panel.take().is_some() {
+            match &self.active {
+                Some(ws) => window.focus(&ws.focus_handle(cx), cx),
+                None => window.focus(&self.focus_handle, cx),
+            }
+            cx.notify();
+        }
+    }
+
+    fn on_settings_close(
+        &mut self,
+        _: &SettingsClose,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.close_settings_panel(window, cx);
+    }
+
+    /// "Default view" — applies to the workspace open right now too (not
+    /// just future ones); the setting itself only picks what a *freshly
+    /// opened* review starts in.
+    fn set_view_mode_default(&mut self, mode: ViewModeSetting, cx: &mut Context<Self>) {
+        self.settings.view_mode_default = mode;
+        self.settings.save();
+        if let Some(ws) = &self.active {
+            ws.update(cx, |ws, cx| ws.set_view_mode_setting(mode, cx));
+        }
+        cx.notify();
+    }
+
+    /// "Context lines" stepper.
+    fn set_context_lines(&mut self, n: u32, cx: &mut Context<Self>) {
+        let n = n.clamp(CONTEXT_LINES_MIN, CONTEXT_LINES_MAX);
+        self.settings.context_lines = n;
+        self.settings.save();
+        if let Some(ws) = &self.active {
+            ws.update(cx, |ws, cx| ws.set_context_lines(n, cx));
+        }
+        cx.notify();
+    }
+
+    /// "Mono font" free-text field. Not validated against installed fonts —
+    /// an unresolvable family just falls back to a proportional sans
+    /// (observed), the same silent fallback an unknown CSS font-family
+    /// gets.
+    fn set_mono_font(&mut self, family: String, window: &mut Window, cx: &mut Context<Self>) {
+        self.settings.mono_font = family;
+        self.settings.save();
+        themes::set_mono_font(&self.settings.mono_font, window, cx);
+        // Keep the panel's own text field in sync when the change didn't
+        // originate from it — e.g. automation's `set_setting mono_font`
+        // while the panel is open (review finding: the input went stale
+        // until the panel was closed and reopened). When the change *did*
+        // come from the input's own `InputEvent::Change` (see
+        // `on_open_settings`), the box's value already equals the new
+        // setting, so the `!=` below skips it there — important, since
+        // `InputState::set_value` resets the caret/selection and would
+        // otherwise fight the user mid-keystroke.
+        if let Some(panel) = &self.settings_panel {
+            let input = panel.mono_font_input.clone();
+            if input.read(cx).value() != self.settings.mono_font {
+                let value = self.settings.mono_font.clone();
+                input.update(cx, |input, cx| input.set_value(value, window, cx));
+            }
+        }
+        cx.notify();
+    }
+
+    /// "Font size" stepper.
+    fn set_mono_font_size(&mut self, size: f32, cx: &mut Context<Self>) {
+        let size = size.clamp(MONO_FONT_SIZE_MIN, MONO_FONT_SIZE_MAX);
+        self.settings.mono_font_size = size;
+        self.settings.save();
+        if let Some(ws) = &self.active {
+            ws.update(cx, |ws, cx| ws.set_font_size(size, cx));
+        }
+        cx.notify();
+    }
+
+    /// One half of the follow-OS light/dark pair. Re-resolves immediately
+    /// if follow-OS is already on (picking a new light theme while the OS
+    /// is currently in light mode must apply right away, not wait for the
+    /// next appearance-changed event).
+    ///
+    /// Validates `name` against the theme registry, same error style as
+    /// `automation_set_setting`'s `"theme"` case — the settings panel's own
+    /// segmented row only ever passes a name from `themes::names()`, so this
+    /// mainly guards `set_setting`'s JSON input and hand-edited
+    /// settings.json values routed through here.
+    fn set_light_theme(
+        &mut self,
+        name: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> anyhow::Result<()> {
+        let name = themes::names()
+            .find(|n| *n == name)
+            .ok_or_else(|| anyhow::anyhow!("unknown theme: {name}"))?;
+        self.settings.light_theme = name.to_string();
+        self.settings.save();
+        self.resolve_follow_os(window, cx);
+        cx.notify();
+        Ok(())
+    }
+
+    fn set_dark_theme(
+        &mut self,
+        name: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> anyhow::Result<()> {
+        let name = themes::names()
+            .find(|n| *n == name)
+            .ok_or_else(|| anyhow::anyhow!("unknown theme: {name}"))?;
+        self.settings.dark_theme = name.to_string();
+        self.settings.save();
+        self.resolve_follow_os(window, cx);
+        cx.notify();
+        Ok(())
+    }
+
+    /// "Follow OS appearance" toggle. Turning on re-resolves immediately
+    /// from the live OS appearance (`resolve_follow_os`). Turning back off
+    /// must restore the persisted explicit `theme` right away too — without
+    /// this, the OS-resolved theme stays painted (and highlighted as active
+    /// in the panel) even though `settings.theme` now says otherwise, until
+    /// the next restart silently repaints it. This matches the `theme`
+    /// field's doc: "turning follow-OS back off restores whatever was
+    /// picked last".
+    fn set_follow_os_appearance(&mut self, on: bool, window: &mut Window, cx: &mut Context<Self>) {
+        self.settings.follow_os_appearance = on;
+        self.settings.save();
+        if on {
+            self.resolve_follow_os(window, cx);
+        } else {
+            let name = self.settings.theme.clone();
+            self.apply_resolved_theme(&name, window, cx);
+        }
+        cx.notify();
     }
 
     fn render_recent_row(&self, index: usize, cx: &mut Context<Self>) -> impl IntoElement + use<> {
@@ -915,6 +1290,356 @@ impl AppShell {
                 ),
         )
     }
+
+    /// The settings panel (`ctrl-,`), when open: a centered modal (wider
+    /// than the pickers — this has more to show), two sections. Mouse-first
+    /// throughout; only escape has a keybinding (see `init`'s
+    /// `SettingsPanelOpen` context) — every control here is a button,
+    /// stepper, or text input clicked/typed directly, which the doc
+    /// explicitly signs off on ("this is fine").
+    fn render_settings_panel(&self, cx: &mut Context<Self>) -> Option<Div> {
+        let panel = self.settings_panel.as_ref()?;
+
+        let theme = cx.theme();
+        let border = theme.border;
+        let popover = theme.popover;
+        let popover_fg = theme.popover_foreground;
+        let muted = theme.muted_foreground;
+
+        let segmented_row =
+            |id_prefix: &'static str,
+             selected_name: String,
+             small: bool,
+             on_pick: fn(&mut Self, &'static str, &mut Window, &mut Context<Self>),
+             cx: &mut Context<Self>| {
+                h_flex()
+                    .gap_1()
+                    .flex_wrap()
+                    .children(themes::names().map(move |name| {
+                        let selected = name == selected_name;
+                        let btn = Button::new(format!("{id_prefix}-{name}"))
+                            .ghost()
+                            .selected(selected)
+                            .label(name)
+                            .on_click(cx.listener(move |this, _, window, cx| {
+                                on_pick(this, name, window, cx);
+                            }));
+                        if small { btn.xsmall() } else { btn }
+                    }))
+            };
+
+        let view_mode = self.settings.view_mode_default;
+        let context_lines = self.settings.context_lines;
+        let follow_on = self.settings.follow_os_appearance;
+        let font_size = self.settings.mono_font_size;
+
+        Some(
+            div()
+                .absolute()
+                .inset_0()
+                .flex()
+                .items_center()
+                .justify_center()
+                .bg(theme.background.opacity(0.6))
+                // `occlude()` blocks hover/scroll from bleeding through to
+                // whatever's dimmed underneath (e.g. a recent-review row's
+                // hover state lighting up through the backdrop). Click on
+                // the dimmed backdrop closes the panel, matching escape —
+                // but not a click on the panel itself (stopped below), same
+                // swallow-the-click pattern the pickers use. Review finding:
+                // this handler used to close the panel *and* let the click
+                // fall through to whatever sidebar row was underneath,
+                // opening it — `stop_propagation()` is the actual fix,
+                // `occlude()` only covers the hover/scroll half of the hole.
+                .occlude()
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(|this, _, window, cx| {
+                        this.close_settings_panel(window, cx);
+                        cx.stop_propagation();
+                    }),
+                )
+                .child(
+                    v_flex()
+                        .id("settings-panel")
+                        .w(px(560.))
+                        .max_w_full()
+                        .max_h(px(600.))
+                        .overflow_hidden()
+                        .p_4()
+                        .gap_4()
+                        .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                        .bg(popover)
+                        .text_color(popover_fg)
+                        .border_1()
+                        .border_color(border)
+                        .rounded_lg()
+                        .shadow_lg()
+                        .child(
+                            h_flex()
+                                .justify_between()
+                                .items_center()
+                                .child(div().font_semibold().child("Settings"))
+                                .child(div().text_xs().text_color(muted).child("esc to close")),
+                        )
+                        // ---- General ------------------------------------
+                        .child(
+                            v_flex()
+                                .gap_3()
+                                .child(div().text_xs().text_color(muted).child("GENERAL"))
+                                .child(
+                                    h_flex()
+                                        .justify_between()
+                                        .items_center()
+                                        .child(div().text_sm().child("Default view"))
+                                        .child(
+                                            h_flex()
+                                                .gap_1()
+                                                .child(
+                                                    Button::new("settings-view-unified")
+                                                        .ghost()
+                                                        .selected(
+                                                            view_mode == ViewModeSetting::Unified,
+                                                        )
+                                                        .label("Unified")
+                                                        .on_click(cx.listener(|this, _, _, cx| {
+                                                            this.set_view_mode_default(
+                                                                ViewModeSetting::Unified,
+                                                                cx,
+                                                            );
+                                                        })),
+                                                )
+                                                .child(
+                                                    Button::new("settings-view-split")
+                                                        .ghost()
+                                                        .selected(
+                                                            view_mode == ViewModeSetting::Split,
+                                                        )
+                                                        .label("Split")
+                                                        .on_click(cx.listener(|this, _, _, cx| {
+                                                            this.set_view_mode_default(
+                                                                ViewModeSetting::Split,
+                                                                cx,
+                                                            );
+                                                        })),
+                                                ),
+                                        ),
+                                )
+                                .child(
+                                    h_flex()
+                                        .justify_between()
+                                        .items_center()
+                                        .child(div().text_sm().child("Context lines"))
+                                        .child(
+                                            h_flex()
+                                                .gap_2()
+                                                .items_center()
+                                                .child(
+                                                    Button::new("settings-context-minus")
+                                                        .ghost()
+                                                        .xsmall()
+                                                        .label("−")
+                                                        .on_click(cx.listener(
+                                                            move |this, _, _, cx| {
+                                                                this.set_context_lines(
+                                                                    context_lines.saturating_sub(1),
+                                                                    cx,
+                                                                );
+                                                            },
+                                                        )),
+                                                )
+                                                .child(
+                                                    div()
+                                                        .w(px(24.))
+                                                        .text_center()
+                                                        .text_sm()
+                                                        .child(context_lines.to_string()),
+                                                )
+                                                .child(
+                                                    Button::new("settings-context-plus")
+                                                        .ghost()
+                                                        .xsmall()
+                                                        .label("+")
+                                                        .on_click(cx.listener(
+                                                            move |this, _, _, cx| {
+                                                                this.set_context_lines(
+                                                                    context_lines + 1,
+                                                                    cx,
+                                                                );
+                                                            },
+                                                        )),
+                                                ),
+                                        ),
+                                ),
+                        )
+                        .child(div().h(px(1.)).w_full().bg(border))
+                        // ---- Appearance ----------------------------------
+                        .child(
+                            v_flex()
+                                .gap_3()
+                                .child(div().text_xs().text_color(muted).child("APPEARANCE"))
+                                .child(
+                                    v_flex()
+                                        .gap_1()
+                                        .child(div().text_sm().child("Theme"))
+                                        .child(segmented_row(
+                                            "settings-theme",
+                                            self.settings.theme.clone(),
+                                            false,
+                                            |this, name, window, cx| {
+                                                this.choose_theme(name, window, cx)
+                                            },
+                                            cx,
+                                        )),
+                                )
+                                .child(
+                                    h_flex()
+                                        .justify_between()
+                                        .items_center()
+                                        .child(div().text_sm().child("Follow OS appearance"))
+                                        .child(
+                                            Button::new("settings-follow-os")
+                                                .ghost()
+                                                .selected(follow_on)
+                                                .label(if follow_on { "On" } else { "Off" })
+                                                .on_click(cx.listener(
+                                                    move |this, _, window, cx| {
+                                                        this.set_follow_os_appearance(
+                                                            !follow_on, window, cx,
+                                                        );
+                                                    },
+                                                )),
+                                        ),
+                                )
+                                .child(
+                                    v_flex()
+                                        .gap_1()
+                                        .child(
+                                            h_flex()
+                                                .gap_2()
+                                                .items_center()
+                                                .child(
+                                                    div()
+                                                        .w(px(40.))
+                                                        .text_xs()
+                                                        .text_color(muted)
+                                                        .child("Light"),
+                                                )
+                                                .child(segmented_row(
+                                                    "settings-light",
+                                                    self.settings.light_theme.clone(),
+                                                    true,
+                                                    |this, name, window, cx| {
+                                                        // Always a name from `themes::names()`
+                                                        // (the row above only renders those), so
+                                                        // this can't actually fail — `.ok()`
+                                                        // just discards the `Result` to match
+                                                        // `on_pick`'s `fn(...)` return type.
+                                                        this.set_light_theme(
+                                                            name.to_string(),
+                                                            window,
+                                                            cx,
+                                                        )
+                                                        .ok();
+                                                    },
+                                                    cx,
+                                                )),
+                                        )
+                                        .child(
+                                            h_flex()
+                                                .gap_2()
+                                                .items_center()
+                                                .child(
+                                                    div()
+                                                        .w(px(40.))
+                                                        .text_xs()
+                                                        .text_color(muted)
+                                                        .child("Dark"),
+                                                )
+                                                .child(segmented_row(
+                                                    "settings-dark",
+                                                    self.settings.dark_theme.clone(),
+                                                    true,
+                                                    |this, name, window, cx| {
+                                                        // Same reasoning as the light-theme row
+                                                        // above: always a valid name, `.ok()`
+                                                        // just matches `on_pick`'s return type.
+                                                        this.set_dark_theme(
+                                                            name.to_string(),
+                                                            window,
+                                                            cx,
+                                                        )
+                                                        .ok();
+                                                    },
+                                                    cx,
+                                                )),
+                                        )
+                                        .child(div().text_xs().text_color(muted).child(
+                                            "Re-checked on real OS light/dark change events \
+                                                 (no per-frame poll — see docs).",
+                                        )),
+                                )
+                                .child(
+                                    h_flex()
+                                        .justify_between()
+                                        .items_center()
+                                        .child(div().text_sm().child("Mono font"))
+                                        .child(
+                                            div()
+                                                .w(px(220.))
+                                                .child(Input::new(&panel.mono_font_input)),
+                                        ),
+                                )
+                                .child(
+                                    h_flex()
+                                        .justify_between()
+                                        .items_center()
+                                        .child(div().text_sm().child("Font size"))
+                                        .child(
+                                            h_flex()
+                                                .gap_2()
+                                                .items_center()
+                                                .child(
+                                                    Button::new("settings-font-minus")
+                                                        .ghost()
+                                                        .xsmall()
+                                                        .label("−")
+                                                        .on_click(cx.listener(
+                                                            move |this, _, _, cx| {
+                                                                this.set_mono_font_size(
+                                                                    font_size - 1.,
+                                                                    cx,
+                                                                );
+                                                            },
+                                                        )),
+                                                )
+                                                .child(
+                                                    div()
+                                                        .w(px(28.))
+                                                        .text_center()
+                                                        .text_sm()
+                                                        .child(format!("{font_size:.0}")),
+                                                )
+                                                .child(
+                                                    Button::new("settings-font-plus")
+                                                        .ghost()
+                                                        .xsmall()
+                                                        .label("+")
+                                                        .on_click(cx.listener(
+                                                            move |this, _, _, cx| {
+                                                                this.set_mono_font_size(
+                                                                    font_size + 1.,
+                                                                    cx,
+                                                                );
+                                                            },
+                                                        )),
+                                                ),
+                                        ),
+                                ),
+                        ),
+                ),
+        )
+    }
 }
 
 impl Render for AppShell {
@@ -942,13 +1667,20 @@ impl Render for AppShell {
                 .into_any_element(),
         };
 
-        // While the theme picker is open the shell node carries an extra
-        // identifier, flipping which key bindings apply (see `init`) — same
-        // mechanism `workspace.rs` uses for its own overlays.
+        // While the theme picker or settings panel is open the shell node
+        // carries an extra identifier, flipping which key bindings apply
+        // (see `init`) — same mechanism `workspace.rs` uses for its own
+        // overlays. The two overlays are mutually exclusive (see
+        // `on_open_theme_picker`/`on_open_settings`'s guards), so at most
+        // one of these ever applies.
         let mut key_context = KEY_CONTEXT.to_string();
         if self.theme_picker.is_some() {
             key_context.push(' ');
             key_context.push_str(THEME_PICKER_CONTEXT);
+        }
+        if self.settings_panel.is_some() {
+            key_context.push(' ');
+            key_context.push_str(SETTINGS_PANEL_CONTEXT);
         }
 
         v_flex()
@@ -963,6 +1695,8 @@ impl Render for AppShell {
             .on_action(cx.listener(Self::on_theme_picker_prev))
             .on_action(cx.listener(Self::on_theme_picker_close))
             .on_action(cx.listener(Self::on_theme_picker_choose))
+            .on_action(cx.listener(Self::on_open_settings))
+            .on_action(cx.listener(Self::on_settings_close))
             .child(
                 TitleBar::new().child(
                     h_flex()
@@ -1056,6 +1790,7 @@ impl Render for AppShell {
                     ),
             )
             .children(self.render_theme_picker(cx))
+            .children(self.render_settings_panel(cx))
     }
 }
 

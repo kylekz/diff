@@ -420,9 +420,21 @@ fn run_gui(cli: Cli) {
         // back to `themes::DEFAULT_THEME` silently — see `Settings::load`).
         // Applied before the window opens so `Root`'s first render already
         // sees the right theme (see the `Root::new` call below for why it
-        // gets no explicit `.bg()` of its own).
+        // gets no explicit `.bg()` of its own). `follow_os_appearance`
+        // resolves right here too — `cx.window_appearance()` is the
+        // platform's live light/dark state, readable at the `App` level
+        // before any window exists yet (docs/phase-4-settings-and-theming.md
+        // deliverable 2). Live changes while the app is running are handled
+        // separately, by `AppShell`'s own `Window::observe_window_appearance`
+        // subscription (see `shell.rs`'s `AppShell::new`) — that one can't
+        // cover startup itself (no window yet to observe from).
         let settings = Settings::load();
-        themes::apply_theme(&settings.theme, None, cx);
+        let os_is_dark = matches!(
+            cx.window_appearance(),
+            WindowAppearance::Dark | WindowAppearance::VibrantDark
+        );
+        let theme_name = settings.effective_theme(os_is_dark).to_string();
+        themes::apply_theme(&theme_name, &settings.mono_font, None, cx);
 
         let Cli {
             seed,

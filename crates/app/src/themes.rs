@@ -6,15 +6,8 @@
 
 use std::rc::Rc;
 
-use gpui::{App, Window};
+use gpui::{App, SharedString, Window};
 use gpui_component::{Theme, ThemeConfig, ThemeMode};
-
-/// Overrides every bundled theme's `mono_font_family` uniformly (font
-/// deliverable) — set here in code rather than per-theme JSON so all four
-/// themes get JetBrains Mono without relying on each theme author
-/// remembering to set `mono_font.family` for themselves. Re-asserted after
-/// every [`apply_theme`] call.
-pub const MONO_FONT_FAMILY: &str = "JetBrains Mono";
 
 /// Falls back here on first launch (no settings.json yet) and on any
 /// unrecognized/corrupt persisted theme name.
@@ -70,14 +63,16 @@ fn find(name: &str) -> &'static Entry {
 }
 
 /// Parse and apply the bundled theme called `name` (falling back to
-/// [`DEFAULT_THEME`] if unrecognized), then re-assert the JetBrains Mono
-/// override so it sticks regardless of which theme JSON is active.
+/// [`DEFAULT_THEME`] if unrecognized), then re-assert `mono_font` (the
+/// settings-panel-editable mono font family, see `settings.rs`'s
+/// `DEFAULT_MONO_FONT`) so it sticks regardless of which theme JSON is
+/// active — none of the four bundled themes set their own `mono_font.family`.
 ///
 /// `window` is `None` at startup (no window exists yet when the App-level
 /// theme is first applied in `main.rs`); `Some` from the live picker, whose
 /// `window.refresh()` (via `Theme::change`) is what makes the swap repaint
 /// immediately instead of waiting for the next unrelated re-render.
-pub fn apply_theme(name: &str, window: Option<&mut Window>, cx: &mut App) {
+pub fn apply_theme(name: &str, mono_font: &str, window: Option<&mut Window>, cx: &mut App) {
     let entry = find(name);
     let config: ThemeConfig = serde_json::from_str(entry.json).unwrap_or_else(|err| {
         panic!(
@@ -87,7 +82,17 @@ pub fn apply_theme(name: &str, window: Option<&mut Window>, cx: &mut App) {
     });
     Theme::change(entry.mode, window, cx);
     Theme::global_mut(cx).apply_config(&Rc::new(config));
-    Theme::global_mut(cx).mono_font_family = MONO_FONT_FAMILY.into();
+    Theme::global_mut(cx).mono_font_family = SharedString::from(mono_font.to_string());
+}
+
+/// Re-assert just the mono font family, without touching the rest of the
+/// theme (colors, mode, ...) — the settings panel's "Mono font" text field
+/// calls this on every edit rather than re-parsing + re-applying the whole
+/// `ThemeConfig` via [`apply_theme`]. `window.refresh()` makes the change
+/// repaint immediately, matching [`apply_theme`]'s live-picker path.
+pub fn set_mono_font(family: &str, window: &mut Window, cx: &mut App) {
+    Theme::global_mut(cx).mono_font_family = SharedString::from(family.to_string());
+    window.refresh();
 }
 
 #[cfg(test)]

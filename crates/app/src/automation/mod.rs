@@ -70,6 +70,11 @@ enum Cmd {
     /// (`Workspace::open_pr`) — replies once the fetch is dispatched, not
     /// once it completes; scripts follow with `wait_ready`.
     OpenPr { number: u64 },
+    /// Apply one setting through the same code path the settings panel's
+    /// own controls use (`AppShell::automation_set_setting`) — `key`
+    /// matches `Settings`'s JSON field names (`theme`, `mono_font_size`,
+    /// `view_mode_default`, ...).
+    SetSetting { key: String, value: Value },
     /// Write a PNG of the window to `path`; responds with physical pixel
     /// dimensions.
     Screenshot { path: PathBuf },
@@ -287,6 +292,14 @@ async fn handle(
                 shell
                     .automation_open_pr(number, window, cx)
                     .map(|()| json!({"opened_pr": number}))
+            })
+        })?,
+
+        Cmd::SetSetting { key, value } => cx.update_window(window, |_, window, cx| {
+            shell.update(cx, |shell, cx| {
+                shell
+                    .automation_set_setting(&key, value, window, cx)
+                    .map(|()| json!({"key": key}))
             })
         })?,
 

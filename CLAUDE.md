@@ -94,6 +94,9 @@ Notes that save debugging time:
   settle delay usually covers it.
 - Screenshots are self-captures of the app's own window (PrintWindow by
   PID) at physical resolution — immune to focus/wrong-window mixups.
+- A `click` immediately after a state-mutating command hit-tests the stale
+  frame (clicks the old UI); insert a `screenshot` (forces a draw + settle)
+  or a short `wait` before position-sensitive clicks.
 
 Fallback when automation can't answer it (window chrome, OS integration):
 launch `cargo run -p dv` in the background, use Windows-MCP full-desktop

@@ -22,7 +22,9 @@ use serde::{Deserialize, Serialize};
 
 use crate::git::DiffSource;
 
-pub use io::resolve_local_git_dir;
+pub use io::{
+    list_dir_names, read_file_at, remove_file_at, resolve_local_git_dir, write_file_atomic_at,
+};
 pub use store::ReviewStore;
 pub use watch::ReviewWatcher;
 

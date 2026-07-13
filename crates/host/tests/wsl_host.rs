@@ -311,6 +311,64 @@ fn wsl_kill_9_host_then_respawn_still_supports_a_fresh_watch() {
     wsl_sh(&format!("rm -rf '{repo}'"));
 }
 
+// --- fs/* over a REAL `wsl.exe`-spawned host (plan §8 S5) ----------------
+
+#[test]
+#[ignore = "requires WSL Ubuntu with dv-host built inside it — see module docs"]
+fn fs_round_trip_through_host() {
+    let repo = temp_repo_path("fs");
+    wsl_sh(&format!("mkdir -p '{repo}' && cd '{repo}' && git init -q"));
+
+    let client = HostClient::spawn_wsl(DISTRO, &host_path()).expect("spawn_wsl");
+    assert!(
+        client.caps().iter().any(|cap| cap == "fs"),
+        "caps: {:?}",
+        client.caps()
+    );
+
+    let rel = "dv/reviews/r-test.json";
+    let bytes = b"{\"v\":1,\"id\":\"r-test\"}".to_vec();
+
+    // Nothing written yet: fs/read must report not-found, not an error.
+    assert!(
+        client
+            .fs_read(&repo, rel)
+            .expect("fs/read (absent)")
+            .is_none(),
+        "fs/read of a not-yet-written file must be Ok(None)"
+    );
+
+    client
+        .fs_write_atomic(&repo, rel, &bytes)
+        .expect("fs/write_atomic");
+
+    let read_back = client
+        .fs_read(&repo, rel)
+        .expect("fs/read (present)")
+        .expect("file was just written, must be found");
+    assert_eq!(
+        read_back, bytes,
+        "fs/read must return byte-identical content"
+    );
+
+    let names = client.fs_list(&repo, "dv/reviews").expect("fs/list");
+    assert!(
+        names.iter().any(|n| n == "r-test.json"),
+        "fs/list should see the just-written file: {names:?}"
+    );
+
+    client.fs_remove(&repo, rel).expect("fs/remove");
+    assert!(
+        client
+            .fs_read(&repo, rel)
+            .expect("fs/read (after remove)")
+            .is_none(),
+        "fs/read after fs/remove must report not-found"
+    );
+
+    wsl_sh(&format!("rm -rf '{repo}'"));
+}
+
 fn wait_until(timeout: Duration, mut condition: impl FnMut() -> bool) -> bool {
     let deadline = Instant::now() + timeout;
     loop {

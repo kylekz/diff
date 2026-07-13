@@ -3,7 +3,10 @@
 //! §2) over stdin/stdout. S1 shipped handshake + `proc/exec`; S2 added
 //! `blob/get`; S4 adds `watch/subscribe`|`watch/unsubscribe` (see
 //! `watch.rs`) plus the outbound `watch/event` notifications a live
-//! subscription pushes.
+//! subscription pushes. S5 adds `fs/read`|`fs/write_atomic`|`fs/list`|
+//! `fs/remove` (see `fs.rs`), replacing `StoreIo`'s WSL `sh -c`/`cat`/`ls`/
+//! `rm` fallback path with structured, locale-proof host-side `std::fs`
+//! calls whenever a live `fs`-capable connection exists.
 //!
 //! This binary's OWN wire shapes are still hand-written rather than built
 //! on `dv_core::remote::proto` (see that module's doc for why: the
@@ -13,9 +16,13 @@
 //! reuse of `resolve_local_git_dir` (see that module's doc and this
 //! crate's Cargo.toml comment for why that's fine: dv-core has no gpui
 //! import, ever, and everything else it pulls in is pure Rust/musl-safe).
+//! `fs.rs` goes one step further and reuses dv-core's `read_file_at`/
+//! `write_file_atomic_at`/`list_dir_names`/`remove_file_at` helpers
+//! directly, not just gitdir resolution — see that module's doc.
 //! NO gpui anywhere in this crate, ever — see CLAUDE.md.
 
 mod blob;
+mod fs;
 mod watch;
 
 use std::io::{BufRead as _, Read as _, Write as _};
@@ -45,7 +52,7 @@ fn main() {
         "proto": PROTO_VERSION,
         "version": env!("DV_HOST_VERSION"),
         "pid": std::process::id(),
-        "caps": ["exec", "blob", "watch"],
+        "caps": ["exec", "blob", "watch", "fs"],
     });
     write_line(&stdout, &hello);
 
@@ -154,6 +161,22 @@ fn dispatch(job: Job, stdout: &Arc<Mutex<std::io::Stdout>>) -> Value {
             Err(err) => json!({"id": id, "err": {"code": err.code, "message": err.message}}),
         },
         "watch/unsubscribe" => match handle_watch_unsubscribe(params) {
+            Ok(result) => json!({"id": id, "ok": result}),
+            Err(err) => json!({"id": id, "err": {"code": err.code, "message": err.message}}),
+        },
+        "fs/read" => match handle_fs_read(params) {
+            Ok(result) => json!({"id": id, "ok": result}),
+            Err(err) => json!({"id": id, "err": {"code": err.code, "message": err.message}}),
+        },
+        "fs/write_atomic" => match handle_fs_write_atomic(params) {
+            Ok(result) => json!({"id": id, "ok": result}),
+            Err(err) => json!({"id": id, "err": {"code": err.code, "message": err.message}}),
+        },
+        "fs/list" => match handle_fs_list(params) {
+            Ok(result) => json!({"id": id, "ok": result}),
+            Err(err) => json!({"id": id, "err": {"code": err.code, "message": err.message}}),
+        },
+        "fs/remove" => match handle_fs_remove(params) {
             Ok(result) => json!({"id": id, "ok": result}),
             Err(err) => json!({"id": id, "err": {"code": err.code, "message": err.message}}),
         },
@@ -368,6 +391,94 @@ fn handle_blob_get(params: Value) -> Result<Value, HostError> {
             "blob/get failed for root={root:?} spec={spec:?}: {err:#}"
         ))),
     }
+}
+
+/// `fs/read` (S5): `found: false` (empty `bytes_b64`) for a missing file is
+/// a normal `ok` result — only a gitdir-resolution/OS-level failure is a
+/// wire `err` (`io`, plan §2's code for exactly this kind of failure).
+fn handle_fs_read(params: Value) -> Result<Value, HostError> {
+    let root = params
+        .get("root")
+        .and_then(Value::as_str)
+        .ok_or_else(|| HostError::bad_request("fs/read: missing \"root\""))?;
+    let rel = params
+        .get("rel")
+        .and_then(Value::as_str)
+        .ok_or_else(|| HostError::bad_request("fs/read: missing \"rel\""))?;
+
+    match fs::read(root, rel) {
+        Ok((found, bytes)) => Ok(json!({
+            "found": found,
+            "bytes_b64": BASE64.encode(&bytes),
+        })),
+        Err(err) => Err(HostError::io(format!(
+            "fs/read failed for root={root:?} rel={rel:?}: {err:#}"
+        ))),
+    }
+}
+
+/// `fs/write_atomic` (S5).
+fn handle_fs_write_atomic(params: Value) -> Result<Value, HostError> {
+    let root = params
+        .get("root")
+        .and_then(Value::as_str)
+        .ok_or_else(|| HostError::bad_request("fs/write_atomic: missing \"root\""))?;
+    let rel = params
+        .get("rel")
+        .and_then(Value::as_str)
+        .ok_or_else(|| HostError::bad_request("fs/write_atomic: missing \"rel\""))?;
+    let bytes_b64 = params
+        .get("bytes_b64")
+        .and_then(Value::as_str)
+        .ok_or_else(|| HostError::bad_request("fs/write_atomic: missing \"bytes_b64\""))?;
+    let bytes = BASE64
+        .decode(bytes_b64)
+        .map_err(|err| HostError::bad_request(format!("fs/write_atomic: bad bytes_b64: {err}")))?;
+
+    fs::write_atomic(root, rel, &bytes).map_err(|err| {
+        HostError::io(format!(
+            "fs/write_atomic failed for root={root:?} rel={rel:?}: {err:#}"
+        ))
+    })?;
+    Ok(json!({}))
+}
+
+/// `fs/list` (S5). `[]` for a missing directory is a normal `ok` result.
+fn handle_fs_list(params: Value) -> Result<Value, HostError> {
+    let root = params
+        .get("root")
+        .and_then(Value::as_str)
+        .ok_or_else(|| HostError::bad_request("fs/list: missing \"root\""))?;
+    let rel_dir = params
+        .get("rel_dir")
+        .and_then(Value::as_str)
+        .ok_or_else(|| HostError::bad_request("fs/list: missing \"rel_dir\""))?;
+
+    match fs::list(root, rel_dir) {
+        Ok(names) => Ok(json!({ "names": names })),
+        Err(err) => Err(HostError::io(format!(
+            "fs/list failed for root={root:?} rel_dir={rel_dir:?}: {err:#}"
+        ))),
+    }
+}
+
+/// `fs/remove` (S5). Not an error if `rel` is already gone.
+fn handle_fs_remove(params: Value) -> Result<Value, HostError> {
+    let root = params
+        .get("root")
+        .and_then(Value::as_str)
+        .ok_or_else(|| HostError::bad_request("fs/remove: missing \"root\""))?;
+    let rel = params
+        .get("rel")
+        .and_then(Value::as_str)
+        .ok_or_else(|| HostError::bad_request("fs/remove: missing \"rel\""))?;
+
+    fs::remove(root, rel).map_err(|err| {
+        HostError::io(format!(
+            "fs/remove failed for root={root:?} rel={rel:?}: {err:#}"
+        ))
+    })?;
+    Ok(json!({}))
 }
 
 fn write_line(stdout: &Arc<Mutex<std::io::Stdout>>, value: &Value) {

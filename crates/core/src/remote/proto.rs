@@ -21,13 +21,20 @@ pub const PROTO_VERSION: u32 = 1;
 
 /// Method names. S1 shipped `proc/exec`; S2 adds `blob/get`; S4 adds
 /// `watch/subscribe`|`watch/unsubscribe` (see [`WATCH_EVENT`] for the
-/// id-less notification a live subscription pushes). `fs/*` from plan §2
-/// arrives in S5.
+/// id-less notification a live subscription pushes). S5 adds `fs/*`
+/// (replacing `StoreIo`'s `sh -c`/`cat`/`ls`/`rm` WSL fallback path with
+/// structured host-side `std::fs` calls — see [`FsReadParams`]'s doc for
+/// the `{root, rel}` shape and why it deliberately deviates from plan §2's
+/// `fs/read | path` table).
 pub mod method {
     pub const PROC_EXEC: &str = "proc/exec";
     pub const BLOB_GET: &str = "blob/get";
     pub const WATCH_SUBSCRIBE: &str = "watch/subscribe";
     pub const WATCH_UNSUBSCRIBE: &str = "watch/unsubscribe";
+    pub const FS_READ: &str = "fs/read";
+    pub const FS_WRITE: &str = "fs/write_atomic";
+    pub const FS_LIST: &str = "fs/list";
+    pub const FS_REMOVE: &str = "fs/remove";
 }
 
 /// [`Notification::event`] value for a live `watch/subscribe`'s pushed
@@ -291,6 +298,80 @@ pub struct WatchEventParams {
     pub overflow: bool,
 }
 
+// --- fs/* (S5) ------------------------------------------------------------
+//
+// **Design deviation from plan §2's table** (`fs/read | path` etc., a single
+// absolute path): every `fs/*` method here instead takes `{root, rel}` —
+// `root` is the absolute in-distro repo ROOT (the same string
+// [`BlobGetParams::root`] carries), `rel` is a path relative to that repo's
+// real `.git` directory. The HOST resolves `root` to the actual gitdir via
+// `dv_core::review::resolve_local_git_dir` (linked-worktree `gitdir:` files
+// included) before touching a single byte.
+//
+// Why: the host runs LOCAL to the files it's serving, so it can resolve the
+// gitdir with a plain `std::fs` read of `.git` — no shell, no locale.
+// Passing an absolute `path` instead would force the CLIENT to resolve the
+// gitdir itself before ever sending a request — and the only way it has to
+// do that over a WSL connection is exactly the `cat <root>/.git` +
+// substring-match-on-"Is a directory" heuristic
+// (`crate::review::io::resolve_wsl_git_dir`) this whole slice exists to
+// delete (see that function's doc, and CLAUDE.md's S5 gate: "LC_ALL
+// irrelevant for remote store ops"). `{root, rel}` keeps gitdir resolution
+// entirely host-side, where it's cheap and locale-proof.
+
+/// `fs/read` params — see the `fs/*` section doc above for the `{root,
+/// rel}` design.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct FsReadParams {
+    pub root: String,
+    pub rel: String,
+}
+
+/// `fs/read` result. `bytes_b64` is empty when `!found`, mirroring
+/// [`BlobGetResult`]'s "missing object" contract.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct FsReadResult {
+    pub found: bool,
+    pub bytes_b64: String,
+}
+
+/// `fs/write_atomic` params: write `bytes_b64` to `rel` (relative to the
+/// gitdir the host resolves from `root`), creating parent directories as
+/// needed and replacing any existing file atomically (tmp file in the same
+/// directory, then rename) — the exact semantics
+/// `crate::review::io::write_file_atomic_at` already gives local callers.
+/// No dedicated result struct: the wire result is the empty object `{}`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct FsWriteParams {
+    pub root: String,
+    pub rel: String,
+    pub bytes_b64: String,
+}
+
+/// `fs/list` params: list file names directly inside `rel_dir` (relative to
+/// the gitdir the host resolves from `root`) — no recursion, no path
+/// prefix.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct FsListParams {
+    pub root: String,
+    pub rel_dir: String,
+}
+
+/// `fs/list` result. `[]` when `rel_dir` doesn't exist — not an error.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct FsListResult {
+    pub names: Vec<String>,
+}
+
+/// `fs/remove` params. Not an error if `rel` doesn't exist (matches `rm -f`
+/// and `crate::review::io::remove_file_at`'s contract). No dedicated result
+/// struct: the wire result is the empty object `{}`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct FsRemoveParams {
+    pub root: String,
+    pub rel: String,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -517,5 +598,87 @@ mod tests {
         let params: WatchEventParams = serde_json::from_str(line).unwrap();
         assert!(params.paths.is_empty());
         assert!(!params.overflow);
+    }
+
+    // --- fs/* (S5) --------------------------------------------------------
+
+    #[test]
+    fn fs_read_params_and_result_round_trip() {
+        let params = FsReadParams {
+            root: "/home/kyle/proj".into(),
+            rel: "dv/reviews/r-1.json".into(),
+        };
+        let line = serde_json::to_string(&params).unwrap();
+        let parsed: FsReadParams = serde_json::from_str(&line).unwrap();
+        assert_eq!(parsed, params);
+
+        let result = FsReadResult {
+            found: true,
+            bytes_b64: "aGVsbG8=".into(),
+        };
+        let line = serde_json::to_string(&result).unwrap();
+        let parsed: FsReadResult = serde_json::from_str(&line).unwrap();
+        assert_eq!(parsed, result);
+    }
+
+    #[test]
+    fn fs_read_result_missing_has_empty_bytes() {
+        let result = FsReadResult {
+            found: false,
+            bytes_b64: String::new(),
+        };
+        let line = serde_json::to_string(&result).unwrap();
+        assert!(line.contains(r#""found":false"#));
+        assert!(line.contains(r#""bytes_b64":"""#));
+    }
+
+    #[test]
+    fn fs_write_params_round_trip() {
+        let params = FsWriteParams {
+            root: "/home/kyle/proj".into(),
+            rel: "dv/reviews/r-1.json".into(),
+            bytes_b64: "aGVsbG8=".into(),
+        };
+        let line = serde_json::to_string(&params).unwrap();
+        let parsed: FsWriteParams = serde_json::from_str(&line).unwrap();
+        assert_eq!(parsed, params);
+    }
+
+    #[test]
+    fn fs_list_params_and_result_round_trip() {
+        let params = FsListParams {
+            root: "/home/kyle/proj".into(),
+            rel_dir: "dv/reviews".into(),
+        };
+        let line = serde_json::to_string(&params).unwrap();
+        let parsed: FsListParams = serde_json::from_str(&line).unwrap();
+        assert_eq!(parsed, params);
+
+        let result = FsListResult {
+            names: vec!["r-1.json".to_string(), "r-2.json".to_string()],
+        };
+        let line = serde_json::to_string(&result).unwrap();
+        let parsed: FsListResult = serde_json::from_str(&line).unwrap();
+        assert_eq!(parsed, result);
+    }
+
+    #[test]
+    fn fs_list_result_empty_round_trips() {
+        let result = FsListResult { names: Vec::new() };
+        let line = serde_json::to_string(&result).unwrap();
+        assert_eq!(line, r#"{"names":[]}"#);
+        let parsed: FsListResult = serde_json::from_str(&line).unwrap();
+        assert!(parsed.names.is_empty());
+    }
+
+    #[test]
+    fn fs_remove_params_round_trip() {
+        let params = FsRemoveParams {
+            root: "/home/kyle/proj".into(),
+            rel: "dv/reviews/r-1.json".into(),
+        };
+        let line = serde_json::to_string(&params).unwrap();
+        let parsed: FsRemoveParams = serde_json::from_str(&line).unwrap();
+        assert_eq!(parsed, params);
     }
 }

@@ -18,7 +18,8 @@ use serde_json::Value;
 use crate::command::decode_output;
 
 use super::proto::{
-    self, BlobGetParams, BlobGetResult, ExecParams, ExecResult, Hello, Notification, PROTO_VERSION,
+    self, BlobGetParams, BlobGetResult, ExecParams, ExecResult, FsListParams, FsListResult,
+    FsReadParams, FsReadResult, FsRemoveParams, FsWriteParams, Hello, Notification, PROTO_VERSION,
     Request, RpcError, RpcResult, WatchEventParams, WatchSubscribeParams, WatchSubscribeResult,
     WatchUnsubscribeParams,
 };
@@ -472,6 +473,78 @@ impl HostClient {
             .decode(&result.bytes_b64)
             .context("decoding blob/get bytes_b64")?;
         Ok(Some(bytes))
+    }
+
+    /// Typed `fs/read` wrapper (plan §8 S5): `root` is the absolute
+    /// in-distro repo root, `rel` a path relative to the gitdir the host
+    /// resolves from it — see [`proto::FsReadParams`]'s doc for why this
+    /// deviates from plan §2's `path`-only table. `found: false` becomes
+    /// `Ok(None)`, matching [`Self::blob_get`]'s "missing" contract.
+    pub fn fs_read(&self, root: &str, rel: &str) -> Result<Option<Vec<u8>>> {
+        let params = FsReadParams {
+            root: root.to_string(),
+            rel: rel.to_string(),
+        };
+        let value = self.request(
+            proto::method::FS_READ,
+            serde_json::to_value(params).context("serializing fs/read params")?,
+        )?;
+        let result: FsReadResult =
+            serde_json::from_value(value).context("decoding fs/read result")?;
+        if !result.found {
+            return Ok(None);
+        }
+        let bytes = BASE64
+            .decode(&result.bytes_b64)
+            .context("decoding fs/read bytes_b64")?;
+        Ok(Some(bytes))
+    }
+
+    /// Typed `fs/write_atomic` wrapper: base64-encodes `bytes` and ignores
+    /// the wire's empty `{}` result — a successful round trip IS the
+    /// signal.
+    pub fn fs_write_atomic(&self, root: &str, rel: &str, bytes: &[u8]) -> Result<()> {
+        let params = FsWriteParams {
+            root: root.to_string(),
+            rel: rel.to_string(),
+            bytes_b64: BASE64.encode(bytes),
+        };
+        self.request(
+            proto::method::FS_WRITE,
+            serde_json::to_value(params).context("serializing fs/write_atomic params")?,
+        )?;
+        Ok(())
+    }
+
+    /// Typed `fs/list` wrapper: file names directly inside `rel_dir`
+    /// (relative to the gitdir the host resolves from `root`), no
+    /// recursion. `[]` when the directory doesn't exist.
+    pub fn fs_list(&self, root: &str, rel_dir: &str) -> Result<Vec<String>> {
+        let params = FsListParams {
+            root: root.to_string(),
+            rel_dir: rel_dir.to_string(),
+        };
+        let value = self.request(
+            proto::method::FS_LIST,
+            serde_json::to_value(params).context("serializing fs/list params")?,
+        )?;
+        let result: FsListResult =
+            serde_json::from_value(value).context("decoding fs/list result")?;
+        Ok(result.names)
+    }
+
+    /// Typed `fs/remove` wrapper. Not an error if `rel` is already gone —
+    /// mirrors `rm -f` and [`crate::review::remove_file_at`]'s contract.
+    pub fn fs_remove(&self, root: &str, rel: &str) -> Result<()> {
+        let params = FsRemoveParams {
+            root: root.to_string(),
+            rel: rel.to_string(),
+        };
+        self.request(
+            proto::method::FS_REMOVE,
+            serde_json::to_value(params).context("serializing fs/remove params")?,
+        )?;
+        Ok(())
     }
 
     /// Whether `cap` is one of the host's advertised capabilities (the

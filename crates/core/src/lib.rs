@@ -10,6 +10,7 @@ pub mod command;
 pub mod diff;
 pub mod git;
 pub mod github;
+pub mod index;
 pub mod location;
 pub mod remote;
 pub mod review;
@@ -21,6 +22,10 @@ pub use github::{
     ChecksSummary, CreatePr, CreatedPr, DraftComment, GhError, GhSide, GithubClient, PrMeta,
     PrState, PrStatus, PrSummary, RepoSlug, ReviewDecision, ReviewEvent, ReviewSubmission,
     SubmittedReview,
+};
+pub use index::{
+    CachedPrStatus, EntryHealth, HydrateOutcome, IndexEntry, ReviewIndex, entry_title,
+    hydrate_location, repo_label,
 };
 pub use location::RepoLocation;
 pub use remote::{HostClient, RequestFailure};

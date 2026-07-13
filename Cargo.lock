@@ -1422,6 +1422,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "base64",
+ "dirs",
  "imara-diff",
  "notify 8.2.0",
  "serde",

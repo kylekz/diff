@@ -23,6 +23,7 @@
 //! marker file this module writes already carries the full hash anyway.
 
 use std::path::PathBuf;
+use std::time::Duration;
 
 use anyhow::anyhow;
 use sha2::{Digest, Sha256};
@@ -37,6 +38,17 @@ const BINARY_FILENAME: &str = "dv-host";
 /// The marker file recording the full sha256 of the binary currently
 /// installed at this directory.
 const MARKER_FILENAME: &str = "dv-host.sha256";
+
+/// Wall-clock bound on every install bootstrap command (plan §5, §8 S5) —
+/// `$HOME` resolution, marker read/delete, and the binary stream, all of
+/// which run under `manager::client_for`'s per-distro lock with no other
+/// timeout of their own. Generous on purpose: it must comfortably cover a
+/// cold distro boot (the SAME boot the 15s handshake timeout budgets for,
+/// plus the time to actually run a tiny shell one-liner afterward) — a wait
+/// beyond this is a genuine wedge, not just a slow-but-normal boot, and
+/// should degrade to `InstallError::Io` (→ `Failed` + cool-down) rather than
+/// blocking every future `client_for` call for this distro indefinitely.
+const INSTALL_COMMAND_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// Where the runnable `dv-host` binary this call resolved to actually came
 /// from — [`super::manager::client_for`] uses this to decide whether a
@@ -242,7 +254,11 @@ fn install_root(builder: &CommandBuilder) -> Result<String, InstallError> {
         return Ok(root);
     }
     let home = builder
-        .run_text("sh", &["-c", home_resolve_script()])
+        .run_text_timeout(
+            "sh",
+            &["-c", home_resolve_script()],
+            INSTALL_COMMAND_TIMEOUT,
+        )
         .map_err(InstallError::Io)?;
     let home = home.trim();
     if home.is_empty() {
@@ -270,7 +286,7 @@ fn binary_at(dir: &str) -> HostBinary {
 fn read_marker(builder: &CommandBuilder, dir: &str) -> Result<String, InstallError> {
     let script = marker_read_script(dir);
     let out = builder
-        .run_text("sh", &["-c", &script])
+        .run_text_timeout("sh", &["-c", &script], INSTALL_COMMAND_TIMEOUT)
         .map_err(InstallError::Io)?;
     Ok(out.trim().to_string())
 }
@@ -278,7 +294,7 @@ fn read_marker(builder: &CommandBuilder, dir: &str) -> Result<String, InstallErr
 fn delete_marker(builder: &CommandBuilder, dir: &str) -> Result<(), InstallError> {
     let script = marker_delete_script(dir);
     builder
-        .run("sh", &["-c", &script])
+        .run_timeout("sh", &["-c", &script], INSTALL_COMMAND_TIMEOUT)
         .map_err(InstallError::Io)?;
     Ok(())
 }
@@ -294,7 +310,7 @@ fn install_and_verify(
 ) -> Result<(), InstallError> {
     let script = install_script(dir, hash);
     builder
-        .run_with_stdin("sh", &["-c", &script], bytes)
+        .run_with_stdin_timeout("sh", &["-c", &script], bytes, INSTALL_COMMAND_TIMEOUT)
         .map_err(InstallError::Io)?;
 
     let verify = read_marker(builder, dir)?;

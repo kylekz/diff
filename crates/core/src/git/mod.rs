@@ -440,13 +440,20 @@ impl GitRepo {
             if client_supports_blob_get(client.caps()) {
                 match client.blob_get(&self.root_arg(), spec) {
                     Ok(result) => return Ok(result),
+                    Err(err) if RequestFailure::is_connection_failure(&err) => {
+                        manager::note_host_connection_lost(
+                            &self.location,
+                            &client,
+                            &format!("blob/get: {err:#}"),
+                        );
+                    }
                     Err(err) => {
+                        // A structured Rpc error (or a Timeout) from an
+                        // otherwise-healthy host — surfaced/counted the same
+                        // as before, but never a reason to start this
+                        // distro's cool-down (see `note_host_connection_lost`'s
+                        // doc: only a connection-level failure does that).
                         manager::note_spawn_fallback(&self.location, &format!("blob/get: {err:#}"));
-                        if RequestFailure::is_connection_failure(&err)
-                            && let RepoLocation::Wsl { distro, .. } = &self.location
-                        {
-                            manager::mark_dead(distro, &client);
-                        }
                     }
                 }
             } else {

@@ -151,6 +151,36 @@ pub(crate) fn decide_respawn(
     }
 }
 
+/// A live host client for `distro` ONLY if one is already connected and
+/// alive in the registry RIGHT NOW — never spawns, installs, or boots a
+/// distro (unlike [`client_for`]). The badge walk uses this so app launch
+/// never boots a stopped distro just to compute a badge (plan §4).
+pub(crate) fn client_if_running(distro: &str) -> Option<Arc<HostClient>> {
+    if !hosts_enabled() {
+        return None;
+    }
+    let slot = registry()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(distro)
+        .cloned()?;
+    // `try_lock`, not `lock`: if the slot is mid-spawn (`client_for` holds it
+    // across a possibly-multi-second cold boot), treat it as "not running
+    // yet" and skip rather than blocking the badge walk on that boot.
+    let guard = slot.try_lock().ok()?;
+    match &*guard {
+        Some(HostEntry::Alive(client)) if client.is_alive() => Some(Arc::clone(client)),
+        _ => None,
+    }
+}
+
+/// Whether a live `dv-host` connection already exists for `distro` (never
+/// spawns/boots — see [`client_if_running`]). The app's badge walk gates WSL
+/// entries on this so launch boots no stopped distros.
+pub fn has_running_host(distro: &str) -> bool {
+    client_if_running(distro).is_some()
+}
+
 /// A connected host client for `distro`, or `None` if hosts are disabled, no
 /// `dv-host` binary is configured/installable (no `DV_HOST_PATH`, no
 /// sidecar — see [`install::ensure_installed`]'s [`install::InstallError::NoSidecar`]),
@@ -183,13 +213,17 @@ pub(crate) fn client_for(distro: &str) -> Option<Arc<HostClient>> {
     // exactly this reason — `::new` would re-enter this function for the
     // same distro and deadlock on the very lock held right here.
     //
-    // KNOWN LIMIT (S3 review P2, deferred to S5 robustness): the install
-    // round trips run under this lock with NO subprocess timeout — a
-    // wedged `wsl.exe` (stuck distro boot) blocks every future
-    // `CommandBuilder::new` for THIS distro indefinitely (other distros
-    // unaffected; the outer registry lock is never held here). S5 should
-    // bound these bootstrap commands with a wait_timeout so a wedged boot
-    // degrades to Failed + cool-down instead of a pile-up.
+    // FIXED (S3 review P2, was a KNOWN LIMIT, closed by S5 robustness): the
+    // install round trips run under this lock, so an unbounded wedged
+    // `wsl.exe` (stuck distro boot) would otherwise block every future
+    // `CommandBuilder::new` for THIS distro indefinitely (other distros are
+    // unaffected either way; the outer registry lock is never held here).
+    // As of S5, every bootstrap command in `install.rs` runs through
+    // `CommandBuilder::run_timeout`/`run_text_timeout`/`run_with_stdin_timeout`
+    // (`INSTALL_COMMAND_TIMEOUT`, 60s) instead of the unbounded `run`/
+    // `run_text`/`run_with_stdin` — a genuine wedge now surfaces as an
+    // `InstallError::Io` here, which the match below turns into `Failed` +
+    // cool-down like any other spawn failure, instead of a lock pile-up.
     let mut guard = slot.lock().unwrap_or_else(|e| e.into_inner());
     let now = Instant::now();
 
@@ -411,6 +445,57 @@ pub fn spawn_fallback_count() -> u64 {
     FALLBACK_COUNT.load(Ordering::SeqCst)
 }
 
+/// The last chunk of a host's stderr (a crash/panic message, typically),
+/// suitable to append to a connection-loss log. Empty when the ring is
+/// blank; otherwise the trailing ~800 chars on a char boundary, prefixed.
+fn stderr_tail(client: &Arc<HostClient>) -> String {
+    truncate_stderr_tail(&client.stderr_snapshot())
+}
+
+/// Pure core of [`stderr_tail`] — factored out so the truncation/formatting
+/// logic is unit-testable without a real `HostClient` (a plain string in,
+/// string out, no process behind it). Trims surrounding whitespace first
+/// (the ring commonly ends in a trailing newline from the last line the
+/// host wrote, which would otherwise eat into the character budget for no
+/// benefit), then keeps at most the last ~800 characters of what's left —
+/// backing up to the nearest UTF-8 character boundary, since slicing a
+/// `str` at a non-boundary byte offset panics (the same hazard
+/// [`crate::command::truncate_lossy`] exists to guard against).
+fn truncate_stderr_tail(s: &str) -> String {
+    const MAX_CHARS: usize = 800;
+    let trimmed = s.trim();
+    if trimmed.is_empty() {
+        return String::new();
+    }
+    let tail = if trimmed.len() > MAX_CHARS {
+        let mut start = trimmed.len() - MAX_CHARS;
+        while start < trimmed.len() && !trimmed.is_char_boundary(start) {
+            start += 1;
+        }
+        &trimmed[start..]
+    } else {
+        trimmed
+    };
+    format!("; host stderr: {tail}")
+}
+
+/// A vended host client's request just failed at the CONNECTION level (the
+/// channel is dead — see [`RequestFailure::is_connection`][super::client::RequestFailure::is_connection]).
+/// Logs the fallback (with the host's stderr tail for crash context) and,
+/// for a `Wsl` location, starts the distro's cool-down via [`mark_dead`].
+/// Centralizes what `CommandBuilder` and `GitRepo::batch_request` both do
+/// on connection loss.
+pub(crate) fn note_host_connection_lost(
+    location: &crate::location::RepoLocation,
+    client: &Arc<HostClient>,
+    reason: &str,
+) {
+    note_spawn_fallback(location, &format!("{reason}{}", stderr_tail(client)));
+    if let crate::location::RepoLocation::Wsl { distro, .. } = location {
+        mark_dead(distro, client);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -624,5 +709,148 @@ mod tests {
     #[test]
     fn should_mark_dead_false_with_no_entry_yet() {
         assert!(!should_mark_dead(None, true));
+    }
+
+    // --- truncate_stderr_tail: pure string truncation/formatting ---------
+    // (plan §8 S5: "stderr ring surfacing")
+
+    #[test]
+    fn truncate_stderr_tail_empty_ring_is_empty_string() {
+        assert_eq!(truncate_stderr_tail(""), "");
+        // Whitespace-only counts as blank too — a ring that only ever saw a
+        // trailing newline has no crash context worth appending.
+        assert_eq!(truncate_stderr_tail("   \n\n  "), "");
+    }
+
+    #[test]
+    fn truncate_stderr_tail_short_text_passes_through_prefixed() {
+        assert_eq!(
+            truncate_stderr_tail("thread 'main' panicked at src/main.rs:1"),
+            "; host stderr: thread 'main' panicked at src/main.rs:1"
+        );
+    }
+
+    #[test]
+    fn truncate_stderr_tail_trims_surrounding_whitespace_first() {
+        assert_eq!(
+            truncate_stderr_tail("\n\n  panic: boom  \n"),
+            "; host stderr: panic: boom"
+        );
+    }
+
+    #[test]
+    fn truncate_stderr_tail_keeps_only_the_last_800_chars() {
+        let long = "a".repeat(1000);
+        let result = truncate_stderr_tail(&long);
+        let prefix = "; host stderr: ";
+        assert!(result.starts_with(prefix));
+        assert_eq!(result.len() - prefix.len(), 800);
+        // It's the TAIL that's kept, not the head.
+        assert!(result.ends_with(&"a".repeat(800)));
+    }
+
+    #[test]
+    fn truncate_stderr_tail_backs_up_to_a_char_boundary() {
+        // "中" is 3 bytes; 300 repeats is 900 bytes, so the naive
+        // `len - 800` byte offset (100) lands mid-character. The result
+        // must still be valid UTF-8 (i.e. not panic) and contain only whole
+        // characters.
+        let long = "中".repeat(300);
+        let result = truncate_stderr_tail(&long);
+        assert!(result.starts_with("; host stderr: "));
+        let tail = result.strip_prefix("; host stderr: ").unwrap();
+        assert!(tail.chars().all(|c| c == '中'));
+    }
+
+    // --- crash_then_cooldown_then_respawn: the full `client_for` path
+    // against a REAL WSL host (plan §8 S5 gate: "crash-respawn cool-down
+    // test") ---------------------------------------------------------------
+    //
+    // The pure `decide_respawn` state machine above is already exhaustively
+    // unit-tested; what was missing is proof that the FULL `client_for`
+    // path — spawn, observe a real crash, cool down, respawn — actually
+    // honors it end to end against a real `dv-host` process. That needs
+    // live WSL (`client_for` -> `install::ensure_installed` ->
+    // `HostClient::spawn_wsl` has no fake seam), so this mirrors
+    // `crates/core/tests/wsl_host_routing.rs`'s ignored WSL test: same
+    // `DV_HOST_PATH`/`DV_HOST_COOLDOWN_MS` env setup, same
+    // `enable_hosts()` call, same shortened cool-down instead of a real
+    // 30s sleep.
+    //
+    // It lives HERE — in this module's own unit tests — rather than
+    // alongside `wsl_host_routing.rs` in `crates/core/tests/`, because
+    // `client_for` is `pub(crate)`: an integration test file is a separate
+    // crate from `dv-core`'s own `#[cfg(test)]` code and can only see
+    // `pub` items (which is exactly why that file drives everything through
+    // `GitRepo`/`manager::enable_hosts`/`manager::spawn_fallback_count`
+    // instead). Being IN the crate is what lets this test call `client_for`
+    // directly and assert on `CoolingDown` vs. `Spawn` instead of only
+    // inferring it from the fallback counter.
+    //
+    // Mutates real process-global state (env vars, the `manager` registry,
+    // the `ENABLED` flag) exactly like that file's test — guarded by its
+    // own env mutex so a manual `--ignored` run can't race another
+    // env-mutating test in this binary. Never runs during the normal
+    // `cargo test` gate (no `--ignored` there), so `ENABLED` being latched
+    // `true` for the rest of the process by this test can never affect any
+    // of this module's other (ambiently-hosts-disabled) tests.
+    static CRASH_RESPAWN_ENV_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[test]
+    #[ignore = "requires WSL Ubuntu with dv-host built inside it (see crates/host/tests/wsl_host.rs's module doc for the build command)"]
+    fn crash_then_cooldown_then_respawn() {
+        let _env_guard = CRASH_RESPAWN_ENV_MUTEX
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        const DISTRO: &str = "Ubuntu";
+        const COOLDOWN_MS: u64 = 800;
+
+        // SAFETY: test-only env mutation; the mutex above serializes this
+        // against any other env-mutating test in this binary that might run
+        // in the same manual `--ignored` pass.
+        unsafe {
+            let host_path = std::env::var("DV_HOST_PATH")
+                .unwrap_or_else(|_| "/home/kyle/.cache/dv-target/debug/dv-host".to_string());
+            std::env::set_var("DV_HOST_PATH", host_path);
+            std::env::set_var("DV_HOST_COOLDOWN_MS", COOLDOWN_MS.to_string());
+        }
+        enable_hosts();
+
+        let first = client_for(DISTRO).expect("initial spawn should succeed");
+        let first_pid = first.pid();
+
+        first.kill();
+        let alive_deadline = Instant::now() + Duration::from_secs(5);
+        while first.is_alive() && Instant::now() < alive_deadline {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(
+            !first.is_alive(),
+            "the reader thread should have observed the killed process's EOF by now"
+        );
+
+        // Immediately after the crash: `client_for` must notice the death
+        // (Alive -> Dead), start the cool-down, and return `None` rather
+        // than respawning right away.
+        assert!(
+            client_for(DISTRO).is_none(),
+            "client_for must return None (cooling down) immediately after a crash"
+        );
+
+        // Sleep past the (shortened) cool-down and try again: a fresh spawn
+        // attempt should succeed, with a DIFFERENT pid than the dead one —
+        // proof this is a genuinely new process, not a stale handle.
+        std::thread::sleep(Duration::from_millis(COOLDOWN_MS + 200));
+        let second = client_for(DISTRO).expect("respawn after cool-down should succeed");
+        assert_ne!(
+            second.pid(),
+            first_pid,
+            "the respawned host must be a different process than the one that crashed"
+        );
+
+        unsafe {
+            std::env::remove_var("DV_HOST_PATH");
+            std::env::remove_var("DV_HOST_COOLDOWN_MS");
+        }
     }
 }

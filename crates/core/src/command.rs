@@ -3,11 +3,12 @@
 //! as `wsl.exe -d <distro> --exec <program> <args…>`. Nothing in dv spawns a
 //! repo-scoped process any other way.
 
-use std::io::Write;
+use std::io::{Read, Write};
 #[cfg(windows)]
 use std::os::windows::process::CommandExt;
 use std::process::{Command, Stdio};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
 
@@ -245,21 +246,12 @@ impl CommandBuilder {
     /// error — callers must never call this for a `Timeout` or an `Rpc`
     /// result the host successfully answered with (see [`RequestFailure`]
     /// and [`RequestFailure::is_connection_failure`], which both call sites
-    /// guard on before reaching here). Logs the fallback (the plan §8 S2
-    /// gate counter) and, for a `Wsl` location, tells the manager to start
-    /// this distro's cool-down clock immediately rather than waiting for
-    /// some unrelated future `CommandBuilder::new` to notice via
-    /// `is_alive()` — passing `client`'s own identity through so a stale
-    /// client this `CommandBuilder` still holds can never downgrade a
-    /// FRESH client that has since replaced it in the registry (see
-    /// [`manager::mark_dead`]'s doc comment). A no-op for the
-    /// `with_host`-on-a-Local-location test seam, which has no distro to
-    /// mark dead.
+    /// guard on before reaching here). Thin wrapper around
+    /// [`manager::note_host_connection_lost`], which centralizes the
+    /// logging-with-stderr-context + cool-down-on-`Wsl` behavior this and
+    /// `GitRepo::batch_request`'s Host arm both need.
     fn note_host_failure(&self, client: &Arc<HostClient>, reason: &str) {
-        manager::note_spawn_fallback(&self.location, reason);
-        if let RepoLocation::Wsl { distro, .. } = &self.location {
-            manager::mark_dead(distro, client);
-        }
+        manager::note_host_connection_lost(&self.location, client, reason);
     }
 
     /// The Stage-A path: build the `wsl.exe`-prefixed (or bare, for Local)
@@ -323,6 +315,152 @@ impl CommandBuilder {
             output.stdout,
             &output.stderr,
         )
+    }
+
+    /// Spawn-arm run with a hard wall-clock `timeout`: a wedged `wsl.exe`
+    /// (stuck distro boot) is killed and reported instead of blocking
+    /// forever. Used only by install bootstrap commands, which run under
+    /// `manager::client_for`'s per-distro lock — an unbounded wait there
+    /// wedges every future `client_for` for that distro. stdin/stdout/stderr
+    /// are drained on their own threads (a full pipe must never deadlock the
+    /// wait), mirroring `dv-host`'s handle_exec; completion is polled via
+    /// `try_wait` on a deadline, the same shape `HostClient`'s Drop already
+    /// uses.
+    fn run_spawn_bounded(
+        &self,
+        program: &str,
+        args: &[&str],
+        stdin_bytes: Option<&[u8]>,
+        timeout: Duration,
+    ) -> Result<Vec<u8>> {
+        let mut cmd = self.command(program, args);
+        cmd.stdout(Stdio::piped());
+        cmd.stderr(Stdio::piped());
+        cmd.stdin(if stdin_bytes.is_some() {
+            Stdio::piped()
+        } else {
+            Stdio::null()
+        });
+
+        let mut child = cmd
+            .spawn()
+            .with_context(|| format!("failed to run {program}: spawn failed"))?;
+
+        // Write stdin on ITS OWN detached thread, never the current one: a
+        // wedged child that never drains stdin would otherwise block this
+        // write and bypass the timeout below entirely (we'd be stuck here,
+        // not even reached the `try_wait` poll loop yet).
+        if let Some(bytes) = stdin_bytes {
+            let mut stdin = child
+                .stdin
+                .take()
+                .with_context(|| format!("{program}: missing stdin handle"))?;
+            let bytes = bytes.to_vec();
+            std::thread::spawn(move || {
+                // A child that exits (or gets killed) before consuming all
+                // of stdin closes its read end — the resulting broken-pipe
+                // write error is expected and not separately actionable, so
+                // it's dropped here rather than surfaced.
+                let _ = stdin.write_all(&bytes);
+            });
+        }
+
+        // Drain stdout/stderr on their own threads too: a full pipe must
+        // never deadlock the `try_wait` poll loop below (the child would
+        // block writing to a pipe nobody's reading, and we'd block waiting
+        // for it to exit — classic pipe deadlock).
+        let mut stdout_pipe = child
+            .stdout
+            .take()
+            .with_context(|| format!("{program}: missing stdout handle"))?;
+        let stdout_thread = std::thread::spawn(move || {
+            let mut buf = Vec::new();
+            let _ = stdout_pipe.read_to_end(&mut buf);
+            buf
+        });
+        let mut stderr_pipe = child
+            .stderr
+            .take()
+            .with_context(|| format!("{program}: missing stderr handle"))?;
+        let stderr_thread = std::thread::spawn(move || {
+            let mut buf = Vec::new();
+            let _ = stderr_pipe.read_to_end(&mut buf);
+            buf
+        });
+
+        let deadline = Instant::now() + timeout;
+        let status = loop {
+            match child.try_wait() {
+                Ok(Some(status)) => break status,
+                Ok(None) if Instant::now() < deadline => {
+                    std::thread::sleep(Duration::from_millis(25));
+                }
+                Ok(None) => {
+                    // Deadline exceeded: kill and report rather than let a
+                    // wedged `wsl.exe` block the caller (and, transitively,
+                    // every future `client_for` for this distro) forever.
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    bail!(
+                        "{program} timed out after {}s — the WSL distro may be wedged or slow to boot",
+                        timeout.as_secs()
+                    );
+                }
+                Err(err) => {
+                    return Err(err).with_context(|| format!("failed waiting for {program}"));
+                }
+            }
+        };
+
+        // The child has exited (or been killed above, which already
+        // returned) — its pipes are closed, so both reader threads are
+        // guaranteed to unblock and finish on their own now.
+        let stdout = stdout_thread.join().unwrap_or_default();
+        let stderr = stderr_thread.join().unwrap_or_default();
+
+        finish(
+            program,
+            args,
+            status.success(),
+            status.code(),
+            stdout,
+            &stderr,
+        )
+    }
+
+    /// [`Self::run_spawn_bounded`] with no stdin, for text/byte-producing
+    /// bootstrap commands.
+    pub(crate) fn run_timeout(
+        &self,
+        program: &str,
+        args: &[&str],
+        timeout: Duration,
+    ) -> Result<Vec<u8>> {
+        self.run_spawn_bounded(program, args, None, timeout)
+    }
+
+    /// [`Self::run_timeout`] + [`decode_output`] + trailing-whitespace trim —
+    /// the bounded counterpart of [`Self::run_text`].
+    pub(crate) fn run_text_timeout(
+        &self,
+        program: &str,
+        args: &[&str],
+        timeout: Duration,
+    ) -> Result<String> {
+        let bytes = self.run_timeout(program, args, timeout)?;
+        Ok(decode_output(&bytes).trim_end().to_string())
+    }
+
+    /// [`Self::run_spawn_bounded`] with `stdin_bytes` piped in — the bounded
+    /// counterpart of [`Self::run_with_stdin`].
+    pub(crate) fn run_with_stdin_timeout(
+        &self,
+        program: &str,
+        args: &[&str],
+        stdin_bytes: &[u8],
+        timeout: Duration,
+    ) -> Result<Vec<u8>> {
+        self.run_spawn_bounded(program, args, Some(stdin_bytes), timeout)
     }
 }
 
@@ -583,5 +721,38 @@ mod tests {
         // 2000-byte cap (see `truncate_lossy`) plus the surrounding format.
         assert!(text.len() < long_stderr.len());
         assert!(text.contains("failed (exit 1):"));
+    }
+
+    // --- run_spawn_bounded: the install-bootstrap timeout (plan §5 / §8 S5)
+
+    // The test binary itself always runs on Windows regardless of what
+    // platform dv targets at runtime, so a portable "sleep longer than the
+    // timeout" child needs a Windows-native command — `cmd /c "ping
+    // 127.0.0.1 -n 3 >NUL"` burns roughly 2s (three ICMP echoes, one per
+    // second, one of them skipped) with no external dependencies.
+    #[cfg(windows)]
+    #[test]
+    fn run_spawn_bounded_times_out_on_a_wedged_child() {
+        let builder = CommandBuilder::new(RepoLocation::Local(PathBuf::from(".")));
+        let start = Instant::now();
+        let err = builder
+            .run_spawn_bounded(
+                "cmd",
+                &["/c", "ping 127.0.0.1 -n 3 >NUL"],
+                None,
+                Duration::from_millis(200),
+            )
+            .unwrap_err();
+        let elapsed = start.elapsed();
+        assert!(
+            err.to_string().contains("timed out"),
+            "expected a timeout error, got: {err}"
+        );
+        // The whole point of the bounded wait: return close to the 200ms
+        // timeout, nowhere near the ~2s the child would otherwise take.
+        assert!(
+            elapsed < Duration::from_secs(1),
+            "expected an early return near the 200ms timeout, took {elapsed:?}"
+        );
     }
 }

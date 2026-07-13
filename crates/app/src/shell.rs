@@ -506,6 +506,25 @@ impl AppShell {
                 .spawn(async move {
                     locations
                         .into_iter()
+                        // Boot-avoidance (plan §4): `compute_local_badge`
+                        // opens a `ReviewStore`, which for a WSL location
+                        // with no live host shells out `wsl.exe cat/ls` —
+                        // booting a stopped distro as a side effect of
+                        // merely painting a sidebar badge. `has_running_host`
+                        // never spawns/installs/boots anything; it only
+                        // reports a distro that already has a connection
+                        // open from some earlier, explicit repo-open. This
+                        // skip covers BOTH the startup walk and a manual
+                        // `RefreshBadges` — sequentially booting every WSL
+                        // entry's distro on an explicit-but-still-surprising
+                        // manual refresh would be just as nasty as doing it
+                        // silently at launch.
+                        .filter(|loc| match loc {
+                            RepoLocation::Wsl { distro, .. } => {
+                                dv_core::remote::manager::has_running_host(distro)
+                            }
+                            RepoLocation::Local(_) => true,
+                        })
                         .filter_map(|loc| {
                             compute_local_badge(loc.clone())
                                 .map(|(badge, remote)| (loc, badge, remote))

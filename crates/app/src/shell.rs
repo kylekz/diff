@@ -26,7 +26,8 @@ use crate::settings::{
 };
 use crate::themes;
 use crate::workspace::{
-    ReviewChanged, SummaryWidthChanged, Workspace, checks_word, pr_state_word, review_decision_word,
+    ReviewChanged, SummaryWidthChanged, Workspace, checks_word, pr_state_word,
+    review_decision_word, source_label,
 };
 
 actions!(
@@ -85,11 +86,13 @@ fn compute_local_badge(location: RepoLocation) -> Option<(ReviewBadge, Option<Re
         .filter(|c| c.status == dv_core::CommentStatus::Open)
         .count();
     let submitted = matches!(latest.state, dv_core::ReviewState::Submitted { .. });
+    let pr_number = latest.remote.as_ref().map(|r| r.pr);
     Some((
         ReviewBadge {
             open,
             submitted,
             pr: None,
+            pr_number,
         },
         latest.remote,
     ))
@@ -113,7 +116,16 @@ fn merge_local_badge(
         return fresh_local;
     }
     ReviewBadge {
-        pr: existing.and_then(|b| b.pr),
+        // Only carry the cached `pr` forward when it's still for the same
+        // PR `fresh_local` just determined is latest at this location —
+        // otherwise a newer, different review becoming latest (a fresh
+        // draft, or switching which PR is linked) would keep showing the
+        // *previous* review's PR cluster under a `fetch_remote: false`
+        // call, which never re-fetches to correct it (review finding P2's
+        // root cause, generalized to the badge cache itself).
+        pr: existing
+            .filter(|b| b.pr_number == fresh_local.pr_number)
+            .and_then(|b| b.pr),
         ..fresh_local
     }
 }
@@ -147,6 +159,29 @@ fn fetch_pr_badge(remote: &RemoteRef) -> Option<PrBadge> {
         decision: status.review_decision,
         checks: status.checks,
     })
+}
+
+/// `state` word for an [`dv_core::IndexEntry`]'s automation dump —
+/// deliberately coarser than `Workspace::automation_state`'s own
+/// `review.state` (`"draft"` / `"submitted:<verdict>"`, verdict included):
+/// the index's automation surface only needs draft-vs-submitted for
+/// docs/phase-6-review-navigator.md's S6b verification, and the verdict is
+/// already available on `Workspace::automation_state` once that specific
+/// review is the one open.
+fn index_state_word(state: &dv_core::ReviewState) -> &'static str {
+    match state {
+        dv_core::ReviewState::Draft => "draft",
+        dv_core::ReviewState::Submitted { .. } => "submitted",
+    }
+}
+
+/// `health` word for an [`dv_core::IndexEntry`]'s automation dump.
+fn index_health_word(health: dv_core::EntryHealth) -> &'static str {
+    match health {
+        dv_core::EntryHealth::Ok => "ok",
+        dv_core::EntryHealth::RepoUnavailable => "repo_unavailable",
+        dv_core::EntryHealth::Missing => "missing",
+    }
 }
 
 pub fn init(cx: &mut App) {
@@ -183,6 +218,30 @@ pub struct AppShell {
     /// index — the recent list shifts when new entries insert at the top
     /// (review finding: index keys wore the wrong rows' badges).
     badges: HashMap<RepoLocation, ReviewBadge>,
+    /// Cross-repo review index (docs/phase-6-review-navigator.md
+    /// deliverable 1): every review dv has ever hydrated, across every
+    /// repo, cached at `<data_dir>/dv/review_index.json`. Loaded
+    /// synchronously in [`Self::new`] so the sidebar's *eventual*
+    /// review-centric render (S6c) can paint instantly from the cached
+    /// file before a single `ReviewStore::list()` call has run; kept
+    /// fresh off-thread by [`Self::hydrate_index`]/
+    /// [`Self::hydrate_index_location`] and by the `ReviewChanged`
+    /// subscription in [`Self::open_review`]. This slice (S6b) only
+    /// populates and exposes it via [`Self::automation_state`] — sidebar
+    /// rendering itself is unchanged until S6c.
+    index: dv_core::ReviewIndex,
+    /// Per-location monotonic sequence, guarding [`Self::hydrate_index_location`]
+    /// against out-of-order completion: `cx.background_executor()` is a real
+    /// multi-threaded pool, so two overlapping hydration passes for the same
+    /// location (e.g. `open_review`'s own call racing the broader
+    /// `hydrate_index` walk, or two `ReviewChanged` events in quick
+    /// succession) are not guaranteed to *complete* in the order they were
+    /// dispatched. `apply_hydration` does a full-outcome replace, so an
+    /// earlier-dispatched read that completes last would silently overwrite
+    /// fresher data with a stale snapshot. Bumped and captured at dispatch
+    /// time; a completion only applies if its captured value still matches
+    /// (mirrors `Workspace::source_epoch`'s discard-if-superseded pattern).
+    index_hydration_gens: HashMap<RepoLocation, u64>,
     /// True while a sidebar-handle drag is in progress (set by the first
     /// drag-move frame). `on_mouse_up_out` fires on ANY left release outside
     /// the handle's hitbox — without this gate every click in the window
@@ -257,6 +316,16 @@ struct ReviewBadge {
     /// review is linked to one and the network fetch succeeded — `None`
     /// either way renders no PR cluster at all (see [`fetch_pr_badge`]).
     pr: Option<PrBadge>,
+    /// The PR number `pr` (once fetched) actually belongs to — i.e. the
+    /// *latest* review's `remote.pr` at the time the local fields were last
+    /// recomputed. `this.badges` is keyed by location, not review, so with
+    /// two PR-linked reviews sharing a location `pr` can go stale relative
+    /// to whichever review the caller actually cares about (review
+    /// finding P2: a different review's cached PR data was being stamped
+    /// onto the wrong `IndexEntry`). Callers that adopt `pr` for a
+    /// *specific* review must first check `pr_number == Some(that review's
+    /// remote.pr)`.
+    pr_number: Option<u64>,
 }
 
 /// Sidebar PR-status cluster for one repo's latest review: state glyph,
@@ -285,6 +354,8 @@ impl AppShell {
             selected: None,
             automation,
             badges: HashMap::new(),
+            index: dv_core::ReviewIndex::load(),
+            index_hydration_gens: HashMap::new(),
             sidebar_dragging: false,
             _ws_subscription: None,
             _ws_summary_subscription: None,
@@ -319,6 +390,14 @@ impl AppShell {
         // one. A manual refresh (`RefreshBadges`) or simply opening that
         // review (`refresh_badge`, not WSL-skipped) still fetches it.
         this.refresh_all_badges(true, cx);
+        // Index hydration (docs/phase-6-review-navigator.md deliverable 1,
+        // S6b): same WSL-liveness gate as the badge walk above
+        // (cross-cutting risk B) — a naive "hydrate every known location at
+        // launch" would boot every stopped distro the index has ever seen a
+        // review in. The gate is unconditional inside `hydrate_index`
+        // itself (not just at startup), so this call and the manual
+        // `RefreshBadges` one below share the same boot-avoidance.
+        this.hydrate_index(cx);
         match seed {
             Some((location, source)) => this.open_review(location, source, pending_pr, window, cx),
             // Nothing to focus into, so hold focus on the shell — otherwise
@@ -359,6 +438,13 @@ impl AppShell {
         // the way there is walking every recent entry at startup. Full
         // refresh (local + network) — see `refresh_badge`'s doc comment.
         self.refresh_badge(index, true, cx);
+        // Fold this location's fresh review set into the index right away
+        // too — don't wait for the broader `hydrate_index` walk, which may
+        // already have run and skipped this location (a brand-new repo
+        // isn't in `recent` yet at the time it runs) or simply not have
+        // gotten to it yet. Not WSL-gated, same "opening it implies it's
+        // live" reasoning as `refresh_badge`'s `fetch_remote: true` above.
+        self.hydrate_index_location(location.clone(), cx);
 
         let view_mode_default = self.settings.view_mode_default;
         let context_lines = self.settings.context_lines;
@@ -382,12 +468,80 @@ impl AppShell {
         // Keep this entry's badge live while the review is being worked on.
         self._ws_subscription = Some(cx.subscribe(
             &workspace,
-            move |this: &mut Self, _, _: &ReviewChanged, cx| {
+            move |this: &mut Self, ws, _: &ReviewChanged, cx| {
                 if let Some(selected) = this.selected {
                     // Local-only, no network — see `refresh_badge`'s doc
                     // comment (review finding P3-3).
                     this.refresh_badge(selected, false, cx);
                 }
+                // Keep this review's cached index entry current on every
+                // change too (comment/reply/resolve, submit, or an
+                // external CLI/other-window edit picked up by the store
+                // watcher) — `opened: false`, same "don't disturb recency"
+                // reasoning as `refresh_badge`'s local-only recompute:
+                // this is a metadata refresh, not a user re-selecting the
+                // review. S6b has no explicit-selection gesture yet (that
+                // lands in S6c) to stamp `last_opened_ms` from.
+                let entry = {
+                    let ws = ws.read(cx);
+                    let location = ws.location().clone();
+                    ws.review().map(|review| {
+                        // Only a PR-linked review carries a `pr_status` at
+                        // all (review finding P2-3) — `this.badges` is
+                        // keyed by *location*, not review, and tracks
+                        // whichever review `compute_local_badge` picked as
+                        // "latest"; stamping its `pr` onto a *different*,
+                        // local-only review sharing that location would
+                        // paint someone else's PR state onto it. Worse, when
+                        // the location has *two* PR-linked reviews (this one
+                        // open, a different one currently "latest"),
+                        // `this.badges[location].pr` can hold data fetched
+                        // for the *other* review's PR (review finding P2) —
+                        // so only adopt it when the badge's `pr_number`
+                        // actually matches this review's own linked PR. When
+                        // the review is PR-linked but the badge's network
+                        // pass hasn't landed yet, or belongs to a different
+                        // PR, fall back to whatever `pr_status` is already
+                        // cached in the index rather than wiping it with
+                        // `None` or stamping the wrong PR's data onto it
+                        // (review finding P2-2).
+                        let pr_status = review.remote.as_ref().and_then(|remote| {
+                            this.badges
+                                .get(&location)
+                                .filter(|b| b.pr_number == Some(remote.pr))
+                                .and_then(|b| b.pr)
+                                .map(|pr| dv_core::CachedPrStatus {
+                                    state: pr.state,
+                                    is_draft: pr.is_draft,
+                                    decision: pr.decision,
+                                    checks: pr.checks,
+                                })
+                                .or_else(|| {
+                                    this.index.get(&review.id).and_then(|e| e.pr_status.clone())
+                                })
+                        });
+                        let mut entry = dv_core::IndexEntry::from_review(&location, review);
+                        entry.pr_status = pr_status;
+                        entry
+                    })
+                };
+                if let Some(entry) = entry {
+                    this.index.upsert(entry, false);
+                }
+                // Deliberately *not* a full `hydrate_index_location` re-list
+                // here too: `ReviewChanged` fires on the open review's own
+                // edits, so the pure `upsert` above is all this event needs
+                // (keep this handler's body cheap — `from_review` is pure,
+                // no I/O). A full store re-list on every comment/reply/
+                // resolve would cost a second whole-index disk write (and,
+                // for a WSL location, a host round trip) on a hot
+                // interactive path to reconcile *other* reviews' deletions
+                // — an event this closure doesn't reliably even fire for.
+                // That reconciliation already happens via `hydrate_index`
+                // (startup, `RefreshBadges`) and `open_review`'s own
+                // location hydrate — good enough for a case (another
+                // window/CLI deleting a sibling review at this location)
+                // that isn't time-critical.
             },
         ));
         // Summary-panel drag-release persistence (Phase 4 deliverable 5) —
@@ -453,15 +607,26 @@ impl AppShell {
                 return;
             }
             let Some(remote) = remote else { return };
+            let pr_number = remote.pr;
+            let slug = remote.slug.clone();
             let pr = cx
                 .background_executor()
                 .spawn(async move { fetch_pr_badge(&remote) })
                 .await;
             if let Some(pr) = pr {
                 this.update(cx, |this, cx| {
-                    if let Some(badge) = this.badges.get_mut(&key) {
+                    if let Some(badge) = this.badges.get_mut(&key)
+                        && badge.pr_number == Some(pr_number)
+                    {
                         badge.pr = Some(pr);
                     }
+                    // Flow the fresh fetch into the index too (review
+                    // finding P3-1) — a review that's merely browsed (no
+                    // comment/reply/resolve) never fires `ReviewChanged`,
+                    // so without this its `IndexEntry.pr_status` would sit
+                    // at `None` for the whole session even though this
+                    // exact fetch just landed the real status.
+                    this.sync_index_pr_status(&slug, pr_number, pr);
                     cx.notify();
                 })
                 .ok();
@@ -582,15 +747,24 @@ impl AppShell {
             .ok();
 
             for (loc, remote) in to_fetch {
+                let pr_number = remote.pr;
+                let slug = remote.slug.clone();
                 let pr = cx
                     .background_executor()
                     .spawn(async move { fetch_pr_badge(&remote) })
                     .await;
                 if let Some(pr) = pr {
                     this.update(cx, |this, cx| {
-                        if let Some(badge) = this.badges.get_mut(&loc) {
+                        if let Some(badge) = this.badges.get_mut(&loc)
+                            && badge.pr_number == Some(pr_number)
+                        {
                             badge.pr = Some(pr);
                         }
+                        // Same index sync as `refresh_badge` (review
+                        // finding P3-1) — a manual `RefreshBadges` (or the
+                        // startup walk) must land in the index too, not
+                        // just `self.badges`.
+                        this.sync_index_pr_status(&slug, pr_number, pr);
                         cx.notify();
                     })
                     .ok();
@@ -600,8 +774,158 @@ impl AppShell {
         .detach();
     }
 
+    /// Propagate a freshly fetched PR status into every index entry linked
+    /// to `remote_slug`/`pr_number` (review finding P3-1).
+    /// `refresh_badge`/`refresh_all_badges`'s network completions previously
+    /// only patched `self.badges` — a review that's merely browsed (no
+    /// comment/reply/resolve to trigger the `ReviewChanged` subscription
+    /// that otherwise updates the index) could sit with
+    /// `IndexEntry.pr_status: None` for the whole session even though the
+    /// badge cache already had the answer.
+    ///
+    /// Matches by `(remote.slug, remote.pr)`, **not** `RepoLocation`
+    /// (review finding P2-2): `self.badges`/`self.recent` are keyed by the
+    /// open-time absolutized path, while the index's entries carry
+    /// whatever `Workspace::location()` normalized to (git's
+    /// `rev-parse --show-toplevel`, via `hydrate_location`/`from_review`) —
+    /// the two can differ textually (a subdirectory open, or a
+    /// case-divergent path on Windows) even for the same repo, so a
+    /// `RepoLocation` equality filter here would silently match nothing
+    /// and leave `pr_status` stuck at `None` forever. `slug`+`pr` identify
+    /// the linked PR itself, independent of how the caller's `RepoLocation`
+    /// happens to be spelled. Still scoped to `pr_number` (matching the
+    /// `ReviewChanged` closure's own reasoning, review finding P2): more
+    /// than one review can be linked to the same repo, but this fetch's
+    /// status belongs to exactly the one PR it was fetched for.
+    fn sync_index_pr_status(&mut self, remote_slug: &str, pr_number: u64, pr: PrBadge) {
+        let status = dv_core::CachedPrStatus {
+            state: pr.state,
+            is_draft: pr.is_draft,
+            decision: pr.decision,
+            checks: pr.checks,
+        };
+        let updates: Vec<dv_core::IndexEntry> = self
+            .index
+            .entries()
+            .iter()
+            .filter(|e| {
+                e.remote.as_ref().map(|r| (r.slug.as_str(), r.pr)) == Some((remote_slug, pr_number))
+            })
+            .cloned()
+            .map(|mut e| {
+                e.pr_status = Some(status.clone());
+                e
+            })
+            .collect();
+        for entry in updates {
+            // `opened: false` — this is a metadata refresh, not the user
+            // re-selecting the review (same reasoning as the
+            // `ReviewChanged` closure's own `upsert` call).
+            self.index.upsert(entry, false);
+        }
+    }
+
+    /// One location's worth of index refresh, off-thread: re-lists that
+    /// repo's `.git/dv` store ([`dv_core::hydrate_location`]) and folds the
+    /// result into `self.index` via
+    /// [`dv_core::ReviewIndex::apply_hydration`]. **Not** idempotent under
+    /// reordering: `apply_hydration` does a full-outcome replace for the
+    /// location, so two overlapping calls (e.g. `open_review`'s own hydrate
+    /// racing this pass's walk, or two `ReviewChanged` events in quick
+    /// succession) that read *different* disk snapshots must still apply in
+    /// dispatch order — and `cx.background_executor()` is a real
+    /// multi-threaded pool, so completion order isn't guaranteed to match
+    /// dispatch order. `index_hydration_gens` guards exactly this
+    /// (cross-cutting risk C, same discard-if-superseded shape as
+    /// `Workspace::source_epoch`): bump-and-capture before spawning, only
+    /// apply on completion if this location's generation hasn't moved on.
+    /// Never itself decides whether it's safe to hydrate a WSL location —
+    /// see call sites.
+    fn hydrate_index_location(&mut self, location: RepoLocation, cx: &mut Context<Self>) {
+        let slot = self
+            .index_hydration_gens
+            .entry(location.clone())
+            .or_insert(0);
+        *slot += 1;
+        let dispatched_gen = *slot;
+        cx.spawn(async move |this, cx| {
+            let loc = location.clone();
+            let outcome = cx
+                .background_executor()
+                .spawn(async move { dv_core::hydrate_location(&loc) })
+                .await;
+            this.update(cx, |this, cx| {
+                // A newer hydration for this same location has been
+                // dispatched since — this outcome is stale, discard it
+                // rather than let it clobber whatever the newer pass
+                // applies (or already applied).
+                if this.index_hydration_gens.get(&location) != Some(&dispatched_gen) {
+                    return;
+                }
+                this.index.apply_hydration(&location, outcome);
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// Walk every location the app currently knows a review for — the
+    /// index's own entries UNION `recent.json`'s seed, deduped by location
+    /// (cross-cutting risk G: a user with only a pre-Phase-6 `recent.json`
+    /// must not lose their sidebar on upgrade to a review-centric one; a
+    /// location already covered by an index entry must not be
+    /// double-hydrated) — and refresh each one off-thread via
+    /// [`Self::hydrate_index_location`]. The WSL-liveness skip mirrors
+    /// `refresh_all_badges`'s boot-avoidance filter exactly (cross-cutting
+    /// risk B) and, like that filter, applies unconditionally regardless of
+    /// caller: `hydrate_index_location` opens a `ReviewStore`, which for a
+    /// WSL location with no live host boots a stopped distro (review
+    /// finding P1/P2 — a startup-only guard here left the manual
+    /// `RefreshBadges` path booting every stopped distro the index has ever
+    /// seen a review in, exactly the storm this policy exists to prevent).
+    fn hydrate_index(&mut self, cx: &mut Context<Self>) {
+        // Dedup the index's own entries by location first (review finding
+        // P3-4) — a location with N cached reviews (N `IndexEntry`s, since
+        // the index is keyed by `review_id` not location) must still only
+        // enqueue one hydration pass, matching this function's own "deduped
+        // by location" doc promise above.
+        let mut locations: Vec<RepoLocation> = Vec::new();
+        for entry in self.index.entries() {
+            if !locations.contains(&entry.location) {
+                locations.push(entry.location.clone());
+            }
+        }
+        for entry in self.recent.entries() {
+            if !locations.contains(&entry.location) {
+                locations.push(entry.location.clone());
+            }
+        }
+        for location in locations {
+            if let RepoLocation::Wsl { distro, .. } = &location
+                && !dv_core::remote::manager::has_running_host(distro)
+            {
+                continue;
+            }
+            self.hydrate_index_location(location, cx);
+        }
+    }
+
     fn on_refresh_badges(&mut self, _: &RefreshBadges, _: &mut Window, cx: &mut Context<Self>) {
         self.refresh_all_badges(false, cx);
+        // Hydrate the cross-repo index too (review finding P3-2) — without
+        // this, `RefreshBadges` only ever refreshed `self.badges`, leaving
+        // a review added via CLI to a repo that isn't currently open
+        // invisible in the index until the app restarts or that repo is
+        // explicitly reopened. Unlike `refresh_all_badges`, whose WSL skip
+        // only gates the local store-open (the network `pr_status` fetch is
+        // still deliberately unconditional on manual refresh),
+        // `hydrate_index_location` itself opens a `ReviewStore` for the
+        // local pass, so its WSL-liveness skip stays unconditional here too
+        // — a stopped distro must not get booted just because the user
+        // asked for a badge refresh (review finding P1/P2, cross-cutting
+        // risk B).
+        self.hydrate_index(cx);
         // Also refresh the active workspace's PR header band, if it has
         // one open (review finding P3-b) — `RefreshBadges` is already the
         // one manual "go sync with GitHub" gesture in the UI, so the
@@ -832,6 +1156,30 @@ impl AppShell {
                     })),
                 })
             }).collect::<Vec<_>>(),
+            // Cross-repo review index (docs/phase-6-review-navigator.md
+            // deliverable 1, S6b): every review the app has hydrated
+            // across every repo it knows about — NOT scoped to `recent`
+            // (a location can appear here without ever showing up in
+            // `recent.json`, and vice versa until its first hydration
+            // completes). Sidebar rendering itself is unchanged this
+            // slice (S6c flips it onto this data) — this exists purely so
+            // `state` can assert hydration behavior without a screenshot.
+            "index": self.index.entries().iter().map(|e| json!({
+                "review_id": e.review_id,
+                "title": e.title,
+                "location": e.location.display_name(),
+                "source": source_label(&e.source),
+                "state": index_state_word(&e.state),
+                "open_comments": e.open_comments,
+                "pr": e.pr_status.as_ref().map(|pr| json!({
+                    "state": pr_state_word(pr.state),
+                    "is_draft": pr.is_draft,
+                    "decision": pr.decision.map(review_decision_word),
+                    "checks": checks_word(pr.checks),
+                })),
+                "health": index_health_word(e.health),
+                "last_opened_ms": e.last_opened_ms,
+            })).collect::<Vec<_>>(),
             // Theme deliverable: the currently-applied theme's own name
             // (read off the live global `Theme`, not `self.settings`, so
             // this can never lie about what's actually painted), whether
@@ -1994,11 +2342,12 @@ impl Render for AppShell {
 mod tests {
     use super::{ChecksSummary, PrBadge, PrState, ReviewBadge, merge_local_badge};
 
-    fn badge(open: usize, pr: Option<PrBadge>) -> ReviewBadge {
+    fn badge(open: usize, pr: Option<PrBadge>, pr_number: Option<u64>) -> ReviewBadge {
         ReviewBadge {
             open,
             submitted: false,
             pr,
+            pr_number,
         }
     }
 
@@ -2015,8 +2364,8 @@ mod tests {
 
     #[test]
     fn merge_local_badge_fetch_remote_true_takes_fresh_local_verbatim() {
-        let existing = Some(badge(1, Some(pr_badge())));
-        let fresh_local = badge(3, None); // local pass never sets `pr` itself
+        let existing = Some(badge(1, Some(pr_badge()), Some(1)));
+        let fresh_local = badge(3, None, Some(1)); // local pass never sets `pr` itself
         let merged = merge_local_badge(existing, fresh_local, true);
         assert_eq!(
             merged.open, 3,
@@ -2031,8 +2380,8 @@ mod tests {
 
     #[test]
     fn merge_local_badge_fetch_remote_false_preserves_existing_pr() {
-        let existing = Some(badge(1, Some(pr_badge())));
-        let fresh_local = badge(2, None); // local recompute, no network run
+        let existing = Some(badge(1, Some(pr_badge()), Some(1)));
+        let fresh_local = badge(2, None, Some(1)); // same PR still latest
         let merged = merge_local_badge(existing, fresh_local, false);
         assert_eq!(merged.open, 2, "local fields still refresh");
         assert!(
@@ -2044,10 +2393,31 @@ mod tests {
 
     #[test]
     fn merge_local_badge_fetch_remote_false_with_no_prior_pr_stays_none() {
-        let merged = merge_local_badge(None, badge(1, None), false);
+        let merged = merge_local_badge(None, badge(1, None, None), false);
         assert!(
             merged.pr.is_none(),
             "nothing to preserve when there was no existing badge at all"
+        );
+    }
+
+    #[test]
+    fn merge_local_badge_fetch_remote_false_drops_pr_when_latest_review_changes() {
+        // The location's "latest" review switched to a different PR (e.g. a
+        // newer draft was created) between local passes — the previously
+        // cached `pr` belongs to the *old* latest review's PR and must not
+        // be carried over onto the new one just because `fetch_remote` is
+        // false (review finding P2, generalized to the badge cache).
+        let existing = Some(badge(1, Some(pr_badge()), Some(10)));
+        let fresh_local = badge(2, None, Some(20));
+        let merged = merge_local_badge(existing, fresh_local, false);
+        assert!(
+            merged.pr.is_none(),
+            "a stale pr badge for a different PR must not be carried forward"
+        );
+        assert_eq!(
+            merged.pr_number,
+            Some(20),
+            "pr_number tracks the new latest review"
         );
     }
 }

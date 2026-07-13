@@ -768,7 +768,11 @@ fn trim_trailing_newlines(body: String) -> String {
     body.trim_end_matches('\n').to_string()
 }
 
-fn source_label(source: &DiffSource) -> &'static str {
+/// `pub(crate)` (docs/phase-6-review-navigator.md S6b) so `shell.rs`'s
+/// review-index automation dump can describe an `IndexEntry`'s source with
+/// the exact same words this workspace's own `automation_state.source`
+/// uses, rather than growing a near-duplicate match arm over there.
+pub(crate) fn source_label(source: &DiffSource) -> &'static str {
     match source {
         DiffSource::WorkingTree => "working tree",
         DiffSource::Staged => "staged",
@@ -1331,6 +1335,24 @@ impl Workspace {
         .detach();
 
         this
+    }
+
+    /// The active review, if one has loaded yet (`None` until the initial
+    /// load's `ReviewChanged` — see [`Self::new`] — and again briefly
+    /// during a watcher-driven reload). `pub(crate)` (docs/phase-6-review-
+    /// navigator.md S6b) so `shell.rs`'s `ReviewChanged` subscription can
+    /// fold this workspace's review into the cross-repo index without
+    /// reaching into a private field.
+    pub(crate) fn review(&self) -> Option<&dv_core::Review> {
+        self.review.as_ref()
+    }
+
+    /// This workspace's repo location — normalized to the store's true
+    /// toplevel once the initial load completes (see [`Self::new`]'s
+    /// `this.location = store_location` reassignment), the raw argument
+    /// before that. Same `pub(crate)` reasoning as [`Self::review`].
+    pub(crate) fn location(&self) -> &RepoLocation {
+        &self.location
     }
 
     /// Switch to another file. A live gutter selection or comment editor

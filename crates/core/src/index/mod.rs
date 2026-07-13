@@ -216,13 +216,29 @@ impl ReviewIndex {
     pub fn apply_hydration(&mut self, location: &RepoLocation, outcome: HydrateOutcome) {
         match outcome {
             HydrateOutcome::Reviews(fresh) => {
+                // Carry recency/`pr_status` forward from each fresh
+                // review's existing entry, wherever it currently lives.
+                // Normally that's under `location` itself, but a stale
+                // duplicate can be parked under a *different*,
+                // textually-unequal `RepoLocation` key for the same repo
+                // (review finding P2-1 — e.g. a mixed-case CLI path
+                // argument vs. git's canonically-cased toplevel, which
+                // `RepoLocation`'s `Path`-derived `Eq` treats as distinct).
+                // Matching on `review_id` across *all* entries here, not
+                // just this location's, means such a leftover gets folded
+                // in rather than surviving as a second, duplicate row for
+                // the same review.
+                let fresh_ids: std::collections::HashSet<&str> =
+                    fresh.iter().map(|e| e.review_id.as_str()).collect();
                 let mut carried: HashMap<String, (u64, Option<CachedPrStatus>)> = self
                     .entries
                     .iter()
-                    .filter(|e| &e.location == location)
+                    .filter(|e| fresh_ids.contains(e.review_id.as_str()))
                     .map(|e| (e.review_id.clone(), (e.last_opened_ms, e.pr_status.clone())))
                     .collect();
-                self.entries.retain(|e| &e.location != location);
+                self.entries.retain(|e| {
+                    &e.location != location && !fresh_ids.contains(e.review_id.as_str())
+                });
                 for mut entry in fresh {
                     if let Some((last_opened_ms, pr_status)) = carried.remove(&entry.review_id) {
                         entry.last_opened_ms = last_opened_ms;
@@ -706,6 +722,52 @@ mod tests {
             index.get("r-1").unwrap().pr_status,
             cached_status,
             "cached pr_status must survive a re-hydration pass"
+        );
+    }
+
+    #[test]
+    fn apply_hydration_drops_a_stale_duplicate_under_a_different_location_key() {
+        // Regression for review finding P2-1: a mixed-case CLI path
+        // argument (or any other textually-unequal-but-same-repo
+        // `RepoLocation`) can leave an entry for the same `review_id`
+        // parked under a *different* location key than the one this
+        // hydration pass is keyed by. The fold must recognize `review_id`
+        // as the true identity and end up with exactly one entry, not two.
+        let proper = local("difftest"); // e.g. git's canonically-cased toplevel
+        let stale = RepoLocation::Local(PathBuf::from("D:\\code\\DIFFTEST"));
+        // Sanity: these two locations really are distinct under `Eq` —
+        // otherwise this test wouldn't be exercising the bug at all.
+        assert_ne!(proper, stale);
+
+        let mut duplicate = sample_entry("r-dup");
+        duplicate.location = stale.clone();
+        duplicate.last_opened_ms = 555;
+        let mut index = ReviewIndex {
+            path: None,
+            entries: vec![duplicate],
+        };
+
+        let mut fresh = sample_entry("r-dup");
+        fresh.location = proper.clone();
+        fresh.pr_status = None; // as `from_review` would produce
+        fresh.last_opened_ms = 0;
+
+        index.apply_hydration(&proper, HydrateOutcome::Reviews(vec![fresh]));
+
+        let matches: Vec<&IndexEntry> = index
+            .entries()
+            .iter()
+            .filter(|e| e.review_id == "r-dup")
+            .collect();
+        assert_eq!(
+            matches.len(),
+            1,
+            "the same review_id must never appear under two locations"
+        );
+        assert_eq!(matches[0].location, proper);
+        assert_eq!(
+            matches[0].last_opened_ms, 555,
+            "recency from the stale-location duplicate must still carry forward"
         );
     }
 

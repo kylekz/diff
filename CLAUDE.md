@@ -192,15 +192,22 @@ Claude Light) with ctrl-shift-t picker + follow-OS, settings.json +
 ctrl-, panel (view mode, context lines, fonts with row-height scaling),
 drag-to-resize sidebar/summary with persisted widths, thread-card/button
 polish pass (docs/phase-4-settings-and-theming.md § Acceptance results).
-Phase 5 (WSL host, docs/phase-5-wsl.md) IN PROGRESS — slices 1–4 of 5
-shipped per docs/phase-5-implementation-plan.md: protocol + HostClient
-(S1), transport swap with zero per-command wsl.exe spawns + blob/get
-(S2), sidecar auto-install with content-hash upgrade + CI musl artifact
-(S3), inotify store/worktree watching replacing the 1s digest poll —
-CLI comment → GUI measured at 139ms (S4). Each slice Fable-reviewed and
-live-verified against the real Ubuntu distro. REMAINING: slice S5
-(robustness: fs/* store methods off sh -c, badge-walk running-host-only
-policy, wedged-wsl.exe timeouts, resubscribe-on-respawn, stderr ring
-surfacing) + the acceptance benchmark vs the Phase-1 numbers (plan §7)
-+ the phase's Acceptance results doc section. Backlog carries the
-deferred S3/S4 review P3s.
+Phase 5 complete (WSL host, docs/phase-5-wsl.md § Acceptance results):
+all five slices shipped per docs/phase-5-implementation-plan.md —
+protocol + HostClient (S1), transport swap with zero per-command wsl.exe
+spawns + blob/get (S2), sidecar auto-install with content-hash upgrade +
+CI musl artifact (S3), inotify store/worktree watching replacing the 1s
+digest poll — CLI comment → GUI 139ms (S4), and robustness + acceptance
+(S5): fs/* store methods off sh -c (locale-proof remote store),
+badge-walk running-host-only policy (no distro boot at launch),
+bounded install-command timeouts, host-stderr surfacing on connection
+loss. Live-verified against the real Ubuntu distro. Acceptance benchmark
+reframed the win honestly: per-file diff and cold startup are UI-bound
+(tree-sitter), NOT git-I/O-bound, so the host holds per-file parity but
+its one-time spawn makes cold startup ~175ms slower; the real win is
+capability — native live watching (worktree watch has no Stage-A
+equivalent) + zero per-command spawns. DEFERRED to backlog (P3s, not
+Phase-5 gate): resubscribe-on-respawn after a mid-session host crash and
+moving watch subscribe/unsubscribe RPCs off the GUI thread. Backlog also
+carries the deferred S3/S4 review P3s and two Phase-7 startup leads
+(host spawn on the cold-start critical path; tree-sitter startup cost).

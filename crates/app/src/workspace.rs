@@ -358,6 +358,21 @@ struct PrPicker {
     /// would clobber the reopened picker's fresher state/timing. Mirrors
     /// `source_epoch`'s discard-if-superseded pattern.
     generation: u64,
+    /// When the currently-shown list was fetched — drives the "updated Nm
+    /// ago" freshness hint and `--automation`'s `age_ms` (Phase 7 D2). Only
+    /// `None` during a first-ever `Loading` (nothing cached yet to paint).
+    fetched_at: Option<std::time::Instant>,
+    /// A background revalidation over an already-shown cached list is in
+    /// flight (stale-while-revalidate) — the list stays visible + usable
+    /// the whole time. `false` while a first-ever (uncached) load is still
+    /// `Loading`, since there's nothing shown yet to call "refreshing".
+    refreshing: bool,
+    /// Last background-refresh failure, if the most recent revalidation
+    /// over an already-shown list failed. The stale list stays on screen
+    /// with this as a warning — stale-but-present beats correct-but-empty
+    /// for a picker the user is actively trying to act on (docs/
+    /// phase-7-performance.md deliverable 2).
+    refresh_error: Option<String>,
 }
 
 enum PrPickerState {
@@ -696,6 +711,26 @@ pub struct Workspace {
     pr_error: Option<String>,
     /// The PR-picker overlay (`ctrl-g`), when open.
     pr_picker: Option<PrPicker>,
+    /// Last `gh pr list` result for this workspace's repo, reused to paint
+    /// the picker instantly on reopen instead of a spinner (Phase 7 D2).
+    /// In-memory only; dies with the workspace today, and is kept alive
+    /// across sidebar switches for free once the S7-3 workspace LRU reuses
+    /// the entity. Tiny (`Vec<PrSummary>`: ints + short strings), scoped to
+    /// this one workspace/repo — not part of the S7-3 byte budget (that
+    /// tracks rendered-diff bytes, which this isn't). No TTL: `ctrl-g`
+    /// always revalidates in the background regardless of age (see
+    /// `on_open_pr_picker`); the `Instant` here is purely the freshness
+    /// hint's/`age_ms`'s timestamp, not an expiry.
+    pr_list_cache: Option<(Vec<PrSummary>, std::time::Instant)>,
+    /// `pr_picker_epoch` generation of the fetch that most recently wrote
+    /// `pr_list_cache`. The cache write in `on_open_pr_picker`'s completion
+    /// is deliberately unconditional on picker liveness (a closed, or
+    /// closed-then-reopened, picker must not discard a successful fetch —
+    /// review finding), but two in-flight fetches can still land
+    /// out-of-order; this lets the completion accept only a fetch at least
+    /// as new as the one that already wrote the cache, so an older result
+    /// can't clobber a fresher one. `None` until the first fetch lands.
+    pr_list_cache_generation: Option<u64>,
     /// Bumped every `on_open_pr_picker` call; stamped into the new
     /// `PrPicker::generation` and captured by that open's list-fetch spawn
     /// so a stale fetch from a since-closed-and-reopened picker can be
@@ -703,9 +738,11 @@ pub struct Workspace {
     /// generation`'s doc comment).
     pr_picker_epoch: u64,
     /// Wall-clock of the most recent `ctrl-g` PR-picker open, from dispatch
-    /// to the list leaving `Loading` (`Loaded`/`Error`) — Phase 7 D4
-    /// instrumentation (mirrors `last_diff_ms`), the cold baseline the S7-2
-    /// picker cache asserts a warm reopen against.
+    /// to the list leaving `Loading` (`Loaded`/`Error`) on a cold (no cache)
+    /// open. Phase 7 D4 instrumentation (mirrors `last_diff_ms`), the cold
+    /// baseline the S7-2 picker cache asserts a warm reopen against — a
+    /// warm open stamps this near-instantly instead (see
+    /// `on_open_pr_picker`), since there's no `Loading` frame to wait out.
     last_pr_list_ms: Option<u64>,
     /// Wall-clock of the most recent `open_pr`, from dispatch to its
     /// current-epoch completion (`Status::Ready` either way, success or
@@ -1201,6 +1238,8 @@ impl Workspace {
             pr_loading: None,
             pr_error: None,
             pr_picker: None,
+            pr_list_cache: None,
+            pr_list_cache_generation: None,
             pr_picker_epoch: 0,
             last_pr_list_ms: None,
             last_pr_open_ms: None,
@@ -2235,11 +2274,44 @@ impl Workspace {
         }
         self.pr_picker_epoch += 1;
         let generation = self.pr_picker_epoch;
-        self.pr_picker = Some(PrPicker {
-            state: PrPickerState::Loading,
-            selected: 0,
-            generation,
-        });
+        let t0 = std::time::Instant::now();
+        // Phase 7 D2: paint from `pr_list_cache` instantly instead of a
+        // spinner if this workspace already has a list on hand — there is
+        // no TTL gate here (always revalidate below, regardless of age);
+        // the cache only decides what's painted for the FIRST frame.
+        self.pr_picker = match self.pr_list_cache.clone() {
+            Some((prs, fetched_at)) => Some(PrPicker {
+                state: PrPickerState::Loaded(prs),
+                selected: 0,
+                generation,
+                fetched_at: Some(fetched_at),
+                refreshing: true,
+                refresh_error: None,
+            }),
+            None => Some(PrPicker {
+                state: PrPickerState::Loading,
+                selected: 0,
+                generation,
+                fetched_at: None,
+                refreshing: false,
+                refresh_error: None,
+            }),
+        };
+        // A warm open never shows `Loading` — it's `Loaded` in the same
+        // frame it's constructed above — so there's no "leaving Loading"
+        // moment for the completion below to time. Stamp `last_pr_list_ms`
+        // right here instead: dispatch-to-list-rendered for a warm open is
+        // this synchronous paint, and it should read near-zero (the whole
+        // point of D2 — no spinner frame). A cold (uncached) open leaves
+        // this untouched; its `last_pr_list_ms` is stamped by the
+        // completion below once the list actually leaves `Loading`.
+        if self
+            .pr_picker
+            .as_ref()
+            .is_some_and(|p| p.fetched_at.is_some())
+        {
+            self.last_pr_list_ms = Some(t0.elapsed().as_millis() as u64);
+        }
         // Capture focus onto the workspace's own handle while the picker is
         // open (Phase 7 D0 fix). `PrPickerChoose`'s Enter binding is scoped
         // `"Workspace && PrPickerOpen"` — that context is only on the
@@ -2255,9 +2327,12 @@ impl Workspace {
         window.focus(&self.focus_handle, cx);
         cx.notify();
 
-        // Phase 7 D4: dispatch-to-settled timing (mirrors `last_diff_ms`).
-        // Captured here, not inside the completion, so it covers the whole
-        // round trip including the background hop.
+        // Always revalidate in the background — even on a warm paint — so
+        // the list patches in place shortly after (stale-while-revalidate,
+        // Phase 7 D2). Phase 7 D4: dispatch-to-settled timing for the COLD
+        // path (mirrors `last_diff_ms`); captured here, not inside the
+        // completion, so it covers the whole round trip including the
+        // background hop.
         let started = std::time::Instant::now();
         cx.spawn(async move |this, cx| {
             let result = cx
@@ -2277,15 +2352,99 @@ impl Workspace {
                 // picker has already started its own fresh fetch/timing;
                 // this stale completion must not clobber its state or
                 // stamp a bogus `last_pr_list_ms` over it.
-                if let Some(picker) = &mut this.pr_picker
-                    && picker.generation == generation
+                let is_current = this
+                    .pr_picker
+                    .as_ref()
+                    .is_some_and(|p| p.generation == generation);
+                // Warm `pr_list_cache` on ANY successful fetch, whether or
+                // not the picker that triggered it is still open/current
+                // (review finding: gating the cache write on `is_current`
+                // silently discarded a successful fetch whenever the picker
+                // was closed — e.g. `escape` or `open_pr`'s Enter, both of
+                // which `take()` the picker — before the round trip
+                // landed, defeating "always revalidate" for the single most
+                // common interaction). Only guard against a genuinely
+                // out-of-order completion (an older generation's fetch
+                // landing after a newer one already wrote a fresher list)
+                // via `pr_list_cache_generation`, never against picker
+                // liveness.
+                if let Ok(prs) = &result
+                    && generation >= this.pr_list_cache_generation.unwrap_or(0)
                 {
-                    picker.selected = 0;
-                    picker.state = match result {
-                        Ok(prs) => PrPickerState::Loaded(prs),
-                        Err(err) => PrPickerState::Error(err),
-                    };
-                    this.last_pr_list_ms = Some(started.elapsed().as_millis() as u64);
+                    this.pr_list_cache = Some((prs.clone(), std::time::Instant::now()));
+                    this.pr_list_cache_generation = Some(generation);
+                }
+                if is_current {
+                    // Whether the picker was still showing its first-ever
+                    // (uncached) `Loading` frame when this landed — only
+                    // then does THIS completion own `last_pr_list_ms` (a
+                    // warm open already stamped it synchronously above).
+                    let was_cold_load = this
+                        .pr_picker
+                        .as_ref()
+                        .is_some_and(|p| matches!(p.state, PrPickerState::Loading));
+                    match result {
+                        Ok(prs) => {
+                            let now = std::time::Instant::now();
+                            if let Some(picker) = &mut this.pr_picker {
+                                // Preserve the user's navigation position
+                                // across the in-place list patch (dropping
+                                // the old unconditional `selected = 0`
+                                // reset) by PR IDENTITY, not raw index — a
+                                // revalidation that reorders or grows the
+                                // list (e.g. a new PR opened upstream lands
+                                // at the top) must not silently repoint the
+                                // highlight at a different PR just because
+                                // the index still fits. Re-find the
+                                // previously-highlighted PR's number in the
+                                // fresh list; if that PR is gone (closed/
+                                // merged upstream since the cached list was
+                                // shown), reset to the top rather than
+                                // falling back to the same raw index, which
+                                // would silently land on whatever unrelated
+                                // PR shifted into that slot (review finding:
+                                // a clamped-index fallback repoints the
+                                // highlight without any visible jump, so
+                                // Enter can open a PR the user never chose).
+                                let prev_number = match &picker.state {
+                                    PrPickerState::Loaded(old) => {
+                                        old.get(picker.selected).map(|pr| pr.number)
+                                    }
+                                    _ => None,
+                                };
+                                picker.selected = match prev_number {
+                                    Some(n) => {
+                                        prs.iter().position(|pr| pr.number == n).unwrap_or(0)
+                                    }
+                                    None => 0,
+                                };
+                                picker.state = PrPickerState::Loaded(prs);
+                                picker.fetched_at = Some(now);
+                                picker.refreshing = false;
+                                picker.refresh_error = None;
+                            }
+                        }
+                        Err(err) => {
+                            if let Some(picker) = &mut this.pr_picker {
+                                if matches!(picker.state, PrPickerState::Loaded(_)) {
+                                    // Stale-but-present beats correct-but-
+                                    // empty (docs/phase-7-performance.md
+                                    // deliverable 2): a revalidation over an
+                                    // already-shown list keeps that list up
+                                    // and just surfaces the failure as a
+                                    // warning instead of blanking it.
+                                    picker.refreshing = false;
+                                    picker.refresh_error = Some(err);
+                                } else {
+                                    picker.state = PrPickerState::Error(err);
+                                    picker.refreshing = false;
+                                }
+                            }
+                        }
+                    }
+                    if was_cold_load {
+                        this.last_pr_list_ms = Some(started.elapsed().as_millis() as u64);
+                    }
                 }
                 cx.notify();
             })
@@ -2471,6 +2630,11 @@ impl Workspace {
                 "review_database_id": t.review_database_id,
             })).collect::<Vec<_>>(),
             "pr_picker_open": self.pr_picker.is_some(),
+            // Phase 7 D2: `refreshing`/`refresh_error`/`age_ms` make the
+            // paint-from-cache-then-revalidate shape assertable without a
+            // screenshot — a warm open is `loading: false` with
+            // `refreshing: true` in the SAME frame it opens (no spinner),
+            // and `age_ms` is how stale that instantly-painted list was.
             "pr_picker": self.pr_picker.as_ref().map(|p| json!({
                 "loading": matches!(p.state, PrPickerState::Loading),
                 "items": match &p.state {
@@ -2482,6 +2646,9 @@ impl Workspace {
                     PrPickerState::Error(err) => Some(err.clone()),
                     _ => None,
                 },
+                "refreshing": p.refreshing,
+                "refresh_error": p.refresh_error,
+                "age_ms": p.fetched_at.map(|at| at.elapsed().as_millis() as u64),
             })),
             "submit": self.submit.as_ref().map(|flow| match flow {
                 SubmitFlow::Validating { verdict } => json!({
@@ -4416,6 +4583,45 @@ impl Workspace {
         let danger = theme.danger;
         let mono = theme.mono_font_family.clone();
 
+        // Phase 7 D2 freshness hint: a warning if the background revalidation
+        // most recently failed (stale list stays on screen either way — see
+        // the `Err` arm in `on_open_pr_picker`), else "refreshing…" while one
+        // is in flight, else "updated Ns/Nm ago" for whatever's currently
+        // shown. `None` only for a first-ever (uncached) `Loading` open,
+        // which has nothing to date yet.
+        let freshness: Option<SharedString> = if let Some(err) = &picker.refresh_error {
+            // Cap to a single line and a small width: `refresh_error` is the
+            // raw `gh` failure string, which can be multi-line/multi-KB
+            // (crates/core/src/github/client.rs truncates it only at 2000
+            // bytes, not to one line). Left uncapped, it squishes/wraps the
+            // "esc to close" label next to it in this fixed-width header
+            // (review finding). The untruncated error is still available
+            // verbatim via `--automation`'s `refresh_error` field.
+            const MAX_CHARS: usize = 60;
+            let first_line = err.lines().next().unwrap_or("");
+            let capped: SharedString = if first_line.chars().count() > MAX_CHARS {
+                format!(
+                    "{}…",
+                    first_line.chars().take(MAX_CHARS).collect::<String>()
+                )
+                .into()
+            } else {
+                first_line.to_string().into()
+            };
+            Some(format!("stale — refresh failed: {capped}").into())
+        } else if picker.refreshing {
+            Some("refreshing…".into())
+        } else {
+            picker.fetched_at.map(|at| {
+                let secs = at.elapsed().as_secs();
+                if secs < 60 {
+                    format!("updated {secs}s ago").into()
+                } else {
+                    format!("updated {}m ago", secs / 60).into()
+                }
+            })
+        };
+
         let body: AnyElement =
             match &picker.state {
                 PrPickerState::Loading => div()
@@ -4534,12 +4740,34 @@ impl Workspace {
                         .rounded_lg()
                         .shadow_lg()
                         .child(
-                            div()
+                            h_flex()
+                                .w_full()
+                                .justify_between()
                                 .px_2()
                                 .pt_1()
-                                .text_xs()
-                                .text_color(muted)
-                                .child("Open PRs \u{b7} enter to open, esc to close"),
+                                .child(
+                                    div()
+                                        .flex_shrink_0()
+                                        .text_xs()
+                                        .text_color(muted)
+                                        .child("Open PRs \u{b7} enter to open, esc to close"),
+                                )
+                                .when_some(freshness, |el, hint| {
+                                    let color = if picker.refresh_error.is_some() {
+                                        danger
+                                    } else {
+                                        muted
+                                    };
+                                    el.child(
+                                        div()
+                                            .min_w(px(0.))
+                                            .max_w(px(260.))
+                                            .truncate()
+                                            .text_xs()
+                                            .text_color(color)
+                                            .child(hint),
+                                    )
+                                }),
                         )
                         .child(body),
                 ),

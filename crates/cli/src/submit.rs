@@ -1,11 +1,12 @@
 //! Shared GitHub review-submission core: the pure comment→[`DraftComment`]
 //! mapping, pre-submission validation, and the post-success local writeback
-//! — reused by both `dv review submit` (`crates/app/src/cli/pr_cmd.rs`) and
-//! the GUI's submit flow (`crates/app/src/workspace.rs`'s `SubmitFlow`,
-//! docs/phase-3-github.md deliverable 3/5). Originally lived entirely in
-//! `cli/pr_cmd.rs`; factored out here (a sibling of `pr.rs`, which already
-//! holds `prepare_pr`/`PrRange`) so the GUI doesn't duplicate — or drift
-//! from — the CLI's validation rules.
+//! — reused by both `dv review submit` (`crates/cli/src/pr_cmd.rs`) and the
+//! GUI's submit flow (`crates/app/src/workspace.rs`'s `SubmitFlow`, via
+//! `dv_cli::submit`, docs/phase-3-github.md deliverable 3/5). Originally
+//! lived entirely in `pr_cmd.rs`; factored out here (a sibling of `pr.rs`,
+//! which already holds `prepare_pr`/`PrRange`) so the GUI doesn't duplicate
+//! — or drift from — the CLI's validation rules (crate-boundary move:
+//! Phase 8 S8b).
 //!
 //! `pr_cmd.rs` keeps only CLI concerns: argument parsing, `--pr`/verdict
 //! resolution, `format_violations` (turns a `&[Violation]` into the CLI's

@@ -23,7 +23,8 @@
 //!  6. the literal string `"you"`.
 //!
 //! Deliberately takes only a [`GitRepo`] (no CLI-only types), so the GUI
-//! can call it too once it's wired in there (a later task).
+//! calls it too (`crates/app/src/workspace.rs`, via `dv_cli::author::
+//! resolve_author`) instead of duplicating the resolution chain.
 
 use std::collections::HashMap;
 use std::path::PathBuf;

@@ -1,19 +1,21 @@
 //! `dv pr <list|view|create|fetch>` and `dv review submit` — the
-//! GitHub-backed extensions of the headless CLI (see `super`'s module doc
-//! and docs/phase-3-github.md). A child module of `cli` purely so it can
-//! reuse `cli`'s private plumbing (`CliError`, `resolve_repo`, `print_json`,
-//! `REVIEW_USAGE`, ...) via `super::` — Rust visibility already allows a
-//! descendant module to see its ancestor's private items, so none of that
-//! needed to become `pub(crate)`.
+//! GitHub-backed extensions of the headless CLI (see the crate root's
+//! (`lib.rs`) module doc and docs/phase-3-github.md). A child module of the
+//! crate root purely so it can reuse the root's private plumbing
+//! (`CliError`, `resolve_repo`, `print_json`, `REVIEW_USAGE`, ...) via
+//! `super::` — Rust visibility already allows a descendant module to see
+//! its ancestor's private items, so none of that needed to become
+//! `pub(crate)`.
 //!
 //! The comment→[`dv_core::DraftComment`] mapping and pre-submission
-//! validation this module used to own outright now live in
-//! `crate::submit` (a sibling of `cli`, not a descendant) — the GUI's
-//! submit flow (`workspace.rs`) needs the exact same rules, so they moved
-//! out to where both can reach them (docs/phase-3-github.md deliverable
-//! 3/5). This module keeps only CLI concerns: argument parsing, `--pr`/
-//! verdict resolution, and formatting `crate::submit::Violation`s into the
-//! CLI's text output.
+//! validation this module used to own outright now live in `crate::submit`
+//! (a sibling of this module, not a descendant) — the GUI's submit flow
+//! (`crates/app/src/workspace.rs`, which reaches it via `dv_cli::submit`)
+//! needs the exact same rules, so they moved out to where both can reach
+//! them (docs/phase-3-github.md deliverable 3/5; the crate-boundary move
+//! itself is Phase 8 S8b). This module keeps only CLI concerns: argument
+//! parsing, `--pr`/verdict resolution, and formatting
+//! `crate::submit::Violation`s into the CLI's text output.
 
 use dv_core::{
     ChecksSummary, CreatePr, CreatedPr, GhError, GitRepo, GithubClient, PrMeta, PrState, PrSummary,

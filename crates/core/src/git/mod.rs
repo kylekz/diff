@@ -33,6 +33,32 @@ pub enum DiffSource {
     Commit(String),
 }
 
+/// Parse a `--range` value (`<a>..<b>` or `<a>...<b>`, the latter resolving
+/// against the merge base) into a [`DiffSource::Range`]. Shared by the GUI's
+/// own `--range` flag (`crates/app/src/main.rs::parse_args`) and `dv-cli`'s
+/// `review create --range` (`crates/cli/src/lib.rs`) — both need the exact
+/// same `a..b` / `a...b` parsing, and this returns a `DiffSource`, so
+/// dv-core (not either CLI-shaped crate) is its natural home (Phase 8, S8b).
+pub fn parse_range(value: &str) -> Result<DiffSource, String> {
+    let (base, head, merge_base) = if let Some((b, h)) = value.split_once("...") {
+        (b, h, true)
+    } else if let Some((b, h)) = value.split_once("..") {
+        (b, h, false)
+    } else {
+        return Err(format!(
+            "--range expects <a>..<b> or <a>...<b>, got: {value}"
+        ));
+    };
+    if base.is_empty() || head.is_empty() {
+        return Err(format!("--range endpoints must be non-empty: {value}"));
+    }
+    Ok(DiffSource::Range {
+        base: base.to_string(),
+        head: head.to_string(),
+        merge_base,
+    })
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ChangeStatus {
     Added,
@@ -656,6 +682,43 @@ fn parse_ls_files_stage0_sha(output: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // --- parse_range (moved from crates/app/src/main.rs, Phase 8 S8b) -----
+
+    #[test]
+    fn parse_range_two_dot() {
+        assert_eq!(
+            parse_range("main..feature"),
+            Ok(DiffSource::Range {
+                base: "main".to_string(),
+                head: "feature".to_string(),
+                merge_base: false,
+            })
+        );
+    }
+
+    #[test]
+    fn parse_range_three_dot_is_merge_base() {
+        assert_eq!(
+            parse_range("main...feature"),
+            Ok(DiffSource::Range {
+                base: "main".to_string(),
+                head: "feature".to_string(),
+                merge_base: true,
+            })
+        );
+    }
+
+    #[test]
+    fn parse_range_rejects_missing_separator() {
+        assert!(parse_range("main").is_err());
+    }
+
+    #[test]
+    fn parse_range_rejects_empty_endpoints() {
+        assert!(parse_range("..feature").is_err());
+        assert!(parse_range("main..").is_err());
+    }
 
     #[test]
     fn parses_simple_statuses() {

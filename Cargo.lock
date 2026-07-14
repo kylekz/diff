@@ -1403,6 +1403,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "dirs",
+ "dv-cli",
  "dv-core",
  "futures",
  "gpui",
@@ -1411,6 +1412,18 @@ dependencies = [
  "gpui_platform",
  "png 0.17.16",
  "ropey",
+ "serde",
+ "serde_json",
+ "windows-sys 0.59.0",
+]
+
+[[package]]
+name = "dv-cli"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "dirs",
+ "dv-core",
  "serde",
  "serde_json",
  "windows-sys 0.59.0",

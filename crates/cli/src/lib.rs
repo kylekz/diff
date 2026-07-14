@@ -1,21 +1,38 @@
 //! `dv review …` / `dv comment …` / `dv pr …` — the agent-facing CLI
-//! (docs/phase-2-review-layer.md § Agent CLI, docs/phase-3-github.md). Pure
-//! headless path: this module must never import `gpui` or anything that
-//! touches a window. `main.rs` branches here before any gpui initialization
-//! when `argv[1]` is `"review"`, `"comment"`, or `"pr"`. `pr_cmd` (the `dv
-//! pr ...` subcommands, plus `dv review submit`) lives in its own child
-//! module — see its doc comment.
+//! (docs/phase-2-review-layer.md § Agent CLI, docs/phase-3-github.md).
+//! Gpui-free by construction (a separate workspace crate, not just a module
+//! under a gpui-linked binary — Phase 8 S8b promoted the earlier
+//! `crates/app/src/cli.rs` module into this standalone crate so it can also
+//! build as a native Linux binary; docs/phase-8-lsp-and-polish.md §
+//! Distribution & first-run). Two callers reach [`run`]:
+//!   - `crates/app/src/main.rs` branches here before any gpui
+//!     initialization when `argv[1]` is `"review"`, `"comment"`, or `"pr"`
+//!     (already validated by that dispatch check);
+//!   - this crate's own `main.rs` (the `dv-cli` binary, installed WSL-side
+//!     as `~/.local/bin/dv` by the S8c provisioner) passes `argv[1..]`
+//!     straight through, unfiltered — so [`run`] itself has to handle
+//!     `--version` and an unrecognized/missing first argument gracefully
+//!     rather than assume a caller already checked.
+//!
+//! `pr_cmd` (the `dv pr ...` subcommands, plus `dv review submit`) lives in
+//! its own child module — see its doc comment. `submit`/`pr`/`author` are
+//! `pub` so the GUI (`crates/app/src/workspace.rs`) can reach the same
+//! submit-validation/PR-prep/author-resolution rules through `dv_cli::`
+//! instead of duplicating them.
 //!
 //! `dv comment list --status open --json` is the canonical "what does the
 //! reviewer want from me" query for Claude Code — see CLAUDE.md § Review
 //! CLI. The JSON shapes documented on each `print_*` function below are a
 //! stable contract: agents parse them.
 //!
-//! Parsing is hand-rolled (no clap), matching `main.rs`'s style: a `while
-//! let Some(arg) = iter.next()` loop per subcommand, `--flag` consuming the
-//! next token as its value.
+//! Parsing is hand-rolled (no clap), matching the app's `main.rs` style: a
+//! `while let Some(arg) = iter.next()` loop per subcommand, `--flag`
+//! consuming the next token as its value.
 
+pub mod author;
+pub mod pr;
 mod pr_cmd;
+pub mod submit;
 
 use std::path::PathBuf;
 
@@ -25,19 +42,32 @@ use dv_core::{
 };
 use serde_json::{Value, json};
 
-/// Entry point called from `main.rs`. `args[0]` is `"review"` or
-/// `"comment"` (guaranteed by the caller's dispatch check); the rest are
-/// that subcommand's own arguments. Returns the process exit code.
+const TOP_USAGE: &str = "\
+usage: dv <review|comment|pr> [options]
+       dv --version
+
+  review    manage local reviews (see `dv review --help`)
+  comment   manage review comments (see `dv comment --help`)
+  pr        GitHub PR operations (see `dv pr --help`)
+  --version print the dv-cli version";
+
+/// Entry point for both `crates/app/src/main.rs`'s headless dispatch (which
+/// pre-filters `argv[1]` to `{review, comment, pr}` before ever calling
+/// this) and the native `dv-cli` binary's own `main()` (which passes
+/// `argv[1..]` straight through, unfiltered) — see the module doc. Returns
+/// the process exit code.
 pub fn run(args: &[String]) -> i32 {
     // SAFETY: `AttachConsole` is documented as safe to call unconditionally
     // (it merely attaches this process to its parent console if one exists
-    // and this process has none). A release build is
+    // and this process has none). A release build of the GUI binary is
     // `windows_subsystem = "windows"` and so starts with no console at all;
     // run from an interactive console, its stdout/stderr would otherwise go
     // nowhere. Failure (already attached — always true in debug builds,
     // which are console-subsystem — or no parent console, e.g. launched
     // from Explorer) is harmless and deliberately ignored: piped/redirected
     // stdio (the case that actually matters for agents) works regardless.
+    // A no-op on the native `dv-cli` Linux binary (this whole block is
+    // `#[cfg(windows)]`).
     #[cfg(windows)]
     unsafe {
         windows_sys::Win32::System::Console::AttachConsole(
@@ -49,7 +79,41 @@ pub fn run(args: &[String]) -> i32 {
         Some("review") => dispatch(&args[1..], REVIEW_USAGE, review_router),
         Some("comment") => dispatch(&args[1..], COMMENT_USAGE, comment_router),
         Some("pr") => dispatch(&args[1..], pr_cmd::PR_USAGE, pr_cmd::pr_router),
-        _ => unreachable!("cli::run requires argv[1] in {{review, comment, pr}}"),
+        // Version-sync is by content hash, not this string (see
+        // `crates/core/src/remote/install.rs`'s module doc) — `--version`
+        // is purely a diagnostic nicety. It's reachable from BOTH callers:
+        // the native `dv-cli` binary passes it straight through, and
+        // `crates/app/src/main.rs`'s headless dispatch also routes
+        // `dv.exe --version`/`-V` here before touching gpui. Print the
+        // invoking binary's own name (argv[0]'s file stem) rather than a
+        // hardcoded "dv-cli" so it reads correctly either way — including
+        // once the S8c provisioner has installed the native binary
+        // WSL-side under the `dv` filename.
+        Some("--version") | Some("-V") => {
+            let program = std::env::args()
+                .next()
+                .and_then(|arg0| {
+                    PathBuf::from(arg0)
+                        .file_stem()
+                        .map(|stem| stem.to_string_lossy().into_owned())
+                })
+                .unwrap_or_else(|| "dv".to_string());
+            println!("{program} {}", env!("CARGO_PKG_VERSION"));
+            0
+        }
+        Some(other) => {
+            let reason = format!("unknown command: {other}");
+            eprintln!("{reason}\n\n{TOP_USAGE}");
+            if args.iter().any(|a| a == "--json") {
+                println!("{}", json!({ "error": reason }));
+            }
+            2
+        }
+        None => {
+            eprintln!("{TOP_USAGE}");
+            // No args at all means no `--json` either — nothing to prescan.
+            2
+        }
     }
 }
 
@@ -285,7 +349,7 @@ fn parse_review_create(args: &[String]) -> Result<DiffSource, String> {
                 let value = iter
                     .next()
                     .ok_or("--range requires <a>..<b> or <a>...<b>")?;
-                let candidate = crate::parse_range(value)?;
+                let candidate = dv_core::parse_range(value)?;
                 set_source_once(&mut source, candidate)?;
             }
             "--commit" => {

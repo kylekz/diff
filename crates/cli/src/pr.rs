@@ -1,8 +1,9 @@
 //! `prepare_pr`: given a GitHub PR's metadata, make sure its commits exist
 //! locally and compute the diff range dv uses everywhere else — the one
-//! function both `dv pr fetch`/`dv review submit`
-//! (crates/app/src/cli/pr_cmd.rs) and the future GUI "open PR" flow share,
-//! per docs/phase-3-github.md deliverable 2.
+//! function both `dv pr fetch`/`dv review submit` (`crates/cli/src/pr_cmd.rs`)
+//! and the GUI's "open PR" flow (`crates/app/src/workspace.rs`, via
+//! `dv_cli::pr::prepare_pr`) share, per docs/phase-3-github.md deliverable
+//! 2 (crate-boundary move: Phase 8 S8b).
 
 use anyhow::{Result, anyhow};
 use dv_core::{GitRepo, PrMeta};

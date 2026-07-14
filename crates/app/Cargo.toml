@@ -6,6 +6,7 @@ publish.workspace = true
 
 [dependencies]
 anyhow.workspace = true
+dv-cli.workspace = true
 dv-core.workspace = true
 gpui.workspace = true
 gpui_platform.workspace = true

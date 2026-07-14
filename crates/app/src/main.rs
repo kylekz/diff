@@ -7,17 +7,13 @@
 // at compile time.
 #![recursion_limit = "256"]
 
-mod author;
 #[cfg(feature = "automation")]
 mod automation;
-mod cli;
 mod fuzzy;
 mod highlight;
-mod pr;
 mod recent;
 mod settings;
 mod shell;
-mod submit;
 mod themes;
 mod workspace;
 
@@ -119,7 +115,7 @@ fn parse_args() -> Result<Cli, String> {
                 let value = args
                     .next()
                     .ok_or("--range requires <a>..<b> or <a>...<b>")?;
-                source = parse_range(&value)?;
+                source = dv_core::parse_range(&value)?;
                 seen_repo_arg = true;
             }
             other if other.starts_with('-') => {
@@ -153,11 +149,12 @@ fn parse_args() -> Result<Cli, String> {
 
 /// The first non-flag token in `dv pr <...>` (everything after `"pr"`),
 /// skipping `--repo <path>` / `--wsl <spec>` / `--json` exactly like
-/// `cli::extract_location_globals` does — so `dv pr --repo X list` and
-/// `dv pr list --repo X` both see `"list"` here, matching whatever
-/// `cli::run` will itself dispatch on. `None` means every token was
-/// consumed as a flag (or there were none): `dv pr` alone stays headless so
-/// `cli::run` prints its own "missing subcommand" usage error.
+/// `dv_cli`'s (private) `extract_location_globals` does — so `dv pr --repo X
+/// list` and `dv pr list --repo X` both see `"list"` here, matching
+/// whatever `dv_cli::run` will itself dispatch on. `None` means every token
+/// was consumed as a flag (or there were none): `dv pr` alone stays
+/// headless so `dv_cli::run` prints its own "missing subcommand" usage
+/// error.
 fn pr_first_positional(args: &[String]) -> Option<&str> {
     let mut iter = args.iter();
     while let Some(arg) = iter.next() {
@@ -173,10 +170,11 @@ fn pr_first_positional(args: &[String]) -> Option<&str> {
 }
 
 /// `dv pr <target>`'s failure modes, split by exit code the same way
-/// `cli::CliError` splits `Usage`/`Op`: a malformed target (not a number,
-/// not a recognizable PR URL) is a parse error (exit 2, printed before
-/// touching any repo); a target that parsed fine but doesn't match this
-/// repo is caught only once a repo is actually opened (exit 1).
+/// `dv_cli`'s (private) `CliError` splits `Usage`/`Op`: a malformed target
+/// (not a number, not a recognizable PR URL) is a parse error (exit 2,
+/// printed before touching any repo); a target that parsed fine but
+/// doesn't match this repo is caught only once a repo is actually opened
+/// (exit 1).
 #[derive(Debug)]
 enum PrArgError {
     Parse(String),
@@ -337,28 +335,6 @@ fn parse_pr_url(url: &str) -> Result<PrUrlTarget, String> {
     })
 }
 
-/// `pub(crate)` so `cli.rs`'s `review create --range` can reuse the exact
-/// same `a..b` / `a...b` parsing instead of drifting a second copy.
-pub(crate) fn parse_range(value: &str) -> Result<DiffSource, String> {
-    let (base, head, merge_base) = if let Some((b, h)) = value.split_once("...") {
-        (b, h, true)
-    } else if let Some((b, h)) = value.split_once("..") {
-        (b, h, false)
-    } else {
-        return Err(format!(
-            "--range expects <a>..<b> or <a>...<b>, got: {value}"
-        ));
-    };
-    if base.is_empty() || head.is_empty() {
-        return Err(format!("--range endpoints must be non-empty: {value}"));
-    }
-    Ok(DiffSource::Range {
-        base: base.to_string(),
-        head: head.to_string(),
-        merge_base,
-    })
-}
-
 /// Embeds the bundled JetBrains Mono TTFs and registers them with gpui's
 /// text system so `mono_font_family: "JetBrains Mono"` (set uniformly by
 /// `themes::apply_theme`) resolves even on a machine that doesn't have the
@@ -406,8 +382,8 @@ fn main() {
     // by `pr_first_positional` before anything commits to either path.
     let raw_args: Vec<String> = std::env::args().collect();
     if let Some(sub) = raw_args.get(1) {
-        if sub == "review" || sub == "comment" {
-            let code = cli::run(&raw_args[1..]);
+        if sub == "review" || sub == "comment" || sub == "--version" || sub == "-V" {
+            let code = dv_cli::run(&raw_args[1..]);
             std::process::exit(code);
         }
         if sub == "pr" {
@@ -417,7 +393,7 @@ fn main() {
                 None | Some("list") | Some("view") | Some("create") | Some("fetch")
             );
             if headless {
-                let code = cli::run(&raw_args[1..]);
+                let code = dv_cli::run(&raw_args[1..]);
                 std::process::exit(code);
             }
             match parse_pr_gui_args(rest) {

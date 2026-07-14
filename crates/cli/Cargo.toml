@@ -1,0 +1,41 @@
+[package]
+name = "dv-cli"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+# Both a lib (`dv_cli` — the GUI's `dv` crate depends on it for the
+# submit/pr/author plumbing it shares with the agent CLI) and a native
+# binary (`dv-cli`, NOT `dv` — the `dv` package already produces a `dv`/
+# `dv.exe` binary target, and two same-named binaries collide at
+# `target/release/`). Phase 8 S8b: this bin target is what gets built for
+# `x86_64-unknown-linux-musl` and installed WSL-side as `~/.local/bin/dv`
+# (crates/core/src/remote/install.rs's `CLI_SPEC`, S8c) — the installer
+# streams bytes onto that stable path regardless of the source filename,
+# exactly like `dv-host-linux-x64` installs as `dv-host`.
+[lib]
+name = "dv_cli"
+path = "src/lib.rs"
+
+[[bin]]
+name = "dv-cli"
+path = "src/main.rs"
+
+# Deliberately minimal — NO gpui, not even transitively, or the musl build
+# (docs/phase-8-lsp-and-polish.md § Release) breaks. `author.rs`/`pr.rs`/
+# `submit.rs` were already gpui-free and already shared with the GUI before
+# this move; this crate just gives them (plus `cli.rs`/`pr_cmd.rs`) a home
+# that can compile as a standalone Linux binary.
+[dependencies]
+anyhow.workspace = true
+dv-core.workspace = true
+serde_json = "1.0.150"
+serde = { version = "1.0.228", features = ["derive"] }
+dirs = "6.0.0"
+
+# `cli::run`'s `AttachConsole` shim (so piped/redirected stdio works when
+# `dv.exe` is run from an interactive console) needs this on Windows only —
+# harmless no-op everywhere else, but the crate still needs the dependency
+# available when building `dv-cli.exe` for Windows.
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = ["Win32_System_Console"] }

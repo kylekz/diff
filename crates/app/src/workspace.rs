@@ -2,6 +2,13 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::ops::Range;
 use std::sync::Arc;
 
+use dv_cli::submit::{self, SubmissionOutcome, Violation};
+// Consumed by `violation_kind_word` (automation-only, see below) in
+// production, and by this module's own `#[cfg(test)]` fixtures
+// (`dummy_violation`) regardless of feature — so it's needed whenever
+// either is compiled in.
+#[cfg(any(feature = "automation", test))]
+use dv_cli::submit::ViolationKind;
 use dv_core::{
     BlobSpec, ChangeStatus, ChangedFile, ChecksSummary, DiffOptions, DiffSource, FileDiff, GhSide,
     GitRepo, GithubClient, LineKind, PrMeta, PrState, PrSummary, RemoteRef, RemoteThread,
@@ -14,13 +21,6 @@ use gpui_component::{ActiveTheme, Disableable as _, StyledExt as _, h_flex, v_fl
 
 use crate::highlight::{self, LineRuns};
 use crate::settings::{SUMMARY_WIDTH_MAX, SUMMARY_WIDTH_MIN, ViewModeSetting};
-use crate::submit::{self, SubmissionOutcome, Violation};
-// Consumed by `violation_kind_word` (automation-only, see below) in
-// production, and by this module's own `#[cfg(test)]` fixtures
-// (`dummy_violation`) regardless of feature — so it's needed whenever
-// either is compiled in.
-#[cfg(any(feature = "automation", test))]
-use crate::submit::ViolationKind;
 
 actions!(
     workspace,
@@ -495,7 +495,7 @@ struct SubmitPrep {
 /// (the pre-existing local finish) regardless of this field.
 enum SubmitFlow {
     /// Background validation in flight: fresh `pr_meta` + `prepare_pr` +
-    /// `crate::submit::build_submission`. No `gh` write has happened yet.
+    /// `dv_cli::submit::build_submission`. No `gh` write has happened yet.
     Validating {
         // Only read by `automation_state`'s JSON dump — the render match
         // below matches this variant with `{ .. }` since the panel text is
@@ -535,8 +535,8 @@ enum SubmitFlow {
     },
     /// Either the `gh` submission itself failed, or (rarer, and far worse)
     /// it succeeded but the local writeback then failed — `message` is
-    /// `crate::submit::writeback_failure_message`'s text in that case, which
-    /// warns against ever retrying.
+    /// `dv_cli::submit::writeback_failure_message`'s text in that case,
+    /// which warns against ever retrying.
     Failed {
         #[cfg_attr(not(feature = "automation"), allow(dead_code))]
         verdict: dv_core::Verdict,
@@ -872,7 +872,7 @@ pub struct Workspace {
     /// Phase 7 D3 automation assertion. `None` before the first `open_pr`.
     last_pr_open_cache_hit: Option<bool>,
     /// Comment/reply author, resolved once in the background at load
-    /// (`crate::author::resolve_author`). `None` until that resolves —
+    /// (`dv_cli::author::resolve_author`). `None` until that resolves —
     /// callers fall back to a placeholder rather than block on it.
     author: Option<String>,
     /// GitHub submission flow state (docs/phase-3-github.md deliverable 2),
@@ -1068,12 +1068,12 @@ pub(crate) fn source_label(source: &DiffSource) -> &'static str {
 }
 
 /// String forms of the GitHub types [`Workspace::automation_state`] dumps —
-/// small, deliberately duplicated copies of `cli/pr_cmd.rs`'s private
-/// equivalents (that module isn't `pub`, and these are one match arm each).
-/// `pub(crate)` so `shell.rs`'s sidebar badge dump (deliverable 3) reuses
-/// these instead of growing a third copy — that module isn't a descendant
-/// of this one the way `cli::pr_cmd` fails to be, so plain visibility is
-/// enough.
+/// small, deliberately duplicated copies of `crates/cli/src/pr_cmd.rs`'s
+/// private equivalents (that module isn't `pub`, and these are one match
+/// arm each). `pub(crate)` so `shell.rs`'s sidebar badge dump
+/// (deliverable 3) reuses these instead of growing a third copy — that
+/// module isn't a descendant of this one the way `dv_cli`'s `pr_cmd` fails
+/// to be, so plain visibility is enough.
 #[cfg(feature = "automation")]
 pub(crate) fn pr_state_word(state: PrState) -> &'static str {
     match state {
@@ -1197,7 +1197,7 @@ fn load_pr(repo: &GitRepo, number: u64, location: RepoLocation) -> anyhow::Resul
     let client = GithubClient::for_repo(repo)?;
     client.preflight()?;
     let meta = client.pr_meta(number)?;
-    let range = crate::pr::prepare_pr(repo, &meta)?;
+    let range = dv_cli::pr::prepare_pr(repo, &meta)?;
     // `range.merge_base` is already the resolved merge-base tip — build the
     // concrete two-dot source directly rather than routing back through
     // `resolve_source`'s `merge_base: true` path (which would just
@@ -1580,7 +1580,7 @@ impl Workspace {
                     // on first use) so new comments/replies stamp the real
                     // author from the very first one, not just once some
                     // later save happens to trigger it.
-                    let author = crate::author::resolve_author(&repo);
+                    let author = dv_cli::author::resolve_author(&repo);
                     anyhow::Ok((
                         Arc::new(repo),
                         head,
@@ -4002,7 +4002,7 @@ impl Workspace {
     }
 
     /// Background validation for a PR-linked verdict click: fresh
-    /// `pr_meta` + `prepare_pr` + `crate::submit::build_submission` — no
+    /// `pr_meta` + `prepare_pr` + `dv_cli::submit::build_submission` — no
     /// `gh` write happens here, only reads. Lands on `Blocked` (a clear
     /// violation list) or `Confirming` (built and waiting on an explicit
     /// [Submit to GitHub] click). Epoch-guarded on `submit_epoch` (review
@@ -4041,7 +4041,7 @@ impl Workspace {
                     if meta.state != dv_core::PrState::Open {
                         anyhow::bail!(submit::pr_not_open_message(pr_number, &meta));
                     }
-                    let pr_range = crate::pr::prepare_pr(&repo, &meta)?;
+                    let pr_range = dv_cli::pr::prepare_pr(&repo, &meta)?;
                     let outcome = submit::build_submission(
                         &repo,
                         &pr_range.merge_base,
@@ -4436,7 +4436,7 @@ impl Workspace {
         let location = self.location.clone();
         let source = self.source.clone();
         let existing = self.review.clone();
-        // Resolved once at load (`crate::author::resolve_author`); falls
+        // Resolved once at load (`dv_cli::author::resolve_author`); falls
         // back to the same placeholder the CLI defaults to until it lands.
         let author = self.author.clone().unwrap_or_else(|| "human".to_string());
 

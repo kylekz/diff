@@ -211,3 +211,20 @@ Phase-5 gate): resubscribe-on-respawn after a mid-session host crash and
 moving watch subscribe/unsubscribe RPCs off the GUI thread. Backlog also
 carries the deferred S3/S4 review P3s and two Phase-7 startup leads
 (host spawn on the cold-start critical path; tree-sitter startup cost).
+Phase 6 complete (review navigator, docs/phase-6-review-navigator.md §
+Acceptance results): six slices S6a–S6f — a headless cross-repo review
+index in dv-core cached in the app-data dir (S6a), shell two-phase
+WSL-gated hydration (S6b), review-centric two-line sidebar cards with
+explicit switching incl. submitted-read-only (S6c), grouping (repo/
+status/PR) + filtering persisted in settings (S6d), out-of-diff comment
+surfacing with jump-switches-source (S6e), and read-only GitHub thread
+pull via `gh api graphql` with resolved-state sync onto own submitted
+threads (S6f). Closes the "my comment vanished" priority cluster — the
+incident replay (comment on a non-default review, switch away/back)
+passes, and github.com resolve → dv-shows-resolved was live-verified
+against kylekz/difftest PR#1. A phase-boundary integration review caught
+4 cross-slice bugs (a watcher-reload wrong-review race the most serious)
+that per-slice reviews couldn't see; all fixed. DEFERRED to backlog
+(P3s): read-only thread mutation buttons render but no-op (dim/hide);
+card absolute-timestamp hover tooltip (no tooltip idiom in this crate);
+location-canonicalization double-hydrate; flaky host watch test.

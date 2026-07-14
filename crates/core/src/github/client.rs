@@ -15,10 +15,23 @@ use std::process::{Command, Stdio};
 
 use super::error::GhError;
 use super::models::{
-    CreatePr, CreatedPr, PrMeta, PrStatus, PrSummary, ReviewSubmission, SubmittedReview,
+    CreatePr, CreatedPr, PrMeta, PrStatus, PrSummary, RemoteThread, ReviewSubmission,
+    SubmittedReview,
 };
 use super::slug::RepoSlug;
 use crate::git::GitRepo;
+
+/// GraphQL query for [`GithubClient::pr_review_threads`] — capped at the
+/// first 100 threads and 50 comments per thread (v1 cap, not paginated; a
+/// PR with more than that silently truncates, flagged here rather than
+/// silently since nothing downstream counts what got dropped). `path`/
+/// `line`/`diffSide` live on the thread itself (not per-comment) per
+/// GitHub's `PullRequestReviewThread` GraphQL type.
+const REVIEW_THREADS_QUERY: &str = "query($owner: String!, $repo: String!, $number: Int!) { \
+repository(owner: $owner, name: $repo) { pullRequest(number: $number) { \
+reviewThreads(first: 100) { nodes { id isResolved path line diffSide \
+comments(first: 50) { nodes { author { login } body createdAt \
+pullRequestReview { fullDatabaseId } } } } } } } }";
 
 /// A resolved `gh` binary pinned to one repo's GitHub identity.
 pub struct GithubClient {
@@ -208,6 +221,45 @@ impl GithubClient {
         args.push(".login");
         let out = self.run_gh(&args)?;
         Ok(crate::command::decode_output(&out).trim().to_string())
+    }
+
+    /// `gh api graphql` for PR `pr`'s review threads — resolved state,
+    /// author/body, and which submitted review (if any) opened each thread
+    /// (docs/phase-6-review-navigator.md deliverable 6, doc-deviation #1:
+    /// REST's `.../pulls/{n}/comments` + `.../reviews` don't expose
+    /// thread-level `isResolved`; only GraphQL's `reviewThreads` connection
+    /// does). `--hostname` (not `-R`) for enterprise hosts, matching
+    /// `submit_review`/`current_login` — `gh api graphql` has no `-R` form.
+    pub fn pr_review_threads(&self, pr: u64) -> Result<Vec<RemoteThread>, GhError> {
+        let owner_arg = format!("owner={}", self.slug.owner);
+        let repo_arg = format!("repo={}", self.slug.repo);
+        let number_arg = format!("number={pr}");
+        let query_arg = format!("query={REVIEW_THREADS_QUERY}");
+        let mut args: Vec<&str> = vec![
+            "api",
+            "graphql",
+            // `-f`/`--raw-field` sends a literal string; `-F`/`--field`
+            // magic-converts a numeric-looking value into a JSON number.
+            // `owner`/`repo` are `String!` in the query below — an
+            // all-digit login or repo name (GitHub permits both) would
+            // otherwise be coerced to a JSON int and rejected by the
+            // variable-type check. `number` is genuinely `Int!`, so it
+            // keeps `-F`.
+            "-f",
+            &query_arg,
+            "-f",
+            &owner_arg,
+            "-f",
+            &repo_arg,
+            "-F",
+            &number_arg,
+        ];
+        if self.slug.host != "github.com" {
+            args.push("--hostname");
+            args.push(&self.slug.host);
+        }
+        let out = self.run_gh(&args)?;
+        RemoteThread::parse_graphql(&out)
     }
 
     fn spawn(&self, args: &[&str]) -> Command {

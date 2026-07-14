@@ -20,8 +20,8 @@ pub use diff::{DiffLine, DiffOptions, FileDiff, Hunk, LineKind};
 pub use git::{BlobSpec, ChangeStatus, ChangedFile, DiffSource, GitRepo};
 pub use github::{
     ChecksSummary, CreatePr, CreatedPr, DraftComment, GhError, GhSide, GithubClient, PrMeta,
-    PrState, PrStatus, PrSummary, RepoSlug, ReviewDecision, ReviewEvent, ReviewSubmission,
-    SubmittedReview,
+    PrState, PrStatus, PrSummary, RemoteComment, RemoteThread, RepoSlug, ReviewDecision,
+    ReviewEvent, ReviewSubmission, SubmittedReview,
 };
 pub use index::{
     CachedPrStatus, EntryHealth, HydrateOutcome, IndexEntry, ReviewIndex, entry_title,

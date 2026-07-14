@@ -16,7 +16,7 @@ pub use client::GithubClient;
 pub use error::GhError;
 pub use models::{
     ChecksSummary, CreatePr, CreatedPr, DraftComment, GhSide, PrMeta, PrState, PrStatus, PrSummary,
-    ReviewDecision, ReviewEvent, ReviewSubmission, SubmittedReview,
+    RemoteComment, RemoteThread, ReviewDecision, ReviewEvent, ReviewSubmission, SubmittedReview,
 };
 pub use slug::RepoSlug;
 
@@ -59,6 +59,47 @@ mod integration_test {
         println!("open PRs: {}", prs.len());
         for pr in &prs {
             println!("  #{} {} ({})", pr.number, pr.title, pr.head_ref);
+        }
+    }
+
+    /// Live-verifies `pr_review_threads`' `gh api graphql` query actually
+    /// parses against a real PR (docs/phase-6-review-navigator.md
+    /// deliverable 6) — `gh api graphql` is otherwise unproven anywhere in
+    /// this codebase. Run manually:
+    ///
+    /// ```text
+    /// cargo test -p dv-core --lib github:: -- --ignored --nocapture
+    /// ```
+    #[test]
+    #[ignore = "hits the real gh binary and a live GitHub repo; run manually"]
+    fn pr_review_threads_smoke() {
+        let repo_path = std::env::var("DV_DIFFTEST_PATH").unwrap_or_else(|_| {
+            std::env::current_dir()
+                .unwrap()
+                .join("../../../difftest")
+                .to_string_lossy()
+                .into_owned()
+        });
+        let repo = GitRepo::open(RepoLocation::Local(repo_path.into()))
+            .expect("open the difftest checkout (set DV_DIFFTEST_PATH if it's elsewhere)");
+
+        let client = GithubClient::for_repo(&repo).expect("resolve gh + parse origin remote");
+        client.preflight().expect("gh --version + gh auth status");
+
+        let threads = client
+            .pr_review_threads(1)
+            .expect("gh api graphql review threads");
+        println!("PR #1 review threads: {}", threads.len());
+        for t in &threads {
+            println!(
+                "  {} resolved={} {}:{:?} comments={} review_database_id={:?}",
+                t.id,
+                t.is_resolved,
+                t.path,
+                t.line,
+                t.comments.len(),
+                t.review_database_id
+            );
         }
     }
 }

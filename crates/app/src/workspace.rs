@@ -3,8 +3,9 @@ use std::ops::Range;
 use std::sync::Arc;
 
 use dv_core::{
-    BlobSpec, ChangeStatus, ChangedFile, ChecksSummary, DiffOptions, DiffSource, FileDiff, GitRepo,
-    GithubClient, LineKind, PrMeta, PrState, PrSummary, RemoteRef, RepoLocation, ReviewDecision,
+    BlobSpec, ChangeStatus, ChangedFile, ChecksSummary, DiffOptions, DiffSource, FileDiff, GhSide,
+    GitRepo, GithubClient, LineKind, PrMeta, PrState, PrSummary, RemoteRef, RemoteThread,
+    RepoLocation, RepoSlug, ReviewDecision,
 };
 use gpui::prelude::FluentBuilder;
 use gpui::*;
@@ -245,6 +246,11 @@ enum DisplayRow {
     Diff(usize),
     /// Index into the current review's comments.
     Thread(usize),
+    /// Index into `self.remote_threads` (docs/phase-6-review-navigator.md
+    /// deliverable 6) — a read-only GitHub-side thread, interleaved
+    /// alongside local ones under whichever anchor row it shares (or at
+    /// the end, unanchored, same as a local thread with no matching row).
+    RemoteThread(usize),
     /// The inline comment editor.
     Editor,
 }
@@ -628,6 +634,31 @@ pub struct Workspace {
     /// (review finding P1-b: the watcher must not adopt an unrelated PR's
     /// newest draft out from under an open PR).
     pr_remote: Option<RemoteRef>,
+    /// GitHub-side review threads for the currently-open PR, read-only
+    /// (docs/phase-6-review-navigator.md deliverable 6) — fetched by
+    /// [`Self::refresh_remote_threads`], interleaved into `self.display`
+    /// alongside local threads by [`Self::reset_diff_list`]. Always empty
+    /// with no PR open; cleared and re-fetched on every `open_pr`.
+    remote_threads: Vec<RemoteThread>,
+    /// Local comment ids whose matching own-submitted-review GitHub thread
+    /// (`review_database_id == pr_remote.submitted_review_id`) is resolved
+    /// on github.com — recomputed by [`Self::reset_diff_list`] from
+    /// `remote_threads` on every rebuild. For a thread `reset_diff_list`
+    /// manages to position-match to a local comment (and dedupes out of the
+    /// read-only `RemoteThread` render as a result — it would double up
+    /// with the local `Thread` card for the same comment), this is how its
+    /// resolved state still reaches the UI: `render_thread` and `render_
+    /// summary` OR it into their "resolved" check alongside the local
+    /// `CommentStatus` (review finding: the dedup used to just discard the
+    /// resolved bit, defeating deliverable 6's headline case for exactly
+    /// the threads `submitted_review_id` exists to identify — "a review
+    /// resolved on github.com shows resolved in dv"). An own thread that
+    /// CAN'T be position-matched (outdated/line-drifted, or carrying a
+    /// GitHub-only reply) isn't dropped either — `reset_diff_list` leaves
+    /// it out of the dedup instead, so it still renders as its own
+    /// read-only `RemoteThread` card (review finding: those were silently
+    /// invisible everywhere).
+    github_resolved: HashSet<String>,
     /// Whether the PR header's "details" (body) toggle is expanded.
     pr_details_open: bool,
     /// Set (to the PR number) while [`Self::open_pr`] is fetching — reused
@@ -866,6 +897,18 @@ pub(crate) fn review_decision_word(decision: ReviewDecision) -> &'static str {
         ReviewDecision::Approved => "approved",
         ReviewDecision::ChangesRequested => "changes_requested",
         ReviewDecision::ReviewRequired => "review_required",
+    }
+}
+
+/// `--automation`'s word for a [`GhSide`], matching this file's existing
+/// `DiffSide` vocabulary ("old"/"new") rather than GitHub's own LEFT/RIGHT
+/// spelling — `automation_state`'s `selection.side` already uses "old"/
+/// "new", and a remote thread's side means the exact same diff-side concept
+/// (docs/phase-6-review-navigator.md deliverable 6).
+fn gh_side_word(side: GhSide) -> &'static str {
+    match side {
+        GhSide::Left => "old",
+        GhSide::Right => "new",
     }
 }
 
@@ -1110,6 +1153,8 @@ impl Workspace {
             _worktree_watcher: None,
             pr: None,
             pr_remote: None,
+            remote_threads: Vec::new(),
+            github_resolved: HashSet::new(),
             pr_details_open: false,
             pr_loading: None,
             pr_error: None,
@@ -1165,9 +1210,49 @@ impl Workspace {
                             .map(|r| (r.id.clone(), r.updated_ms, r.comments.len()))
                     };
                     if fingerprint(&this.review) != fingerprint(&review) {
+                        // `remote_threads` was fetched for whichever PR
+                        // `pr_remote` pointed at before this reload — key
+                        // on (slug, pr number), the same identity
+                        // `refresh_remote_threads`'s own epoch check uses,
+                        // to tell whether that fetch still applies.
+                        let old_pr_key = this.pr_remote.as_ref().map(|r| (r.slug.clone(), r.pr));
                         this.review = review;
                         this.pinned_review_id =
                             resolved_pin(this.pinned_review_id.take(), &this.review);
+                        // Keep `pr_remote` in sync with the review actually
+                        // on screen — it's the only place
+                        // `own_submitted_review_id` (github-thread dedup +
+                        // resolved-sync) is read from, and a review
+                        // reassignment here (e.g. a CLI `dv review submit`
+                        // picked up mid-session) is exactly as fresh a
+                        // `remote` as the initial-load path a few lines up
+                        // (review finding: this used to only happen at
+                        // initial load / `open_pr`, so an in-session submit
+                        // left `pr_remote` permanently stale).
+                        this.pr_remote = this.review.as_ref().and_then(|r| r.remote.clone());
+                        let new_pr_key = this.pr_remote.as_ref().map(|r| (r.slug.clone(), r.pr));
+                        if old_pr_key != new_pr_key {
+                            // The reload landed on a different PR (or none)
+                            // than `remote_threads` was fetched for — keeping
+                            // it around would misattribute a stale PR's
+                            // read-only threads (including their resolved
+                            // badges) onto whatever review this reload
+                            // landed on, since the interleave in
+                            // `reset_diff_list` matches purely by (path,
+                            // side, line) and isn't gated on which review is
+                            // current (review finding P1: this used to only
+                            // get cleared in `open_pr`'s success arm, so an
+                            // external review change/delete mid-session left
+                            // `remote_threads` stale). A subsequent
+                            // `refresh_remote_threads` (explicit
+                            // `RefreshBadges`, or the next `open_pr`)
+                            // repopulates it for whatever PR is actually
+                            // current; same-PR reloads (e.g. a CLI comment
+                            // add) deliberately keep the existing fetch
+                            // rather than blanking the cards until the next
+                            // manual refresh.
+                            this.remote_threads.clear();
+                        }
                         cx.emit(ReviewChanged);
                         // A watcher-driven reload invalidates a parked
                         // submit panel — it was built against the review
@@ -1355,6 +1440,25 @@ impl Workspace {
                         this.review = review;
                         this.pinned_review_id =
                             resolved_pin(this.pinned_review_id.take(), &this.review);
+                        // A PR-linked review reached directly (sidebar
+                        // click, not `open_pr`) still needs `pr_remote`
+                        // populated so `refresh_remote_threads` has a
+                        // slug/pr to act on when the user hits the manual
+                        // `RefreshBadges` gesture (review finding:
+                        // sidebar-opened submitted PR reviews never synced
+                        // remote threads because this was left `None`).
+                        // `refresh_pr`'s own no-op (it keys off `self.pr`,
+                        // the PR *header*, which nothing populates on this
+                        // path) is a separate, pre-existing gap — fixing it
+                        // needs an initial header fetch, a bigger change
+                        // out of scope for this slice's remote-thread sync.
+                        // Skipped when `pending_pr` is set — `open_pr` right
+                        // below assigns its own (possibly different)
+                        // `pr_remote` from the PR it's about to load, which
+                        // would immediately overwrite this anyway.
+                        if pending_pr.is_none() {
+                            this.pr_remote = this.review.as_ref().and_then(|r| r.remote.clone());
+                        }
                         this.author = Some(author);
                         cx.emit(ReviewChanged);
                         this.location = store_location.clone();
@@ -1840,11 +1944,18 @@ impl Workspace {
                         this.selected = None;
                         this.pending_jump = None;
                         this.pr_remote = review.remote.clone();
+                        // Belongs to the PR being left behind (if any) —
+                        // keeping it around would flash the old PR's
+                        // read-only threads under the new PR's files until
+                        // `refresh_remote_threads`'s fetch lands (docs/
+                        // phase-6-review-navigator.md deliverable 6).
+                        this.remote_threads.clear();
                         this.review = Some(review);
                         cx.emit(ReviewChanged);
                         this.pr = Some(meta.into());
                         this.pr_details_open = false;
                         this.status = Status::Ready;
+                        this.refresh_remote_threads(cx);
                         if this.files.is_empty() {
                             this.reset_diff_list(cx);
                         } else {
@@ -1923,6 +2034,77 @@ impl Workspace {
 
     fn on_refresh_pr(&mut self, _: &RefreshPr, _: &mut Window, cx: &mut Context<Self>) {
         self.refresh_pr(cx);
+    }
+
+    /// Fetch this workspace's PR-linked review's GitHub-side review threads
+    /// off-thread (docs/phase-6-review-navigator.md deliverable 6) —
+    /// resolved state, author/body, and which submitted review (if any)
+    /// opened each thread. A no-op that clears any stale threads with no PR
+    /// linked (`self.pr_remote` is `None`) — nothing to fetch, nothing to
+    /// show. Called only from `open_pr`'s success arm and the sidebar's
+    /// `RefreshBadges` gesture (cross-cutting risk B: never a startup/index
+    /// walk — this is a network call per PR, gated to an explicit PR-open
+    /// or an explicit "go sync with GitHub" action only; `gh` always runs
+    /// host-side via `GithubClient`, so this never touches `dv-host`/
+    /// `crates/host` even for a WSL-located repo). Epoch-guarded the same
+    /// way `refresh_pr` is — a source switch (or a newer PR open) mid-fetch
+    /// discards the result rather than clobbering whatever replaced it.
+    pub(crate) fn refresh_remote_threads(&mut self, cx: &mut Context<Self>) {
+        let Some(remote) = self.pr_remote.clone() else {
+            if !self.remote_threads.is_empty() {
+                self.remote_threads.clear();
+                self.reset_diff_list(cx);
+            }
+            return;
+        };
+        let mut parts = remote.slug.splitn(3, '/');
+        let (Some(host), Some(owner), Some(repo)) = (parts.next(), parts.next(), parts.next())
+        else {
+            return;
+        };
+        if host.is_empty() || owner.is_empty() || repo.is_empty() {
+            return;
+        }
+        let slug = RepoSlug {
+            host: host.to_string(),
+            owner: owner.to_string(),
+            repo: repo.to_string(),
+        };
+        let pr = remote.pr;
+        let epoch = self.source_epoch;
+        cx.spawn(async move |this, cx| {
+            let result: Result<Vec<RemoteThread>, dv_core::GhError> = cx
+                .background_executor()
+                .spawn(async move {
+                    let client = GithubClient::for_slug(slug)?;
+                    client.pr_review_threads(pr)
+                })
+                .await;
+            this.update(cx, |this, cx| {
+                if this.source_epoch != epoch
+                    || this.pr_remote.as_ref().map(|r| (r.slug.clone(), r.pr))
+                        != Some((remote.slug.clone(), remote.pr))
+                {
+                    // A newer source switch (or PR open) superseded this
+                    // fetch — discard rather than stamp a stale fetch's
+                    // threads over whatever's showing now (cross-cutting
+                    // risk C).
+                    return;
+                }
+                // Silent on failure (gh missing, unauthenticated, network
+                // down, rate-limited, ...) — matches `fetch_pr_badge`'s
+                // posture: a PR with no fetched threads is a perfectly
+                // good fallback for a read-only sync feature, not an error
+                // the user needs to see.
+                if let Ok(threads) = result {
+                    this.remote_threads = threads;
+                    this.reset_diff_list(cx);
+                }
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
     }
 
     // ---- PR picker -----------------------------------------------------
@@ -2127,6 +2309,18 @@ impl Workspace {
             // docs/phase-6-review-navigator.md deliverable 5:
             // `switch_source_and_jump`'s most recent failure, if any.
             "source_switch_error": self.source_switch_error,
+            // docs/phase-6-review-navigator.md deliverable 6: read-only
+            // GitHub-side threads fetched by `refresh_remote_threads` —
+            // makes the interleaved rendering + resolved-state sync
+            // assertable without a screenshot.
+            "remote_threads": self.remote_threads.iter().map(|t| json!({
+                "path": t.path,
+                "line": t.line,
+                "side": gh_side_word(t.side),
+                "resolved": t.is_resolved,
+                "comments": t.comments.len(),
+                "review_database_id": t.review_database_id,
+            })).collect::<Vec<_>>(),
             "pr_picker_open": self.pr_picker.is_some(),
             "pr_picker": self.pr_picker.as_ref().map(|p| json!({
                 "loading": matches!(p.state, PrPickerState::Loading),
@@ -2294,14 +2488,25 @@ impl Workspace {
     /// editor interleaved under their anchors — and re-sync the list.
     /// Anything that changes rows, comments, selection, or the editor calls
     /// this. Threads whose anchor line isn't visible (outside hunks, stale)
-    /// append at the end so they're never silently hidden.
+    /// append at the end so they're never silently hidden. Read-only
+    /// GitHub-side threads (docs/phase-6-review-navigator.md deliverable 6)
+    /// are woven in here too, at the same anchor row as any local thread
+    /// they share — this is the ONLY place they enter `self.display`
+    /// (display rows are rebuilt per selected file, so a one-time append
+    /// elsewhere would vanish on the next file switch). Also recomputes
+    /// `github_resolved` (dv's own submitted-review threads that GitHub
+    /// reports resolved) every call, since that's the only path back to
+    /// the local `Thread` card once its matching remote thread gets
+    /// deduped out below.
     fn reset_diff_list(&mut self, cx: &mut Context<Self>) -> bool {
         let row_count = self.diff_row_count();
         let file_path = self.selected.map(|i| self.files[i].path.clone());
 
-        // Anchor each of this file's comments to a diff row.
-        let mut at_row: HashMap<usize, Vec<usize>> = HashMap::new();
-        let mut unanchored: Vec<usize> = Vec::new();
+        // Anchor each of this file's comments (local, then remote) to a
+        // diff row. Holding `DisplayRow` values directly (rather than raw
+        // comment/thread indices) lets both kinds share one grouping map.
+        let mut at_row: HashMap<usize, Vec<DisplayRow>> = HashMap::new();
+        let mut unanchored: Vec<DisplayRow> = Vec::new();
         if let (Some(path), Some(review)) = (&file_path, &self.review) {
             for (ci, comment) in review.comments.iter().enumerate() {
                 if &comment.path != path {
@@ -2312,8 +2517,124 @@ impl Workspace {
                     dv_core::Side::New => DiffSide::New,
                 };
                 match self.anchor_row(side, comment.end_line) {
-                    Some(row) => at_row.entry(row).or_default().push(ci),
-                    None => unanchored.push(ci),
+                    Some(row) => at_row.entry(row).or_default().push(DisplayRow::Thread(ci)),
+                    None => unanchored.push(DisplayRow::Thread(ci)),
+                }
+            }
+        }
+        // Our own submitted review's threads round-trip through GitHub too
+        // (`refresh_remote_threads` fetches every thread on the PR, dv's
+        // own included) — skip those below so a comment dv already shows as
+        // an interactive local `Thread` card doesn't ALSO draw a redundant
+        // read-only `RemoteThread` card for the identical author/body
+        // (review finding: threads were doubling for a submitted-then-
+        // refreshed review). `review_database_id` exists precisely to
+        // identify "this is our submitted review's thread" — compare it
+        // against the currently-linked review's own submitted id.
+        let own_submitted_review_id = self.pr_remote.as_ref().and_then(|r| r.submitted_review_id);
+
+        // Recompute which local comments have a resolved own-submitted-
+        // review GitHub thread, so the dedup below doesn't silently lose
+        // that resolved state (review finding: it used to just discard the
+        // skipped thread's `is_resolved`, defeating deliverable 6's
+        // headline case for exactly the threads `submitted_review_id`
+        // exists to identify). Scanned over the WHOLE review — not just
+        // the selected file — because `render_summary` lists every comment
+        // regardless of which file is open, and this needs to stay
+        // consistent with it; matching is by (path, side, line) alone, so
+        // it doesn't need that file's diff to be loaded. This position
+        // match is inherently fragile — a later commit can shift or null
+        // out `thread.line` (GitHub marks the thread "outdated"), and two
+        // local comments sharing one (path, side, line) would both match a
+        // single thread — but it's the only anchor a local `Comment` (which
+        // stores no GitHub comment/thread id) carries. When `thread.line`
+        // has gone null, fall back to matching the opening comment's
+        // (author, body) so an outdated-but-resolved own thread still
+        // reaches `github_resolved` (review finding: it previously bailed
+        // out via `let Some(line) = thread.line else { continue }` before
+        // ever considering such a thread, so the local `Thread`/summary
+        // card kept showing it unresolved even though the read-only
+        // `RemoteThread` card — only visible while this thread's file is
+        // selected — showed it correctly). That fallback only feeds
+        // `github_resolved`, never `matched_own_threads`: an outdated
+        // thread's position can't be trusted enough to fully dedupe the
+        // read-only card away. `matched_own_threads` records exactly the
+        // own threads this loop managed to join to a local comment BY
+        // POSITION (with no GitHub-only replies beyond what's stored
+        // locally); anything it DIDN'T match that way — outdated with no
+        // (author, body) match, line-drifted, or carrying a colleague's
+        // reply the local store lacks — is deliberately left out of the
+        // dedup below so it still renders as a read-only `RemoteThread`
+        // card instead of vanishing (review findings: resolved-but-
+        // outdated/drifted own threads, and GitHub-only replies on an own
+        // thread, were both silently lost).
+        let mut matched_own_threads: HashSet<usize> = HashSet::new();
+        self.github_resolved.clear();
+        if let (Some(review), Some(own_id)) = (&self.review, own_submitted_review_id) {
+            for (ti, thread) in self.remote_threads.iter().enumerate() {
+                if thread.review_database_id != Some(own_id) {
+                    continue;
+                }
+                let side = match thread.side {
+                    GhSide::Left => DiffSide::Old,
+                    GhSide::Right => DiffSide::New,
+                };
+                for comment in &review.comments {
+                    let comment_side = match comment.side {
+                        dv_core::Side::Old => DiffSide::Old,
+                        dv_core::Side::New => DiffSide::New,
+                    };
+                    if comment.path != thread.path || comment_side != side {
+                        continue;
+                    }
+                    let position_match = thread.line == Some(comment.end_line);
+                    let outdated_match = thread.line.is_none()
+                        && thread.comments.first().is_some_and(|opening| {
+                            opening.author == comment.author && opening.body == comment.body
+                        });
+                    if !position_match && !outdated_match {
+                        continue;
+                    }
+                    if thread.is_resolved {
+                        self.github_resolved.insert(comment.id.clone());
+                    }
+                    // Only safe to fully dedupe the read-only card if the
+                    // match was by position (an (author, body) fallback
+                    // match is too weak to trust for that) and GitHub
+                    // doesn't carry a reply the local store lacks (review
+                    // finding: a colleague's github.com reply to an own
+                    // thread was disappearing).
+                    if position_match && thread.comments.len() <= 1 + comment.replies.len() {
+                        matched_own_threads.insert(ti);
+                    }
+                }
+            }
+        }
+        if let Some(path) = &file_path {
+            for (ti, thread) in self.remote_threads.iter().enumerate() {
+                if &thread.path != path {
+                    continue;
+                }
+                if own_submitted_review_id.is_some()
+                    && thread.review_database_id == own_submitted_review_id
+                    && matched_own_threads.contains(&ti)
+                {
+                    continue;
+                }
+                // `diffSide` is GitHub's LEFT/RIGHT — map onto the diff's
+                // Old/New (cross-cutting note, docs/phase-6-review-
+                // navigator.md S6f).
+                let side = match thread.side {
+                    GhSide::Left => DiffSide::Old,
+                    GhSide::Right => DiffSide::New,
+                };
+                let row = thread.line.and_then(|line| self.anchor_row(side, line));
+                match row {
+                    Some(row) => at_row
+                        .entry(row)
+                        .or_default()
+                        .push(DisplayRow::RemoteThread(ti)),
+                    None => unanchored.push(DisplayRow::RemoteThread(ti)),
                 }
             }
         }
@@ -2328,14 +2649,14 @@ impl Workspace {
         for row in 0..row_count {
             diff_to_display.push(display.len());
             display.push(DisplayRow::Diff(row));
-            if let Some(comments) = at_row.get(&row) {
-                display.extend(comments.iter().map(|&ci| DisplayRow::Thread(ci)));
+            if let Some(rows) = at_row.get(&row) {
+                display.extend(rows.iter().copied());
             }
             if editor_row == Some(row) {
                 display.push(DisplayRow::Editor);
             }
         }
-        display.extend(unanchored.into_iter().map(DisplayRow::Thread));
+        display.extend(unanchored);
         if self.editor.is_some() && editor_row.is_none() {
             display.push(DisplayRow::Editor);
         }
@@ -2950,6 +3271,14 @@ impl Workspace {
                 let (fresh_review, flow) = submit_flow_from_submission(verdict, result);
                 if let Some(fresh) = fresh_review {
                     this.review = Some(fresh);
+                    // `fresh.remote.submitted_review_id` is now `Some` —
+                    // refresh `pr_remote` from it so the github-thread
+                    // dedup/resolved-sync in `reset_diff_list` (which reads
+                    // `own_submitted_review_id` off `pr_remote`, not
+                    // `review`) sees the submission this same session
+                    // (review finding: submitting from inside dv otherwise
+                    // left `pr_remote` stale for the rest of the session).
+                    this.pr_remote = this.review.as_ref().and_then(|r| r.remote.clone());
                     cx.emit(ReviewChanged);
                 }
                 this.submit = Some(flow);
@@ -4161,6 +4490,16 @@ impl Workspace {
         let warning = cx.theme().warning;
         let accent = cx.theme().accent;
         let review = self.review.as_ref();
+        // A comment reads as resolved here if EITHER dv's local status says
+        // so OR it's one of dv's own submitted-review threads that GitHub
+        // reports resolved (`github_resolved`, populated by
+        // `reset_diff_list` — see its doc comment). The summary panel lists
+        // every comment in the review regardless of which file is open
+        // (deliverable 5), so it has to agree with `render_thread`'s badge
+        // rather than falling back to local-only status.
+        let is_resolved = |c: &dv_core::Comment| {
+            c.status == dv_core::CommentStatus::Resolved || self.github_resolved.contains(&c.id)
+        };
         let comments: Vec<(usize, &dv_core::Comment)> = review
             .map(|r| {
                 r.comments
@@ -4168,19 +4507,14 @@ impl Workspace {
                     .enumerate()
                     .filter(|(_, c)| match self.summary_filter {
                         SummaryFilter::All => true,
-                        SummaryFilter::Open => c.status == dv_core::CommentStatus::Open,
-                        SummaryFilter::Resolved => c.status == dv_core::CommentStatus::Resolved,
+                        SummaryFilter::Open => !is_resolved(c),
+                        SummaryFilter::Resolved => is_resolved(c),
                     })
                     .collect()
             })
             .unwrap_or_default();
         let open_count = review
-            .map(|r| {
-                r.comments
-                    .iter()
-                    .filter(|c| c.status == dv_core::CommentStatus::Open)
-                    .count()
-            })
+            .map(|r| r.comments.iter().filter(|c| !is_resolved(c)).count())
             .unwrap_or(0);
         let total = review.map(|r| r.comments.len()).unwrap_or(0);
         let submitted = review.and_then(|r| match &r.state {
@@ -4211,7 +4545,7 @@ impl Workspace {
             .iter()
             .map(|(_, comment)| {
                 let id = comment.id.clone();
-                let resolved = comment.status == dv_core::CommentStatus::Resolved;
+                let resolved = is_resolved(comment);
                 let first_line = comment.body.lines().next().unwrap_or("").to_string();
                 // docs/phase-6-review-navigator.md deliverable 5: a comment
                 // whose file isn't in the currently open diff at all (as
@@ -4670,7 +5004,7 @@ impl Workspace {
     }
 
     /// One display row: a diff row (per view mode), an inline comment
-    /// thread, or the comment editor.
+    /// thread, a read-only GitHub thread, or the comment editor.
     fn render_display_row(&self, display_ix: usize, cx: &mut Context<Self>) -> AnyElement {
         match self.display.get(display_ix) {
             Some(&DisplayRow::Diff(row)) => match self.view_mode {
@@ -4679,6 +5013,9 @@ impl Workspace {
             },
             Some(&DisplayRow::Thread(comment_ix)) => {
                 self.render_thread(comment_ix, cx).into_any_element()
+            }
+            Some(&DisplayRow::RemoteThread(thread_ix)) => {
+                self.render_remote_thread(thread_ix, cx).into_any_element()
             }
             Some(&DisplayRow::Editor) => self.render_editor(cx).into_any_element(),
             None => div().into_any_element(),
@@ -4697,7 +5034,16 @@ impl Workspace {
         else {
             return div();
         };
-        let resolved = comment.status == dv_core::CommentStatus::Resolved;
+        // `local_resolved` drives the Resolve/Unresolve button — dv can
+        // only ever mutate the local status (two-way GitHub sync is a
+        // non-goal, docs/phase-6-review-navigator.md § Non-goals).
+        // `resolved` (badge/border) ORs in `github_resolved`, which covers
+        // dv's own submitted-review threads deduped out of the read-only
+        // `RemoteThread` cards in `reset_diff_list` — their resolved state
+        // has to surface here instead, since either side resolving reads
+        // as "resolved" (deliverable 6).
+        let local_resolved = comment.status == dv_core::CommentStatus::Resolved;
+        let resolved = local_resolved || self.github_resolved.contains(&comment.id);
         let id = comment.id.clone();
         let id_for_delete = comment.id.clone();
         let id_for_reply = comment.id.clone();
@@ -4775,9 +5121,13 @@ impl Workspace {
                                     Button::new(("resolve", comment_ix))
                                         .ghost()
                                         .small()
-                                        .label(if resolved { "Unresolve" } else { "Resolve" })
+                                        .label(if local_resolved {
+                                            "Unresolve"
+                                        } else {
+                                            "Resolve"
+                                        })
                                         .on_click(cx.listener(move |this, _, _, cx| {
-                                            let status = if resolved {
+                                            let status = if local_resolved {
                                                 dv_core::CommentStatus::Open
                                             } else {
                                                 dv_core::CommentStatus::Resolved
@@ -4882,6 +5232,93 @@ impl Workspace {
                                         this.submit_thread_input(window, cx)
                                     })),
                             ),
+                    )
+                }),
+        )
+    }
+
+    /// A read-only GitHub-side review thread card (docs/phase-6-review-
+    /// navigator.md deliverable 6): author/body/created for every comment
+    /// in the thread, plus a "resolved" badge when GitHub says so — no
+    /// reply/edit/resolve controls at all (two-way sync is a non-goal, see
+    /// the phase doc's Non-goals). Deliberately a separate render fn from
+    /// [`Self::render_thread`] rather than a read-only branch bolted onto
+    /// it: a shared render fn risks a stray enabled button leaking through
+    /// a future edit, where a wholly distinct fn structurally can't.
+    fn render_remote_thread(&self, thread_ix: usize, cx: &mut Context<Self>) -> Div {
+        // Owned copies before building any child (same borrow-avoidance
+        // idiom as `render_thread`/`render_summary` — cross-cutting risk F
+        // — even though this card has no listeners today, for consistency
+        // with every other card in this file).
+        let theme = cx.theme();
+        let border = theme.border;
+        let popover = theme.popover;
+        let success = theme.success;
+        let muted = theme.muted_foreground;
+
+        let Some(thread) = self.remote_threads.get(thread_ix) else {
+            return div();
+        };
+        let Some(opening) = thread.comments.first() else {
+            return div();
+        };
+        let replies = &thread.comments[1..];
+        let line_label = thread
+            .line
+            .map(|l| format!("line {l}"))
+            .unwrap_or_else(|| "outdated".to_string());
+
+        div().w_full().px_4().py_3().child(
+            v_flex()
+                .w_full()
+                .max_w(px(720.))
+                .p_3()
+                .gap_3()
+                // A muted background (rather than `render_thread`'s
+                // unresolved-primary tint, which means "needs your
+                // attention in dv") — a read-only remote thread never
+                // needs dv-side attention, only visibility.
+                .bg(popover.opacity(0.6))
+                .border_1()
+                .border_color(border)
+                .rounded_lg()
+                .child(
+                    h_flex()
+                        .items_center()
+                        .gap_2()
+                        .flex_wrap()
+                        .text_sm()
+                        .child(div().font_semibold().child(opening.author.clone()))
+                        .child(div().text_color(muted).child(format!(
+                            "GitHub \u{b7} {line_label} \u{b7} {}",
+                            crate::shell::relative_age(opening.created_ms)
+                        )))
+                        .when(thread.is_resolved, |el| {
+                            el.child(div().text_color(success).child("\u{2713} resolved"))
+                        }),
+                )
+                .child(div().text_sm().child(opening.body.clone()))
+                .when(!replies.is_empty(), |el| {
+                    el.child(
+                        v_flex()
+                            .gap_2()
+                            .pl_3()
+                            .border_l_2()
+                            .border_color(border)
+                            .children(replies.iter().map(|reply| {
+                                h_flex()
+                                    .gap_2()
+                                    .items_center()
+                                    .text_sm()
+                                    .child(div().font_semibold().child(reply.author.clone()))
+                                    .child(
+                                        div()
+                                            .text_color(muted)
+                                            .text_xs()
+                                            .child(crate::shell::relative_age(reply.created_ms)),
+                                    )
+                                    .child(div().child(reply.body.clone()))
+                            })),
                     )
                 }),
         )

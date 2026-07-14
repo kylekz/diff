@@ -478,7 +478,7 @@ const REVIEW_FILTER_ROWS: &[FilterAccessor] = &[
 /// sort order). No finer than a day beyond the first month, and no finer
 /// than a month beyond the first year — a review this stale doesn't need
 /// second-guessing to the hour.
-fn relative_age(updated_ms: u64) -> String {
+pub(crate) fn relative_age(updated_ms: u64) -> String {
     let now = dv_core::review::now_ms();
     let secs = now.saturating_sub(updated_ms) / 1000;
     if secs < 60 {
@@ -1418,8 +1418,17 @@ impl AppShell {
         // one manual "go sync with GitHub" gesture in the UI, so the
         // header shouldn't need a second, undiscoverable way to unstick
         // itself. `Workspace::refresh_pr` no-ops when no PR is open.
+        //
+        // Same reasoning extends to the read-only GitHub thread pull
+        // (docs/phase-6-review-navigator.md deliverable 6, acceptance: "a
+        // thread resolved on github.com shows resolved in dv after a
+        // manual refresh, without restarting dv") — `refresh_remote_threads`
+        // no-ops with no PR linked.
         if let Some(ws) = &self.active {
-            ws.update(cx, |ws, cx| ws.refresh_pr(cx));
+            ws.update(cx, |ws, cx| {
+                ws.refresh_pr(cx);
+                ws.refresh_remote_threads(cx);
+            });
         }
     }
 

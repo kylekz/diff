@@ -431,6 +431,251 @@ impl SubmittedReview {
 }
 
 // ---------------------------------------------------------------------
+// Review threads (read-only GitHub sync, docs/phase-6-review-navigator.md
+// deliverable 6). Doc-deviation #1: sourced from `gh api graphql`, not the
+// two REST endpoints (`.../pulls/{n}/comments` + `.../reviews`) the phase
+// doc names — REST doesn't expose thread-level `isResolved` at all; only
+// GraphQL's `reviewThreads` connection does.
+// ---------------------------------------------------------------------
+
+/// One review thread as GitHub's GraphQL `reviewThreads` connection reports
+/// it — read-only, rendered alongside dv's own local threads. Modeled with
+/// its own `Raw*` structs below rather than reusing `PrState`/
+/// `ReviewDecision`/`ChecksSummary`/etc.: GraphQL is a third wire
+/// convention in this file (camelCase field names, and `diffSide` is
+/// `SCREAMING_SNAKE_CASE` like [`GhSide`] but under a different field name
+/// than the REST `side`/`start_side` this file already wraps).
+#[derive(Debug, Clone, PartialEq)]
+pub struct RemoteThread {
+    /// GraphQL node id — opaque identity, for keying/debugging only. NOT
+    /// the mapping key back to a dv-submitted review; see
+    /// `review_database_id`.
+    pub id: String,
+    pub is_resolved: bool,
+    /// Forward-slash relative path, matching [`crate::ChangedFile::path`].
+    pub path: String,
+    /// `None` for a thread GitHub can no longer place on the current diff
+    /// (its side went outdated).
+    pub line: Option<u32>,
+    pub side: GhSide,
+    /// The opening comment first, any replies after, oldest first — same
+    /// order GitHub returns them in.
+    pub comments: Vec<RemoteComment>,
+    /// The opening comment's `PullRequestReview.fullDatabaseId` — the
+    /// REST-equivalent numeric id, i.e. exactly what
+    /// [`crate::review::RemoteRef::submitted_review_id`] stores. NOT the
+    /// GraphQL node id above. A thread's later replies can belong to a
+    /// different review (or none — a plain conversation reply), so only
+    /// the opening comment's review identifies "this is our submitted
+    /// review's thread". `None` when the opening comment isn't part of any
+    /// review.
+    pub review_database_id: Option<u64>,
+}
+
+/// One comment inside a [`RemoteThread`] — read-only.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RemoteComment {
+    pub author: String,
+    pub body: String,
+    pub created_ms: u64,
+}
+
+/// `gh api graphql`'s response envelope: GraphQL always answers HTTP 200
+/// (so `run_gh`'s exit-code check alone can't catch a query error) and
+/// reports failures via a top-level `errors` array instead, with `data`
+/// left null or partially populated — both must be checked explicitly
+/// rather than just unwrapping `data`.
+#[derive(Deserialize)]
+struct RawGraphQlEnvelope {
+    #[serde(default)]
+    data: Option<RawGraphQlData>,
+    #[serde(default)]
+    errors: Option<Vec<RawGraphQlError>>,
+}
+
+#[derive(Deserialize)]
+struct RawGraphQlError {
+    message: String,
+}
+
+#[derive(Deserialize)]
+struct RawGraphQlData {
+    repository: Option<RawThreadsRepository>,
+}
+
+#[derive(Deserialize)]
+struct RawThreadsRepository {
+    #[serde(rename = "pullRequest")]
+    pull_request: Option<RawThreadsPullRequest>,
+}
+
+#[derive(Deserialize)]
+struct RawThreadsPullRequest {
+    #[serde(rename = "reviewThreads")]
+    review_threads: RawReviewThreadConnection,
+}
+
+#[derive(Deserialize)]
+struct RawReviewThreadConnection {
+    nodes: Vec<RawReviewThread>,
+}
+
+#[derive(Deserialize)]
+struct RawReviewThread {
+    id: String,
+    #[serde(rename = "isResolved")]
+    is_resolved: bool,
+    path: String,
+    #[serde(default)]
+    line: Option<u32>,
+    #[serde(rename = "diffSide", default)]
+    diff_side: Option<String>,
+    comments: RawThreadCommentConnection,
+}
+
+#[derive(Deserialize)]
+struct RawThreadCommentConnection {
+    nodes: Vec<RawThreadComment>,
+}
+
+#[derive(Deserialize)]
+struct RawThreadComment {
+    /// `null` for a deleted GitHub account — falls back to `"ghost"`
+    /// (GitHub's own placeholder login for this case) in [`From`] below.
+    #[serde(default)]
+    author: Option<RawAuthor>,
+    body: String,
+    #[serde(rename = "createdAt")]
+    created_at: String,
+    #[serde(rename = "pullRequestReview", default)]
+    pull_request_review: Option<RawThreadReviewRef>,
+}
+
+#[derive(Deserialize)]
+struct RawThreadReviewRef {
+    /// A JSON *string* on the wire, not a number — live-verified against
+    /// `kylekz/difftest`: `fullDatabaseId` prints quoted (it can exceed the
+    /// safe-integer range other GraphQL `Int` ids stay under). Parsed to
+    /// `u64` in the [`From`] impl below rather than here, so a value that
+    /// doesn't parse degrades to `None` instead of failing the whole fetch.
+    #[serde(rename = "fullDatabaseId", default)]
+    full_database_id: Option<String>,
+}
+
+impl RemoteThread {
+    /// Parse `gh api graphql`'s response to the query
+    /// [`super::client::GithubClient::pr_review_threads`] sends.
+    pub(super) fn parse_graphql(bytes: &[u8]) -> Result<Vec<RemoteThread>, GhError> {
+        let envelope: RawGraphQlEnvelope = serde_json::from_slice(bytes)
+            .map_err(|e| invalid("gh api graphql review-threads response", e))?;
+        if let Some(errors) = envelope.errors.filter(|errors| !errors.is_empty()) {
+            let detail = errors
+                .into_iter()
+                .map(|e| e.message)
+                .collect::<Vec<_>>()
+                .join("; ");
+            return Err(GhError::InvalidResponse {
+                detail: format!("GraphQL error: {detail}"),
+            });
+        }
+        let pull_request = envelope
+            .data
+            .and_then(|d| d.repository)
+            .and_then(|r| r.pull_request)
+            .ok_or_else(|| GhError::InvalidResponse {
+                detail: "GraphQL review-threads response had no repository/pull request \
+                          (wrong owner/repo/number, or no access)"
+                    .to_string(),
+            })?;
+        Ok(pull_request
+            .review_threads
+            .nodes
+            .into_iter()
+            .map(Into::into)
+            .collect())
+    }
+}
+
+impl From<RawReviewThread> for RemoteThread {
+    fn from(raw: RawReviewThread) -> Self {
+        // `diffSide` is nullable in principle (an outdated thread); default
+        // to `Right` rather than fail the whole fetch over one field this
+        // build has no better guess for.
+        let side = match raw.diff_side.as_deref() {
+            Some("LEFT") => GhSide::Left,
+            _ => GhSide::Right,
+        };
+        let review_database_id = raw
+            .comments
+            .nodes
+            .first()
+            .and_then(|c| c.pull_request_review.as_ref())
+            .and_then(|r| r.full_database_id.as_deref())
+            .and_then(|s| s.parse::<u64>().ok());
+        let comments = raw
+            .comments
+            .nodes
+            .into_iter()
+            .map(|c| RemoteComment {
+                author: c
+                    .author
+                    .map(|a| a.login)
+                    .unwrap_or_else(|| "ghost".to_string()),
+                body: c.body,
+                created_ms: parse_github_datetime_ms(&c.created_at).unwrap_or(0),
+            })
+            .collect();
+        RemoteThread {
+            id: raw.id,
+            is_resolved: raw.is_resolved,
+            path: raw.path,
+            line: raw.line,
+            side,
+            comments,
+            review_database_id,
+        }
+    }
+}
+
+/// Parse a UTC RFC3339 timestamp the way GitHub's GraphQL `DateTime` scalar
+/// always prints it (`"2026-07-01T20:09:31Z"` — no fractional seconds, no
+/// offset besides `Z`) into epoch milliseconds. Hand-rolled rather than
+/// pulling in `chrono` for this one field: dv-core has no other date-
+/// parsing need anywhere else in the crate. `None` on anything that doesn't
+/// match; the caller falls back to `0` rather than failing the whole fetch
+/// over one malformed comment timestamp.
+fn parse_github_datetime_ms(s: &str) -> Option<u64> {
+    let s = s.strip_suffix('Z')?;
+    let (date, time) = s.split_once('T')?;
+    let mut date_parts = date.split('-');
+    let year: i64 = date_parts.next()?.parse().ok()?;
+    let month: i64 = date_parts.next()?.parse().ok()?;
+    let day: i64 = date_parts.next()?.parse().ok()?;
+    let mut time_parts = time.split(':');
+    let hour: i64 = time_parts.next()?.parse().ok()?;
+    let minute: i64 = time_parts.next()?.parse().ok()?;
+    // Seconds may carry fractional digits ("31.123") — GitHub doesn't emit
+    // these today, but tolerate them rather than fail the whole parse.
+    let second: i64 = time_parts.next()?.split('.').next()?.parse().ok()?;
+    if !(1..=9999).contains(&year) || !(1..=12).contains(&month) || !(1..=31).contains(&day) {
+        return None;
+    }
+
+    // Days since the Unix epoch via the standard civil-calendar algorithm
+    // (Howard Hinnant's `days_from_civil`).
+    let y = if month <= 2 { year - 1 } else { year };
+    let era = if y >= 0 { y } else { y - 399 } / 400;
+    let yoe = y - era * 400; // [0, 399]
+    let mp = (month + 9) % 12; // [0, 11]
+    let doy = (153 * mp + 2) / 5 + day - 1; // [0, 365]
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy; // [0, 146096]
+    let days = era * 146097 + doe - 719468;
+
+    let secs = days * 86400 + hour * 3600 + minute * 60 + second;
+    (secs >= 0).then_some(secs as u64 * 1000)
+}
+
+// ---------------------------------------------------------------------
 // PR creation
 // ---------------------------------------------------------------------
 
@@ -771,5 +1016,135 @@ mod tests {
     fn created_pr_errors_on_unparsable_output() {
         assert!(CreatedPr::parse_stdout(b"no url here\n").is_err());
         assert!(CreatedPr::parse_stdout(b"").is_err());
+    }
+
+    // --- RemoteThread / GraphQL parsing ----------------------------------
+
+    #[test]
+    fn parses_review_threads_graphql_fixture() {
+        let fixture = r#"{
+            "data": {
+                "repository": {
+                    "pullRequest": {
+                        "reviewThreads": {
+                            "nodes": [
+                                {
+                                    "id": "PRRT_1",
+                                    "isResolved": true,
+                                    "path": "src/a.rs",
+                                    "line": 10,
+                                    "diffSide": "RIGHT",
+                                    "comments": {
+                                        "nodes": [
+                                            {
+                                                "author": {"login": "kylekz"},
+                                                "body": "why this way?",
+                                                "createdAt": "2026-07-01T12:00:00Z",
+                                                "pullRequestReview": {"fullDatabaseId": "555"}
+                                            },
+                                            {
+                                                "author": {"login": "reviewer2"},
+                                                "body": "agreed, resolving",
+                                                "createdAt": "2026-07-01T12:05:00Z",
+                                                "pullRequestReview": null
+                                            }
+                                        ]
+                                    }
+                                },
+                                {
+                                    "id": "PRRT_2",
+                                    "isResolved": false,
+                                    "path": "src/b.rs",
+                                    "line": null,
+                                    "diffSide": "LEFT",
+                                    "comments": {
+                                        "nodes": [
+                                            {
+                                                "author": null,
+                                                "body": "old thread",
+                                                "createdAt": "2026-01-01T00:00:00Z",
+                                                "pullRequestReview": null
+                                            }
+                                        ]
+                                    }
+                                }
+                            ]
+                        }
+                    }
+                }
+            }
+        }"#;
+        let threads = RemoteThread::parse_graphql(fixture.as_bytes()).unwrap();
+        assert_eq!(threads.len(), 2);
+
+        assert_eq!(threads[0].id, "PRRT_1");
+        assert!(threads[0].is_resolved);
+        assert_eq!(threads[0].path, "src/a.rs");
+        assert_eq!(threads[0].line, Some(10));
+        assert_eq!(threads[0].side, GhSide::Right);
+        assert_eq!(threads[0].comments.len(), 2);
+        assert_eq!(threads[0].comments[0].author, "kylekz");
+        assert_eq!(threads[0].review_database_id, Some(555));
+
+        assert!(!threads[1].is_resolved);
+        assert_eq!(threads[1].line, None);
+        assert_eq!(threads[1].side, GhSide::Left);
+        assert_eq!(threads[1].comments[0].author, "ghost");
+        assert_eq!(threads[1].review_database_id, None);
+    }
+
+    #[test]
+    fn review_threads_graphql_errors_array_becomes_invalid_response() {
+        let fixture =
+            r#"{"data": null, "errors": [{"message": "Could not resolve to a Repository"}]}"#;
+        let err = RemoteThread::parse_graphql(fixture.as_bytes()).unwrap_err();
+        match err {
+            GhError::InvalidResponse { detail } => {
+                assert!(detail.contains("Could not resolve to a Repository"))
+            }
+            other => panic!("expected InvalidResponse, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn review_threads_graphql_missing_pull_request_is_invalid_response() {
+        let fixture = r#"{"data": {"repository": {"pullRequest": null}}}"#;
+        assert!(RemoteThread::parse_graphql(fixture.as_bytes()).is_err());
+    }
+
+    #[test]
+    fn review_threads_graphql_empty_nodes_is_empty_vec() {
+        let fixture =
+            r#"{"data": {"repository": {"pullRequest": {"reviewThreads": {"nodes": []}}}}}"#;
+        let threads = RemoteThread::parse_graphql(fixture.as_bytes()).unwrap();
+        assert!(threads.is_empty());
+    }
+
+    #[test]
+    fn parse_github_datetime_ms_epoch() {
+        assert_eq!(parse_github_datetime_ms("1970-01-01T00:00:00Z"), Some(0));
+    }
+
+    #[test]
+    fn parse_github_datetime_ms_known_value() {
+        // 2000-01-01T00:00:00Z is 946684800 seconds after the epoch.
+        assert_eq!(
+            parse_github_datetime_ms("2000-01-01T00:00:00Z"),
+            Some(946_684_800_000)
+        );
+    }
+
+    #[test]
+    fn parse_github_datetime_ms_tolerates_fractional_seconds() {
+        assert_eq!(
+            parse_github_datetime_ms("1970-01-01T00:00:01.500Z"),
+            Some(1000)
+        );
+    }
+
+    #[test]
+    fn parse_github_datetime_ms_rejects_non_utc_or_malformed() {
+        assert_eq!(parse_github_datetime_ms("not a date"), None);
+        assert_eq!(parse_github_datetime_ms("2026-07-01T12:00:00+01:00"), None);
     }
 }

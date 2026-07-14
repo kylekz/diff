@@ -1179,13 +1179,15 @@ impl Workspace {
                 // sidebar-row pin (if any — docs/phase-6-review-navigator.md
                 // S6c) so a reload can't silently un-pin a SUBMITTED review
                 // the user explicitly selected.
-                let Ok((location, current_id, current_pr, pinned_id)) =
+                let Ok((location, current_id, current_pr, pinned_id, start_epoch, pr_in_flight)) =
                     this.update(cx, |this, _| {
                         (
                             this.location.clone(),
                             this.review.as_ref().map(|r| r.id.clone()),
                             this.pr_remote.clone(),
                             this.pinned_review_id.clone(),
+                            this.source_epoch,
+                            this.pr_loading.is_some(),
                         )
                     })
                 else {
@@ -1205,6 +1207,22 @@ impl Workspace {
                     })
                     .await;
                 let alive = this.update(cx, |this, cx| {
+                    // Discard-if-superseded: this reload's `pick_review` inputs
+                    // (`current_id`/`current_pr`) were snapshotted before an
+                    // explicit navigation moved the workspace. `open_pr` and
+                    // `switch_source_and_jump` bump `source_epoch` at dispatch,
+                    // so a changed epoch means a newer source is (being) loaded;
+                    // and a PR already loading at snapshot time (its epoch bump
+                    // is before this snapshot, so the epoch check alone can't
+                    // see it) would let this reload clobber the just-loaded PR's
+                    // review with the pre-load one — later comments would then
+                    // save against the wrong review (capstone P1/P2). Either
+                    // way drop this stale reload; the watcher re-fires on the
+                    // next event, and the navigation owns whichever review it
+                    // lands on.
+                    if this.source_epoch != start_epoch || pr_in_flight {
+                        return;
+                    }
                     let fingerprint = |r: &Option<dv_core::Review>| {
                         r.as_ref()
                             .map(|r| (r.id.clone(), r.updated_ms, r.comments.len()))
@@ -3438,6 +3456,14 @@ impl Workspace {
                         this.expanded.clear();
                         this.stale.clear();
                         this.stale_checked = None;
+                        // The GitHub remote threads (S6f) were fetched against
+                        // the PR's LIVE range; this jump moves `source` to the
+                        // review's own recorded range, where those line numbers
+                        // don't apply. Clear them (as `open_pr`'s teardown does)
+                        // so they can't misanchor or double-render own-comment
+                        // cards against the wrong coordinates; a later `open_pr`
+                        // refetches for the live range (capstone P3).
+                        this.remote_threads.clear();
                         this.selected = None;
                         this.pending_jump = None;
                         this.files = files;

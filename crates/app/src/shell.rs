@@ -874,6 +874,11 @@ impl AppShell {
         // un-stamped, so the sidebar's recency order went stale after the
         // first event).
         let mut stamped_review_id: Option<String> = None;
+        // True until the one transient pre-PR `ReviewChanged` of a `dv pr <n>`
+        // launch has been skipped. Cleared after that skip so a `pending_pr`
+        // that never resolves (bad/failed PR number) doesn't suppress recency
+        // stamping for the rest of the workspace's life (capstone P3).
+        let mut transient_pr_wait = true;
         // Keep this entry's badge live while the review is being worked on.
         self._ws_subscription = Some(cx.subscribe(
             &workspace,
@@ -958,11 +963,24 @@ impl AppShell {
                     // stamping.
                     let opened = match &stamped_review_id {
                         None => {
-                            pending_pr.is_none()
-                                || entry
-                                    .remote
-                                    .as_ref()
-                                    .is_some_and(|r| Some(r.pr) == pending_pr)
+                            if pending_pr.is_none() {
+                                true
+                            } else if entry
+                                .remote
+                                .as_ref()
+                                .is_some_and(|r| Some(r.pr) == pending_pr)
+                            {
+                                // The awaited PR-linked review landed.
+                                true
+                            } else {
+                                // Skip only the one transient pre-PR fallback
+                                // event (`mem::take` clears the flag on that
+                                // first skip). If `open_pr` never delivers a
+                                // matching event (failed/typo'd PR), later
+                                // events stamp rather than freezing recency for
+                                // the whole session (capstone P3).
+                                !std::mem::take(&mut transient_pr_wait)
+                            }
                         }
                         Some(prev) => *prev != review_id,
                     };
@@ -1282,7 +1300,13 @@ impl AppShell {
             .entries()
             .iter()
             .filter(|e| {
-                e.remote.as_ref().map(|r| (r.slug.as_str(), r.pr)) == Some((remote_slug, pr_number))
+                // Case-fold the slug the same way `pr_group_key` does — two
+                // reviews of one PR can carry case-divergent slugs (origin URL
+                // casing drift), and an exact match would leave the sibling's
+                // sidebar PR glyph stale (capstone P3).
+                e.remote
+                    .as_ref()
+                    .is_some_and(|r| r.pr == pr_number && r.slug.eq_ignore_ascii_case(remote_slug))
             })
             .cloned()
             .map(|mut e| {

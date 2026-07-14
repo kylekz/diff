@@ -661,6 +661,14 @@ pub struct AppShell {
     /// callback itself (see its construction site in `Self::new`), so
     /// startup needed its own resolution anyway.
     _appearance_subscription: Option<Subscription>,
+    /// Wall-clock of the most recent [`Self::open_review`]'s synchronous
+    /// body (dispatch to the `self.active` assignment) — Phase 7 D4
+    /// instrumentation (mirrors `Workspace::last_diff_ms`). A warm switch
+    /// (S7-3) does all its content work synchronously, so a small value
+    /// here is the "no flash" signal; a cold switch defers to an async
+    /// load, so this alone doesn't mean the workspace has finished loading
+    /// (check `workspace.settled`/`workspace.status` for that).
+    last_switch_ms: Option<u64>,
 }
 
 /// The theme picker overlay, while open.
@@ -750,6 +758,7 @@ impl AppShell {
             theme_picker: None,
             settings_panel: None,
             _appearance_subscription: None,
+            last_switch_ms: None,
         };
         // Live follow-OS updates (docs/phase-4-settings-and-theming.md
         // deliverable 2): `Window::observe_window_appearance`'s registration
@@ -816,6 +825,11 @@ impl AppShell {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        // Phase 7 D4: wall time of this whole synchronous body, down to the
+        // `self.active` assignment below (mirrors `Workspace::last_diff_ms`).
+        // Measured on the UI thread with no async hop, so there's no
+        // epoch/supersede concern the way the async-completion timings need.
+        let t0 = std::time::Instant::now();
         // Persist an absolute path: a relative one (`dv .`) would resolve
         // against whatever cwd the app is next launched from.
         let location = absolutize(location);
@@ -1047,6 +1061,7 @@ impl AppShell {
             },
         ));
         self.active = Some(workspace);
+        self.last_switch_ms = Some(t0.elapsed().as_millis() as u64);
         cx.notify();
     }
 
@@ -1760,6 +1775,11 @@ impl AppShell {
             // `hydrate_index`/`refresh_all_badges`).
             "recent": self.known_locations().iter().map(|l| l.display_name()).collect::<Vec<_>>(),
             "selected_review_id": self.selected_review_id,
+            // Phase 7 D4 instrumentation: wall time of the most recent
+            // `open_review` (sidebar switch / new-review open), synchronous
+            // body only — see the field's doc comment for what a small
+            // value here does and doesn't prove.
+            "last_switch_ms": self.last_switch_ms,
             // The sidebar's actual rendered row list (docs/phase-6-review-
             // navigator.md deliverables 3/4), in render order — filtered by
             // `settings.sidebar_filters` and, when `sidebar_grouping` isn't

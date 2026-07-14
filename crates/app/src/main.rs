@@ -1,4 +1,11 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+// `Workspace::automation_state`'s single `json!` call has grown large enough
+// (Phase 7 D4 added two more fields) to blow past `serde_json`'s default
+// macro recursion limit of 128 nested `json_internal!` expansions. Bumping
+// the limit is the standard fix for this exact `json!` failure mode — the
+// macro itself isn't recursive at runtime, only in how far rustc unrolls it
+// at compile time.
+#![recursion_limit = "256"]
 
 mod author;
 mod automation;

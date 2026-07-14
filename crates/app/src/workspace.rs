@@ -350,6 +350,14 @@ struct PrPicker {
     state: PrPickerState,
     /// Cursor into `state`'s list, once loaded.
     selected: usize,
+    /// Snapshot of `Workspace::pr_picker_epoch` at the moment this picker
+    /// was opened. The list-fetch spawned in `on_open_pr_picker` captures
+    /// the same value and only applies its result if this still matches on
+    /// completion — otherwise a stale fetch from a closed-then-reopened
+    /// picker (escape, then `ctrl-g` again before the first fetch lands)
+    /// would clobber the reopened picker's fresher state/timing. Mirrors
+    /// `source_epoch`'s discard-if-superseded pattern.
+    generation: u64,
 }
 
 enum PrPickerState {
@@ -688,6 +696,22 @@ pub struct Workspace {
     pr_error: Option<String>,
     /// The PR-picker overlay (`ctrl-g`), when open.
     pr_picker: Option<PrPicker>,
+    /// Bumped every `on_open_pr_picker` call; stamped into the new
+    /// `PrPicker::generation` and captured by that open's list-fetch spawn
+    /// so a stale fetch from a since-closed-and-reopened picker can be
+    /// told apart from the current one on completion (see `PrPicker::
+    /// generation`'s doc comment).
+    pr_picker_epoch: u64,
+    /// Wall-clock of the most recent `ctrl-g` PR-picker open, from dispatch
+    /// to the list leaving `Loading` (`Loaded`/`Error`) — Phase 7 D4
+    /// instrumentation (mirrors `last_diff_ms`), the cold baseline the S7-2
+    /// picker cache asserts a warm reopen against.
+    last_pr_list_ms: Option<u64>,
+    /// Wall-clock of the most recent `open_pr`, from dispatch to its
+    /// current-epoch completion (`Status::Ready` either way, success or
+    /// error) — Phase 7 D4 instrumentation, the cold baseline the S7-5
+    /// PR-reopen cache asserts a warm reopen against.
+    last_pr_open_ms: Option<u64>,
     /// Comment/reply author, resolved once in the background at load
     /// (`crate::author::resolve_author`). `None` until that resolves —
     /// callers fall back to a placeholder rather than block on it.
@@ -1177,6 +1201,9 @@ impl Workspace {
             pr_loading: None,
             pr_error: None,
             pr_picker: None,
+            pr_picker_epoch: 0,
+            last_pr_list_ms: None,
+            last_pr_open_ms: None,
             author: None,
             submit: None,
             submit_epoch: 0,
@@ -1928,6 +1955,10 @@ impl Workspace {
         let epoch = self.source_epoch;
         cx.notify();
 
+        // Phase 7 D4: dispatch-to-`Status::Ready` timing (mirrors
+        // `last_diff_ms`/`last_pr_list_ms`), the cold baseline the S7-5
+        // PR-reopen cache asserts a warm reopen against.
+        let started = std::time::Instant::now();
         let location = self.location.clone();
         cx.spawn_in(window, async move |this, cx| {
             let outcome = cx
@@ -1950,6 +1981,10 @@ impl Workspace {
                     return;
                 }
                 this.pr_loading = None;
+                // Current-epoch completion, success or error either way —
+                // both set `Status::Ready` below, and a superseded call
+                // already returned above without reaching here.
+                this.last_pr_open_ms = Some(started.elapsed().as_millis() as u64);
                 match outcome {
                     Ok(PrOpenOutcome {
                         meta,
@@ -2198,9 +2233,12 @@ impl Workspace {
         if let Some(shell) = self.shell.upgrade() {
             shell.update(cx, |shell, cx| shell.close_filter_popover(cx));
         }
+        self.pr_picker_epoch += 1;
+        let generation = self.pr_picker_epoch;
         self.pr_picker = Some(PrPicker {
             state: PrPickerState::Loading,
             selected: 0,
+            generation,
         });
         // Capture focus onto the workspace's own handle while the picker is
         // open (Phase 7 D0 fix). `PrPickerChoose`'s Enter binding is scoped
@@ -2217,6 +2255,10 @@ impl Workspace {
         window.focus(&self.focus_handle, cx);
         cx.notify();
 
+        // Phase 7 D4: dispatch-to-settled timing (mirrors `last_diff_ms`).
+        // Captured here, not inside the completion, so it covers the whole
+        // round trip including the background hop.
+        let started = std::time::Instant::now();
         cx.spawn(async move |this, cx| {
             let result = cx
                 .background_executor()
@@ -2227,12 +2269,23 @@ impl Workspace {
                 })
                 .await;
             this.update(cx, |this, cx| {
-                if let Some(picker) = &mut this.pr_picker {
+                // Apply and stamp only if this picker is still the one we
+                // opened — checked by `generation`, not just presence,
+                // because a closed-then-reopened picker (escape, then
+                // `ctrl-g` again before this fetch lands) is also `Some`
+                // and would otherwise look like a match. That reopened
+                // picker has already started its own fresh fetch/timing;
+                // this stale completion must not clobber its state or
+                // stamp a bogus `last_pr_list_ms` over it.
+                if let Some(picker) = &mut this.pr_picker
+                    && picker.generation == generation
+                {
                     picker.selected = 0;
                     picker.state = match result {
                         Ok(prs) => PrPickerState::Loaded(prs),
                         Err(err) => PrPickerState::Error(err),
                     };
+                    this.last_pr_list_ms = Some(started.elapsed().as_millis() as u64);
                 }
                 cx.notify();
             })
@@ -2321,6 +2374,12 @@ impl Workspace {
             "selected": self.selected,
             "current_hunk": self.current_hunk,
             "last_diff_ms": self.last_diff_ms,
+            // Phase 7 D4 instrumentation: dispatch-to-settled wall time for
+            // the PR-picker list fetch and the most recent `open_pr`, the
+            // cold baselines the S7-2/S7-5 caches assert a warm reopen
+            // against.
+            "last_pr_list_ms": self.last_pr_list_ms,
+            "last_pr_open_ms": self.last_pr_open_ms,
             "selection": self.selection.as_ref().map(|sel| {
                 let (start, end) = sel.range();
                 json!({

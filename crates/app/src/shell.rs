@@ -18,7 +18,7 @@ use gpui_component::{
 
 use std::collections::HashMap;
 
-use crate::recent::{RecentEntry, RecentStore, title_for};
+use crate::recent::RecentStore;
 use crate::settings::{
     CONTEXT_LINES_MAX, CONTEXT_LINES_MIN, DEFAULT_SIDEBAR_WIDTH, MONO_FONT_SIZE_MAX,
     MONO_FONT_SIZE_MIN, SIDEBAR_WIDTH_MAX, SIDEBAR_WIDTH_MIN, SUMMARY_WIDTH_MAX, SUMMARY_WIDTH_MIN,
@@ -184,6 +184,86 @@ fn index_health_word(health: dv_core::EntryHealth) -> &'static str {
     }
 }
 
+/// Compact relative time for a review card's line-1 age (docs/phase-6-
+/// review-navigator.md deliverable 2's sketch: "2h", "3d") — measured from
+/// `updated_ms` (the review's own last activity, not when the user last
+/// opened it in the sidebar; that's `last_opened_ms`, which only drives
+/// sort order). No finer than a day beyond the first month, and no finer
+/// than a month beyond the first year — a review this stale doesn't need
+/// second-guessing to the hour.
+fn relative_age(updated_ms: u64) -> String {
+    let now = dv_core::review::now_ms();
+    let secs = now.saturating_sub(updated_ms) / 1000;
+    if secs < 60 {
+        "just now".to_string()
+    } else if secs < 3_600 {
+        format!("{}m", secs / 60)
+    } else if secs < 86_400 {
+        format!("{}h", secs / 3_600)
+    } else if secs < 86_400 * 30 {
+        format!("{}d", secs / 86_400)
+    } else if secs < 86_400 * 365 {
+        format!("{}mo", secs / (86_400 * 30))
+    } else {
+        format!("{}y", secs / (86_400 * 365))
+    }
+}
+
+/// Sidebar PR-status glyph cluster: state dot (draft/open/merged/closed),
+/// review-decision marker, CI marker — subtle, one glyph each. The state
+/// glyph and the CI marker deliberately use different shapes (round dot vs.
+/// small square), not just different colors — an open PR (green ●) with
+/// passing checks (used to also be a green ●) was otherwise two
+/// indistinguishable dots side by side (review finding P3-2, from the
+/// retired per-repo `render_recent_row`; this is that same cluster,
+/// factored out for [`AppShell::render_review_card`]).
+#[allow(clippy::too_many_arguments)]
+fn render_pr_glyphs(
+    is_draft: bool,
+    state: PrState,
+    decision: Option<ReviewDecision>,
+    checks: ChecksSummary,
+    muted: Hsla,
+    success: Hsla,
+    primary: Hsla,
+    danger: Hsla,
+    warning: Hsla,
+) -> impl IntoElement {
+    let (state_glyph, state_color) = if is_draft {
+        ("\u{25d0}", muted) // draft
+    } else {
+        match state {
+            PrState::Merged => ("\u{21d7}", primary), // merged
+            PrState::Open => ("\u{25cf}", success),   // open
+            PrState::Closed => ("\u{25cf}", danger),  // closed
+        }
+    };
+    let decision_glyph = match decision {
+        Some(ReviewDecision::Approved) => Some(("\u{2713}", success)),
+        Some(ReviewDecision::ChangesRequested) => Some(("\u{b1}", danger)),
+        Some(ReviewDecision::ReviewRequired) | None => None,
+    };
+    let ci_color = match checks {
+        ChecksSummary::Passing => Some(success),
+        ChecksSummary::Failing => Some(danger),
+        ChecksSummary::Pending => Some(warning),
+        ChecksSummary::None => None,
+    };
+    h_flex()
+        .id("pr-badge")
+        .flex_none()
+        .gap_1()
+        .items_center()
+        .text_xs()
+        .child(div().text_color(state_color).child(state_glyph))
+        .children(decision_glyph.map(|(glyph, color)| div().text_color(color).child(glyph)))
+        .children(
+            // Small square (▪), not a dot — see the doc comment above on
+            // why this must not share the state glyph's shape.
+            ci_color.map(|color| div().text_color(color).child("\u{25aa}")),
+        )
+}
+
 pub fn init(cx: &mut App) {
     let shell = Some(KEY_CONTEXT);
     let theme_picker = Some("AppShell && ThemePickerOpen");
@@ -207,8 +287,18 @@ pub struct AppShell {
     focus_handle: FocusHandle,
     recent: RecentStore,
     active: Option<Entity<Workspace>>,
-    /// Index into `recent.entries()` of the active review, for highlighting.
-    selected: Option<usize>,
+    /// The active review's id, for sidebar-row highlighting and
+    /// [`Self::open_review_row`]'s pin (docs/phase-6-review-navigator.md
+    /// S6c). Identity, not position: once the sidebar renders from
+    /// [`Self::index`] instead of the recency list, a row's on-screen index
+    /// is no longer stable (grouping/filtering in S6d can reorder or hide
+    /// rows entirely) — the review's own id is the only thing worth
+    /// tracking. Set the instant an explicit pin is known (a row click,
+    /// `{"cmd":"select_review"}`); for an open with no pin (a brand-new
+    /// repo, `dv pr <n>`'s `pending_pr`), it's `None` until the workspace's
+    /// own `ReviewChanged` reports which review actually landed (see
+    /// `_ws_subscription`, below).
+    selected_review_id: Option<String>,
     /// True under `--automation`: blocks the native folder picker, which
     /// would wedge the foreground executor (and thus the whole automation
     /// channel) until a human dismissed it.
@@ -329,7 +419,9 @@ struct ReviewBadge {
 }
 
 /// Sidebar PR-status cluster for one repo's latest review: state glyph,
-/// review-decision marker, and CI dot (rendered in [`AppShell::render_recent_row`]).
+/// review-decision marker, and CI dot — flows into the review index's
+/// [`dv_core::CachedPrStatus`] ([`AppShell::sync_index_pr_status`]) and, from
+/// there, into [`render_pr_glyphs`]'s rendering on each review card.
 #[derive(Debug, Clone, Copy)]
 struct PrBadge {
     state: PrState,
@@ -351,7 +443,7 @@ impl AppShell {
             focus_handle: cx.focus_handle(),
             recent: RecentStore::load(),
             active: None,
-            selected: None,
+            selected_review_id: None,
             automation,
             badges: HashMap::new(),
             index: dv_core::ReviewIndex::load(),
@@ -399,7 +491,9 @@ impl AppShell {
         // `RefreshBadges` one below share the same boot-avoidance.
         this.hydrate_index(cx);
         match seed {
-            Some((location, source)) => this.open_review(location, source, pending_pr, window, cx),
+            Some((location, source)) => {
+                this.open_review(location, source, pending_pr, None, window, cx)
+            }
             // Nothing to focus into, so hold focus on the shell — otherwise
             // the advertised Ctrl+N binding (in the shell's key context) has
             // no focused node on its dispatch path and never fires.
@@ -408,40 +502,43 @@ impl AppShell {
         this
     }
 
-    /// Open a review for `location`/`source`: record it as most-recent,
-    /// spin up a fresh Workspace, and focus it so keyboard nav is live.
-    /// `pending_pr` is only ever `Some` on the very first review a freshly
-    /// launched `dv pr <number|url>` opens — `open_recent`/`automation_open`
-    /// always pass `None`.
+    /// Open a review: spin up a fresh Workspace for `location`/`source` and
+    /// focus it so keyboard nav is live. `pending_pr` is only ever `Some` on
+    /// the very first review a freshly launched `dv pr <number|url>` opens.
+    /// `pinned_review_id`, when set, is an explicit user pick (a sidebar row
+    /// click via [`Self::open_review_row`], or `{"cmd":"select_review"}`)
+    /// that `Workspace::pick_review` must honor over its own auto-selection
+    /// — including a SUBMITTED review, opened read-only
+    /// (docs/phase-6-review-navigator.md's headline incident fix). The two
+    /// are mutually exclusive by construction: every caller passes at most
+    /// one.
     fn open_review(
         &mut self,
         location: RepoLocation,
         source: DiffSource,
         pending_pr: Option<u64>,
+        pinned_review_id: Option<String>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         // Persist an absolute path: a relative one (`dv .`) would resolve
         // against whatever cwd the app is next launched from.
         let location = absolutize(location);
-        let title = title_for(&location, &source);
-        let index = self.recent.touch(RecentEntry {
-            location: location.clone(),
-            source: source.clone(),
-            title,
-            last_opened_ms: 0, // touch stamps the real time
-        });
-        self.selected = Some(index);
+        // A pin is known to be the selected review right away; anything
+        // else (a brand-new repo, `pending_pr`, a plain re-open) doesn't
+        // know which review will actually land until the workspace's own
+        // `ReviewChanged` reports it (see `_ws_subscription`, below).
+        self.selected_review_id = pinned_review_id.clone();
         // Review-open refresh (docs/phase-3-github.md deliverable 3): not
         // WSL-skipped — opening this specific review already implies its
         // distro (if any) is live, so there's no cold-boot backlog hazard
         // the way there is walking every recent entry at startup. Full
         // refresh (local + network) — see `refresh_badge`'s doc comment.
-        self.refresh_badge(index, true, cx);
+        self.refresh_badge(location.clone(), true, cx);
         // Fold this location's fresh review set into the index right away
         // too — don't wait for the broader `hydrate_index` walk, which may
         // already have run and skipped this location (a brand-new repo
-        // isn't in `recent` yet at the time it runs) or simply not have
+        // isn't in the index yet at the time it runs) or simply not have
         // gotten to it yet. Not WSL-gated, same "opening it implies it's
         // live" reasoning as `refresh_badge`'s `fetch_remote: true` above.
         self.hydrate_index_location(location.clone(), cx);
@@ -455,6 +552,7 @@ impl AppShell {
                 location,
                 source,
                 pending_pr,
+                pinned_review_id,
                 view_mode_default,
                 context_lines,
                 font_size,
@@ -465,26 +563,36 @@ impl AppShell {
         });
         let handle = workspace.focus_handle(cx);
         window.focus(&handle, cx);
+        // Tracks the review id the *last* recency stamp was for — `None`
+        // until the first stamp. Every `ReviewChanged` on the same
+        // workspace whose review id is unchanged from the last stamp (a
+        // comment, reply, resolve, submit, or an external CLI/other-window
+        // edit picked up by the store watcher) is a metadata refresh, not
+        // the user re-selecting the review, and must not reorder the
+        // sidebar under them. But a workspace can also switch to a
+        // *different* review without a fresh `open_review` call — the
+        // in-app PR picker (`Workspace::on_pr_picker_choose`) calls
+        // `open_pr` directly on this same entity — and that IS an explicit
+        // user pick, so it must still bump `last_opened_ms` (review
+        // finding: a plain one-shot bool stamped once and never reset left
+        // every later picker-driven switch on an already-open workspace
+        // un-stamped, so the sidebar's recency order went stale after the
+        // first event).
+        let mut stamped_review_id: Option<String> = None;
         // Keep this entry's badge live while the review is being worked on.
         self._ws_subscription = Some(cx.subscribe(
             &workspace,
             move |this: &mut Self, ws, _: &ReviewChanged, cx| {
-                if let Some(selected) = this.selected {
-                    // Local-only, no network — see `refresh_badge`'s doc
-                    // comment (review finding P3-3).
-                    this.refresh_badge(selected, false, cx);
-                }
+                let location = ws.read(cx).location().clone();
+                // Local-only, no network — see `refresh_badge`'s doc
+                // comment (review finding P3-3).
+                this.refresh_badge(location.clone(), false, cx);
                 // Keep this review's cached index entry current on every
                 // change too (comment/reply/resolve, submit, or an
                 // external CLI/other-window edit picked up by the store
-                // watcher) — `opened: false`, same "don't disturb recency"
-                // reasoning as `refresh_badge`'s local-only recompute:
-                // this is a metadata refresh, not a user re-selecting the
-                // review. S6b has no explicit-selection gesture yet (that
-                // lands in S6c) to stamp `last_opened_ms` from.
+                // watcher).
                 let entry = {
                     let ws = ws.read(cx);
-                    let location = ws.location().clone();
                     ws.review().map(|review| {
                         // Only a PR-linked review carries a `pr_status` at
                         // all (review finding P2-3) — `this.badges` is
@@ -522,26 +630,93 @@ impl AppShell {
                         });
                         let mut entry = dv_core::IndexEntry::from_review(&location, review);
                         entry.pr_status = pr_status;
-                        entry
+                        (review.id.clone(), entry)
                     })
                 };
-                if let Some(entry) = entry {
-                    this.index.upsert(entry, false);
+                if let Some((review_id, entry)) = entry {
+                    // This workspace is the active one — whatever review it
+                    // shows right now is, by definition, the sidebar's
+                    // selected review, however it got there (an explicit
+                    // row pin, `pick_review`'s auto-selection, or a watcher
+                    // swap all funnel through here).
+                    this.selected_review_id = Some(review_id.clone());
+                    // A `pending_pr` launch (`dv pr <n>`) produces TWO
+                    // `ReviewChanged` events for one `open_review` call: the
+                    // initial load's own `pick_review` fallback (no PR
+                    // context yet — typically an unrelated newest draft),
+                    // immediately followed by `open_pr`'s own load of the
+                    // actual PR-linked review. The first event is transient,
+                    // not the user's selection, so it must not consume the
+                    // first recency stamp (review finding: doing so bumped
+                    // the unrelated draft's `last_opened_ms` and left the
+                    // just-launched PR review's recency untouched, sorting
+                    // the wrong review to the top of the sidebar on the
+                    // next resort). Wait for the event whose review is
+                    // actually linked to `pending_pr` before stamping; a
+                    // plain open (no `pending_pr`) or an already-pinned open
+                    // has no such transient step, so its first event is
+                    // definitive as before. Once a review HAS been stamped,
+                    // any later event for a *different* review id (the
+                    // PR-picker case above) is by construction an explicit
+                    // switch too, so it re-stamps unconditionally; only a
+                    // later event for the *same* review id (an edit) skips
+                    // stamping.
+                    let opened = match &stamped_review_id {
+                        None => {
+                            pending_pr.is_none()
+                                || entry
+                                    .remote
+                                    .as_ref()
+                                    .is_some_and(|r| Some(r.pr) == pending_pr)
+                        }
+                        Some(prev) => *prev != review_id,
+                    };
+                    if opened {
+                        stamped_review_id = Some(review_id.clone());
+                    }
+                    // Re-dispatch a full location hydration on every live
+                    // metadata write too, not just when `open_review`
+                    // itself dispatches one — an in-flight hydration
+                    // dispatched *before* this upsert (e.g. `open_review`'s
+                    // own location hydrate, reading a pre-edit snapshot)
+                    // must be treated as stale once fresher data has landed
+                    // here, or its completion clobbers this upsert's
+                    // `open_comments` with the older snapshot. Merely
+                    // bumping the generation to invalidate that stale
+                    // hydration (without redispatching) fixed the clobber
+                    // but introduced a worse regression: the invalidated
+                    // hydration was often the *only* thing that would ever
+                    // apply this location's full review set, so a
+                    // brand-new repo with sibling reviews lost every
+                    // sibling but the active one until the next manual
+                    // refresh (review finding — the S6c acceptance
+                    // assertion that `state.sidebar` lists every review in
+                    // a multi-review repo). `hydrate_index_location` bumps
+                    // the generation itself (superseding the stale
+                    // dispatch) and reads a guaranteed post-upsert
+                    // snapshot, so its completion both drops the clobber
+                    // risk and restores every sibling; `apply_hydration`
+                    // carries `last_opened_ms`/`pr_status` forward by
+                    // review id, so this upsert's own stamp survives the
+                    // re-hydration.
+                    this.index.upsert(entry, opened);
+                    this.hydrate_index_location(location.clone(), cx);
+                } else {
+                    // The active workspace's review store is now fully
+                    // empty (e.g. the only review, currently open, was
+                    // deleted externally via CLI or another window) —
+                    // `pick_review` has nothing left to fall back to and
+                    // `ws.review()` is `None`. `self._ws_subscription`
+                    // holds only the *current* workspace's subscription
+                    // (assigning a new one drops and unsubscribes the
+                    // old), so this closure only ever runs for the active
+                    // workspace and it's always correct to clear
+                    // `selected_review_id` here (review finding: leaving it
+                    // pointed at the now-deleted id kept the stale row
+                    // highlighted in the sidebar for the rest of the
+                    // session with no path back to `None`).
+                    this.selected_review_id = None;
                 }
-                // Deliberately *not* a full `hydrate_index_location` re-list
-                // here too: `ReviewChanged` fires on the open review's own
-                // edits, so the pure `upsert` above is all this event needs
-                // (keep this handler's body cheap — `from_review` is pure,
-                // no I/O). A full store re-list on every comment/reply/
-                // resolve would cost a second whole-index disk write (and,
-                // for a WSL location, a host round trip) on a hot
-                // interactive path to reconcile *other* reviews' deletions
-                // — an event this closure doesn't reliably even fire for.
-                // That reconciliation already happens via `hydrate_index`
-                // (startup, `RefreshBadges`) and `open_review`'s own
-                // location hydrate — good enough for a case (another
-                // window/CLI deleting a sibling review at this location)
-                // that isn't time-critical.
             },
         ));
         // Summary-panel drag-release persistence (Phase 4 deliverable 5) —
@@ -574,11 +749,12 @@ impl AppShell {
     /// whatever `pr` badge already exists rather than clobbering it — the
     /// network view stays exactly as fresh as the last real refresh (app
     /// open, review open, or a manual `RefreshBadges`).
-    fn refresh_badge(&mut self, index: usize, fetch_remote: bool, cx: &mut Context<Self>) {
-        let Some(entry) = self.recent.entries().get(index) else {
-            return;
-        };
-        let location = entry.location.clone();
+    fn refresh_badge(
+        &mut self,
+        location: RepoLocation,
+        fetch_remote: bool,
+        cx: &mut Context<Self>,
+    ) {
         cx.spawn(async move |this, cx| {
             let key = location.clone();
             let local = cx
@@ -658,13 +834,15 @@ impl AppShell {
     ///   fields unconditionally, and queue the network pass for every
     ///   PR-linked entry — including WSL ones, since this is a deliberate,
     ///   infrequent ask with no cold-boot backlog concern.
+    ///
+    /// Locations come from [`Self::known_locations`] (index UNION recent),
+    /// not `self.recent.entries()` alone (review finding: since S6c stopped
+    /// writing `recent.json` on every open, that list is frozen at launch —
+    /// scoping this walk to it silently stopped covering any review opened
+    /// afterward, which is the *only* bulk path that fetches `pr_status` for
+    /// the index-driven sidebar).
     fn refresh_all_badges(&mut self, startup: bool, cx: &mut Context<Self>) {
-        let locations: Vec<_> = self
-            .recent
-            .entries()
-            .iter()
-            .map(|e| e.location.clone())
-            .collect();
+        let locations: Vec<_> = self.known_locations();
         cx.spawn(async move |this, cx| {
             let local = cx
                 .background_executor()
@@ -870,26 +1048,26 @@ impl AppShell {
         .detach();
     }
 
-    /// Walk every location the app currently knows a review for — the
-    /// index's own entries UNION `recent.json`'s seed, deduped by location
+    /// Every location the app currently knows a review for — the index's
+    /// own entries UNION `recent.json`'s seed, deduped by location
     /// (cross-cutting risk G: a user with only a pre-Phase-6 `recent.json`
-    /// must not lose their sidebar on upgrade to a review-centric one; a
-    /// location already covered by an index entry must not be
-    /// double-hydrated) — and refresh each one off-thread via
-    /// [`Self::hydrate_index_location`]. The WSL-liveness skip mirrors
-    /// `refresh_all_badges`'s boot-avoidance filter exactly (cross-cutting
-    /// risk B) and, like that filter, applies unconditionally regardless of
-    /// caller: `hydrate_index_location` opens a `ReviewStore`, which for a
-    /// WSL location with no live host boots a stopped distro (review
-    /// finding P1/P2 — a startup-only guard here left the manual
-    /// `RefreshBadges` path booting every stopped distro the index has ever
-    /// seen a review in, exactly the storm this policy exists to prevent).
-    fn hydrate_index(&mut self, cx: &mut Context<Self>) {
+    /// must not lose their sidebar on upgrade to a review-centric one).
+    /// Shared by [`Self::hydrate_index`] (which pass gets the local-store
+    /// walk) and [`Self::refresh_all_badges`] (which pass gets the network
+    /// PR-status fetch): since S6c stopped `RecentStore::touch`ing on every
+    /// open (`recent.rs`'s "read-only as of S6c"), `self.recent.entries()`
+    /// alone is a snapshot frozen at launch — a location opened afterward
+    /// only ever exists in `self.index`, and a badges walk scoped to
+    /// `recent` alone would never fetch PR/CI status for it (review
+    /// finding, `refresh_all_badges` regression: the manual "Refresh
+    /// badges" action and the startup badge walk both silently stopped
+    /// covering every review the sidebar itself now shows).
+    fn known_locations(&self) -> Vec<RepoLocation> {
         // Dedup the index's own entries by location first (review finding
         // P3-4) — a location with N cached reviews (N `IndexEntry`s, since
         // the index is keyed by `review_id` not location) must still only
-        // enqueue one hydration pass, matching this function's own "deduped
-        // by location" doc promise above.
+        // appear once, matching this function's own "deduped by location"
+        // doc promise above.
         let mut locations: Vec<RepoLocation> = Vec::new();
         for entry in self.index.entries() {
             if !locations.contains(&entry.location) {
@@ -901,7 +1079,21 @@ impl AppShell {
                 locations.push(entry.location.clone());
             }
         }
-        for location in locations {
+        locations
+    }
+
+    /// Walk every location the app currently knows a review for (see
+    /// [`Self::known_locations`]) and refresh each one off-thread via
+    /// [`Self::hydrate_index_location`]. The WSL-liveness skip mirrors
+    /// `refresh_all_badges`'s boot-avoidance filter exactly (cross-cutting
+    /// risk B) and, like that filter, applies unconditionally regardless of
+    /// caller: `hydrate_index_location` opens a `ReviewStore`, which for a
+    /// WSL location with no live host boots a stopped distro (review
+    /// finding P1/P2 — a startup-only guard here left the manual
+    /// `RefreshBadges` path booting every stopped distro the index has ever
+    /// seen a review in, exactly the storm this policy exists to prevent).
+    fn hydrate_index(&mut self, cx: &mut Context<Self>) {
+        for location in self.known_locations() {
             if let RepoLocation::Wsl { distro, .. } = &location
                 && !dv_core::remote::manager::has_running_host(distro)
             {
@@ -1082,11 +1274,28 @@ impl AppShell {
         self.apply_resolved_theme(&name, window, cx);
     }
 
-    fn open_recent(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(entry) = self.recent.entries().get(index).cloned() else {
+    /// Explicit row selection (a sidebar card click, or
+    /// `{"cmd":"select_review"}`): pin `review_id` and reopen it — including
+    /// a SUBMITTED review, read-only (docs/phase-6-review-navigator.md's
+    /// headline incident fix: a review only reachable before via the CLI or
+    /// `pick_review`'s auto-selection is now a click away). An id with no
+    /// matching index entry (a stale click racing a hydration that dropped
+    /// it) is a silent no-op here — [`Self::automation_select_review`]
+    /// checks first and surfaces that case as an error instead.
+    fn open_review_row(&mut self, review_id: &str, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(entry) = self.index.get(review_id) else {
             return;
         };
-        self.open_review(entry.location, entry.source, None, window, cx);
+        let location = entry.location.clone();
+        let source = entry.source.clone();
+        self.open_review(
+            location,
+            source,
+            None,
+            Some(review_id.to_string()),
+            window,
+            cx,
+        );
     }
 
     /// The "new review" flow: a native folder picker. Because the picker can
@@ -1127,7 +1336,7 @@ impl AppShell {
         // be parsed is dropped silently for now; a validation surface lands
         // with Phase 2.
         if let Ok(location) = RepoLocation::from_path_arg(&path.to_string_lossy()) {
-            self.open_review(location, DiffSource::WorkingTree, None, window, cx);
+            self.open_review(location, DiffSource::WorkingTree, None, None, window, cx);
         }
     }
 
@@ -1137,15 +1346,31 @@ impl AppShell {
         use serde_json::json;
         let theme = cx.theme();
         json!({
-            "recent": self.recent.entries().iter().map(|e| e.title.clone()).collect::<Vec<_>>(),
-            "selected": self.selected,
+            // Every location the app currently knows a review for, live for
+            // the whole session — NOT `self.recent.entries()` (review
+            // finding: `recent.json` is a startup-only seed, read-only as
+            // of S6c, so scoping this to it silently stopped covering any
+            // repo opened after launch, exactly the regression
+            // `Self::known_locations`'s doc comment already calls out for
+            // `hydrate_index`/`refresh_all_badges`).
+            "recent": self.known_locations().iter().map(|l| l.display_name()).collect::<Vec<_>>(),
+            "selected_review_id": self.selected_review_id,
+            // Ordered review ids as the sidebar actually renders them —
+            // S6c is a flat list (last_opened_ms desc, same order as
+            // `index` below); S6d's grouping/filtering will make this
+            // diverge from `index`'s own order, which is why this exists
+            // as its own field rather than something scripts derive by
+            // re-sorting `index` themselves.
+            "sidebar": self.index.entries().iter().map(|e| e.review_id.clone()).collect::<Vec<_>>(),
             "workspace": self.active.as_ref().map(|ws| ws.read(cx).automation_state()),
-            // Per-recent-entry badge dump (docs/phase-3-github.md
-            // deliverable 3/4), same order as `recent` above.
-            "badges": self.recent.entries().iter().map(|entry| {
-                let badge = self.badges.get(&entry.location);
+            // Per-location badge dump (docs/phase-3-github.md deliverable
+            // 3/4), same order/coverage as `recent` above — see that
+            // field's comment for why this is `known_locations()`, not
+            // `self.recent.entries()`.
+            "badges": self.known_locations().iter().map(|location| {
+                let badge = self.badges.get(location);
                 json!({
-                    "title": entry.title,
+                    "title": location.display_name(),
                     "open": badge.map(|b| b.open),
                     "submitted": badge.map(|b| b.submitted),
                     "pr": badge.and_then(|b| b.pr.as_ref()).map(|pr| json!({
@@ -1157,13 +1382,16 @@ impl AppShell {
                 })
             }).collect::<Vec<_>>(),
             // Cross-repo review index (docs/phase-6-review-navigator.md
-            // deliverable 1, S6b): every review the app has hydrated
-            // across every repo it knows about — NOT scoped to `recent`
-            // (a location can appear here without ever showing up in
+            // deliverable 1): every review the app has hydrated across
+            // every repo it knows about — NOT scoped to `recent` (a
+            // location can appear here without ever showing up in
             // `recent.json`, and vice versa until its first hydration
-            // completes). Sidebar rendering itself is unchanged this
-            // slice (S6c flips it onto this data) — this exists purely so
-            // `state` can assert hydration behavior without a screenshot.
+            // completes). This is also the sidebar's actual data source
+            // as of S6c (see `"sidebar"`, above, and
+            // `Render::render`'s review-card list) — `index` still
+            // carries every field (including ones the flat S6c list
+            // doesn't render, like `health`) so a script can assert
+            // hydration behavior without a screenshot.
             "index": self.index.entries().iter().map(|e| json!({
                 "review_id": e.review_id,
                 "title": e.title,
@@ -1250,7 +1478,27 @@ impl AppShell {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.open_review(location, DiffSource::WorkingTree, None, window, cx);
+        self.open_review(location, DiffSource::WorkingTree, None, None, window, cx);
+    }
+
+    /// `{"cmd":"select_review","id":"..."}`: explicit row selection by
+    /// review id — the S6c incident-fix entry point for automation, same
+    /// pin-and-reopen path a sidebar card click takes
+    /// ([`Self::open_review_row`]). Errors (rather than silently no-oping)
+    /// on an unknown id, matching [`Self::automation_select_file`]'s
+    /// contract: a script's response must never claim a selection that
+    /// didn't happen.
+    pub(crate) fn automation_select_review(
+        &mut self,
+        id: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> anyhow::Result<()> {
+        if self.index.get(&id).is_none() {
+            anyhow::bail!("unknown review id: {id}");
+        }
+        self.open_review_row(&id, window, cx);
+        Ok(())
     }
 
     /// `{"cmd":"open_pr","number":N}`: open PR `number` in the active
@@ -1559,108 +1807,119 @@ impl AppShell {
         cx.notify();
     }
 
-    fn render_recent_row(&self, index: usize, cx: &mut Context<Self>) -> impl IntoElement + use<> {
-        let entry = &self.recent.entries()[index];
+    /// One two-line review card (docs/phase-6-review-navigator.md
+    /// deliverable 2's user sketch): line 1 is `repo_label`(muted) left +
+    /// `relative_age`(muted) right; line 2 is the review's derived title
+    /// (semibold, truncating) left + a status cluster right (health warning,
+    /// PR glyphs, open-comment pill/submitted check). Colors are snapshotted
+    /// as owned locals up front — holding `&Theme` across the card's own
+    /// `cx.listener` setup below is a borrow-check error (CLAUDE.md's gpui
+    /// gotcha; same pattern as `render_summary`/`render_split_row`).
+    fn render_review_card(
+        &self,
+        entry: &dv_core::IndexEntry,
+        selected: bool,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement + use<> {
         let theme = cx.theme();
-        let selected = self.selected == Some(index);
-        h_flex()
-            .id(index)
+        let accent = theme.accent;
+        let muted = theme.muted_foreground;
+        let primary = theme.primary;
+        let success = theme.success;
+        let warning = theme.warning;
+        let danger = theme.danger;
+
+        let review_id = entry.review_id.clone();
+        let repo = dv_core::repo_label(&entry.location, entry.remote.as_ref());
+        let age = relative_age(entry.updated_ms);
+        let title = entry.title.clone();
+        let open_comments = entry.open_comments;
+        let submitted = matches!(entry.state, dv_core::ReviewState::Submitted { .. });
+        let unavailable = entry.health == dv_core::EntryHealth::RepoUnavailable;
+        let pr = entry.pr_status.clone();
+
+        v_flex()
+            .id(SharedString::from(format!("review-card-{review_id}")))
             .w_full()
             .px_2()
-            .py_1()
-            .gap_2()
+            .py_1p5()
+            .gap_0p5()
             .rounded_md()
             .cursor_pointer()
-            .when(selected, |el| el.bg(theme.accent))
-            .hover(|el| el.bg(theme.accent.opacity(0.5)))
+            .when(selected, |el| el.bg(accent))
+            .hover(|el| el.bg(accent.opacity(0.5)))
             .on_mouse_down(
                 MouseButton::Left,
-                cx.listener(move |this, _, window, cx| this.open_recent(index, window, cx)),
+                cx.listener(move |this, _, window, cx| {
+                    this.open_review_row(&review_id, window, cx);
+                }),
             )
             .child(
-                div()
-                    .flex_1()
-                    .min_w(px(0.))
-                    .text_sm()
-                    .truncate()
-                    .child(entry.title.clone()),
-            )
-            .children(self.badges.get(&entry.location).map(|badge| {
                 h_flex()
-                    .flex_none()
+                    .w_full()
+                    .gap_2()
+                    .text_xs()
+                    .text_color(muted)
+                    .child(div().flex_1().min_w(px(0.)).truncate().child(repo))
+                    .child(div().flex_none().child(age)),
+            )
+            .child(
+                h_flex()
+                    .w_full()
                     .gap_2()
                     .items_center()
-                    .child(if badge.open > 0 {
+                    .child(
                         div()
-                            .flex_none()
-                            .px_1p5()
-                            .rounded_full()
-                            .bg(theme.primary.opacity(0.25))
-                            .text_xs()
-                            .text_color(theme.primary)
-                            .child(format!("{}", badge.open))
-                            .into_any_element()
-                    } else if badge.submitted {
-                        div()
-                            .flex_none()
-                            .text_xs()
-                            .text_color(theme.success)
-                            .child("\u{2713}")
-                            .into_any_element()
-                    } else {
-                        div().into_any_element()
-                    })
-                    .children(badge.pr.as_ref().map(|pr| {
-                        // PR-status cluster (docs/phase-3-github.md
-                        // deliverable 3/5): state glyph, review-decision
-                        // marker, CI marker — subtle, one glyph each, kept
-                        // well inside the row's ~24px height. The state
-                        // glyph and the CI marker deliberately use different
-                        // shapes (round dot vs. small square), not just
-                        // different colors — an open PR (green ●) with
-                        // passing checks (used to also be a green ●) was
-                        // otherwise two indistinguishable dots side by side
-                        // (review finding P3-2).
-                        let (state_glyph, state_color) = if pr.is_draft {
-                            ("\u{25d0}", theme.muted_foreground) // draft
-                        } else {
-                            match pr.state {
-                                PrState::Merged => ("\u{21d7}", theme.primary), // merged
-                                PrState::Open => ("\u{25cf}", theme.success),   // open
-                                PrState::Closed => ("\u{25cf}", theme.danger),  // closed
-                            }
-                        };
-                        let decision = match pr.decision {
-                            Some(ReviewDecision::Approved) => Some(("\u{2713}", theme.success)),
-                            Some(ReviewDecision::ChangesRequested) => {
-                                Some(("\u{b1}", theme.danger))
-                            }
-                            Some(ReviewDecision::ReviewRequired) | None => None,
-                        };
-                        let ci_color = match pr.checks {
-                            ChecksSummary::Passing => Some(theme.success),
-                            ChecksSummary::Failing => Some(theme.danger),
-                            ChecksSummary::Pending => Some(theme.warning),
-                            ChecksSummary::None => None,
-                        };
+                            .flex_1()
+                            .min_w(px(0.))
+                            .text_sm()
+                            .font_semibold()
+                            .truncate()
+                            .child(title),
+                    )
+                    .child(
                         h_flex()
-                            .id("pr-badge")
                             .flex_none()
-                            .gap_1()
+                            .gap_1p5()
                             .items_center()
-                            .text_xs()
-                            .child(div().text_color(state_color).child(state_glyph))
-                            .children(
-                                decision.map(|(glyph, color)| div().text_color(color).child(glyph)),
-                            )
-                            .children(
-                                // Small square (▪), not a dot — see the
-                                // comment above on why this must not share
-                                // the state glyph's shape.
-                                ci_color.map(|color| div().text_color(color).child("\u{25aa}")),
-                            )
-                    }))
-            }))
+                            .when(unavailable, |el| {
+                                el.child(div().text_color(warning).child("\u{26a0}"))
+                            })
+                            .children(pr.map(|pr| {
+                                render_pr_glyphs(
+                                    pr.is_draft,
+                                    pr.state,
+                                    pr.decision,
+                                    pr.checks,
+                                    muted,
+                                    success,
+                                    primary,
+                                    danger,
+                                    warning,
+                                )
+                            }))
+                            .child(if open_comments > 0 {
+                                div()
+                                    .flex_none()
+                                    .px_1p5()
+                                    .rounded_full()
+                                    .bg(primary.opacity(0.25))
+                                    .text_xs()
+                                    .text_color(primary)
+                                    .child(format!("{open_comments}"))
+                                    .into_any_element()
+                            } else if submitted {
+                                div()
+                                    .flex_none()
+                                    .text_xs()
+                                    .text_color(success)
+                                    .child("\u{2713}")
+                                    .into_any_element()
+                            } else {
+                                div().into_any_element()
+                            }),
+                    ),
+            )
     }
 
     /// The sidebar's inner-edge drag handle (Phase 4 deliverable 5): a 6px
@@ -2187,11 +2446,12 @@ impl AppShell {
 impl Render for AppShell {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme();
-        let recent_count = self.recent.entries().len();
+        let review_count = self.index.entries().len();
 
         let active_title = self
-            .selected
-            .and_then(|i| self.recent.entries().get(i))
+            .selected_review_id
+            .as_deref()
+            .and_then(|id| self.index.get(id))
             .map(|e| e.title.clone());
 
         let has_active = self.active.is_some();
@@ -2289,7 +2549,7 @@ impl Render for AppShell {
                                             .flex_1()
                                             .text_xs()
                                             .text_color(theme.muted_foreground)
-                                            .child("RECENT"),
+                                            .child("REVIEWS"),
                                     )
                                     .child(
                                         // Manual badge refresh (docs/phase-3-github.md
@@ -2307,12 +2567,16 @@ impl Render for AppShell {
                             )
                             .child(
                                 uniform_list(
-                                    "recent-list",
-                                    recent_count,
+                                    "review-list",
+                                    review_count,
                                     cx.processor(|this, range: std::ops::Range<usize>, _, cx| {
                                         range
                                             .map(|i| {
-                                                this.render_recent_row(i, cx).into_any_element()
+                                                let entry = &this.index.entries()[i];
+                                                let selected = this.selected_review_id.as_deref()
+                                                    == Some(entry.review_id.as_str());
+                                                this.render_review_card(entry, selected, cx)
+                                                    .into_any_element()
                                             })
                                             .collect::<Vec<_>>()
                                     }),

@@ -181,7 +181,8 @@ impl Settings {
     }
 
     /// Best-effort save; silently does nothing if the data dir can't be
-    /// determined or the write fails (same posture as `RecentStore::save`).
+    /// determined or the write fails (same posture as
+    /// `dv_core::ReviewIndex::save`).
     pub fn save(&self) {
         let Some(path) = default_path() else { return };
         if let Some(parent) = path.parent() {

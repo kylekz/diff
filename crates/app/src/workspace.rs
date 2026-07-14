@@ -584,6 +584,18 @@ pub struct Workspace {
     stale_checked: Option<(usize, u64)>,
     /// The repo location, for opening the review store off-thread.
     location: RepoLocation,
+    /// An explicit sidebar-row pick (docs/phase-6-review-navigator.md S6c —
+    /// a card click via `AppShell::open_review_row`, or
+    /// `{"cmd":"select_review"}`), threaded in at construction from
+    /// `AppShell::open_review`'s `pinned_review_id` param. Takes precedence
+    /// over `pick_review`'s own auto-selection at every call site (initial
+    /// load and every watcher-driven reload) — including a SUBMITTED
+    /// review, so an explicit pick isn't silently un-pinned by the next
+    /// external edit. `None` for every open that isn't an explicit pick (a
+    /// brand-new repo, `dv pr <n>`'s `pending_pr`, a plain re-open); an
+    /// explicit [`Self::open_pr`] clears it too — a PR open is itself a
+    /// different explicit selection.
+    pinned_review_id: Option<String>,
     /// The active draft review (latest draft in the store), lazily loaded.
     review: Option<dv_core::Review>,
     editor: Option<CommentEditor>,
@@ -686,6 +698,17 @@ fn anchor_spec(source: &DiffSource, side: dv_core::Side, path: &str) -> BlobSpec
 /// Which review the workspace should display, from a store listing
 /// (newest-first).
 ///
+/// `pinned_id` (docs/phase-6-review-navigator.md S6c) takes precedence over
+/// everything below it: an explicit sidebar-row pick (a card click via
+/// `AppShell::open_review_row`, or `{"cmd":"select_review"}`) wins outright
+/// when it still resolves to a review in this listing — ANY state,
+/// including SUBMITTED (the whole point: a submitted review is otherwise
+/// unreachable once it's not the newest draft and no PR is open). A vanished
+/// pin (the review was deleted between the click and this listing) falls
+/// through to the logic below rather than returning `None` and blanking the
+/// workspace — same "never go blank over a stale reference" posture the
+/// PR-arm's own fallback already has.
+///
 /// When the workspace has a PR open (`current_pr` is `Some`), a draft
 /// created by a completely unrelated `dv comment add` (e.g. the CLI writing
 /// against some other PR's review) must never hijack the display just for
@@ -708,7 +731,13 @@ fn pick_review(
     reviews: Vec<dv_core::Review>,
     current_id: Option<&str>,
     current_pr: Option<&RemoteRef>,
+    pinned_id: Option<&str>,
 ) -> Option<dv_core::Review> {
+    if let Some(pin) = pinned_id
+        && let Some(pinned) = reviews.iter().find(|r| r.id == pin)
+    {
+        return Some(pinned.clone());
+    }
     if let Some(pr) = current_pr {
         let matches_pr = |r: &&dv_core::Review| {
             r.remote.as_ref().is_some_and(|remote| {
@@ -735,6 +764,20 @@ fn pick_review(
         return Some(current.clone());
     }
     reviews.into_iter().next()
+}
+
+/// What `pinned_review_id` should become right after a `pick_review` result
+/// lands. A pin only makes sense pointing at the review actually being
+/// shown — if it didn't resolve (the pinned review was deleted between the
+/// click and this listing, and `pick_review` fell through to something
+/// else per its own "never go blank over a stale reference" posture), the
+/// pin is dropped rather than left dangling. A stale pin left pointing at a
+/// vanished id would otherwise still read as `is_some()` and permanently
+/// block new comments (`Workspace::new_comment_blocked`) on a review
+/// nobody explicitly selected (review finding, docs/phase-6-review-
+/// navigator.md S6c).
+fn resolved_pin(pinned_id: Option<String>, review: &Option<dv_core::Review>) -> Option<String> {
+    pinned_id.filter(|pin| review.as_ref().is_some_and(|r| &r.id == pin))
 }
 
 /// A one-row "diff" carrying an error message where the hunks would be.
@@ -995,6 +1038,7 @@ impl Workspace {
         location: RepoLocation,
         source: DiffSource,
         pending_pr: Option<u64>,
+        pinned_review_id: Option<String>,
         view_mode_default: ViewModeSetting,
         context_lines: u32,
         font_size: f32,
@@ -1021,6 +1065,7 @@ impl Workspace {
             title: location.display_name().into(),
             source_desc: source_label(&source).into(),
             location: location.clone(),
+            pinned_review_id: pinned_review_id.clone(),
             review: None,
             editor: None,
             display: Vec::new(),
@@ -1074,16 +1119,22 @@ impl Workspace {
                 while watch_rx.try_recv().is_ok() {}
                 // The normalized location (set by the load task), the
                 // review currently shown so it isn't dropped when a submit
-                // leaves no draft behind, and the PR this workspace is
-                // scoped to (if any) so a reload can't adopt some other
-                // PR's draft out from under it (review finding P1-b).
-                let Ok((location, current_id, current_pr)) = this.update(cx, |this, _| {
-                    (
-                        this.location.clone(),
-                        this.review.as_ref().map(|r| r.id.clone()),
-                        this.pr_remote.clone(),
-                    )
-                }) else {
+                // leaves no draft behind, the PR this workspace is scoped to
+                // (if any) so a reload can't adopt some other PR's draft out
+                // from under it (review finding P1-b), and the explicit
+                // sidebar-row pin (if any — docs/phase-6-review-navigator.md
+                // S6c) so a reload can't silently un-pin a SUBMITTED review
+                // the user explicitly selected.
+                let Ok((location, current_id, current_pr, pinned_id)) =
+                    this.update(cx, |this, _| {
+                        (
+                            this.location.clone(),
+                            this.review.as_ref().map(|r| r.id.clone()),
+                            this.pr_remote.clone(),
+                            this.pinned_review_id.clone(),
+                        )
+                    })
+                else {
                     break;
                 };
                 let review = cx
@@ -1095,6 +1146,7 @@ impl Workspace {
                                 .unwrap_or_default(),
                             current_id.as_deref(),
                             current_pr.as_ref(),
+                            pinned_id.as_deref(),
                         )
                     })
                     .await;
@@ -1105,6 +1157,8 @@ impl Workspace {
                     };
                     if fingerprint(&this.review) != fingerprint(&review) {
                         this.review = review;
+                        this.pinned_review_id =
+                            resolved_pin(this.pinned_review_id.take(), &this.review);
                         cx.emit(ReviewChanged);
                         // A watcher-driven reload invalidates a parked
                         // submit panel — it was built against the review
@@ -1263,6 +1317,7 @@ impl Workspace {
                             .unwrap_or_default(),
                         None,
                         None,
+                        pinned_review_id.as_deref(),
                     );
                     // Resolved here (off-thread: it may hit a `gh` subprocess
                     // on first use) so new comments/replies stamp the real
@@ -1289,6 +1344,8 @@ impl Workspace {
                         this.files = files;
                         this.source = source;
                         this.review = review;
+                        this.pinned_review_id =
+                            resolved_pin(this.pinned_review_id.take(), &this.review);
                         this.author = Some(author);
                         cx.emit(ReviewChanged);
                         this.location = store_location.clone();
@@ -1353,6 +1410,39 @@ impl Workspace {
     /// before that. Same `pub(crate)` reasoning as [`Self::review`].
     pub(crate) fn location(&self) -> &RepoLocation {
         &self.location
+    }
+
+    /// Whether the active review is submitted — suppresses mutation of its
+    /// EXISTING threads (docs/phase-6-review-navigator.md S6c doc-deviation
+    /// #4: the thread card's reply/edit/resolve/delete) plus shows a banner
+    /// in the summary panel ([`Self::render_summary`]). Deliberately
+    /// narrower than a blanket lockdown — scroll/nav/the verdict caption
+    /// stay live, matching the deviation's stated scope. `false` while no
+    /// review has loaded yet (nothing to gate).
+    ///
+    /// Does NOT by itself gate *new* top-level comments — see
+    /// [`Self::new_comment_blocked`], which is deliberately narrower still.
+    fn review_is_readonly(&self) -> bool {
+        self.review
+            .as_ref()
+            .is_some_and(|r| matches!(r.state, dv_core::ReviewState::Submitted { .. }))
+    }
+
+    /// Whether starting a NEW top-level comment (gutter selection → editor)
+    /// is currently blocked. Narrower than [`Self::review_is_readonly`] on
+    /// purpose: only an EXPLICITLY pinned submitted review (a sidebar-row
+    /// pick or `select_review`, S6c) blocks new comments outright. A
+    /// merely auto-selected submitted review — the newest review with no
+    /// PR open, or the review `submit_review` just finished in-app with no
+    /// pin — still accepts a new gutter comment, which lands in a fresh
+    /// draft (`submit_comment`'s Submitted-state branch); that's the
+    /// "continue reviewing" flow `pick_review`'s and `submit_review`'s own
+    /// doc comments promise. Existing-thread mutation has no such
+    /// exception — there's no "start a fresh draft" fallback for editing a
+    /// comment that already belongs to a specific (now-submitted) review,
+    /// so those stay gated on plain `review_is_readonly()` everywhere else.
+    fn new_comment_blocked(&self) -> bool {
+        self.pinned_review_id.is_some() && self.review_is_readonly()
     }
 
     /// Switch to another file. A live gutter selection or comment editor
@@ -1631,6 +1721,10 @@ impl Workspace {
         // fixes (review finding P1-2). `Submitting` was already refused
         // above, so this can only cancel, never clobber an in-flight POST.
         self.cancel_submit_flow(cx);
+        // An explicit PR open is itself an explicit selection — any earlier
+        // sidebar-row pin (docs/phase-6-review-navigator.md S6c) no longer
+        // applies once the source is moving to a different review entirely.
+        self.pinned_review_id = None;
 
         let Some(repo) = self.repo.clone() else {
             // The repo hasn't finished its own initial load yet — nothing
@@ -1967,6 +2061,12 @@ impl Workspace {
                     dv_core::ReviewState::Draft => "draft".to_string(),
                     dv_core::ReviewState::Submitted { verdict, .. } => format!("submitted:{verdict:?}"),
                 },
+                // docs/phase-6-review-navigator.md S6c: whether comment
+                // mutation (new/reply/edit/resolve/delete) is suppressed —
+                // see `review_is_readonly`'s doc comment for the exact
+                // scope (suppressed entry points + a banner, not a blanket
+                // lockdown).
+                "readonly": self.review_is_readonly(),
             })),
             "display_rows": self.display.len(),
             "scroll_item": self.diff_list.logical_scroll_top().item_ix,
@@ -2367,8 +2467,19 @@ impl Workspace {
     // ---- Gutter selection (comment anchoring) ------------------------
 
     /// Mouse pressed on a line's gutter: start (or shift-extend) a
-    /// selection on that side.
+    /// selection on that side. This is the sole entry point into the
+    /// gutter-selection → editor pipeline (`Self::gutter_up` only opens the
+    /// editor for a selection this created), so gating it here is enough to
+    /// suppress new comments on a SUBMITTED review (docs/phase-6-review-
+    /// navigator.md S6c doc-deviation #4) without touching `gutter_up`/
+    /// `open_editor` individually.
+    ///
+    /// Gated on [`Self::new_comment_blocked`] — see its doc comment for why
+    /// that's narrower than plain `review_is_readonly()`.
     fn gutter_down(&mut self, side: DiffSide, line: u32, shift: bool, cx: &mut Context<Self>) {
+        if self.new_comment_blocked() {
+            return;
+        }
         let Some(file) = self.selected else {
             return;
         };
@@ -2528,9 +2639,17 @@ impl Workspace {
             this.update(cx, |this, cx| {
                 match result {
                     // Keep showing the just-submitted review; the next
-                    // comment auto-creates a fresh draft.
+                    // comment auto-creates a fresh draft. An in-app finish
+                    // is itself an explicit state transition out of
+                    // "browsing a pinned submitted review" — clear any pin
+                    // (mirrors `open_pr`'s clear) so `new_comment_blocked`
+                    // doesn't dead-end that fresh-draft continuation for a
+                    // review the user reached via a sidebar-row pick
+                    // (review finding, docs/phase-6-review-navigator.md
+                    // S6c).
                     Ok(review) => {
                         this.review = Some(review);
+                        this.pinned_review_id = None;
                         cx.emit(ReviewChanged);
                     }
                     Err(err) => eprintln!("finish review failed: {err:#}"),
@@ -2977,13 +3096,21 @@ impl Workspace {
     }
 
     /// Toggle a comment's open/resolved status (by id), persisting
-    /// off-thread.
+    /// off-thread. Gated behind `review_is_readonly` (docs/phase-6-review-
+    /// navigator.md S6c doc-deviation #4) — Resolve/Unresolve on a
+    /// SUBMITTED review's thread card is a no-op. That synchronous check is
+    /// only half the guard: the freshly-loaded review is re-checked below
+    /// too, since a submit can land on disk in the window between this
+    /// click and the fresh load completing (review finding, S6c).
     fn set_comment_status(
         &mut self,
         comment_id: String,
         status: dv_core::CommentStatus,
         cx: &mut Context<Self>,
     ) {
+        if self.review_is_readonly() {
+            return;
+        }
         let Some(review) = self.review.clone() else {
             return;
         };
@@ -2995,19 +3122,26 @@ impl Workspace {
                     let store = dv_core::ReviewStore::open(location);
                     // Fresh-load before mutating (see submit_comment).
                     let mut review = store.load(&review.id).ok().flatten().unwrap_or(review);
+                    // Re-check against the freshly-loaded state, not the
+                    // stale clone the synchronous check above saw.
+                    if matches!(review.state, dv_core::ReviewState::Submitted { .. }) {
+                        return anyhow::Ok((review, false));
+                    }
                     review.set_status(&comment_id, status)?;
                     store.save(&review)?;
-                    anyhow::Ok(review)
+                    anyhow::Ok((review, true))
                 })
                 .await;
             this.update(cx, |this, cx| {
                 match result {
-                    Ok(review) => {
+                    Ok((review, applied)) => {
                         this.review = Some(review);
                         cx.emit(ReviewChanged);
-                        // Resolving/reopening a comment can invalidate a
-                        // parked submit panel (review finding P1-3).
-                        this.cancel_submit_flow_if_parked(cx);
+                        if applied {
+                            // Resolving/reopening a comment can invalidate a
+                            // parked submit panel (review finding P1-3).
+                            this.cancel_submit_flow_if_parked(cx);
+                        }
                     }
                     Err(err) => eprintln!("comment status update failed: {err:#}"),
                 }
@@ -3019,8 +3153,16 @@ impl Workspace {
         .detach();
     }
 
-    /// Delete a comment (by id), persisting off-thread.
+    /// Delete a comment (by id), persisting off-thread. Gated behind
+    /// `review_is_readonly` (docs/phase-6-review-navigator.md S6c
+    /// doc-deviation #4) — Delete on a SUBMITTED review's thread card is a
+    /// no-op. Re-checked again against the freshly-loaded review below —
+    /// see `set_comment_status`'s doc comment for why the synchronous check
+    /// alone isn't enough.
     fn delete_comment(&mut self, comment_id: String, cx: &mut Context<Self>) {
+        if self.review_is_readonly() {
+            return;
+        }
         let Some(review) = self.review.clone() else {
             return;
         };
@@ -3032,20 +3174,25 @@ impl Workspace {
                     let store = dv_core::ReviewStore::open(location);
                     // Fresh-load before mutating (see submit_comment).
                     let mut review = store.load(&review.id).ok().flatten().unwrap_or(review);
+                    if matches!(review.state, dv_core::ReviewState::Submitted { .. }) {
+                        return anyhow::Ok((review, false));
+                    }
                     review.comments.retain(|c| c.id != comment_id);
                     review.updated_ms = dv_core::review::now_ms();
                     store.save(&review)?;
-                    anyhow::Ok(review)
+                    anyhow::Ok((review, true))
                 })
                 .await;
             this.update(cx, |this, cx| {
                 match result {
-                    Ok(review) => {
+                    Ok((review, applied)) => {
                         this.review = Some(review);
                         cx.emit(ReviewChanged);
-                        // Deleting a comment can invalidate a parked submit
-                        // panel (review finding P1-3).
-                        this.cancel_submit_flow_if_parked(cx);
+                        if applied {
+                            // Deleting a comment can invalidate a parked
+                            // submit panel (review finding P1-3).
+                            this.cancel_submit_flow_if_parked(cx);
+                        }
                     }
                     Err(err) => eprintln!("comment delete failed: {err:#}"),
                 }
@@ -3058,7 +3205,11 @@ impl Workspace {
     }
 
     /// Open a reply (or body-edit) input inside a thread card. Only one is
-    /// open at a time.
+    /// open at a time. Gates both `Reply` and `EditBody` behind
+    /// `review_is_readonly` (docs/phase-6-review-navigator.md S6c
+    /// doc-deviation #4) — a SUBMITTED review's thread cards keep their
+    /// buttons rendered (this is a suppress-the-entry-point posture, not a
+    /// hide-the-controls one) but the click does nothing.
     fn open_thread_input(
         &mut self,
         comment_id: String,
@@ -3067,6 +3218,9 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) {
         use gpui_component::input::{InputEvent, InputState};
+        if self.review_is_readonly() {
+            return;
+        }
         // An in-flight save keeps its input alive: replacing it here would
         // drop the pending body (and the completion would close the NEW
         // input). Finish or fail first.
@@ -3123,7 +3277,16 @@ impl Workspace {
     }
 
     /// Persist the open reply/edit, fresh-loading the review first (see
-    /// submit_comment for why the UI clone can't be trusted).
+    /// submit_comment for why the UI clone can't be trusted). Unlike
+    /// `open_thread_input` (which only checks `review_is_readonly` at
+    /// dispatch time, when the input is opened), this re-checks the
+    /// freshly-loaded review's state right before saving — a submit (in-
+    /// app or via the CLI) can land on disk while the input sat open
+    /// (review finding, docs/phase-6-review-navigator.md S6c). There's no
+    /// "start a fresh draft" fallback for a reply/edit the way
+    /// `submit_comment` has for a brand-new comment — a reply targets a
+    /// specific comment id on a specific (now-submitted) review — so a
+    /// save that loses this race is simply dropped and the input closed.
     fn submit_thread_input(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(ti) = &mut self.thread_input else {
             return;
@@ -3153,6 +3316,12 @@ impl Workspace {
                 .spawn(async move {
                     let store = dv_core::ReviewStore::open(location);
                     let mut review = store.load(&review.id).ok().flatten().unwrap_or(review);
+                    // Re-check against the freshly-loaded state — the
+                    // `review_is_readonly` check `open_thread_input` did
+                    // when this input was opened can be stale by now.
+                    if matches!(review.state, dv_core::ReviewState::Submitted { .. }) {
+                        return anyhow::Ok((review, false));
+                    }
                     match mode {
                         ThreadInputMode::Reply => {
                             review.reply(&comment_id, body, author)?;
@@ -3171,7 +3340,7 @@ impl Workspace {
                         }
                     }
                     store.save(&review)?;
-                    anyhow::Ok(review)
+                    anyhow::Ok((review, true))
                 })
                 .await;
 
@@ -3183,12 +3352,21 @@ impl Workspace {
                     .as_ref()
                     .is_some_and(|ti| ti.comment_id == done_id && ti.mode == mode);
                 match result {
-                    Ok(review) => {
+                    Ok((review, applied)) => {
                         this.review = Some(review);
                         cx.emit(ReviewChanged);
-                        // A reply or body edit can invalidate a parked
-                        // submit panel (review finding P1-3).
-                        this.cancel_submit_flow_if_parked(cx);
+                        if applied {
+                            // A reply or body edit can invalidate a parked
+                            // submit panel (review finding P1-3).
+                            this.cancel_submit_flow_if_parked(cx);
+                        } else {
+                            eprintln!("thread input save skipped: review was submitted");
+                        }
+                        // Whether applied or lost the submitted-race, there's
+                        // nothing left for this input to do — a submitted
+                        // review has no fresh-draft fallback for a reply/edit
+                        // (see this fn's doc comment), so leaving it open
+                        // would just let the user retry into the same wall.
                         if same_input {
                             this.close_thread_input(window, cx);
                         }
@@ -3806,6 +3984,8 @@ impl Workspace {
             dv_core::ReviewState::Draft => None,
             dv_core::ReviewState::Submitted { verdict, .. } => Some(*verdict),
         });
+        let readonly = self.review_is_readonly();
+        let new_comment_blocked = self.new_comment_blocked();
 
         let filter_button = |label: &'static str,
                              value: SummaryFilter,
@@ -3886,6 +4066,31 @@ impl Workspace {
                             total - open_count
                         ))),
                 )
+                .when(readonly, |el| {
+                    // Suppress-the-entry-point posture (docs/phase-6-
+                    // review-navigator.md S6c doc-deviation #4): this banner
+                    // is the visible half of it — `open_thread_input`/
+                    // `set_comment_status`/`delete_comment` are the
+                    // unconditional enforcing half (existing threads on a
+                    // submitted review can never be mutated). `gutter_down`
+                    // is narrower still (`Self::new_comment_blocked`): a
+                    // merely auto-selected submitted review still accepts a
+                    // NEW comment, which starts a fresh draft — so the
+                    // banner text distinguishes the two cases rather than
+                    // claiming a uniform lockdown that isn't real.
+                    el.child(
+                        div()
+                            .px_3()
+                            .py_1()
+                            .text_xs()
+                            .text_color(warning)
+                            .child(if new_comment_blocked {
+                                "Read-only \u{2014} this review has been submitted."
+                            } else {
+                                "This review has been submitted \u{2014} new comments start a fresh draft."
+                            }),
+                    )
+                })
                 .child(
                     h_flex()
                         .px_2()
@@ -5380,7 +5585,7 @@ mod tests {
     use super::{
         ChecksSummary, PrHeader, PrMeta, PrState, PreparedLine, SplitRow, SubmissionOutcome,
         SubmitFlow, SubmitPrep, Violation, ViolationKind, build_split_rows,
-        cancel_submit_flow_outcome, gap_above, pick_review, reconcile_file_selection,
+        cancel_submit_flow_outcome, gap_above, pick_review, reconcile_file_selection, resolved_pin,
         review_adopts_pr, submit_flow_from_submission, submit_flow_from_validation,
         trim_trailing_newlines, verdict_automation_word, verdict_label, violation_kind_word,
     };
@@ -5578,7 +5783,7 @@ mod tests {
             ),
             fake_review("r-draft", ReviewState::Draft, None),
         ];
-        let picked = pick_review(reviews, None, None);
+        let picked = pick_review(reviews, None, None, None);
         assert_eq!(picked.map(|r| r.id), Some("r-draft".to_string()));
     }
 
@@ -5600,7 +5805,7 @@ mod tests {
             ),
             fake_review("r-a-current", ReviewState::Draft, Some(pr_a.clone())),
         ];
-        let picked = pick_review(reviews, Some("r-a-current"), Some(&pr_a));
+        let picked = pick_review(reviews, Some("r-a-current"), Some(&pr_a), None);
         assert_eq!(picked.map(|r| r.id), Some("r-a-current".to_string()));
     }
 
@@ -5612,7 +5817,7 @@ mod tests {
             ReviewState::Draft,
             Some(fake_remote(5, "github.com/acme/widgets")),
         )];
-        let picked = pick_review(reviews, None, Some(&current_pr));
+        let picked = pick_review(reviews, None, Some(&current_pr), None);
         assert_eq!(picked.map(|r| r.id), Some("r-a".to_string()));
     }
 
@@ -5630,7 +5835,7 @@ mod tests {
                 Some(fake_remote(99, "github.com/other/repo")),
             ),
         ];
-        let picked = pick_review(reviews, Some("r-current"), Some(&current_pr));
+        let picked = pick_review(reviews, Some("r-current"), Some(&current_pr), None);
         assert_eq!(picked.map(|r| r.id), Some("r-current".to_string()));
     }
 
@@ -5645,8 +5850,94 @@ mod tests {
             ReviewState::Draft,
             Some(fake_remote(99, "github.com/other/repo")),
         )];
-        let picked = pick_review(reviews, None, Some(&current_pr));
+        let picked = pick_review(reviews, None, Some(&current_pr), None);
         assert!(picked.is_none());
+    }
+
+    // ---- pick_review pinned_id precedence (docs/phase-6-review-navigator.md
+    // S6c) --------------------------------------------------------------
+
+    /// The headline case: a pin wins outright over a SUBMITTED review that
+    /// `pick_review`'s ordinary rules would never surface (no PR open, and
+    /// a draft exists and would otherwise win).
+    #[test]
+    fn pick_review_pinned_id_wins_over_a_submitted_review_with_a_draft_present() {
+        let submitted = fake_review(
+            "r-submitted",
+            ReviewState::Submitted {
+                verdict: dv_core::Verdict::Approve,
+                at_ms: 0,
+            },
+            None,
+        );
+        let reviews = vec![submitted, fake_review("r-draft", ReviewState::Draft, None)];
+        let picked = pick_review(reviews, None, None, Some("r-submitted"));
+        assert_eq!(picked.map(|r| r.id), Some("r-submitted".to_string()));
+    }
+
+    /// A pin also wins over the PR-scoping rule — pinning a review outside
+    /// the currently open PR is an explicit user choice, not the kind of
+    /// accidental cross-PR adoption `current_pr`'s arm guards against.
+    #[test]
+    fn pick_review_pinned_id_wins_over_pr_scoping() {
+        let pr_a = fake_remote(5, "github.com/acme/widgets");
+        let reviews = vec![
+            fake_review("r-a-current", ReviewState::Draft, Some(pr_a.clone())),
+            fake_review("r-unrelated", ReviewState::Draft, None),
+        ];
+        let picked = pick_review(
+            reviews,
+            Some("r-a-current"),
+            Some(&pr_a),
+            Some("r-unrelated"),
+        );
+        assert_eq!(picked.map(|r| r.id), Some("r-unrelated".to_string()));
+    }
+
+    /// A vanished pin (the review was deleted between the click and this
+    /// listing) must fall through to the normal rules rather than return
+    /// `None` and blank the workspace.
+    #[test]
+    fn pick_review_pinned_id_not_found_falls_through() {
+        let reviews = vec![fake_review("r-draft", ReviewState::Draft, None)];
+        let picked = pick_review(reviews, None, None, Some("r-gone"));
+        assert_eq!(picked.map(|r| r.id), Some("r-draft".to_string()));
+    }
+
+    // ---- resolved_pin (review finding, docs/phase-6-review-navigator.md
+    // S6c: a stale pin must not outlive the review it points at) ---------
+
+    /// The common case: the pin resolved to the review actually shown, so
+    /// it's kept as-is.
+    #[test]
+    fn resolved_pin_keeps_a_pin_matching_the_shown_review() {
+        let review = fake_review("r-a", ReviewState::Draft, None);
+        let pin = resolved_pin(Some("r-a".to_string()), &Some(review));
+        assert_eq!(pin, Some("r-a".to_string()));
+    }
+
+    /// The pinned review vanished and `pick_review` fell through to an
+    /// unrelated one — the pin must be dropped, not left dangling (a
+    /// dangling pin would keep blocking new comments on a review nobody
+    /// explicitly selected).
+    #[test]
+    fn resolved_pin_drops_a_pin_that_landed_on_a_different_review() {
+        let fallback = fake_review("r-other", ReviewState::Draft, None);
+        let pin = resolved_pin(Some("r-gone".to_string()), &Some(fallback));
+        assert_eq!(pin, None);
+    }
+
+    /// Nothing was pinned to begin with — stays `None`.
+    #[test]
+    fn resolved_pin_stays_none_when_nothing_was_pinned() {
+        let review = fake_review("r-a", ReviewState::Draft, None);
+        assert_eq!(resolved_pin(None, &Some(review)), None);
+    }
+
+    /// The pin resolved to nothing at all (no review loaded) — dropped.
+    #[test]
+    fn resolved_pin_drops_a_pin_when_no_review_is_loaded() {
+        assert_eq!(resolved_pin(Some("r-a".to_string()), &None), None);
     }
 
     // ---- review_adopts_pr / load_pr find-or-create (review finding P1) ----

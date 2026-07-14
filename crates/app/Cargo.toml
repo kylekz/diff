@@ -16,7 +16,10 @@ futures = "0.3"
 serde_json = "1.0.150"
 serde = { version = "1.0.228", features = ["derive"] }
 dirs = "6.0.0"
-png = "0.17"
+# Only used by automation/capture.rs's PNG screenshot encoder — optional so
+# it drops out of the `--no-default-features` release build along with the
+# rest of the automation surface (see the `automation` feature below).
+png = { version = "0.17", optional = true }
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.59", features = [
@@ -27,3 +30,13 @@ windows-sys = { version = "0.59", features = [
     "Win32_System_Threading",
     "Win32_UI_WindowsAndMessaging",
 ] }
+
+[features]
+default = ["automation"]
+# `dv --automation`: the JSON-over-stdio control channel (crates/app/src/
+# automation/) used for dev/CI-driven UI verification. Default-on so
+# `cargo build -p dv` keeps today's behavior; the distributed release build
+# (docs/phase-8-lsp-and-polish.md § Release) compiles with
+# `--no-default-features` so the shipped binary carries no automation
+# surface at all (see main.rs's `#[cfg(feature = "automation")]` gates).
+automation = ["dep:png"]

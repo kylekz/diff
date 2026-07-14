@@ -8,6 +8,7 @@
 #![recursion_limit = "256"]
 
 mod author;
+#[cfg(feature = "automation")]
 mod automation;
 mod cli;
 mod fuzzy;
@@ -29,6 +30,11 @@ use gpui_component::{Root, TitleBar};
 use crate::settings::Settings;
 use crate::shell::AppShell;
 
+// Two cfg-gated copies rather than one string with the automation lines
+// spliced in at runtime: `--automation` itself only parses under the
+// `automation` feature (see the parse arms below), so a `--no-default-features`
+// build's own `--help`/usage text must not advertise a flag it then rejects.
+#[cfg(feature = "automation")]
 const USAGE: &str = "\
 usage: dv [<repo-path>] [options]
 
@@ -43,6 +49,24 @@ options:
   (default)                     working tree vs HEAD
 
 usage: dv pr <number|url> [--repo <path>|--wsl <distro>:<posix-path>] [--automation]
+
+  <number>             a bare PR number, opened against <repo-path>/cwd
+  <url>                a PR URL — must match the repo's origin remote";
+
+#[cfg(not(feature = "automation"))]
+const USAGE: &str = "\
+usage: dv [<repo-path>] [options]
+
+  <repo-path>          local path or \\\\wsl.localhost\\<distro>\\<path> (default: .)
+
+options:
+  --wsl <distro>:<posix-path>   open a repo inside a WSL distro
+  --staged                      diff index vs HEAD
+  --commit <rev>                diff one commit against its parent
+  --range <a>..<b> | <a>...<b>  diff two revisions (... = merge base)
+  (default)                     working tree vs HEAD
+
+usage: dv pr <number|url> [--repo <path>|--wsl <distro>:<posix-path>]
 
   <number>             a bare PR number, opened against <repo-path>/cwd
   <url>                a PR URL — must match the repo's origin remote";
@@ -62,6 +86,10 @@ fn parse_args() -> Result<Cli, String> {
 
     let mut location: Option<RepoLocation> = None;
     let mut source = DiffSource::WorkingTree;
+    // Only mutated by the `"--automation"` arm below, which is itself
+    // gated out under `--no-default-features` (falls through to the
+    // unknown-option error instead) — `mut` goes unused in that build.
+    #[cfg_attr(not(feature = "automation"), allow(unused_mut))]
     let mut automation = false;
     // `--automation` alone must behave like a bare launch, so track whether
     // any argument actually described a repo/diff.
@@ -71,6 +99,7 @@ fn parse_args() -> Result<Cli, String> {
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--help" | "-h" => return Err(USAGE.to_string()),
+            #[cfg(feature = "automation")]
             "--automation" => automation = true,
             "--wsl" => {
                 let value = args.next().ok_or("--wsl requires <distro>:<posix-path>")?;
@@ -164,6 +193,10 @@ enum PrArgError {
 fn parse_pr_gui_args(args: &[String]) -> Result<Cli, PrArgError> {
     let mut location: Option<RepoLocation> = None;
     let mut target: Option<&str> = None;
+    // Only mutated by the `"--automation"` arm below, which is itself
+    // gated out under `--no-default-features` (falls through to the
+    // unknown-option error instead) — `mut` goes unused in that build.
+    #[cfg_attr(not(feature = "automation"), allow(unused_mut))]
     let mut automation = false;
 
     let mut iter = args.iter();
@@ -187,6 +220,7 @@ fn parse_pr_gui_args(args: &[String]) -> Result<Cli, PrArgError> {
                         .map_err(|e| PrArgError::Parse(format!("{e:#}")))?,
                 );
             }
+            #[cfg(feature = "automation")]
             "--automation" => automation = true,
             "--json" => {}
             other if other.starts_with('-') => {
@@ -465,7 +499,16 @@ fn run_gui(cli: Cli) {
                 ..Default::default()
             };
 
+            // Only read back under the `automation` feature (to hand the
+            // freshly built shell to `automation::start` below) — allow the
+            // otherwise-unused write/binding under `--no-default-features`
+            // rather than cfg-splitting the closure body itself.
+            #[cfg_attr(
+                not(feature = "automation"),
+                allow(unused_variables, unused_assignments)
+            )]
             let mut shell_slot = None;
+            #[cfg_attr(not(feature = "automation"), allow(unused_variables))]
             let window = cx
                 .open_window(options, |window, cx| {
                     let shell = cx.new(|cx| {
@@ -488,6 +531,7 @@ fn run_gui(cli: Cli) {
                 })
                 .expect("failed to open window");
 
+            #[cfg(feature = "automation")]
             if automation {
                 let shell = shell_slot.expect("window builder ran");
                 cx.update(|cx| automation::start(window, shell, cx));
@@ -639,11 +683,22 @@ mod tests {
         assert!(cli.seed.is_some());
     }
 
+    #[cfg(feature = "automation")]
     #[test]
     fn parse_pr_gui_args_honors_automation_flag() {
         let a = args(&["123", "--automation"]);
         let cli = parse_pr_gui_args(&a).expect("should parse");
         assert!(cli.automation);
+    }
+
+    // Mirrors `parse_pr_gui_args_honors_automation_flag` but for the
+    // `--no-default-features` build: `--automation` must not exist as a
+    // known flag here either, matching `parse_args`'s top-level gate.
+    #[cfg(not(feature = "automation"))]
+    #[test]
+    fn parse_pr_gui_args_rejects_automation_flag_when_feature_disabled() {
+        let a = args(&["123", "--automation"]);
+        assert!(matches!(parse_pr_gui_args(&a), Err(PrArgError::Parse(_))));
     }
 
     #[test]

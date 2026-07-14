@@ -21,14 +21,17 @@ use std::collections::{HashMap, VecDeque};
 use crate::recent::RecentStore;
 use crate::settings::{
     CONTEXT_LINES_MAX, CONTEXT_LINES_MIN, DEFAULT_SIDEBAR_WIDTH, MONO_FONT_SIZE_MAX,
-    MONO_FONT_SIZE_MIN, SIDEBAR_WIDTH_MAX, SIDEBAR_WIDTH_MIN, SUMMARY_WIDTH_MAX, SUMMARY_WIDTH_MIN,
-    Settings, SidebarFilters, SidebarGrouping, ViewModeSetting,
+    MONO_FONT_SIZE_MIN, SIDEBAR_WIDTH_MAX, SIDEBAR_WIDTH_MIN, Settings, SidebarFilters,
+    SidebarGrouping, ViewModeSetting,
 };
+// Only consumed by `Self::set_summary_width` (automation-only, see below).
+#[cfg(feature = "automation")]
+use crate::settings::{SUMMARY_WIDTH_MAX, SUMMARY_WIDTH_MIN};
 use crate::themes;
-use crate::workspace::{
-    ReviewChanged, SummaryWidthChanged, Workspace, checks_word, pr_state_word,
-    review_decision_word, source_label,
-};
+use crate::workspace::{ReviewChanged, SummaryWidthChanged, Workspace};
+// Only consumed by `Self::automation_state`'s "badges"/"index" dump.
+#[cfg(feature = "automation")]
+use crate::workspace::{checks_word, pr_state_word, review_decision_word, source_label};
 
 actions!(
     shell,
@@ -180,6 +183,7 @@ fn fetch_pr_badge(remote: &RemoteRef) -> Option<PrBadge> {
 /// docs/phase-6-review-navigator.md's S6b verification, and the verdict is
 /// already available on `Workspace::automation_state` once that specific
 /// review is the one open.
+#[cfg(feature = "automation")]
 fn index_state_word(state: &dv_core::ReviewState) -> &'static str {
     match state {
         dv_core::ReviewState::Draft => "draft",
@@ -188,6 +192,7 @@ fn index_state_word(state: &dv_core::ReviewState) -> &'static str {
 }
 
 /// `health` word for an [`dv_core::IndexEntry`]'s automation dump.
+#[cfg(feature = "automation")]
 fn index_health_word(health: dv_core::EntryHealth) -> &'static str {
     match health {
         dv_core::EntryHealth::Ok => "ok",
@@ -197,6 +202,7 @@ fn index_health_word(health: dv_core::EntryHealth) -> &'static str {
 }
 
 /// `sidebar_grouping` word for `Self::automation_state`'s `settings` dump.
+#[cfg(feature = "automation")]
 fn grouping_word(grouping: SidebarGrouping) -> &'static str {
     match grouping {
         SidebarGrouping::None => "none",
@@ -888,7 +894,15 @@ struct SidebarResizeDrag;
 /// Sidebar badge for one repo's latest review.
 #[derive(Debug, Clone, Copy)]
 struct ReviewBadge {
+    // `open`/`submitted` are only read by `automation_state`'s "badges"
+    // dump (the sidebar cards render off `self.index`/`IndexEntry` instead,
+    // not off `self.badges` — see `visible_sidebar_items`) — `allow`ed
+    // rather than `cfg`'d out under `--no-default-features` since both
+    // fields are still unconditionally written by `compute_local_badge`/
+    // `merge_local_badge`.
+    #[cfg_attr(not(feature = "automation"), allow(dead_code))]
     open: usize,
+    #[cfg_attr(not(feature = "automation"), allow(dead_code))]
     submitted: bool,
     /// PR status (docs/phase-3-github.md deliverable 3/5), when the latest
     /// review is linked to one and the network fetch succeeded — `None`
@@ -2220,6 +2234,7 @@ impl AppShell {
     /// (so its `Workspace && PrPickerOpen` Enter binding is on the
     /// dispatch path); `"shell"` means `AppShell`'s handle (theme picker /
     /// settings panel); `"none"` otherwise.
+    #[cfg(feature = "automation")]
     pub(crate) fn focus_label(&self, window: &Window, cx: &App) -> &'static str {
         if let Some(ws) = &self.active
             && ws.focus_handle(cx).is_focused(window)
@@ -2266,6 +2281,7 @@ impl AppShell {
 
     /// Semantic state for `--automation`: the sidebar plus the active
     /// review's own dump (see [`Workspace::automation_state`]).
+    #[cfg(feature = "automation")]
     pub(crate) fn automation_state(&self, cx: &App) -> serde_json::Value {
         use serde_json::json;
         let theme = cx.theme();
@@ -2417,6 +2433,7 @@ impl AppShell {
     }
 
     /// True when nothing is loading — a bare shell counts as settled.
+    #[cfg(feature = "automation")]
     pub(crate) fn automation_settled(&self, cx: &App) -> bool {
         match &self.active {
             Some(ws) => ws.read(cx).automation_settled(),
@@ -2427,6 +2444,7 @@ impl AppShell {
     /// Select the nth changed file in the active review. Errors (rather
     /// than silently no-oping) so automation responses never claim a
     /// selection that didn't happen.
+    #[cfg(feature = "automation")]
     pub(crate) fn automation_select_file(
         &mut self,
         index: usize,
@@ -2441,6 +2459,7 @@ impl AppShell {
 
     /// Scripted replacement for the folder picker (`{"cmd":"open"}`): open
     /// a working-tree review of `location` directly.
+    #[cfg(feature = "automation")]
     pub(crate) fn automation_open(
         &mut self,
         location: RepoLocation,
@@ -2457,6 +2476,7 @@ impl AppShell {
     /// on an unknown id, matching [`Self::automation_select_file`]'s
     /// contract: a script's response must never claim a selection that
     /// didn't happen.
+    #[cfg(feature = "automation")]
     pub(crate) fn automation_select_review(
         &mut self,
         id: String,
@@ -2474,6 +2494,7 @@ impl AppShell {
     /// review's workspace (`Workspace::open_pr`). Errors (rather than
     /// silently no-oping) when there's no active review, matching
     /// `automation_select_file`'s contract.
+    #[cfg(feature = "automation")]
     pub(crate) fn automation_open_pr(
         &mut self,
         number: u64,
@@ -2494,6 +2515,7 @@ impl AppShell {
     /// own controls call — so a script exercises the real live-apply +
     /// persist path, not a parallel one. `key` matches `Settings`'s JSON
     /// field names one-to-one.
+    #[cfg(feature = "automation")]
     pub(crate) fn automation_set_setting(
         &mut self,
         key: &str,
@@ -2745,6 +2767,7 @@ impl AppShell {
     /// on release, so it doesn't route through here — this is for the
     /// discrete, already-final values `set_setting`/a hand-edited settings
     /// panel control would supply).
+    #[cfg(feature = "automation")]
     fn set_sidebar_width(&mut self, width: f32, cx: &mut Context<Self>) {
         self.settings.sidebar_width = width.clamp(SIDEBAR_WIDTH_MIN, SIDEBAR_WIDTH_MAX);
         self.settings.save();
@@ -2755,6 +2778,7 @@ impl AppShell {
     /// active workspace (which owns the live render-time value; see
     /// `Workspace::summary_width`) and persists. Mirrors `set_sidebar_width`
     /// above, but for the workspace-owned panel.
+    #[cfg(feature = "automation")]
     fn set_summary_width(&mut self, width: f32, cx: &mut Context<Self>) {
         let width = width.clamp(SUMMARY_WIDTH_MIN, SUMMARY_WIDTH_MAX);
         self.settings.summary_width = width;
@@ -4076,10 +4100,12 @@ mod tests {
     // --- entry_passes_filters / repo_group_key / status_group_label
     // (docs/phase-6-review-navigator.md deliverables 3/4) -----------------
 
+    #[cfg(feature = "automation")]
+    use super::grouping_word;
     use super::{
-        SidebarFilters, entry_passes_filters, grouping_word, pr_group_key, repo_group_key,
-        status_group_label,
+        SidebarFilters, entry_passes_filters, pr_group_key, repo_group_key, status_group_label,
     };
+    #[cfg(feature = "automation")]
     use crate::settings::SidebarGrouping;
     use std::path::PathBuf;
 
@@ -4446,6 +4472,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "automation")]
     #[test]
     fn grouping_word_matches_automation_set_setting_strings() {
         // `automation_set_setting`'s "sidebar_grouping" arm accepts exactly

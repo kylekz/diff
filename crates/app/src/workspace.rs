@@ -14,7 +14,13 @@ use gpui_component::{ActiveTheme, Disableable as _, StyledExt as _, h_flex, v_fl
 
 use crate::highlight::{self, LineRuns};
 use crate::settings::{SUMMARY_WIDTH_MAX, SUMMARY_WIDTH_MIN, ViewModeSetting};
-use crate::submit::{self, SubmissionOutcome, Violation, ViolationKind};
+use crate::submit::{self, SubmissionOutcome, Violation};
+// Consumed by `violation_kind_word` (automation-only, see below) in
+// production, and by this module's own `#[cfg(test)]` fixtures
+// (`dummy_violation`) regardless of feature — so it's needed whenever
+// either is compiled in.
+#[cfg(any(feature = "automation", test))]
+use crate::submit::ViolationKind;
 
 actions!(
     workspace,
@@ -490,12 +496,21 @@ struct SubmitPrep {
 enum SubmitFlow {
     /// Background validation in flight: fresh `pr_meta` + `prepare_pr` +
     /// `crate::submit::build_submission`. No `gh` write has happened yet.
-    Validating { verdict: dv_core::Verdict },
+    Validating {
+        // Only read by `automation_state`'s JSON dump — the render match
+        // below matches this variant with `{ .. }` since the panel text is
+        // the same regardless of verdict. Field stays unconditionally
+        // constructed (see `Self::begin_submit_flow`), so it's `allow`ed
+        // rather than `cfg`'d out, under `--no-default-features`.
+        #[cfg_attr(not(feature = "automation"), allow(dead_code))]
+        verdict: dv_core::Verdict,
+    },
     /// Validation found problems — a stale/unanchored comment, or one that
     /// fell outside the PR's diff. Nothing was sent; nothing can be until
     /// the underlying comments (or the PR itself) change and the verdict is
     /// clicked again.
     Blocked {
+        #[cfg_attr(not(feature = "automation"), allow(dead_code))]
         verdict: dv_core::Verdict,
         violations: Vec<Violation>,
     },
@@ -509,7 +524,10 @@ enum SubmitFlow {
     /// Unlike every other stage, this one is not cancellable — see
     /// [`Workspace::cancel_submit_flow`] — and blocks a source switch the
     /// same way an in-flight comment save does (see `open_pr`/`select_file`).
-    Submitting { verdict: dv_core::Verdict },
+    Submitting {
+        #[cfg_attr(not(feature = "automation"), allow(dead_code))]
+        verdict: dv_core::Verdict,
+    },
     /// GitHub accepted the review and the local writeback succeeded.
     Done {
         verdict: dv_core::Verdict,
@@ -520,6 +538,7 @@ enum SubmitFlow {
     /// `crate::submit::writeback_failure_message`'s text in that case, which
     /// warns against ever retrying.
     Failed {
+        #[cfg_attr(not(feature = "automation"), allow(dead_code))]
         verdict: dv_core::Verdict,
         message: String,
     },
@@ -1055,6 +1074,7 @@ pub(crate) fn source_label(source: &DiffSource) -> &'static str {
 /// these instead of growing a third copy — that module isn't a descendant
 /// of this one the way `cli::pr_cmd` fails to be, so plain visibility is
 /// enough.
+#[cfg(feature = "automation")]
 pub(crate) fn pr_state_word(state: PrState) -> &'static str {
     match state {
         PrState::Open => "open",
@@ -1063,6 +1083,7 @@ pub(crate) fn pr_state_word(state: PrState) -> &'static str {
     }
 }
 
+#[cfg(feature = "automation")]
 pub(crate) fn checks_word(checks: ChecksSummary) -> &'static str {
     match checks {
         ChecksSummary::Passing => "passing",
@@ -1072,6 +1093,7 @@ pub(crate) fn checks_word(checks: ChecksSummary) -> &'static str {
     }
 }
 
+#[cfg(feature = "automation")]
 pub(crate) fn review_decision_word(decision: ReviewDecision) -> &'static str {
     match decision {
         ReviewDecision::Approved => "approved",
@@ -1085,6 +1107,7 @@ pub(crate) fn review_decision_word(decision: ReviewDecision) -> &'static str {
 /// spelling — `automation_state`'s `selection.side` already uses "old"/
 /// "new", and a remote thread's side means the exact same diff-side concept
 /// (docs/phase-6-review-navigator.md deliverable 6).
+#[cfg(feature = "automation")]
 fn gh_side_word(side: GhSide) -> &'static str {
     match side {
         GhSide::Left => "old",
@@ -1105,6 +1128,7 @@ fn verdict_label(verdict: dv_core::Verdict) -> &'static str {
 
 /// snake_case verdict word for `--automation`'s JSON, matching
 /// `cli/pr_cmd.rs`'s `event_word` convention (machine-parsed, so no space).
+#[cfg(feature = "automation")]
 fn verdict_automation_word(verdict: dv_core::Verdict) -> &'static str {
     match verdict {
         dv_core::Verdict::Comment => "comment",
@@ -1114,6 +1138,7 @@ fn verdict_automation_word(verdict: dv_core::Verdict) -> &'static str {
 }
 
 /// snake_case word for a [`ViolationKind`], for `--automation`'s JSON.
+#[cfg(feature = "automation")]
 fn violation_kind_word(kind: ViolationKind) -> &'static str {
     match kind {
         ViolationKind::StaleAnchor => "stale_anchor",
@@ -2303,6 +2328,7 @@ impl Workspace {
     /// instead of calling this, since it already owns the render-time value
     /// and just needs `cx.notify()` per frame — no `Settings` round trip
     /// mid-drag.
+    #[cfg(feature = "automation")]
     pub(crate) fn set_summary_width_external(&mut self, width: f32, cx: &mut Context<Self>) {
         let width = width.clamp(SUMMARY_WIDTH_MIN, SUMMARY_WIDTH_MAX);
         if self.summary_width == width {
@@ -3056,6 +3082,7 @@ impl Workspace {
     /// Semantic state for `--automation` (`{"cmd":"state"}`): what the
     /// workspace believes, independent of layout, so agents can assert on
     /// behavior and reserve screenshots for style.
+    #[cfg(feature = "automation")]
     pub(crate) fn automation_state(&self) -> serde_json::Value {
         use serde_json::json;
         let status = match &self.status {
@@ -3250,6 +3277,7 @@ impl Workspace {
     /// Bounds-checked selection for `--automation`: unlike the UI path
     /// (which silently ignores stale indices), scripts get a hard error so
     /// the response never lies about what happened.
+    #[cfg(feature = "automation")]
     pub(crate) fn automation_select_file(
         &mut self,
         index: usize,
@@ -3272,6 +3300,7 @@ impl Workspace {
     /// PR open settled (`open_pr` reuses `Status::Loading` for this), and
     /// an open PR picker's `gh pr list` fetch finished loading. `wait_ready`
     /// polls this.
+    #[cfg(feature = "automation")]
     pub(crate) fn automation_settled(&self) -> bool {
         if self
             .pr_picker
@@ -7189,9 +7218,13 @@ mod tests {
         SubmitFlow, SubmitPrep, Violation, ViolationKind, build_split_rows,
         cancel_submit_flow_outcome, gap_above, pick_review, pr_source_key,
         reconcile_file_selection, resolved_pin, review_adopts_pr, submit_flow_from_submission,
-        submit_flow_from_validation, trim_trailing_newlines, verdict_automation_word,
-        verdict_label, violation_kind_word,
+        submit_flow_from_validation, trim_trailing_newlines, verdict_label,
     };
+    // Automation-only word functions (see their `#[cfg(feature =
+    // "automation")]` gates above) — only the tests exercising them
+    // directly need the import, so it's gated the same way.
+    #[cfg(feature = "automation")]
+    use super::{verdict_automation_word, violation_kind_word};
     use dv_core::{
         ChangeStatus, ChangedFile, DiffSource, LineKind, RemoteRef, Review, ReviewState,
     };
@@ -8022,18 +8055,34 @@ mod tests {
             dv_core::Verdict::RequestChanges,
         ] {
             assert!(!verdict_label(verdict).is_empty());
-            assert!(!verdict_automation_word(verdict).is_empty());
         }
-        assert_eq!(
-            verdict_automation_word(dv_core::Verdict::RequestChanges),
-            "request_changes"
-        );
         assert_eq!(
             verdict_label(dv_core::Verdict::RequestChanges),
             "request changes"
         );
     }
 
+    // `verdict_automation_word`/`violation_kind_word` are automation-only
+    // (see their `#[cfg(feature = "automation")]` gates above); these two
+    // tests exercise them directly, so they're gated the same way rather
+    // than failing to resolve under `--no-default-features`.
+    #[cfg(feature = "automation")]
+    #[test]
+    fn verdict_automation_words_cover_every_variant() {
+        for verdict in [
+            dv_core::Verdict::Comment,
+            dv_core::Verdict::Approve,
+            dv_core::Verdict::RequestChanges,
+        ] {
+            assert!(!verdict_automation_word(verdict).is_empty());
+        }
+        assert_eq!(
+            verdict_automation_word(dv_core::Verdict::RequestChanges),
+            "request_changes"
+        );
+    }
+
+    #[cfg(feature = "automation")]
     #[test]
     fn violation_kind_words_cover_every_variant() {
         for kind in [

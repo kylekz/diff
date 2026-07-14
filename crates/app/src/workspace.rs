@@ -639,6 +639,13 @@ pub struct Workspace {
     /// settings that have since changed again (two quick picker/panel
     /// choices) never clobbers a newer computation that already landed.
     highlight_epoch: u64,
+    /// Set when a theme/context-lines change staled this workspace's cached
+    /// `diffs` while it was PARKED with no live host (WSL, no dv-host — see
+    /// `invalidate_diff_cache`'s non-eager path, which can't recompute then
+    /// without booting the distro). `revalidate` rebakes the selected file's
+    /// diff on reactivation when this is set, so it never paints under the
+    /// old theme's baked syntax colors (capstone P2).
+    diffs_theme_stale: bool,
     view_mode: ViewMode,
     /// Context lines shown around each hunk (`dv_core::DiffOptions`'s
     /// existing knob) — from `settings::Settings::context_lines`, live via
@@ -1315,6 +1322,7 @@ impl Workspace {
             source: source.clone(),
             source_epoch: 0,
             highlight_epoch: 0,
+            diffs_theme_stale: false,
             status: Status::Loading,
             repo: None,
             head: "".into(),
@@ -1868,6 +1876,20 @@ impl Workspace {
         if matches!(self.status, Status::Loading) || self.pr_loading.is_some() {
             return;
         }
+        // Rebake the selected file if its cached diff was baked under a
+        // since-changed theme/context while this entity was parked without a
+        // live host (`invalidate_diff_cache`'s non-eager path couldn't
+        // recompute then). Reactivation implies the repo is live now, so this
+        // is a normal recompute with the current theme's colors (capstone P2).
+        if self.diffs_theme_stale {
+            self.diffs_theme_stale = false;
+            self.diffs.clear();
+            self.diff_pending.clear();
+            if let Some(index) = self.selected {
+                self.request_diff(index, cx);
+            }
+            cx.notify();
+        }
         let Some(repo) = self.repo.clone() else {
             return;
         };
@@ -1878,6 +1900,17 @@ impl Workspace {
         let current_pr = self.pr_remote.clone();
         let pinned_id = self.pinned_review_id.clone();
         let epoch = self.source_epoch;
+        // Snapshot the review as it stands NOW; if a concurrent reload (the
+        // still-live store-watch loop, or a GUI/CLI write) moves this.review
+        // — including to a DIFFERENT id — before this pass's off-thread
+        // pick_review completes, that reload read the store more recently, so
+        // our result is stale and its review half must be discarded (capstone
+        // P3: apply_review_reload's same-id monotonicity guard can't catch an
+        // id change).
+        let review_fp = self
+            .review
+            .as_ref()
+            .map(|r| (r.id.clone(), r.updated_ms, r.comments.len()));
 
         cx.spawn(async move |this, cx| {
             let (review, files) = cx
@@ -1909,7 +1942,18 @@ impl Workspace {
                 // writer (review finding P3: this pass's `pick_review` read
                 // is a snapshot that can complete after a newer write, e.g.
                 // a GUI comment save, has already landed). ----
-                let review_changed = this.apply_review_reload(review, cx);
+                // Discard the review half entirely if a concurrent reload
+                // moved this.review since dispatch (capstone P3) — the
+                // worktree half below is independent and still runs.
+                let cur_fp = this
+                    .review
+                    .as_ref()
+                    .map(|r| (r.id.clone(), r.updated_ms, r.comments.len()));
+                let review_changed = if cur_fp == review_fp {
+                    this.apply_review_reload(review, cx)
+                } else {
+                    false
+                };
 
                 // ---- worktree half: `apply_worktree_reload` is the exact
                 // same body the worktree-watch consumer (`Self::new`, above)
@@ -2201,9 +2245,18 @@ impl Workspace {
         if host_reachable {
             self.diffs.clear();
             self.diff_pending.clear();
+            self.diffs_theme_stale = false;
             if let Some(index) = self.selected {
                 self.request_diff(index, cx);
             }
+        } else {
+            // Parked WSL entry with no live host: recomputing here would boot
+            // the stopped distro (cross-cutting risk D), and clearing without
+            // recomputing would blank the pane on reactivation (a cache-hit
+            // reactivation re-selects nothing). So keep the now-stale-theme
+            // rows and flag them — `revalidate` rebakes the selected file on
+            // reactivation, when the host is live again (capstone P2).
+            self.diffs_theme_stale = true;
         }
         cx.notify();
     }

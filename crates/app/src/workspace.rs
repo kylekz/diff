@@ -1349,60 +1349,12 @@ impl Workspace {
                     if this.source_epoch != start_epoch || pr_in_flight {
                         return;
                     }
-                    let fingerprint = |r: &Option<dv_core::Review>| {
-                        r.as_ref()
-                            .map(|r| (r.id.clone(), r.updated_ms, r.comments.len()))
-                    };
-                    if fingerprint(&this.review) != fingerprint(&review) {
-                        // `remote_threads` was fetched for whichever PR
-                        // `pr_remote` pointed at before this reload — key
-                        // on (slug, pr number), the same identity
-                        // `refresh_remote_threads`'s own epoch check uses,
-                        // to tell whether that fetch still applies.
-                        let old_pr_key = this.pr_remote.as_ref().map(|r| (r.slug.clone(), r.pr));
-                        this.review = review;
-                        this.pinned_review_id =
-                            resolved_pin(this.pinned_review_id.take(), &this.review);
-                        // Keep `pr_remote` in sync with the review actually
-                        // on screen — it's the only place
-                        // `own_submitted_review_id` (github-thread dedup +
-                        // resolved-sync) is read from, and a review
-                        // reassignment here (e.g. a CLI `dv review submit`
-                        // picked up mid-session) is exactly as fresh a
-                        // `remote` as the initial-load path a few lines up
-                        // (review finding: this used to only happen at
-                        // initial load / `open_pr`, so an in-session submit
-                        // left `pr_remote` permanently stale).
-                        this.pr_remote = this.review.as_ref().and_then(|r| r.remote.clone());
-                        let new_pr_key = this.pr_remote.as_ref().map(|r| (r.slug.clone(), r.pr));
-                        if old_pr_key != new_pr_key {
-                            // The reload landed on a different PR (or none)
-                            // than `remote_threads` was fetched for — keeping
-                            // it around would misattribute a stale PR's
-                            // read-only threads (including their resolved
-                            // badges) onto whatever review this reload
-                            // landed on, since the interleave in
-                            // `reset_diff_list` matches purely by (path,
-                            // side, line) and isn't gated on which review is
-                            // current (review finding P1: this used to only
-                            // get cleared in `open_pr`'s success arm, so an
-                            // external review change/delete mid-session left
-                            // `remote_threads` stale). A subsequent
-                            // `refresh_remote_threads` (explicit
-                            // `RefreshBadges`, or the next `open_pr`)
-                            // repopulates it for whatever PR is actually
-                            // current; same-PR reloads (e.g. a CLI comment
-                            // add) deliberately keep the existing fetch
-                            // rather than blanking the cards until the next
-                            // manual refresh.
-                            this.remote_threads.clear();
-                        }
-                        cx.emit(ReviewChanged);
-                        // A watcher-driven reload invalidates a parked
-                        // submit panel — it was built against the review
-                        // as it stood before this external change (review
-                        // finding P1-3).
-                        this.cancel_submit_flow_if_parked(cx);
+                    // Shared with `Self::revalidate`'s review half and the
+                    // worktree-watch consumer's sibling loop below — see
+                    // `apply_review_reload`'s doc comment (fingerprint
+                    // reconciliation + the monotonicity guard against a
+                    // faster concurrent writer).
+                    if this.apply_review_reload(review, cx) {
                         this.reset_diff_list(cx);
                         cx.notify();
                     }
@@ -1467,51 +1419,12 @@ impl Workspace {
                     {
                         return; // superseded — discard rather than clobber newer state
                     }
+                    // Shared with `Self::revalidate`'s worktree half — see
+                    // `apply_worktree_reload`'s doc comment (index-keyed
+                    // reconciliation via `reconcile_file_selection`, never a
+                    // blind swap).
                     if let Ok(files) = files {
-                        let old_files = std::mem::replace(&mut this.files, files);
-                        // `selected`/`diffs`/`diff_pending`/`expanded` are
-                        // all keyed by INDEX into `this.files`, not by path
-                        // — a naive replace either panics once the list has
-                        // shrunk past the old selected index (review
-                        // finding P1-1: an external `git commit` emptying
-                        // the list while file 2 was selected) or silently
-                        // re-renders the wrong file's cached diff under a
-                        // reused index once a new file sorts in earlier.
-                        let (new_selected, needs_invalidation) =
-                            reconcile_file_selection(&old_files, &this.files, this.selected);
-                        if needs_invalidation {
-                            this.diffs.clear();
-                            this.diff_pending.clear();
-                            this.expanded.clear();
-                            this.pending_jump = None;
-                            match new_selected {
-                                Some(index) => {
-                                    // Same file as before, just relocated —
-                                    // preserve `current_hunk` and the diff
-                                    // list's scroll position (reset_diff_list,
-                                    // called below, keeps the current offset).
-                                    this.selected = Some(index);
-                                    this.request_diff(index, cx);
-                                }
-                                None if !this.files.is_empty() => {
-                                    // The previously selected file is gone
-                                    // (or nothing was selected yet) — this is
-                                    // genuinely a different file, so reset
-                                    // hunk navigation same as a normal
-                                    // `select_file`.
-                                    this.selected = Some(0);
-                                    this.current_hunk = 0;
-                                    this.request_diff(0, cx);
-                                }
-                                None => {
-                                    // Nothing left to show — clear cleanly
-                                    // rather than leave a dangling index (the
-                                    // original crash: `self.files[2]` after
-                                    // an external commit emptied the list).
-                                    this.selected = None;
-                                }
-                            }
-                        }
+                        this.apply_worktree_reload(files, cx);
                     }
                     // Force `refresh_stale` (called at the tail of
                     // `reset_diff_list` below) to actually re-run its git
@@ -1678,6 +1591,259 @@ impl Workspace {
     /// slice.
     pub(crate) fn estimated_diff_bytes(&self) -> usize {
         self.diffs.values().map(|d| d.estimated_bytes()).sum()
+    }
+
+    /// Applies a freshly `pick_review`d snapshot to `this.review`,
+    /// reconciling `pinned_review_id`/`pr_remote`/`remote_threads` and
+    /// emitting `ReviewChanged` on a genuine change. Shared body for the
+    /// store-watch consumer (`Self::new`, above), the worktree-watch
+    /// consumer's sibling loop (which never calls this — it doesn't touch
+    /// `this.review`), and [`Self::revalidate`]'s review half (review
+    /// finding: these three used to fork this logic three ways; consolidated
+    /// here so a future fix to the fingerprint/pr_remote reconciliation
+    /// can't silently miss one call site).
+    ///
+    /// Monotonicity guard (review finding P3, S7-4): `review` is a snapshot
+    /// read off-thread, so by completion time a *faster* concurrent writer
+    /// — a GUI comment save, or another one of these three reload paths —
+    /// may have already landed a newer version of the SAME review into
+    /// `this.review`. Comparing only the `(id, updated_ms, comments.len())`
+    /// fingerprint can't tell "genuinely different" apart from "an older
+    /// snapshot of what's already current", so a same-id pick whose
+    /// `updated_ms` is strictly older than what's already showing is
+    /// discarded rather than applied — this pass must never move a review
+    /// backwards in time. A different id (the pick genuinely landed on a
+    /// different review, e.g. the pin fell through to another draft) always
+    /// applies regardless of its `updated_ms`.
+    ///
+    /// Returns whether `this.review` actually changed — callers use this to
+    /// decide whether to call `reset_diff_list`/`cx.notify()`, since
+    /// [`Self::revalidate`] also has an independent worktree-half change to
+    /// fold into the same repaint.
+    fn apply_review_reload(
+        &mut self,
+        review: Option<dv_core::Review>,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let stale_snapshot = matches!(
+            (&self.review, &review),
+            (Some(current), Some(picked))
+                if current.id == picked.id && picked.updated_ms < current.updated_ms
+        );
+        if stale_snapshot {
+            return false;
+        }
+        let fingerprint = |r: &Option<dv_core::Review>| {
+            r.as_ref()
+                .map(|r| (r.id.clone(), r.updated_ms, r.comments.len()))
+        };
+        if fingerprint(&self.review) == fingerprint(&review) {
+            return false;
+        }
+        // `remote_threads` was fetched for whichever PR `pr_remote` pointed
+        // at before this reload — key on (slug, pr number), the same
+        // identity `refresh_remote_threads`'s own epoch check uses, to tell
+        // whether that fetch still applies.
+        let old_pr_key = self.pr_remote.as_ref().map(|r| (r.slug.clone(), r.pr));
+        self.review = review;
+        self.pinned_review_id = resolved_pin(self.pinned_review_id.take(), &self.review);
+        // Keep `pr_remote` in sync with the review actually on screen — it's
+        // the only place `own_submitted_review_id` (github-thread dedup +
+        // resolved-sync) is read from, and a review reassignment here (e.g.
+        // a CLI `dv review submit` picked up mid-session, or a reactivation
+        // revalidation) is exactly as fresh a `remote` as the initial-load
+        // path (review finding: this used to only happen at initial load /
+        // `open_pr`, so an in-session submit left `pr_remote` permanently
+        // stale).
+        self.pr_remote = self.review.as_ref().and_then(|r| r.remote.clone());
+        let new_pr_key = self.pr_remote.as_ref().map(|r| (r.slug.clone(), r.pr));
+        if old_pr_key != new_pr_key {
+            // The reload landed on a different PR (or none) than
+            // `remote_threads` was fetched for — keeping it around would
+            // misattribute a stale PR's read-only threads (including their
+            // resolved badges) onto whatever review this reload landed on,
+            // since the interleave in `reset_diff_list` matches purely by
+            // (path, side, line) and isn't gated on which review is current
+            // (review finding P1: this used to only get cleared in
+            // `open_pr`'s success arm, so an external review change/delete
+            // mid-session left `remote_threads` stale). A subsequent
+            // `refresh_remote_threads` (explicit `RefreshBadges`, or the
+            // next `open_pr`) repopulates it for whatever PR is actually
+            // current; same-PR reloads (e.g. a CLI comment add) deliberately
+            // keep the existing fetch rather than blanking the cards until
+            // the next manual refresh.
+            self.remote_threads.clear();
+        }
+        cx.emit(ReviewChanged);
+        // A watcher-driven (or revalidation-driven) reload invalidates a
+        // parked submit panel — it was built against the review as it stood
+        // before this external change (review finding P1-3).
+        self.cancel_submit_flow_if_parked(cx);
+        true
+    }
+
+    /// Applies a freshly `changed_files`-listed file list to `this.files`,
+    /// reconciling every index-keyed cache (`diffs`/`diff_pending`/
+    /// `expanded`/`selected`) via [`reconcile_file_selection`] rather than a
+    /// blind swap (cross-cutting risk E: `selected`/`diffs`/`diff_pending`/
+    /// `expanded` are all keyed by INDEX into `this.files`, not by path — a
+    /// naive replace either panics once the list has shrunk past the old
+    /// selected index, or silently re-renders the wrong file's cached diff
+    /// under a reused index once a new file sorts in earlier). Shared body
+    /// for the worktree-watch consumer (`Self::new`, above) and
+    /// [`Self::revalidate`]'s worktree half.
+    fn apply_worktree_reload(&mut self, files: Vec<ChangedFile>, cx: &mut Context<Self>) {
+        let old_files = std::mem::replace(&mut self.files, files);
+        let (new_selected, needs_invalidation) =
+            reconcile_file_selection(&old_files, &self.files, self.selected);
+        if needs_invalidation {
+            self.diffs.clear();
+            self.diff_pending.clear();
+            self.expanded.clear();
+            self.pending_jump = None;
+            match new_selected {
+                Some(index) => {
+                    // Same file as before, just relocated — preserve
+                    // `current_hunk` and the diff list's scroll position
+                    // (`reset_diff_list`, called by the caller, keeps the
+                    // current offset).
+                    self.selected = Some(index);
+                    self.request_diff(index, cx);
+                }
+                None if !self.files.is_empty() => {
+                    // The previously selected file is gone (or nothing was
+                    // selected yet) — this is genuinely a different file, so
+                    // reset hunk navigation same as a normal `select_file`.
+                    self.selected = Some(0);
+                    self.current_hunk = 0;
+                    self.request_diff(0, cx);
+                }
+                None => {
+                    // Nothing left to show — clear cleanly rather than leave
+                    // a dangling index (the original crash: `self.files[2]`
+                    // after an external commit emptied the list).
+                    self.selected = None;
+                }
+            }
+        }
+    }
+
+    /// One-shot revalidation of this workspace against its store + working
+    /// tree, dispatched by `AppShell::revalidate_active` right after the
+    /// `Self::open_review` cache-hit branch reactivates a parked entry
+    /// (Phase 7 D1b — the stale-while-revalidate half of Deliverable 1 that
+    /// S7-3 deliberately left as a no-op stub rather than land prematurely).
+    /// A consolidation of the store-watch and worktree-watch consumer
+    /// BODIES ([`Self::new`]'s two `cx.spawn` loops, above) as an on-demand
+    /// pass rather than a new signal source: re-pick the review from a
+    /// fresh store list (same as the store watcher), and — for a
+    /// `WorkingTree` source only, since a PR/range/commit file list is
+    /// fixed by its endpoints — re-list `changed_files` and reconcile
+    /// index-keyed caches via [`reconcile_file_selection`] (same as the
+    /// worktree watcher), forcing a staleness recheck either way. This is
+    /// the case no parked watcher covers on its own: the review-store
+    /// watcher only observes `.git/dv`, never the working tree, so a Local
+    /// repo's working-tree edit made while parked is otherwise invisible
+    /// until some unrelated trigger forces a rebuild.
+    ///
+    /// Calling the exact same helpers the two watch consumers call (rather
+    /// than forking the logic) is also what makes racing the parked
+    /// entity's still-live watcher for the same change safe (cross-cutting
+    /// risk C): both funnel through the same fingerprint check and
+    /// `reconcile_file_selection`, so whichever lands second is a no-op,
+    /// never a double-apply.
+    ///
+    /// No-ops if a load or `open_pr` is already in flight
+    /// (`Status::Loading` / `pr_loading.is_some()`) — there's nothing
+    /// settled to revalidate against yet, and that in-flight completion
+    /// already supersedes anything this pass could compute. Captures
+    /// `source_epoch` up front and re-checks it on completion, discarding
+    /// the result if it no longer matches — the user switched away again,
+    /// or opened a PR, before this pass finished — same discard-if-
+    /// superseded pattern `source_epoch`'s doc comment describes.
+    ///
+    /// Reactivation implies the repo (including a WSL distro) is live —
+    /// the same reasoning `AppShell::open_review`'s non-WSL-gated
+    /// `refresh_badge` call already relies on — so this may touch the
+    /// host. It is invoked ONLY for the single reactivated entry; never
+    /// sweep `AppShell::workspace_cache` in the background (cross-cutting
+    /// risk D — that would boot a stopped WSL distro just for sitting in
+    /// the cache).
+    pub(crate) fn revalidate(&mut self, cx: &mut Context<Self>) {
+        if matches!(self.status, Status::Loading) || self.pr_loading.is_some() {
+            return;
+        }
+        let Some(repo) = self.repo.clone() else {
+            return;
+        };
+        let location = self.location.clone();
+        let source = self.source.clone();
+        let is_working_tree = matches!(source, DiffSource::WorkingTree);
+        let current_id = self.review.as_ref().map(|r| r.id.clone());
+        let current_pr = self.pr_remote.clone();
+        let pinned_id = self.pinned_review_id.clone();
+        let epoch = self.source_epoch;
+
+        cx.spawn(async move |this, cx| {
+            let (review, files) = cx
+                .background_executor()
+                .spawn(async move {
+                    let review = pick_review(
+                        dv_core::ReviewStore::open(location)
+                            .list()
+                            .unwrap_or_default(),
+                        current_id.as_deref(),
+                        current_pr.as_ref(),
+                        pinned_id.as_deref(),
+                    );
+                    let files = is_working_tree.then(|| repo.changed_files(&source));
+                    (review, files)
+                })
+                .await;
+
+            let alive = this.update(cx, |this, cx| {
+                // Superseded — see doc comment above.
+                if this.source_epoch != epoch {
+                    return;
+                }
+
+                // ---- review half: `apply_review_reload` is the exact same
+                // body the store-watch consumer (`Self::new`, above) calls,
+                // including its `pr_remote`/`remote_threads` reconciliation
+                // and the monotonicity guard against a faster concurrent
+                // writer (review finding P3: this pass's `pick_review` read
+                // is a snapshot that can complete after a newer write, e.g.
+                // a GUI comment save, has already landed). ----
+                let review_changed = this.apply_review_reload(review, cx);
+
+                // ---- worktree half: `apply_worktree_reload` is the exact
+                // same body the worktree-watch consumer (`Self::new`, above)
+                // calls, including the unconditional staleness recheck below
+                // (a worktree edit can drift a comment's anchor without the
+                // file list itself changing). Only for a `WorkingTree`
+                // source that's STILL current — `this.source` may have moved
+                // on since this pass was dispatched even with a matching
+                // epoch (review finding P2-1's exact reasoning, quoted in
+                // the worktree consumer above). ----
+                let mut worktree_pass = false;
+                if matches!(this.source, DiffSource::WorkingTree)
+                    && let Some(files) = files
+                {
+                    worktree_pass = true;
+                    if let Ok(files) = files {
+                        this.apply_worktree_reload(files, cx);
+                    }
+                    this.stale_checked = None;
+                }
+
+                if review_changed || worktree_pass {
+                    this.reset_diff_list(cx);
+                    cx.notify();
+                }
+            });
+            alive.ok();
+        })
+        .detach();
     }
 
     /// Whether this workspace's own PR picker overlay is currently open.

@@ -1116,6 +1116,15 @@ impl AppShell {
             // that already has a review loaded.
             self.install_active(ws, None, cx);
             self.selected_review_id = Some(key.clone());
+            // Phase 7 D1b (S7-4): kick a one-shot background revalidation
+            // of the entry just reactivated — corrects any drift no parked
+            // watcher covered while it sat in the cache (notably a Local
+            // `WorkingTree` edit; the review-store watcher only observes
+            // `.git/dv`, never the working tree). Dispatched AFTER
+            // `install_active` so `self.active` is already the reactivated
+            // entity, and it's the only entry ever touched here — never a
+            // sweep of the whole `workspace_cache` (cross-cutting risk D).
+            self.revalidate_active(cx);
             // Reactivating an already-loaded entity emits no `ReviewChanged`
             // (nothing about it changed) — `install_active`'s closure is the
             // ONLY place that stamps `last_opened_ms` (via
@@ -1433,6 +1442,24 @@ impl AppShell {
             },
         ));
         self.active = Some(workspace);
+    }
+
+    /// Kicks a one-shot Phase 7 D1b revalidation ([`Workspace::revalidate`])
+    /// of `self.active` — dispatched only from [`Self::open_review`]'s
+    /// cache-hit branch, right after [`Self::install_active`] has landed
+    /// the reactivated entity as `self.active`. This is the S7-4 completion
+    /// of the no-op `install_active`/cache-hit stub S7-3 deliberately left
+    /// in place rather than land prematurely. Never call this for a brand-
+    /// new (cache-miss) `Workspace::new` — its own initial load already does
+    /// the equivalent work from a clean slate, so revalidating it again
+    /// would be redundant. Also never sweep `self.workspace_cache` here —
+    /// this only ever touches the single entity that was just reactivated
+    /// (cross-cutting risk D: a background pass over every parked entry
+    /// could boot a stopped WSL distro just for sitting in the cache).
+    fn revalidate_active(&mut self, cx: &mut Context<Self>) {
+        if let Some(ws) = &self.active {
+            ws.update(cx, |ws, cx| ws.revalidate(cx));
+        }
     }
 
     /// Lighter `ReviewChanged` handler for a PARKED [`WorkspaceCache`] entry

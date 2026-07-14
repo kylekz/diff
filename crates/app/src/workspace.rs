@@ -663,6 +663,14 @@ pub struct Workspace {
     /// Mirrors `source_epoch`'s exact same pattern for `open_pr`/
     /// `request_diff`.
     submit_epoch: u64,
+    /// The most recent [`Self::switch_source_and_jump`] failure, if any
+    /// (docs/phase-6-review-navigator.md deliverable 5) — a comment whose
+    /// file isn't reachable in *any* known source (should be impossible for
+    /// a well-formed comment) or a background fetch error (e.g. a rebased-
+    /// away oid). Deliberately separate from `Status::Failed` for the same
+    /// reason `pr_error` is: the workspace stays exactly as usable as it was
+    /// before the attempt. Cleared on the next attempt.
+    source_switch_error: Option<String>,
 }
 
 /// Which blob a comment on `side` of `path` anchors to, given the review's
@@ -1109,6 +1117,7 @@ impl Workspace {
             author: None,
             submit: None,
             submit_epoch: 0,
+            source_switch_error: None,
         };
 
         cx.spawn(async move |this, cx| {
@@ -1478,6 +1487,12 @@ impl Workspace {
         if index >= self.files.len() {
             return;
         }
+        // Any successful selection — a plain sidebar click, an in-place
+        // summary jump, or the landing select_file of a source switch —
+        // supersedes a stale "Jump: ..." banner from an earlier failed
+        // switch_source_and_jump (P3 finding: it used to persist across
+        // unrelated successful navigation).
+        self.source_switch_error = None;
         self.selected = Some(index);
         self.current_hunk = 0;
         self.file_scroll
@@ -1746,6 +1761,11 @@ impl Workspace {
         }
 
         self.pr_error = None;
+        // A leftover "Jump: ..." banner from an earlier failed
+        // switch_source_and_jump would otherwise outlive this unrelated,
+        // successful source switch (P3 finding: it was cleared only at the
+        // top of switch_source_and_jump itself, never by open_pr).
+        self.source_switch_error = None;
         self.pr_loading = Some(number);
         self.status = Status::Loading;
         // Bumped before the fetch even starts, so any request_diff already
@@ -2067,6 +2087,14 @@ impl Workspace {
                 // scope (suppressed entry points + a banner, not a blanket
                 // lockdown).
                 "readonly": self.review_is_readonly(),
+                // docs/phase-6-review-navigator.md deliverable 5: comment
+                // ids anchored to a file that isn't in the currently open
+                // `self.files` — the summary panel's off-diff marker, made
+                // assertable without a screenshot.
+                "off_diff": r.comments.iter()
+                    .filter(|c| !self.files.iter().any(|f| f.path == c.path))
+                    .map(|c| c.id.clone())
+                    .collect::<Vec<_>>(),
             })),
             "display_rows": self.display.len(),
             "scroll_item": self.diff_list.logical_scroll_top().item_ix,
@@ -2096,6 +2124,9 @@ impl Workspace {
                 "url": pr.url.to_string(),
             })),
             "pr_error": self.pr_error,
+            // docs/phase-6-review-navigator.md deliverable 5:
+            // `switch_source_and_jump`'s most recent failure, if any.
+            "source_switch_error": self.source_switch_error,
             "pr_picker_open": self.pr_picker.is_some(),
             "pr_picker": self.pr_picker.as_ref().map(|p| json!({
                 "loading": matches!(p.state, PrPickerState::Loading),
@@ -2942,12 +2973,184 @@ impl Workspace {
             return;
         };
         let Some(file) = self.files.iter().position(|f| f.path == path) else {
-            return; // comment on a file outside this diff (see backlog)
+            // Off-diff (docs/phase-6-review-navigator.md deliverable 5): the
+            // comment's file isn't part of the currently open source at
+            // all. Switch to the review's own recorded source first, then
+            // land the jump — instead of the previous silent no-op.
+            self.switch_source_and_jump(comment_id, window, cx);
+            return;
         };
         self.pending_jump = Some(comment_id);
         self.select_file(file, window, cx);
         // If the diff was already cached, the jump consumed inside
         // select_file's reset; otherwise it fires when the compute lands.
+    }
+
+    /// Reopens the comment's own review-recorded source and lands the jump
+    /// on it, for a summary click on a comment whose file isn't in the
+    /// currently open diff (docs/phase-6-review-navigator.md deliverable 5).
+    ///
+    /// Doc-deviation #3: this reopens `review.source` — the concrete
+    /// `Range { base, head }` (or plain `WorkingTree`/`Staged`/`Commit`)
+    /// already recorded on the comment's own review at anchor time — via
+    /// the same local `resolve_source` + `changed_files` path the initial
+    /// load uses, NOT a fresh `gh pr fetch`. Faster, works offline, and it
+    /// means the jump targets exactly what the comment was anchored
+    /// against rather than whatever the live PR range happens to be today.
+    ///
+    /// Mirrors `open_pr`'s teardown block exactly: `diffs`/`diff_pending`/
+    /// `expanded`/`stale`/`stale_checked` are all index-keyed into
+    /// `self.files`, so replacing the file list without clearing them would
+    /// render the wrong file's cached content under a reused index. Guarded
+    /// by the same save-in-flight refusal as `open_pr`. The completion
+    /// re-checks BOTH `source_epoch` (a second switch, or `open_pr`,
+    /// superseding this one) AND that `self.review`'s id hasn't moved out
+    /// from under it (cross-cutting risk C / finding P2-1: an epoch-only
+    /// check can miss a change that never bumps the epoch in the first
+    /// place — here, a store-watcher reload landing mid-flight and picking
+    /// a *different* review).
+    fn switch_source_and_jump(
+        &mut self,
+        comment_id: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        // Same "never orphan an in-flight save" contract as `open_pr`.
+        if self.editor.as_ref().is_some_and(|e| e.saving)
+            || self.thread_input.as_ref().is_some_and(|t| t.saving)
+            || self.submit_in_flight()
+        {
+            return;
+        }
+        let Some(review) = self.review.as_ref() else {
+            return;
+        };
+        let Some(comment) = review.comments.iter().find(|c| c.id == comment_id) else {
+            return;
+        };
+        let target_source = review.source.clone();
+        if target_source == self.source {
+            // The comment's own review is already anchored against this
+            // exact source — its file genuinely isn't part of this diff
+            // (should be impossible for a well-formed comment). Nothing to
+            // switch to; surface it rather than silently doing nothing.
+            self.source_switch_error =
+                Some("comment's file isn't part of this review's diff".into());
+            cx.notify();
+            return;
+        }
+        let Some(repo) = self.repo.clone() else {
+            return;
+        };
+        let review_id = review.id.clone();
+        let path = comment.path.clone();
+
+        // A parked submit panel is scoped to the source being left behind
+        // (same reasoning as `open_pr`); `Submitting` was already refused
+        // above, so this can only cancel, never clobber an in-flight POST.
+        self.cancel_submit_flow(cx);
+        self.source_switch_error = None;
+        self.status = Status::Loading;
+        self.source_epoch += 1;
+        let epoch = self.source_epoch;
+        cx.notify();
+
+        cx.spawn_in(window, async move |this, cx| {
+            let outcome = cx
+                .background_executor()
+                .spawn(async move {
+                    let source = resolve_source(&repo, target_source)?;
+                    let files = repo.changed_files(&source)?;
+                    anyhow::Ok((source, files))
+                })
+                .await;
+
+            this.update_in(cx, |this, window, cx| {
+                if this.source_epoch != epoch {
+                    // A newer switch/`open_pr` superseded this one before
+                    // this fetch finished — it already set `Loading` itself
+                    // and owns transitioning back to `Ready` on its own
+                    // completion (same as `open_pr`'s own epoch-mismatch
+                    // arm, which leaves `status` alone entirely).
+                    return;
+                }
+                if this.review.as_ref().map(|r| r.id.as_str()) != Some(review_id.as_str()) {
+                    // The review changed out from under us via a
+                    // store-watcher reload (finding P2-1's generalization:
+                    // that reload never bumps `source_epoch`, so the epoch
+                    // check above can't catch it) — no other in-flight
+                    // operation is going to fix `status` for us, so reset it
+                    // here or the workspace wedges in `Loading` forever.
+                    this.status = Status::Ready;
+                    cx.notify();
+                    return;
+                }
+                this.status = Status::Ready;
+                match outcome {
+                    Ok((source, files)) => {
+                        this.selection = None;
+                        let dropped_editor = this.editor.take().is_some();
+                        let dropped_input = this.thread_input.take().is_some();
+                        if dropped_editor || dropped_input {
+                            window.focus(&this.focus_handle, cx);
+                        }
+                        if matches!(this.source, DiffSource::WorkingTree) {
+                            // Same one-way teardown `open_pr` does — there's
+                            // no path back to `WorkingTree` from here either.
+                            this._worktree_watcher = None;
+                        }
+                        this.source = source;
+                        this.source_desc = source_label(&this.source).into();
+                        // Index-keyed into the old file list — stale
+                        // caches would render the wrong file under the
+                        // right name (same as `open_pr`).
+                        this.diffs.clear();
+                        this.diff_pending.clear();
+                        this.expanded.clear();
+                        this.stale.clear();
+                        this.stale_checked = None;
+                        this.selected = None;
+                        this.pending_jump = None;
+                        this.files = files;
+                        match this.files.iter().position(|f| f.path == path) {
+                            Some(index) => {
+                                this.pending_jump = Some(comment_id.clone());
+                                this.select_file(index, window, cx);
+                                // Consumed inside select_file's reset if the
+                                // diff is already cached; otherwise it fires
+                                // once the compute lands (same as a
+                                // same-source jump).
+                            }
+                            None => {
+                                // Should be impossible for a well-formed
+                                // comment (its own review's recorded source
+                                // doesn't contain its own path) — land on
+                                // the switched source anyway rather than
+                                // wedge, just without a jump target.
+                                this.source_switch_error = Some(
+                                    "comment's file isn't in its review's recorded source".into(),
+                                );
+                                if !this.files.is_empty() {
+                                    this.selected = Some(0);
+                                    this.current_hunk = 0;
+                                    this.request_diff(0, cx);
+                                }
+                                this.reset_diff_list(cx);
+                            }
+                        }
+                    }
+                    Err(err) => {
+                        // Leave source/files exactly as they were — same
+                        // "don't tear down a working view over a failed
+                        // attempt" posture as `open_pr`'s error arm.
+                        this.source_switch_error = Some(format!("{err:#}"));
+                    }
+                }
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
     }
 
     /// Persist the comment under composition: ensure a draft review exists,
@@ -4003,12 +4206,20 @@ impl Workspace {
         };
 
         let stale = &self.stale;
+        let files = &self.files;
         let rows: Vec<Stateful<Div>> = comments
             .iter()
             .map(|(_, comment)| {
                 let id = comment.id.clone();
                 let resolved = comment.status == dv_core::CommentStatus::Resolved;
                 let first_line = comment.body.lines().next().unwrap_or("").to_string();
+                // docs/phase-6-review-navigator.md deliverable 5: a comment
+                // whose file isn't in the currently open diff at all (as
+                // opposed to `stale`, which is a comment ON this diff whose
+                // anchored content has since drifted). Its click still
+                // works — `jump_to_comment` reopens the review's own
+                // recorded source for it (`switch_source_and_jump`).
+                let off_diff = !files.iter().any(|f| f.path == comment.path);
                 div()
                     .id(SharedString::from(format!("summary-{}", comment.id)))
                     .w_full()
@@ -4040,6 +4251,9 @@ impl Workspace {
                             )
                             .when(stale.contains(&comment.id), |el| {
                                 el.child(div().text_color(warning).child("\u{26a0}"))
+                            })
+                            .when(off_diff, |el| {
+                                el.child(div().text_color(muted).child("\u{2197}"))
                             }),
                     )
                     .child(div().text_sm().truncate().child(first_line))
@@ -5529,6 +5743,15 @@ impl Render for Workspace {
                                 .text_color(theme.danger)
                                 .truncate()
                                 .child(format!("PR: {err}")),
+                        )
+                    })
+                    .when_some(self.source_switch_error.clone(), |el, err| {
+                        el.child(
+                            div()
+                                .text_sm()
+                                .text_color(theme.danger)
+                                .truncate()
+                                .child(format!("Jump: {err}")),
                         )
                     })
                     .child(div().flex_1())

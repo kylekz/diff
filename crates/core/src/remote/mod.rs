@@ -16,7 +16,10 @@ pub mod proto;
 pub mod worktree;
 
 pub use client::{ExecOutcome, HostClient, RequestFailure};
-pub use install::{HostBinary, HostBinarySource, InstallError};
+pub use install::{
+    CLI_SPEC, HOST_SPEC, HostBinary, HostBinarySource, InstallError, InstallLayout,
+    InstalledBinary, ManagedSpec, cli_install_marker, ensure_cli_installed, ensure_installed_spec,
+};
 pub use manager::enable_hosts;
 pub use proto::{BlobGetParams, BlobGetResult, Hello, Notification, PROTO_VERSION, RpcError};
 pub use worktree::{WorktreeWatcher, watch_worktree};

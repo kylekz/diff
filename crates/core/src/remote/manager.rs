@@ -259,7 +259,7 @@ pub(crate) fn client_for(distro: &str) -> Option<Arc<HostClient>> {
                 // silent, no `Failed` entry, so a sidecar that appears
                 // later (or a `DV_HOST_PATH` set later) works on the very
                 // next call instead of waiting out a stale cool-down.
-                Err(install::InstallError::NoSidecar) => return None,
+                Err(install::InstallError::NoSidecar { .. }) => return None,
                 Err(err) => {
                     eprintln!("[dv-host manager] failed to install dv-host for {distro}: {err}");
                     *guard = Some(HostEntry::Failed { since: now });

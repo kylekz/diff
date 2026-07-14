@@ -1,5 +1,6 @@
-//! Sidecar resolution + install/upgrade flow for `dv-host`
-//! (docs/phase-5-implementation-plan.md §5, §8 S3). Consumed by
+//! Sidecar resolution + install/upgrade flow for dv's own managed binaries
+//! (docs/phase-5-implementation-plan.md §5, §8 S3; generalized in
+//! docs/phase-8-lsp-and-polish.md's onboarding spine, §8 S8c). Consumed by
 //! [`super::manager::client_for`], which calls [`ensure_installed`] inside
 //! its per-distro lock to turn "no `DV_HOST_PATH`" into a real, in-distro
 //! POSIX path — installing (or upgrading) the binary first if needed.
@@ -21,8 +22,37 @@
 //! different commits get different directories, and identical bytes always
 //! reuse the same one) and costs nothing distribution-side, since the
 //! marker file this module writes already carries the full hash anyway.
+//!
+//! **S8c generalization:** the pipeline above was written, hardened, and
+//! reviewed for exactly one binary (`dv-host`). Phase 8's onboarding spine
+//! needs a SECOND managed binary — the native `dv` CLI (crate `dv-cli`,
+//! S8b), installed to a STABLE path (`~/.local/bin/dv`, so it can sit on
+//! `PATH`) rather than a hash-named directory. [`ManagedSpec`] +
+//! [`InstallLayout`] parameterize the same stream/verify pipeline over
+//! either shape without duplicating it: [`HOST_SPEC`] reproduces today's
+//! `dv-host` behavior byte-for-byte (proven by the exact-string unit tests
+//! below staying green unchanged), and [`CLI_SPEC`] is the new `dv` CLI
+//! path. [`ensure_installed`]/[`force_reinstall`] stay the exact public API
+//! [`super::manager::client_for`] already calls — now thin wrappers over the
+//! generalized [`ensure_installed_spec`]/[`force_reinstall_spec`] machinery.
+//! [`ensure_cli_installed`]/[`cli_install_marker`] are the new CLI_SPEC
+//! entry points (the latter reads the marker WITHOUT streaming, for a fast
+//! per-launch consistency check).
+//!
+//! Because [`InstallLayout::StablePath`] has no hash-named directory, a
+//! present binary can never be trusted on its own — the marker file is the
+//! primary drift signal. A `~/.local/bin/dv` with a missing or mismatched
+//! marker MUST be treated as drift and re-provisioned, never assumed-good
+//! (see [`InstallLayout::StablePath`]'s doc and [`is_drift`]). The mirror
+//! case matters too: `bin_dir` and `marker_dir` are separate directories, so
+//! an out-of-band deletion of just the binary can leave a still-matching
+//! marker behind. [`install_spec`]'s non-force check and
+//! [`cli_install_marker`] both fold a binary-presence stat into the same
+//! round trip as the marker read
+//! ([`read_marker_and_binary_presence`]) so that state is drift too, never
+//! assumed-good.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use anyhow::anyhow;
@@ -38,6 +68,23 @@ const BINARY_FILENAME: &str = "dv-host";
 /// The marker file recording the full sha256 of the binary currently
 /// installed at this directory.
 const MARKER_FILENAME: &str = "dv-host.sha256";
+
+/// The Windows-side sidecar for the native `dv` CLI (built by `dv-cli`, S8b,
+/// as `x86_64-unknown-linux-musl`, renamed by the release pipeline).
+const CLI_SIDECAR_FILENAME: &str = "dv-linux-x64";
+/// The CLI installs under dv's own name — it IS `dv` on the user's `PATH`.
+const CLI_BINARY_FILENAME: &str = "dv";
+/// The CLI's marker file — see [`InstallLayout::StablePath`]'s doc for why
+/// this is the sole drift signal for a stable-path install.
+const CLI_MARKER_FILENAME: &str = "dv.sha256";
+
+/// Env var overriding the install root a [`ManagedSpec`] resolves against —
+/// verbatim, replacing the computed `$HOME`-relative default entirely (test
+/// seam). Named after `dv-host` for backward compatibility (predates this
+/// generalization) but honored by every [`InstallLayout`], including
+/// [`InstallLayout::StablePath`]'s `marker_dir` (never its `bin_dir` — see
+/// that variant's doc for why the binary path itself is never redirected).
+const INSTALL_ROOT_ENV: &str = "DV_HOST_INSTALL_ROOT";
 
 /// Wall-clock bound on every install bootstrap command (plan §5, §8 S5) —
 /// `$HOME` resolution, marker read/delete, and the binary stream, all of
@@ -81,17 +128,129 @@ pub struct HostBinary {
     pub source: HostBinarySource,
 }
 
+/// Where a [`ManagedSpec`]'s installed binary (and its drift marker) live
+/// inside the distro.
+#[derive(Debug, Clone, Copy)]
+pub enum InstallLayout {
+    /// `<root>/<hash-prefix>/<binary_filename>`, marker colocated in the
+    /// same hash-named directory — today's `dv-host` layout (see the module
+    /// doc's pre-approved content-hash-directory deviation). `<root>` is
+    /// `~/.local/share/dv/<subdir>` by default, or [`INSTALL_ROOT_ENV`]
+    /// verbatim when set.
+    HashDir {
+        subdir: &'static str,
+        binary_filename: &'static str,
+    },
+    /// `<home>/<bin_dir>/<binary_filename>` — a STABLE path (no hash-named
+    /// directory, so it can sit on `PATH`) whose marker is tracked
+    /// SEPARATELY at `<home>/<marker_dir>/<marker_filename>` (or
+    /// [`INSTALL_ROOT_ENV`] verbatim when set — a test seam; see
+    /// [`stable_dirs`]). `bin_dir` itself is never redirected by
+    /// [`INSTALL_ROOT_ENV`]: the whole point of a stable path is that it's
+    /// the real, on-`PATH` location (docs/phase-8-lsp-and-polish.md
+    /// doc-deviation 5 — dv owns the `dv` name there). Because the binary
+    /// path never moves, the marker is the primary drift signal: a binary
+    /// present with a missing or mismatched marker is drift, never
+    /// assumed-good (see [`is_drift`]). The mirror case is drift too: since
+    /// `bin_dir` and `marker_dir` are separate directories, a matching
+    /// marker with the binary itself missing (out-of-band deletion) must
+    /// not be assumed-good either — callers stat the binary alongside the
+    /// marker read (see [`read_marker_and_binary_presence`]) rather than
+    /// trusting the marker alone.
+    StablePath {
+        bin_dir: &'static str,
+        binary_filename: &'static str,
+        marker_dir: &'static str,
+    },
+}
+
+/// A binary dv installs/upgrades by content hash inside a distro.
+/// [`HOST_SPEC`] is today's `dv-host`; [`CLI_SPEC`] is the native `dv` CLI
+/// added for Phase 8's onboarding spine (docs/phase-8-lsp-and-polish.md).
+#[derive(Debug, Clone, Copy)]
+pub struct ManagedSpec {
+    /// Windows-side sidecar file name, resolved next to the running `dv.exe`
+    /// (see [`sidecar_path`]/[`sidecar_path_for`]).
+    pub sidecar_filename: &'static str,
+    /// Env var overriding the sidecar search entirely — a test seam letting
+    /// tests point at any local file standing in for the sidecar.
+    pub sidecar_env: &'static str,
+    /// Env var bypassing the install flow altogether with an in-distro path
+    /// (the dev loop bypass — no marker, no verification, used as-is).
+    pub dev_override_env: &'static str,
+    /// File name recording the full sha256 of the currently-installed
+    /// binary.
+    pub marker_filename: &'static str,
+    /// Human-readable name of the managed binary this spec installs —
+    /// interpolated into [`InstallError`]'s `Display` text so a CLI_SPEC
+    /// failure reads "dv-cli", not a hardcoded "dv-host" left over from
+    /// before this type was generalized (S8c review, P2/P3).
+    pub component: &'static str,
+    pub layout: InstallLayout,
+}
+
+/// dv-host: today's exact, hardened layout — reproduced byte-for-byte so the
+/// exact-string unit tests below (written against the pre-generalization
+/// module) stay green unchanged, which IS the regression proof this
+/// refactor left `dv-host`'s behavior untouched.
+pub const HOST_SPEC: ManagedSpec = ManagedSpec {
+    sidecar_filename: SIDECAR_FILENAME,
+    sidecar_env: "DV_HOST_SIDECAR",
+    dev_override_env: "DV_HOST_PATH",
+    marker_filename: MARKER_FILENAME,
+    component: "dv-host",
+    layout: InstallLayout::HashDir {
+        subdir: "host",
+        binary_filename: BINARY_FILENAME,
+    },
+};
+
+/// The native `dv` CLI (crate `dv-cli`, S8b): installed to a STABLE path so
+/// it can sit on `PATH` and be invoked as plain `dv` from inside the distro
+/// (docs/phase-8-lsp-and-polish.md § Distribution & first-run).
+pub const CLI_SPEC: ManagedSpec = ManagedSpec {
+    sidecar_filename: CLI_SIDECAR_FILENAME,
+    sidecar_env: "DV_CLI_SIDECAR",
+    dev_override_env: "DV_CLI_PATH",
+    marker_filename: CLI_MARKER_FILENAME,
+    component: "dv-cli",
+    layout: InstallLayout::StablePath {
+        bin_dir: ".local/bin",
+        binary_filename: CLI_BINARY_FILENAME,
+        marker_dir: ".local/share/dv/cli",
+    },
+};
+
+/// The result of a successful [`ensure_installed_spec`]/
+/// [`force_reinstall_spec`] call — [`HostBinary`] plus the content hash the
+/// binary was verified against (S8d's consistency check compares this
+/// against [`cli_install_marker`] without a second round trip).
+#[derive(Debug, Clone)]
+pub struct InstalledBinary {
+    /// Absolute POSIX path *inside the distro* to the runnable binary.
+    pub path: String,
+    /// The sha256 hex digest the binary was installed/verified against.
+    /// Empty for [`HostBinarySource::DevOverride`] (no hash computed at
+    /// all — an arbitrary dev-supplied path, nothing to verify).
+    pub hash: String,
+    pub source: HostBinarySource,
+}
+
 /// Every way [`ensure_installed`]/[`force_reinstall`] can fail.
 #[derive(Debug)]
 pub enum InstallError {
-    /// No sidecar configured: no `dv-host-linux-x64` next to the running
-    /// `dv.exe`, and no `DV_HOST_SIDECAR` override either.
+    /// No sidecar configured: no sidecar file (`dv-host-linux-x64` /
+    /// `dv-linux-x64`) next to the running `dv.exe`, and no env override
+    /// either. `component` names which [`ManagedSpec`] was resolving (S8c
+    /// review, P2/P3 — before the generalization this was always dv-host,
+    /// so the `Display` text could hardcode it; now that [`InstallError`] is
+    /// shared with [`CLI_SPEC`] it must say which one actually failed).
     ///
     /// [`super::manager::client_for`] treats this exactly like today's
     /// missing `DV_HOST_PATH`: silent, no `Failed` registry entry, so a
     /// sidecar (or env var) that appears later works on the very next call
     /// instead of being stuck behind a stale cool-down.
-    NoSidecar,
+    NoSidecar { component: &'static str },
     /// Anything else: the sidecar file couldn't be read/hashed, a Stage-A
     /// WSL round trip failed (spawn failure, `$HOME` unresolvable, the
     /// stream-install script itself failing), ... Carries the full
@@ -102,17 +261,28 @@ pub enum InstallError {
     /// sidecar's hash — something is wrong beyond a stale cache (a
     /// half-written file from a killed process, a foreign/hostile file at
     /// the target path, a filesystem that silently truncated the write, …).
-    VerifyFailed { expected: String, actual: String },
+    /// `component` — see [`NoSidecar`](InstallError::NoSidecar)'s doc.
+    VerifyFailed {
+        component: &'static str,
+        expected: String,
+        actual: String,
+    },
 }
 
 impl std::fmt::Display for InstallError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            InstallError::NoSidecar => write!(f, "no dv-host sidecar configured"),
+            InstallError::NoSidecar { component } => {
+                write!(f, "no {component} sidecar configured")
+            }
             InstallError::Io(err) => write!(f, "{err:#}"),
-            InstallError::VerifyFailed { expected, actual } => write!(
+            InstallError::VerifyFailed {
+                component,
+                expected,
+                actual,
+            } => write!(
                 f,
-                "dv-host install verification failed: expected sha256 {expected}, found {actual:?}"
+                "{component} install verification failed: expected sha256 {expected}, found {actual:?}"
             ),
         }
     }
@@ -129,7 +299,14 @@ impl std::error::Error for InstallError {}
 /// `None` means "not configured"; [`ensure_installed`] maps that to
 /// [`InstallError::NoSidecar`].
 pub fn sidecar_path() -> Option<PathBuf> {
-    if let Ok(over) = std::env::var("DV_HOST_SIDECAR")
+    sidecar_path_for(&HOST_SPEC)
+}
+
+/// [`sidecar_path`], generalized over any [`ManagedSpec`] — resolves
+/// `spec.sidecar_env` (verbatim override) then falls back to
+/// `spec.sidecar_filename` next to the running `dv.exe`.
+fn sidecar_path_for(spec: &ManagedSpec) -> Option<PathBuf> {
+    if let Ok(over) = std::env::var(spec.sidecar_env)
         && !over.is_empty()
     {
         let path = PathBuf::from(over);
@@ -137,46 +314,42 @@ pub fn sidecar_path() -> Option<PathBuf> {
             // An explicitly-set override pointing nowhere is a config
             // mistake, not the ordinary "no sidecar shipped" case — say so
             // once instead of silently degrading (S3 review, P3). Once per
-            // process: the NoSidecar path is retried per command by design,
-            // and this must not become per-command spam.
-            static LOGGED: std::sync::Once = std::sync::Once::new();
-            LOGGED.call_once(|| {
-                eprintln!(
-                    "[dv-host] DV_HOST_SIDECAR is set but not a file: {}",
-                    path.display()
-                );
-            });
+            // (env var, not just per process): each `ManagedSpec` has its
+            // own override var, and either's NoSidecar path is retried per
+            // command by design — this must not become per-command spam for
+            // EITHER spec.
+            log_missing_sidecar_override_once(spec, &path);
             return None;
         }
         return Some(path);
     }
     let exe = std::env::current_exe().ok()?;
-    let candidate = exe.parent()?.join(SIDECAR_FILENAME);
+    let candidate = exe.parent()?.join(spec.sidecar_filename);
     candidate.is_file().then_some(candidate)
+}
+
+fn log_missing_sidecar_override_once(spec: &ManagedSpec, path: &Path) {
+    static LOGGED: std::sync::Mutex<Option<std::collections::HashSet<&'static str>>> =
+        std::sync::Mutex::new(None);
+    let mut guard = LOGGED.lock().unwrap_or_else(|e| e.into_inner());
+    let logged_vars = guard.get_or_insert_with(std::collections::HashSet::new);
+    if logged_vars.insert(spec.sidecar_env) {
+        eprintln!(
+            "[dv] {} is set but not a file: {}",
+            spec.sidecar_env,
+            path.display()
+        );
+    }
 }
 
 /// Resolve `distro`'s runnable `dv-host` binary, installing/upgrading it
 /// first if necessary. See the module doc for the overall flow and the
-/// content-hash-directory deviation from plan §5.
+/// content-hash-directory deviation from plan §5. Thin wrapper over
+/// [`ensure_installed_spec`] with [`HOST_SPEC`] — kept as its own function
+/// (rather than inlined at call sites) so [`super::manager::client_for`]
+/// stays untouched by the S8c generalization.
 pub fn ensure_installed(distro: &str) -> Result<HostBinary, InstallError> {
-    if let Some(path) = dev_override_path() {
-        return Ok(HostBinary {
-            path,
-            source: HostBinarySource::DevOverride,
-        });
-    }
-
-    let (bytes, hash) = locate_and_hash_sidecar()?;
-    let builder = spawn_only_builder(distro);
-    let dir = resolve_dir(&builder, &hash)?;
-
-    let marker = read_marker(&builder, &dir)?;
-    if marker == hash {
-        return Ok(binary_at(&dir));
-    }
-
-    install_and_verify(&builder, &dir, &bytes, &hash)?;
-    Ok(binary_at(&dir))
+    ensure_installed_spec(distro, &HOST_SPEC).map(InstalledBinary::into_host_binary)
 }
 
 /// Force a fresh install even if the on-disk marker currently matches:
@@ -185,19 +358,212 @@ pub fn ensure_installed(distro: &str) -> Result<HostBinary, InstallError> {
 /// exactly once per handshake proto mismatch against a
 /// [`HostBinarySource::Managed`] binary (plan §2) — never for a
 /// `DevOverride` path, which has no marker to invalidate in the first
-/// place.
+/// place. Thin wrapper over [`force_reinstall_spec`] with [`HOST_SPEC`].
 pub fn force_reinstall(distro: &str) -> Result<HostBinary, InstallError> {
-    let (bytes, hash) = locate_and_hash_sidecar()?;
-    let builder = spawn_only_builder(distro);
-    let dir = resolve_dir(&builder, &hash)?;
-
-    delete_marker(&builder, &dir)?;
-    install_and_verify(&builder, &dir, &bytes, &hash)?;
-    Ok(binary_at(&dir))
+    force_reinstall_spec(distro, &HOST_SPEC).map(InstalledBinary::into_host_binary)
 }
 
+/// Resolve `distro`'s runnable binary for `spec`, installing/upgrading it
+/// first if necessary — the generalized form of [`ensure_installed`] over
+/// any [`ManagedSpec`]/[`InstallLayout`]. [`ensure_cli_installed`] is the
+/// [`CLI_SPEC`] instantiation.
+pub fn ensure_installed_spec(
+    distro: &str,
+    spec: &ManagedSpec,
+) -> Result<InstalledBinary, InstallError> {
+    install_spec(distro, spec, ForceReinstall::No)
+}
+
+/// [`force_reinstall`]'s generalized form over any [`ManagedSpec`].
+pub fn force_reinstall_spec(
+    distro: &str,
+    spec: &ManagedSpec,
+) -> Result<InstalledBinary, InstallError> {
+    install_spec(distro, spec, ForceReinstall::Yes)
+}
+
+/// Resolve (installing/upgrading if necessary) `distro`'s native `dv` CLI —
+/// the [`CLI_SPEC`] instantiation of [`ensure_installed_spec`].
+/// `CLI_SPEC.dev_override_env` (`DV_CLI_PATH`) short-circuits everything
+/// else, exactly like [`HostBinarySource::DevOverride`] does for `dv-host`.
+pub fn ensure_cli_installed(distro: &str) -> Result<InstalledBinary, InstallError> {
+    ensure_installed_spec(distro, &CLI_SPEC)
+}
+
+/// Read [`CLI_SPEC`]'s installed marker inside `distro` WITHOUT streaming a
+/// binary — S8d's fast per-launch consistency check compares this against
+/// the sidecar's LOCAL hash to decide "drift" without paying for a
+/// reinstall (or even a hash of the remote binary) on every launch.
+/// `Ok(None)` means "not installed" as far as this check can tell: either no
+/// marker file exists yet (never installed, or an install that failed
+/// before the marker write landed), OR the marker matches but
+/// `~/.local/bin/dv` itself is missing — an out-of-band deletion of just the
+/// binary (dotfile-manager resync, PATH cleanup, a non-persisted bin mount)
+/// that would otherwise read as falsely "installed" (S8c review, P2). Per
+/// [`InstallLayout::StablePath`]'s doc, a present `~/.local/bin/dv` with a
+/// missing marker — or a present marker with a missing binary — is drift,
+/// never assumed-good; this fn folds the binary-presence check in so the
+/// caller only has to compare the returned hash, no separate stat needed.
+pub fn cli_install_marker(distro: &str) -> Result<Option<String>, InstallError> {
+    let InstallLayout::StablePath {
+        bin_dir,
+        binary_filename,
+        marker_dir,
+    } = &CLI_SPEC.layout
+    else {
+        unreachable!("CLI_SPEC always uses InstallLayout::StablePath")
+    };
+    let builder = spawn_only_builder(distro);
+    let (bin_dir, marker_dir) = stable_dirs(&builder, bin_dir, marker_dir, CLI_SPEC.component)?;
+    let (marker, binary_present) = read_marker_and_binary_presence(
+        &builder,
+        &bin_dir,
+        binary_filename,
+        &marker_dir,
+        CLI_SPEC.marker_filename,
+    )?;
+    if !binary_present {
+        return Ok(None);
+    }
+    Ok((!marker.is_empty()).then_some(marker))
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ForceReinstall {
+    Yes,
+    No,
+}
+
+/// The shared install pipeline behind [`ensure_installed_spec`]/
+/// [`force_reinstall_spec`]: resolve the sidecar, resolve `spec`'s
+/// destination path(s) for its [`InstallLayout`], compare the marker
+/// against the sidecar's hash (or unconditionally delete it first when
+/// `force` requests a reinstall), and stream+verify on a mismatch.
+fn install_spec(
+    distro: &str,
+    spec: &ManagedSpec,
+    force: ForceReinstall,
+) -> Result<InstalledBinary, InstallError> {
+    if let Some(path) = dev_override_path_for(spec) {
+        return Ok(InstalledBinary {
+            path,
+            hash: String::new(),
+            source: HostBinarySource::DevOverride,
+        });
+    }
+
+    let (bytes, hash) = locate_and_hash_sidecar_for(spec)?;
+    let builder = spawn_only_builder(distro);
+
+    let (bin_dir, marker_dir, binary_filename) = match &spec.layout {
+        InstallLayout::HashDir {
+            subdir,
+            binary_filename,
+        } => {
+            let dir = resolve_dir_generic(&builder, subdir, &hash, spec.component)?;
+            (dir.clone(), dir, *binary_filename)
+        }
+        InstallLayout::StablePath {
+            bin_dir,
+            binary_filename,
+            marker_dir,
+        } => {
+            let (bin_dir, marker_dir) = stable_dirs(&builder, bin_dir, marker_dir, spec.component)?;
+            (bin_dir, marker_dir, *binary_filename)
+        }
+    };
+
+    if force == ForceReinstall::Yes {
+        delete_marker_at(&builder, &marker_dir, spec.marker_filename)?;
+    } else {
+        // For `StablePath` the marker alone is NOT a trustworthy "already
+        // installed" signal: bin_dir and marker_dir are separate
+        // directories, so a marker can survive an out-of-band deletion of
+        // just the binary (dotfile-manager resync, PATH cleanup, a
+        // non-persisted bin mount). Fold a binary-presence check into the
+        // same round trip so that state is reported as drift too, never
+        // assumed-good (S8c review, P2 — mirrors the missing/mismatched-
+        // marker handling `is_drift` already does). `HashDir` doesn't need
+        // this: binary and marker are colocated, so a marker match implies
+        // the binary is right there in the same directory, and this branch
+        // is kept byte-identical to the pre-generalization behavior so the
+        // exact-string regression tests stay meaningful.
+        let up_to_date = match &spec.layout {
+            InstallLayout::StablePath { .. } => {
+                let (marker, binary_present) = read_marker_and_binary_presence(
+                    &builder,
+                    &bin_dir,
+                    binary_filename,
+                    &marker_dir,
+                    spec.marker_filename,
+                )?;
+                binary_present && !is_drift(&marker, &hash)
+            }
+            InstallLayout::HashDir { .. } => {
+                let marker = read_marker_at(&builder, &marker_dir, spec.marker_filename)?;
+                !is_drift(&marker, &hash)
+            }
+        };
+        if up_to_date {
+            return Ok(InstalledBinary {
+                path: format!("{bin_dir}/{binary_filename}"),
+                hash,
+                source: HostBinarySource::Managed,
+            });
+        }
+    }
+
+    let script = if bin_dir == marker_dir {
+        install_script_generic(&bin_dir, &hash, binary_filename, spec.marker_filename)
+    } else {
+        install_script_stable(
+            &bin_dir,
+            &marker_dir,
+            &hash,
+            binary_filename,
+            spec.marker_filename,
+        )
+    };
+    run_install_script(&builder, &script, &bytes)?;
+    verify_marker(
+        &builder,
+        &marker_dir,
+        spec.marker_filename,
+        &hash,
+        spec.component,
+    )?;
+
+    Ok(InstalledBinary {
+        path: format!("{bin_dir}/{binary_filename}"),
+        hash,
+        source: HostBinarySource::Managed,
+    })
+}
+
+/// A present binary can never be trusted on its own — the marker is the
+/// sole drift signal (loudest for [`InstallLayout::StablePath`], which has
+/// no hash-named directory to fall back on): a missing marker (`marker` is
+/// empty — [`read_marker_at`]'s "doesn't exist yet" reading) or one that no
+/// longer matches the sidecar's current hash both count as drift and must
+/// trigger a re-provision, never be assumed-good.
+fn is_drift(marker: &str, hash: &str) -> bool {
+    marker != hash
+}
+
+/// Test-only alias for `dev_override_path_for(&HOST_SPEC)` — kept
+/// (`#[cfg(test)]`, unused outside the regression suite below) purely so the
+/// pre-generalization exact-string tests keep calling it by its original
+/// zero-arg name; production code always goes through
+/// [`dev_override_path_for`] with an explicit spec.
+#[cfg(test)]
 fn dev_override_path() -> Option<String> {
-    std::env::var("DV_HOST_PATH").ok().filter(|v| !v.is_empty())
+    dev_override_path_for(&HOST_SPEC)
+}
+
+fn dev_override_path_for(spec: &ManagedSpec) -> Option<String> {
+    std::env::var(spec.dev_override_env)
+        .ok()
+        .filter(|v| !v.is_empty())
 }
 
 fn spawn_only_builder(distro: &str) -> CommandBuilder {
@@ -207,8 +573,10 @@ fn spawn_only_builder(distro: &str) -> CommandBuilder {
     })
 }
 
-fn locate_and_hash_sidecar() -> Result<(Vec<u8>, String), InstallError> {
-    let sidecar = sidecar_path().ok_or(InstallError::NoSidecar)?;
+fn locate_and_hash_sidecar_for(spec: &ManagedSpec) -> Result<(Vec<u8>, String), InstallError> {
+    let sidecar = sidecar_path_for(spec).ok_or(InstallError::NoSidecar {
+        component: spec.component,
+    })?;
     let bytes = std::fs::read(&sidecar)
         .map_err(|err| InstallError::Io(anyhow!("reading sidecar {}: {err}", sidecar.display())))?;
     let hash = hash_hex(&bytes);
@@ -225,34 +593,15 @@ fn hash_hex(bytes: &[u8]) -> String {
         .collect()
 }
 
-/// The install directory for a given sidecar hash: `<root>/<hash-prefix>`,
-/// where `<root>` is [`install_root`] and `<hash-prefix>` is the first 16
-/// hex characters of `hash` (see the module doc's content-hash-directory
-/// deviation note).
-fn resolve_dir(builder: &CommandBuilder, hash: &str) -> Result<String, InstallError> {
-    let root = install_root(builder)?;
-    Ok(format!("{}/{}", root.trim_end_matches('/'), &hash[..16]))
-}
-
-/// The base directory holding every installed version's own subdirectory —
-/// `~/.local/share/dv/host` by default, or `DV_HOST_INSTALL_ROOT` verbatim
-/// when set (test seam: an absolute path to a throwaway root instead of the
-/// real user directory, so tests never touch it).
-///
-/// `$HOME` is resolved by asking the remote shell directly (one Stage-A
-/// round trip: `printf %s "$HOME"`) rather than embedding an unexpanded
-/// `$HOME` in every later script: the path this module ultimately returns
-/// is handed to `HostClient::spawn_wsl`'s `--exec`, which runs with **no
-/// shell** and would never expand it. Once resolved, every subsequent
-/// script embeds the fully-resolved directory, single-quote-escaped, the
-/// same way `review::io::StoreIo::write_atomic`'s WSL branch already
-/// handles arbitrary absolute paths.
-fn install_root(builder: &CommandBuilder) -> Result<String, InstallError> {
-    if let Ok(root) = std::env::var("DV_HOST_INSTALL_ROOT")
-        && !root.is_empty()
-    {
-        return Ok(root);
-    }
+/// `$HOME`, resolved by asking the remote shell directly (one Stage-A round
+/// trip: `printf %s "$HOME"`) rather than embedding an unexpanded `$HOME` in
+/// every later script: the paths this module ultimately returns are handed
+/// to `HostClient::spawn_wsl`'s `--exec`, which runs with **no shell** and
+/// would never expand it. Once resolved, every subsequent script embeds the
+/// fully-resolved directory, single-quote-escaped, the same way
+/// `review::io::StoreIo::write_atomic`'s WSL branch already handles
+/// arbitrary absolute paths.
+fn resolve_home(builder: &CommandBuilder, component: &'static str) -> Result<String, InstallError> {
     let home = builder
         .run_text_timeout(
             "sh",
@@ -262,60 +611,183 @@ fn install_root(builder: &CommandBuilder) -> Result<String, InstallError> {
         .map_err(InstallError::Io)?;
     let home = home.trim();
     if home.is_empty() {
-        return Err(InstallError::Io(anyhow!(
-            "dv-host install: \"$HOME\" resolved empty inside the distro"
-        )));
+        return Err(InstallError::Io(anyhow!(empty_home_message(component))));
     }
-    Ok(format!(
-        "{}/.local/share/dv/host",
-        home.trim_end_matches('/')
-    ))
+    Ok(home.trim_end_matches('/').to_string())
 }
 
-fn binary_at(dir: &str) -> HostBinary {
-    HostBinary {
-        path: format!("{dir}/{BINARY_FILENAME}"),
-        source: HostBinarySource::Managed,
-    }
+/// [`resolve_home`]'s empty-`$HOME` error text, component-labeled so a
+/// `dv-cli` provisioning failure never reads identically to a `dv-host` one
+/// (S8c review, P3) — split out as a pure fn so the exact text is
+/// unit-testable without a live builder, matching this module's existing
+/// script/message-text test pattern.
+fn empty_home_message(component: &str) -> String {
+    format!("{component} install: \"$HOME\" resolved empty inside the distro")
 }
 
-/// `cat <dir>/dv-host.sha256`, tolerating "doesn't exist yet" as an empty
+/// The install directory for a given sidecar hash under an
+/// [`InstallLayout::HashDir`]: `<root>/<hash-prefix>`, where `<root>` is
+/// `~/.local/share/dv/<subdir>` by default or [`INSTALL_ROOT_ENV`] verbatim
+/// when set (test seam: an absolute path to a throwaway root instead of the
+/// real user directory, so tests never touch it), and `<hash-prefix>` is the
+/// first 16 hex characters of `hash` (see the module doc's content-hash-
+/// directory deviation note). `component` is only used to label a
+/// [`resolve_home`] failure (e.g. an empty `$HOME`) with the [`ManagedSpec`]
+/// that was resolving, so a `dv-cli` provisioning failure never reads as a
+/// `dv-host` one or vice versa (S8c review, P3).
+fn resolve_dir_generic(
+    builder: &CommandBuilder,
+    subdir: &str,
+    hash: &str,
+    component: &'static str,
+) -> Result<String, InstallError> {
+    let root = if let Ok(root) = std::env::var(INSTALL_ROOT_ENV)
+        && !root.is_empty()
+    {
+        root
+    } else {
+        format!(
+            "{}/.local/share/dv/{subdir}",
+            resolve_home(builder, component)?
+        )
+    };
+    Ok(format!("{}/{}", root.trim_end_matches('/'), &hash[..16]))
+}
+
+/// Resolve [`InstallLayout::StablePath`]'s two directories from a live
+/// `$HOME` lookup, then delegate to [`stable_dirs_from_home`] for the pure
+/// arithmetic (kept separate so it's unit-testable without a live builder).
+/// `component` — see [`resolve_dir_generic`]'s doc.
+fn stable_dirs(
+    builder: &CommandBuilder,
+    bin_dir: &str,
+    marker_dir: &str,
+    component: &'static str,
+) -> Result<(String, String), InstallError> {
+    let home = resolve_home(builder, component)?;
+    Ok(stable_dirs_from_home(&home, bin_dir, marker_dir))
+}
+
+/// `bin_dir` is ALWAYS `$HOME`-relative and NEVER redirected by
+/// [`INSTALL_ROOT_ENV`] — see [`InstallLayout::StablePath`]'s doc for why
+/// (it must be the real, on-`PATH` location). `marker_dir` DOES honor the
+/// override, matching [`resolve_dir_generic`]'s `HashDir` behavior, so tests
+/// can point the drift signal at a throwaway location without disturbing a
+/// real prior install's marker.
+fn stable_dirs_from_home(home: &str, bin_dir: &str, marker_dir: &str) -> (String, String) {
+    let home = home.trim_end_matches('/');
+    let bin_dir_resolved = format!("{home}/{bin_dir}");
+    let marker_dir_resolved = if let Ok(root) = std::env::var(INSTALL_ROOT_ENV)
+        && !root.is_empty()
+    {
+        root
+    } else {
+        format!("{home}/{marker_dir}")
+    };
+    (bin_dir_resolved, marker_dir_resolved)
+}
+
+/// `cat <dir>/<marker_filename>`, tolerating "doesn't exist yet" as an empty
 /// string rather than an error — `2>/dev/null || true` keeps the shell's own
 /// exit code always 0, so there's no need for `is_missing_path_error`-style
 /// stderr sniffing here.
-fn read_marker(builder: &CommandBuilder, dir: &str) -> Result<String, InstallError> {
-    let script = marker_read_script(dir);
+fn read_marker_at(
+    builder: &CommandBuilder,
+    dir: &str,
+    marker_filename: &str,
+) -> Result<String, InstallError> {
+    let script = marker_read_script_generic(dir, marker_filename);
     let out = builder
         .run_text_timeout("sh", &["-c", &script], INSTALL_COMMAND_TIMEOUT)
         .map_err(InstallError::Io)?;
     Ok(out.trim().to_string())
 }
 
-fn delete_marker(builder: &CommandBuilder, dir: &str) -> Result<(), InstallError> {
-    let script = marker_delete_script(dir);
+/// [`InstallLayout::StablePath`]'s combined "is this actually installed"
+/// probe: reads the marker AND stats the binary in one round trip, so a
+/// marker that still matches after the binary alone was removed
+/// out-of-band is never mistaken for "installed" (S8c review, P2 — see the
+/// call site in [`install_spec`] and [`cli_install_marker`]).
+fn read_marker_and_binary_presence(
+    builder: &CommandBuilder,
+    bin_dir: &str,
+    binary_filename: &str,
+    marker_dir: &str,
+    marker_filename: &str,
+) -> Result<(String, bool), InstallError> {
+    let script =
+        marker_and_binary_probe_script(bin_dir, binary_filename, marker_dir, marker_filename);
+    let out = builder
+        .run_text_timeout("sh", &["-c", &script], INSTALL_COMMAND_TIMEOUT)
+        .map_err(InstallError::Io)?;
+    Ok(parse_marker_and_binary_probe(&out))
+}
+
+/// Script for [`read_marker_and_binary_presence`]: `cat`s the marker
+/// (tolerating "doesn't exist yet" the same way [`marker_read_script_generic`]
+/// does) then, on its own line, `1`/`0` for whether `binary_filename` is
+/// present and executable at `bin_dir`. Marker content is a lowercase hex
+/// sha256 digest (or empty) — never contains a newline — so splitting the
+/// two-line output back apart in [`parse_marker_and_binary_probe`] is
+/// unambiguous.
+fn marker_and_binary_probe_script(
+    bin_dir: &str,
+    binary_filename: &str,
+    marker_dir: &str,
+    marker_filename: &str,
+) -> String {
+    let bd = sh_escape(bin_dir);
+    let md = sh_escape(marker_dir);
+    format!(
+        "m=$(cat '{md}/{marker_filename}' 2>/dev/null || true); [ -x '{bd}/{binary_filename}' ] && b=1 || b=0; printf '%s\\n%s' \"$m\" \"$b\""
+    )
+}
+
+/// Pure counterpart to [`marker_and_binary_probe_script`]: splits the
+/// two-line `<marker>\n<0|1>` output back into `(marker, binary_present)`.
+/// Kept separate from [`read_marker_and_binary_presence`] so the parsing
+/// logic is unit-testable without a live builder.
+fn parse_marker_and_binary_probe(output: &str) -> (String, bool) {
+    let mut lines = output.splitn(2, '\n');
+    let marker = lines.next().unwrap_or("").trim().to_string();
+    let present = lines.next().unwrap_or("").trim() == "1";
+    (marker, present)
+}
+
+fn delete_marker_at(
+    builder: &CommandBuilder,
+    dir: &str,
+    marker_filename: &str,
+) -> Result<(), InstallError> {
+    let script = marker_delete_script_generic(dir, marker_filename);
     builder
         .run_timeout("sh", &["-c", &script], INSTALL_COMMAND_TIMEOUT)
         .map_err(InstallError::Io)?;
     Ok(())
 }
 
-/// Stream `bytes` into `<dir>/dv-host` (plan §5's exact pipeline: mkdir-p +
-/// stdin-to-tmp + chmod +x + rename + marker write) and then re-read the
-/// marker to confirm it landed correctly.
-fn install_and_verify(
+fn run_install_script(
+    builder: &CommandBuilder,
+    script: &str,
+    bytes: &[u8],
+) -> Result<(), InstallError> {
+    builder
+        .run_with_stdin_timeout("sh", &["-c", script], bytes, INSTALL_COMMAND_TIMEOUT)
+        .map_err(InstallError::Io)?;
+    Ok(())
+}
+
+fn verify_marker(
     builder: &CommandBuilder,
     dir: &str,
-    bytes: &[u8],
+    marker_filename: &str,
     hash: &str,
+    component: &'static str,
 ) -> Result<(), InstallError> {
-    let script = install_script(dir, hash);
-    builder
-        .run_with_stdin_timeout("sh", &["-c", &script], bytes, INSTALL_COMMAND_TIMEOUT)
-        .map_err(InstallError::Io)?;
-
-    let verify = read_marker(builder, dir)?;
+    let verify = read_marker_at(builder, dir, marker_filename)?;
     if verify != hash {
         return Err(InstallError::VerifyFailed {
+            component,
             expected: hash.to_string(),
             actual: verify,
         });
@@ -327,21 +799,36 @@ fn home_resolve_script() -> &'static str {
     "printf %s \"$HOME\""
 }
 
-fn marker_read_script(dir: &str) -> String {
+fn marker_read_script_generic(dir: &str, marker_filename: &str) -> String {
     format!(
-        "cat '{}/{MARKER_FILENAME}' 2>/dev/null || true",
+        "cat '{}/{marker_filename}' 2>/dev/null || true",
         sh_escape(dir)
     )
 }
 
-fn marker_delete_script(dir: &str) -> String {
-    format!("rm -f '{}/{MARKER_FILENAME}'", sh_escape(dir))
+/// Test-only alias for `marker_read_script_generic(dir, MARKER_FILENAME)` —
+/// see [`dev_override_path`]'s doc for why these zero-generic-arg names are
+/// kept `#[cfg(test)]`-only.
+#[cfg(test)]
+fn marker_read_script(dir: &str) -> String {
+    marker_read_script_generic(dir, MARKER_FILENAME)
 }
 
-/// The stream-install script: create the version dir, pipe the sidecar
-/// bytes to a temp file via stdin, verify the received bytes hash to the
-/// expected digest, mark it executable, rename into place, then write the
-/// marker. Same mkdir + tmp-file + rename shape as
+fn marker_delete_script_generic(dir: &str, marker_filename: &str) -> String {
+    format!("rm -f '{}/{marker_filename}'", sh_escape(dir))
+}
+
+/// Test-only alias — see [`dev_override_path`]'s doc.
+#[cfg(test)]
+fn marker_delete_script(dir: &str) -> String {
+    marker_delete_script_generic(dir, MARKER_FILENAME)
+}
+
+/// The stream-install script for an [`InstallLayout::HashDir`] (binary and
+/// marker colocated in one directory): create the directory, pipe the
+/// sidecar bytes to a temp file via stdin, verify the received bytes hash to
+/// the expected digest, mark it executable, rename into place, then write
+/// the marker. Same mkdir + tmp-file + rename shape as
 /// [`crate::review::io::StoreIo::write_atomic`]'s WSL branch, with two
 /// hardenings the review demanded (Phase-5 S3 review, P1):
 /// - the tmp name is suffixed with THIS process's pid — two dv processes
@@ -355,11 +842,43 @@ fn marker_delete_script(dir: &str) -> String {
 /// `hash` is a lowercase hex sha256 digest (fixed charset, no shell
 /// metacharacters) so it's embedded as-is inside its own single quotes
 /// without needing [`sh_escape`].
-fn install_script(dir: &str, hash: &str) -> String {
+fn install_script_generic(
+    dir: &str,
+    hash: &str,
+    binary_filename: &str,
+    marker_filename: &str,
+) -> String {
     let d = sh_escape(dir);
-    let tmp = format!("{BINARY_FILENAME}.tmp.{}", std::process::id());
+    let tmp = format!("{binary_filename}.tmp.{}", std::process::id());
     format!(
-        "mkdir -p '{d}' && cat > '{d}/{tmp}' && [ \"$(sha256sum < '{d}/{tmp}' | cut -d' ' -f1)\" = '{hash}' ] && chmod +x '{d}/{tmp}' && mv '{d}/{tmp}' '{d}/{BINARY_FILENAME}' && printf %s '{hash}' > '{d}/{MARKER_FILENAME}'"
+        "mkdir -p '{d}' && cat > '{d}/{tmp}' && [ \"$(sha256sum < '{d}/{tmp}' | cut -d' ' -f1)\" = '{hash}' ] && chmod +x '{d}/{tmp}' && mv '{d}/{tmp}' '{d}/{binary_filename}' && printf %s '{hash}' > '{d}/{marker_filename}'"
+    )
+}
+
+/// Test-only alias — see [`dev_override_path`]'s doc.
+#[cfg(test)]
+fn install_script(dir: &str, hash: &str) -> String {
+    install_script_generic(dir, hash, BINARY_FILENAME, MARKER_FILENAME)
+}
+
+/// [`InstallLayout::StablePath`]'s install script — same shape as
+/// [`install_script_generic`] (pid-suffixed tmp, hash gate before `mv`,
+/// atomic rename, marker write) but `mkdir -p`s and writes into TWO
+/// directories: `bin_dir` (kept stable, on `PATH`) and a SEPARATE
+/// `marker_dir` (the sole drift signal — see [`InstallLayout::StablePath`]'s
+/// doc).
+fn install_script_stable(
+    bin_dir: &str,
+    marker_dir: &str,
+    hash: &str,
+    binary_filename: &str,
+    marker_filename: &str,
+) -> String {
+    let bd = sh_escape(bin_dir);
+    let md = sh_escape(marker_dir);
+    let tmp = format!("{binary_filename}.tmp.{}", std::process::id());
+    format!(
+        "mkdir -p '{bd}' '{md}' && cat > '{bd}/{tmp}' && [ \"$(sha256sum < '{bd}/{tmp}' | cut -d' ' -f1)\" = '{hash}' ] && chmod +x '{bd}/{tmp}' && mv '{bd}/{tmp}' '{bd}/{binary_filename}' && printf %s '{hash}' > '{md}/{marker_filename}'"
     )
 }
 
@@ -370,6 +889,18 @@ fn install_script(dir: &str, hash: &str) -> String {
 /// literal quote, reopen the quote).
 fn sh_escape(s: &str) -> String {
     s.replace('\'', r"'\''")
+}
+
+impl InstalledBinary {
+    /// Drop the [`InstalledBinary`]-only `hash` field to get the
+    /// [`HostBinary`] shape [`ensure_installed`]/[`force_reinstall`] (and
+    /// thus [`super::manager::client_for`]) still expect.
+    fn into_host_binary(self) -> HostBinary {
+        HostBinary {
+            path: self.path,
+            source: self.source,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -579,5 +1110,263 @@ printf %s '{hash}' > '{d}/dv-host.sha256'"
         unsafe {
             std::env::remove_var("DV_HOST_PATH");
         }
+    }
+
+    // --- S8c generalization: HOST_SPEC reproduces the pre-generalization ---
+    // --- constants byte-for-byte (the regression proof this refactor left -
+    // --- dv-host untouched, on top of every exact-string test above still -
+    // --- passing unchanged). -------------------------------------------
+
+    #[test]
+    fn host_spec_reproduces_the_original_dv_host_constants() {
+        assert_eq!(HOST_SPEC.sidecar_filename, "dv-host-linux-x64");
+        assert_eq!(HOST_SPEC.sidecar_env, "DV_HOST_SIDECAR");
+        assert_eq!(HOST_SPEC.dev_override_env, "DV_HOST_PATH");
+        assert_eq!(HOST_SPEC.marker_filename, "dv-host.sha256");
+        let InstallLayout::HashDir {
+            subdir,
+            binary_filename,
+        } = HOST_SPEC.layout
+        else {
+            panic!("HOST_SPEC must use InstallLayout::HashDir");
+        };
+        assert_eq!(subdir, "host");
+        assert_eq!(binary_filename, "dv-host");
+    }
+
+    // --- install_script_stable: InstallLayout::StablePath's two-dir install
+    // --- script mirrors install_script_generic exactly (S8c binding (5)) --
+
+    #[test]
+    fn install_script_stable_exact_text() {
+        let hash = "deadbeef00000000000000000000000000000000000000000000000000000000";
+        let bd = "/home/kyle/.local/bin";
+        let md = "/home/kyle/.local/share/dv/cli";
+        let script = install_script_stable(bd, md, hash, "dv", "dv.sha256");
+        let tmp = format!("dv.tmp.{}", std::process::id());
+        assert_eq!(
+            script,
+            format!(
+                "mkdir -p '{bd}' '{md}' && cat > '{bd}/{tmp}' && \
+[ \"$(sha256sum < '{bd}/{tmp}' | cut -d' ' -f1)\" = '{hash}' ] && \
+chmod +x '{bd}/{tmp}' && mv '{bd}/{tmp}' '{bd}/dv' && \
+printf %s '{hash}' > '{md}/dv.sha256'"
+            )
+        );
+    }
+
+    #[test]
+    fn install_script_stable_tmp_name_is_pid_unique_and_hash_gated() {
+        let script = install_script_stable("/bin", "/marker", "aa", "dv", "dv.sha256");
+        assert!(script.contains(&format!("dv.tmp.{}", std::process::id())));
+        let gate = script.find("sha256sum").expect("hash gate present");
+        let mv = script.find(" mv ").expect("mv present");
+        assert!(gate < mv, "hash gate must run before mv");
+    }
+
+    #[test]
+    fn install_script_stable_escapes_single_quotes_in_both_dirs() {
+        let script = install_script_stable(
+            "/tmp/o'brien/bin",
+            "/tmp/o'brien/marker",
+            "aa",
+            "dv",
+            "dv.sha256",
+        );
+        assert!(script.contains(r"mkdir -p '/tmp/o'\''brien/bin' '/tmp/o'\''brien/marker'"));
+    }
+
+    // --- CLI_SPEC: StablePath path resolution -------------------------------
+
+    #[test]
+    fn cli_spec_uses_a_stable_path_with_a_separate_marker_dir() {
+        assert_eq!(CLI_SPEC.sidecar_filename, "dv-linux-x64");
+        assert_eq!(CLI_SPEC.sidecar_env, "DV_CLI_SIDECAR");
+        assert_eq!(CLI_SPEC.dev_override_env, "DV_CLI_PATH");
+        assert_eq!(CLI_SPEC.marker_filename, "dv.sha256");
+        let InstallLayout::StablePath {
+            bin_dir,
+            binary_filename,
+            marker_dir,
+        } = CLI_SPEC.layout
+        else {
+            panic!("CLI_SPEC must use InstallLayout::StablePath");
+        };
+        assert_eq!(bin_dir, ".local/bin");
+        assert_eq!(binary_filename, "dv");
+        assert_eq!(marker_dir, ".local/share/dv/cli");
+    }
+
+    #[test]
+    fn cli_spec_resolves_stable_bin_and_marker_paths() {
+        let _guard = test_env_lock();
+        // SAFETY: test-only env mutation; guarded by test_env_lock above.
+        unsafe {
+            std::env::remove_var("DV_HOST_INSTALL_ROOT");
+        }
+        let (bin_dir, marker_dir) =
+            stable_dirs_from_home("/home/kyle", ".local/bin", ".local/share/dv/cli");
+        assert_eq!(bin_dir, "/home/kyle/.local/bin");
+        assert_eq!(format!("{bin_dir}/dv"), "/home/kyle/.local/bin/dv");
+        assert_eq!(marker_dir, "/home/kyle/.local/share/dv/cli");
+        assert_eq!(
+            format!("{marker_dir}/dv.sha256"),
+            "/home/kyle/.local/share/dv/cli/dv.sha256"
+        );
+    }
+
+    #[test]
+    fn cli_spec_marker_dir_honors_install_root_override_but_bin_dir_never_does() {
+        let _guard = test_env_lock();
+        // SAFETY: test-only env mutation; guarded by test_env_lock above.
+        unsafe {
+            std::env::set_var("DV_HOST_INSTALL_ROOT", "/tmp/dv-test-throwaway");
+        }
+        let (bin_dir, marker_dir) =
+            stable_dirs_from_home("/home/kyle", ".local/bin", ".local/share/dv/cli");
+        // bin_dir is ALWAYS the real, on-PATH stable location — never
+        // redirected by the test-seam override (InstallLayout::StablePath's
+        // doc: that's the whole point of a stable path).
+        assert_eq!(bin_dir, "/home/kyle/.local/bin");
+        // marker_dir DOES honor the override, matching resolve_dir_generic's
+        // HashDir behavior for DV_HOST_INSTALL_ROOT.
+        assert_eq!(marker_dir, "/tmp/dv-test-throwaway");
+        unsafe {
+            std::env::remove_var("DV_HOST_INSTALL_ROOT");
+        }
+    }
+
+    // --- is_drift: missing/mismatched marker is always drift, never --------
+    // --- assumed-good (S8c binding (4)) -------------------------------------
+
+    #[test]
+    fn missing_marker_is_drift() {
+        assert!(is_drift("", "deadbeefdeadbeef"));
+    }
+
+    #[test]
+    fn mismatched_marker_is_drift() {
+        assert!(is_drift("stalehash", "deadbeefdeadbeef"));
+    }
+
+    #[test]
+    fn matching_marker_is_not_drift() {
+        assert!(!is_drift("deadbeefdeadbeef", "deadbeefdeadbeef"));
+    }
+
+    // --- InstallError::Display: component-labeled, not hardcoded "dv-host" -
+    // --- (S8c review, P2/P3) ------------------------------------------------
+
+    #[test]
+    fn no_sidecar_display_names_the_failing_component() {
+        assert_eq!(
+            InstallError::NoSidecar {
+                component: "dv-host"
+            }
+            .to_string(),
+            "no dv-host sidecar configured"
+        );
+        assert_eq!(
+            InstallError::NoSidecar {
+                component: "dv-cli"
+            }
+            .to_string(),
+            "no dv-cli sidecar configured"
+        );
+    }
+
+    #[test]
+    fn verify_failed_display_names_the_failing_component() {
+        let err = InstallError::VerifyFailed {
+            component: "dv-cli",
+            expected: "aa".to_string(),
+            actual: "bb".to_string(),
+        };
+        assert_eq!(
+            err.to_string(),
+            "dv-cli install verification failed: expected sha256 aa, found \"bb\""
+        );
+    }
+
+    #[test]
+    fn host_and_cli_spec_carry_distinct_component_labels() {
+        assert_eq!(HOST_SPEC.component, "dv-host");
+        assert_eq!(CLI_SPEC.component, "dv-cli");
+    }
+
+    #[test]
+    fn empty_home_message_names_the_failing_component() {
+        assert_eq!(
+            empty_home_message("dv-host"),
+            "dv-host install: \"$HOME\" resolved empty inside the distro"
+        );
+        assert_eq!(
+            empty_home_message("dv-cli"),
+            "dv-cli install: \"$HOME\" resolved empty inside the distro"
+        );
+    }
+
+    // --- read_marker_and_binary_presence: StablePath's combined marker + ---
+    // --- binary-presence probe (S8c review, P2 — a present marker with an --
+    // --- absent binary must read as drift, not "installed"). ---------------
+
+    #[test]
+    fn marker_and_binary_probe_script_exact_text() {
+        let script = marker_and_binary_probe_script(
+            "/home/kyle/.local/bin",
+            "dv",
+            "/home/kyle/.local/share/dv/cli",
+            "dv.sha256",
+        );
+        assert_eq!(
+            script,
+            "m=$(cat '/home/kyle/.local/share/dv/cli/dv.sha256' 2>/dev/null || true); \
+[ -x '/home/kyle/.local/bin/dv' ] && b=1 || b=0; printf '%s\\n%s' \"$m\" \"$b\""
+        );
+    }
+
+    #[test]
+    fn marker_and_binary_probe_script_escapes_single_quotes() {
+        let script = marker_and_binary_probe_script(
+            "/tmp/o'brien/bin",
+            "dv",
+            "/tmp/o'brien/marker",
+            "dv.sha256",
+        );
+        assert!(script.contains(r"'/tmp/o'\''brien/marker/dv.sha256'"));
+        assert!(script.contains(r"'/tmp/o'\''brien/bin/dv'"));
+    }
+
+    #[test]
+    fn parse_marker_and_binary_probe_reads_both_lines() {
+        assert_eq!(
+            parse_marker_and_binary_probe("deadbeef\n1"),
+            ("deadbeef".to_string(), true)
+        );
+        assert_eq!(
+            parse_marker_and_binary_probe("deadbeef\n0"),
+            ("deadbeef".to_string(), false)
+        );
+    }
+
+    #[test]
+    fn parse_marker_and_binary_probe_treats_empty_marker_as_no_marker() {
+        // The marker line is empty (no marker file) but the binary line
+        // still says present/absent independently — the two signals are
+        // orthogonal, exactly the "matching-marker survives a binary-only
+        // deletion" scenario this probe exists to catch (and its mirror,
+        // "binary present but never provisioned via dv").
+        assert_eq!(parse_marker_and_binary_probe("\n0"), (String::new(), false));
+        assert_eq!(parse_marker_and_binary_probe("\n1"), (String::new(), true));
+    }
+
+    #[test]
+    fn parse_marker_and_binary_probe_missing_second_line_is_absent() {
+        // Defensive: a truncated/short read (should never happen given the
+        // script always prints both lines) must not be misread as present.
+        assert_eq!(
+            parse_marker_and_binary_probe("deadbeef"),
+            ("deadbeef".to_string(), false)
+        );
     }
 }

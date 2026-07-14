@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::ops::Range;
 use std::sync::Arc;
 
@@ -244,6 +244,31 @@ impl RenderedDiff {
             + self.split.len() * std::mem::size_of::<SplitRow>();
         unified + split + (self.hunk_rows_unified.len() + self.hunk_rows_split.len()) * 8
     }
+}
+
+/// Maximum number of PRs' worth of resolved file-list + rendered diffs kept
+/// in [`Workspace::pr_diff_cache`] at once (Phase 7 D3). Small on purpose —
+/// this is a "toggling back and forth over the last couple of PRs" cache,
+/// not a general-purpose store — and its bytes are folded into the S7-3
+/// workspace byte budget (`Workspace::estimated_diff_bytes`), so a generous
+/// cap here would just eat into that ceiling for little benefit.
+const MAX_PR_DIFF_ENTRIES: usize = 3;
+
+/// Content-addressed cache entry for one PR's resolved diff, keyed by
+/// `(merge_base, head_oid)` in [`Workspace::pr_diff_cache`]. `diffs` is
+/// index-aligned with `files` (cross-cutting risk E) — the two are always
+/// stashed and restored together, never independently, so a restore can
+/// never pair one PR's file list with another's diffs. `expanded` is a
+/// render INPUT baked into `diffs` (gap-expansion state) and is index-keyed
+/// the same way, so it travels with the other two rather than being left
+/// for `Workspace::expanded` to be cleared out from under the rows it
+/// produced (P3 finding: a cache hit used to restore expansion-baked rows
+/// while wiping the expansion map, silently collapsing a previously-open
+/// gap the next time a *different* gap was expanded).
+struct CachedPrDiff {
+    files: Vec<ChangedFile>,
+    diffs: HashMap<usize, Arc<RenderedDiff>>,
+    expanded: HashMap<usize, HashSet<usize>>,
 }
 
 /// Which side of the diff a line (and so a comment anchor) lives on.
@@ -788,9 +813,38 @@ pub struct Workspace {
     last_pr_list_ms: Option<u64>,
     /// Wall-clock of the most recent `open_pr`, from dispatch to its
     /// current-epoch completion (`Status::Ready` either way, success or
-    /// error) — Phase 7 D4 instrumentation, the cold baseline the S7-5
-    /// PR-reopen cache asserts a warm reopen against.
+    /// error) — Phase 7 D4 instrumentation. NOT a warm-vs-cold signal for
+    /// the S7-5 PR-reopen cache (review finding, P3): this only times
+    /// `load_pr` (`gh pr view` + fetch + merge-base + `changed_files`),
+    /// which runs identically whether or not `pr_diff_cache` has a hit — the
+    /// work the cache actually skips (the per-file tree-sitter
+    /// `compute_diff` pass) happens later, inside `select_file`/
+    /// `request_diff`, and is timed separately into `last_diff_ms` on a
+    /// miss (never invoked at all on a hit). Use `last_pr_open_cache_hit`
+    /// to assert warm vs. cold, not a `<<` comparison on this field.
     last_pr_open_ms: Option<u64>,
+    /// Content-addressed cache of a PR's resolved file-list + rendered
+    /// diffs, keyed by [`pr_source_key`] — Phase 7 D3. Reopening the same
+    /// `(merge_base, head_oid)` pair reuses this instead of re-running
+    /// `changed_files` + a tree-sitter `compute_diff` pass per file (the
+    /// real per-recon cost). `pr_meta` (state/decision/CI/title) is NEVER
+    /// stored here — `open_pr`'s `load_pr` call fetches it fresh on every
+    /// open regardless of a diff-cache hit, so a force-push or a status
+    /// change is always caught even when the diff itself is reused. Cleared
+    /// wholesale by `invalidate_diff_cache` (a theme/context-lines change
+    /// re-bakes diff colors/hunk structure, so cached rows would otherwise
+    /// go stale under the new theme) — that single choke point is why no
+    /// per-entry theme fingerprint is needed here. Its bytes are folded
+    /// into `estimated_diff_bytes`, the S7-3 workspace LRU's memory budget
+    /// (cross-cutting risk F).
+    pr_diff_cache: HashMap<(String, String), CachedPrDiff>,
+    /// Front = most-recently used, back = evict next — bounds
+    /// `pr_diff_cache` at [`MAX_PR_DIFF_ENTRIES`] entries.
+    pr_diff_lru: VecDeque<(String, String)>,
+    /// Whether the most recent `open_pr` reused a cached diff
+    /// (`pr_diff_cache` hit, `true`) or recomputed from scratch (`false`) —
+    /// Phase 7 D3 automation assertion. `None` before the first `open_pr`.
+    last_pr_open_cache_hit: Option<bool>,
     /// Comment/reply author, resolved once in the background at load
     /// (`crate::author::resolve_author`). `None` until that resolves —
     /// callers fall back to a placeholder rather than block on it.
@@ -1087,6 +1141,22 @@ fn review_adopts_pr(review: &dv_core::Review, slug: &str, pr: u64) -> bool {
             .is_some_and(|remote| remote.pr == pr && remote.slug.eq_ignore_ascii_case(slug))
 }
 
+/// The content-addressed key `Workspace::pr_diff_cache` is keyed by, when
+/// `source` is a PR's resolved diff range: `(merge_base, head_oid)`. `None`
+/// for every other `DiffSource` variant (`WorkingTree`/`Staged`/`Commit`
+/// never go through the PR-reopen cache). `load_pr` sets `base` to the
+/// already-resolved merge-base tip (not a symbolic ref), so this pair is
+/// stable and safe to cache against regardless of elapsed time — it only
+/// changes on a force-push (new `head_oid`) or a rebase/merge of the base
+/// branch (new `merge_base`), both of which are exactly the cases that
+/// should miss and recompute.
+fn pr_source_key(source: &DiffSource) -> Option<(String, String)> {
+    match source {
+        DiffSource::Range { base, head, .. } => Some((base.clone(), head.clone())),
+        _ => None,
+    }
+}
+
 /// Fetch a PR's metadata, make sure its diff range is available locally,
 /// reload the changed-file list against it, and find-or-create the draft
 /// review it links to — everything [`Workspace::open_pr`] needs, done
@@ -1285,6 +1355,9 @@ impl Workspace {
             pr_picker_epoch: 0,
             last_pr_list_ms: None,
             last_pr_open_ms: None,
+            pr_diff_cache: HashMap::new(),
+            pr_diff_lru: VecDeque::new(),
+            last_pr_open_cache_hit: None,
             author: None,
             submit: None,
             submit_epoch: 0,
@@ -1585,12 +1658,34 @@ impl Workspace {
     /// Estimated bytes of every cached [`RenderedDiff`] this workspace is
     /// holding right now — what the S7-3 `AppShell::WorkspaceCache` LRU
     /// budgets against (`pub(crate)` so `shell.rs` can read it without a
-    /// getter round trip through a private field). Cross-cutting risk F: a
-    /// PR-reopen diff cache would need to be folded in here too so the
-    /// budget doesn't silently undercount — none exists yet as of this
-    /// slice.
+    /// getter round trip through a private field). Counts both `self.diffs`
+    /// (the currently-open source's diffs) AND `self.pr_diff_cache` (Phase
+    /// 7 D3's parked-PR diffs) — cross-cutting risk F: leaving either out
+    /// would silently undercount the budget a workspace this size actually
+    /// costs.
     pub(crate) fn estimated_diff_bytes(&self) -> usize {
-        self.diffs.values().map(|d| d.estimated_bytes()).sum()
+        let live: usize = self.diffs.values().map(|d| d.estimated_bytes()).sum();
+        let pr_cached: usize = self
+            .pr_diff_cache
+            .values()
+            .flat_map(|entry| entry.diffs.values())
+            .map(|d| d.estimated_bytes())
+            .sum();
+        live + pr_cached
+    }
+
+    /// Evict least-recently-used `pr_diff_cache` entries until at most
+    /// [`MAX_PR_DIFF_ENTRIES`] remain (Phase 7 D3) — the count cap this
+    /// small cache uses instead of a byte budget of its own, since its
+    /// bytes are already folded into `estimated_diff_bytes` and bounded by
+    /// the S7-3 workspace-level ceiling.
+    fn evict_pr_diff_cache(&mut self) {
+        while self.pr_diff_lru.len() > MAX_PR_DIFF_ENTRIES {
+            let Some(key) = self.pr_diff_lru.pop_back() else {
+                break;
+            };
+            self.pr_diff_cache.remove(&key);
+        }
     }
 
     /// Applies a freshly `pick_review`d snapshot to `this.review`,
@@ -2087,6 +2182,15 @@ impl Workspace {
     ///   switched to since the theme/context change.
     fn invalidate_diff_cache(&mut self, eager: bool, cx: &mut Context<Self>) {
         self.highlight_epoch += 1;
+        // Content-baked PR diffs (Phase 7 D3) are colors/hunk-structure just
+        // like `self.diffs` — a theme/context-lines change stales them the
+        // same way, so drop them unconditionally, on BOTH the eager and
+        // non-eager (host-unreachable) paths below. This is cheap (no git/
+        // recompute work, just dropping cached rows) and is the single
+        // choke point that keeps a reopened PR from ever painting under a
+        // since-changed theme (see `pr_diff_cache`'s doc comment).
+        self.pr_diff_cache.clear();
+        self.pr_diff_lru.clear();
         let host_reachable = eager
             || match &self.location {
                 RepoLocation::Wsl { distro, .. } => {
@@ -2242,6 +2346,54 @@ impl Workspace {
             return;
         };
 
+        // Phase 7 D3: capture the OUTGOING PR's resolved diff now — before
+        // `source`/`files`/`diffs` get replaced below — so it CAN be
+        // stashed into `pr_diff_cache`, but don't commit it yet. Guarded by
+        // `pr_source_key` returning `Some`: only a `DiffSource::Range` (i.e.
+        // an already-open PR) has anything worth content-addressing; a
+        // `WorkingTree`/`Staged`/`Commit` source has no `(merge_base,
+        // head_oid)` pair to key under. An empty `self.diffs` (nothing
+        // selected yet) isn't worth caching either.
+        //
+        // Committing this into `pr_diff_cache` is deferred to the
+        // completion's current-epoch success arm (mirrors `last_pr_open_ms`,
+        // which likewise only stamps there) rather than done eagerly here —
+        // two review findings against an eager entry-time insert: (a) a
+        // failed fetch left this exact content doubly counted — once live in
+        // `self.diffs` (untouched by the `Err` arm), once redundantly
+        // stashed here — permanently inflating `estimated_diff_bytes` until
+        // some later navigation overwrote the key; (b) the entry-time
+        // insert's own eviction could pop the very `(merge_base, head_oid)`
+        // key THIS SAME call is about to look up (a 4-distinct-PR toggle
+        // pattern with `MAX_PR_DIFF_ENTRIES` full), turning an intended warm
+        // reopen into a forced cold recompute. Deferring the commit to after
+        // the target-key lookup in the success arm fixes both: nothing is
+        // stashed on failure, and the lookup always runs before this
+        // insert's eviction can touch the cache.
+        //
+        // Also captures `highlight_epoch` alongside the stash (review
+        // finding, P2): a theme/context-lines change firing while this
+        // fetch is in flight bumps `highlight_epoch` and, via
+        // `invalidate_diff_cache`, wholesale-clears `pr_diff_cache` right
+        // out from under us — but `self.diffs` was already snapshotted here
+        // and would otherwise get unconditionally re-inserted by the
+        // completion below, re-poisoning the cache with rows baked under
+        // the old theme/context. Mirrors `request_diff`'s
+        // `highlight_epoch`-capture-and-recheck pattern.
+        let captured_highlight_epoch = self.highlight_epoch;
+        let outgoing_pr_stash = pr_source_key(&self.source)
+            .filter(|_| !self.diffs.is_empty())
+            .map(|key| {
+                (
+                    key,
+                    CachedPrDiff {
+                        files: self.files.clone(),
+                        diffs: self.diffs.clone(),
+                        expanded: self.expanded.clone(),
+                    },
+                )
+            });
+
         // Closing the picker here (rather than deferred to the completion
         // below, like the rest of the teardown) is still fine: it holds no
         // user data, and leaving it open over the "Loading" pane would
@@ -2267,8 +2419,10 @@ impl Workspace {
         cx.notify();
 
         // Phase 7 D4: dispatch-to-`Status::Ready` timing (mirrors
-        // `last_diff_ms`/`last_pr_list_ms`), the cold baseline the S7-5
-        // PR-reopen cache asserts a warm reopen against.
+        // `last_diff_ms`/`last_pr_list_ms`) — this is `load_pr`'s latency
+        // only, identical on a `pr_diff_cache` hit or miss (see
+        // `last_pr_open_ms`'s field doc); it is NOT the S7-5 warm/cold
+        // signal, that's `last_pr_open_cache_hit`.
         let started = std::time::Instant::now();
         let location = self.location.clone();
         cx.spawn_in(window, async move |this, cx| {
@@ -2326,13 +2480,77 @@ impl Workspace {
                         // so nothing ever needs to re-create it once torn
                         // down here.
                         this._worktree_watcher = None;
-                        this.files = files;
-                        // The old file list's diffs are keyed by index into
-                        // a now-replaced list — stale caches would render
-                        // the wrong file's content under the right name.
-                        this.diffs.clear();
+                        // Phase 7 D3: a `pr_diff_cache` hit on THIS PR's
+                        // `(merge_base, head_oid)` reuses its resolved file
+                        // list + rendered diffs wholesale instead of the
+                        // freshly-fetched `files` above — skipping the
+                        // per-file tree-sitter `compute_diff` recompute
+                        // that already happened the last time this exact
+                        // content was open. `files` and `diffs` are
+                        // restored TOGETHER from the same cache entry
+                        // (cross-cutting risk E: `diffs` is keyed by index
+                        // into `files`, so the two must never come from
+                        // different sources) — content-addressing
+                        // guarantees the cached pair is identical to what a
+                        // fresh fetch would produce anyway. `pr_meta`
+                        // (`this.pr`, set below) is never cached and is
+                        // always this call's freshly-fetched value, so a
+                        // diff-cache hit still shows fresh state/decision/
+                        // CI.
+                        let key = pr_source_key(&this.source);
+                        let cache_hit = key.as_ref().and_then(|k| this.pr_diff_cache.remove(k));
+                        if let Some(hit) = cache_hit {
+                            if let Some(k) = &key {
+                                this.pr_diff_lru.retain(|lk| lk != k);
+                            }
+                            this.files = hit.files;
+                            this.diffs = hit.diffs;
+                            // `expanded` is a render input baked into the
+                            // restored `diffs` (which hunk-gaps are open) —
+                            // restore it alongside files/diffs rather than
+                            // clearing it, or the map would drift out of
+                            // sync with what's on screen and silently
+                            // collapse this gap the next time a different
+                            // one is expanded (P3 finding).
+                            this.expanded = hit.expanded;
+                            this.last_pr_open_cache_hit = Some(true);
+                        } else {
+                            this.files = files;
+                            // The old file list's diffs are keyed by index
+                            // into a now-replaced list — stale caches would
+                            // render the wrong file's content under the
+                            // right name.
+                            this.diffs.clear();
+                            this.expanded.clear();
+                            this.last_pr_open_cache_hit = Some(false);
+                        }
+                        // Now that the fetch actually succeeded, commit the
+                        // OUTGOING PR's diff (captured at entry, above) into
+                        // `pr_diff_cache` — after, not before, the
+                        // target-key lookup right above, so this insert's
+                        // own eviction can never pop the entry that lookup
+                        // just served (see `outgoing_pr_stash`'s doc
+                        // comment). Skipped if the outgoing key is the same
+                        // as the target key (reopening the PR already on
+                        // screen) — there's nothing meaningfully "outgoing"
+                        // in that case, and stashing it would just overwrite
+                        // whatever the lookup above already resolved. Also
+                        // skipped if `highlight_epoch` moved since entry
+                        // (review finding, P2): a theme/context-lines change
+                        // mid-fetch already cleared `pr_diff_cache` via
+                        // `invalidate_diff_cache`, and committing this
+                        // old-theme-baked snapshot now would silently
+                        // re-poison it right after that clear.
+                        if let Some((out_key, out_entry)) = outgoing_pr_stash
+                            && Some(&out_key) != key.as_ref()
+                            && this.highlight_epoch == captured_highlight_epoch
+                        {
+                            this.pr_diff_cache.insert(out_key.clone(), out_entry);
+                            this.pr_diff_lru.retain(|k| k != &out_key);
+                            this.pr_diff_lru.push_front(out_key);
+                            this.evict_pr_diff_cache();
+                        }
                         this.diff_pending.clear();
-                        this.expanded.clear();
                         this.stale.clear();
                         this.stale_checked = None;
                         this.selected = None;
@@ -2360,9 +2578,15 @@ impl Workspace {
                         // Leave source/files/pr exactly as they were — the
                         // workspace stays on whatever it was showing before
                         // this attempt, selection/editor/thread-input
-                        // included.
+                        // included. `last_pr_open_cache_hit` does need
+                        // resetting though (P3 finding): this attempt never
+                        // reached the cache-check above, so leaving it at
+                        // whatever the previous successful open recorded
+                        // would misreport a failed, non-cached open as a
+                        // stale hit/miss from an unrelated PR.
                         this.status = Status::Ready;
                         this.pr_error = Some(format!("{err:#}"));
+                        this.last_pr_open_cache_hit = None;
                     }
                 }
                 cx.notify();
@@ -2806,11 +3030,19 @@ impl Workspace {
             "current_hunk": self.current_hunk,
             "last_diff_ms": self.last_diff_ms,
             // Phase 7 D4 instrumentation: dispatch-to-settled wall time for
-            // the PR-picker list fetch and the most recent `open_pr`, the
-            // cold baselines the S7-2/S7-5 caches assert a warm reopen
-            // against.
+            // the PR-picker list fetch and the most recent `open_pr`.
+            // `last_pr_list_ms` IS the S7-2 warm/cold signal (a warm picker
+            // open skips the `Loading` frame entirely, so this stamps near-
+            // instantly). `last_pr_open_ms` is NOT the S7-5 signal though —
+            // it times `load_pr` only, which runs the same on a
+            // `pr_diff_cache` hit or miss; use `last_pr_open_cache_hit`
+            // below for that (see the field's doc comment).
             "last_pr_list_ms": self.last_pr_list_ms,
             "last_pr_open_ms": self.last_pr_open_ms,
+            // Phase 7 D3: whether the most recent `open_pr` reused a cached
+            // `(merge_base, head_oid)` diff (`pr_diff_cache` hit) instead of
+            // recomputing — the S7-5 warm-reopen assertion.
+            "last_pr_open_cache_hit": self.last_pr_open_cache_hit,
             "selection": self.selection.as_ref().map(|sel| {
                 let (start, end) = sel.range();
                 json!({
@@ -6902,9 +7134,10 @@ mod tests {
     use super::{
         ChecksSummary, PrHeader, PrMeta, PrState, PreparedLine, SplitRow, SubmissionOutcome,
         SubmitFlow, SubmitPrep, Violation, ViolationKind, build_split_rows,
-        cancel_submit_flow_outcome, gap_above, pick_review, reconcile_file_selection, resolved_pin,
-        review_adopts_pr, submit_flow_from_submission, submit_flow_from_validation,
-        trim_trailing_newlines, verdict_automation_word, verdict_label, violation_kind_word,
+        cancel_submit_flow_outcome, gap_above, pick_review, pr_source_key,
+        reconcile_file_selection, resolved_pin, review_adopts_pr, submit_flow_from_submission,
+        submit_flow_from_validation, trim_trailing_newlines, verdict_automation_word,
+        verdict_label, violation_kind_word,
     };
     use dv_core::{
         ChangeStatus, ChangedFile, DiffSource, LineKind, RemoteRef, Review, ReviewState,
@@ -7360,6 +7593,85 @@ mod tests {
             .iter()
             .find(|r| review_adopts_pr(r, &remote.slug, remote.pr));
         assert_eq!(found.map(|r| r.id.as_str()), Some("r-draft"));
+    }
+
+    // ---- pr_source_key (Phase 7 D3 PR-reopen cache) ------------------------
+    //
+    // `open_pr`'s cache stash/restore itself does real git/gh I/O and can't
+    // run headless (same reasoning as `load_pr` above) — but the key
+    // derivation it hinges on is pure, so it's exercised directly here
+    // against the exact matrix the content-addressing promise relies on: a
+    // `Range` source keys by `(merge_base, head_oid)` regardless of the
+    // `merge_base` two-dot/three-dot flag, and every non-`Range` source has
+    // no key at all (nothing for `open_pr`'s stash-on-entry guard to cache
+    // under).
+
+    #[test]
+    fn pr_source_key_extracts_base_and_head_from_a_range_source() {
+        let source = DiffSource::Range {
+            base: "deadbeef".to_string(),
+            head: "cafef00d".to_string(),
+            merge_base: false,
+        };
+        assert_eq!(
+            pr_source_key(&source),
+            Some(("deadbeef".to_string(), "cafef00d".to_string()))
+        );
+    }
+
+    #[test]
+    fn pr_source_key_ignores_the_merge_base_flag() {
+        // `load_pr` always resolves `base` to the merge-base tip itself and
+        // sets `merge_base: false` (a concrete two-dot range) — but the key
+        // must be stable off `base`/`head` alone, not the flag, so a
+        // hand-built three-dot `Range` (if one ever reached this path)
+        // wouldn't silently key differently for the same content.
+        let two_dot = DiffSource::Range {
+            base: "deadbeef".to_string(),
+            head: "cafef00d".to_string(),
+            merge_base: false,
+        };
+        let three_dot = DiffSource::Range {
+            base: "deadbeef".to_string(),
+            head: "cafef00d".to_string(),
+            merge_base: true,
+        };
+        assert_eq!(pr_source_key(&two_dot), pr_source_key(&three_dot));
+    }
+
+    #[test]
+    fn pr_source_key_is_none_for_non_range_sources() {
+        assert_eq!(pr_source_key(&DiffSource::WorkingTree), None);
+        assert_eq!(pr_source_key(&DiffSource::Staged), None);
+        assert_eq!(
+            pr_source_key(&DiffSource::Commit("abc123".to_string())),
+            None
+        );
+    }
+
+    #[test]
+    fn pr_source_key_differs_on_either_oid_changing() {
+        // The two cases the D3 verification calls out by name: a
+        // force-push changes `head_oid` (base branch untouched), a rebase/
+        // merge of the base branch changes `merge_base` (head untouched).
+        // Either alone must miss the cache.
+        let original = pr_source_key(&DiffSource::Range {
+            base: "base1".to_string(),
+            head: "head1".to_string(),
+            merge_base: false,
+        });
+        let force_pushed = pr_source_key(&DiffSource::Range {
+            base: "base1".to_string(),
+            head: "head2".to_string(),
+            merge_base: false,
+        });
+        let rebased_base = pr_source_key(&DiffSource::Range {
+            base: "base2".to_string(),
+            head: "head1".to_string(),
+            merge_base: false,
+        });
+        assert_ne!(original, force_pushed);
+        assert_ne!(original, rebased_base);
     }
 
     // ---- trim_trailing_newlines (review finding P3-a) ----------------------

@@ -22,7 +22,7 @@ use crate::recent::RecentStore;
 use crate::settings::{
     CONTEXT_LINES_MAX, CONTEXT_LINES_MIN, DEFAULT_SIDEBAR_WIDTH, MONO_FONT_SIZE_MAX,
     MONO_FONT_SIZE_MIN, SIDEBAR_WIDTH_MAX, SIDEBAR_WIDTH_MIN, SUMMARY_WIDTH_MAX, SUMMARY_WIDTH_MIN,
-    Settings, ViewModeSetting,
+    Settings, SidebarFilters, SidebarGrouping, ViewModeSetting,
 };
 use crate::themes;
 use crate::workspace::{
@@ -51,6 +51,18 @@ const KEY_CONTEXT: &str = "AppShell";
 const THEME_PICKER_CONTEXT: &str = "ThemePickerOpen";
 /// Same mechanism, for the settings panel (`ctrl-,`).
 const SETTINGS_PANEL_CONTEXT: &str = "SettingsPanelOpen";
+
+/// Fixed height, in px, of every sidebar row — both a review card
+/// ([`AppShell::render_review_card`]) and a group header
+/// ([`AppShell::render_sidebar_header`]). `uniform_list` measures exactly
+/// one row (index 0 of whatever's currently visible) and applies that
+/// height to every row's scroll math (see gpui's `elements/uniform_list.rs`
+/// doc comment); once grouping (S6d) can put a `Header` at index 0, a
+/// content-sized header that doesn't exactly match a content-sized card's
+/// natural height would desync scrolling for the rest of the list. Fixing
+/// both to the same explicit height sidesteps that outright rather than
+/// trying to keep two different elements' natural sizes in lockstep.
+const SIDEBAR_ROW_HEIGHT: f32 = 52.;
 
 // Font-size/context-lines clamp bounds (`MONO_FONT_SIZE_MIN`/`_MAX`,
 // `CONTEXT_LINES_MIN`/`_MAX`) live in `settings.rs` now — shared with
@@ -183,6 +195,281 @@ fn index_health_word(health: dv_core::EntryHealth) -> &'static str {
         dv_core::EntryHealth::Missing => "missing",
     }
 }
+
+/// `sidebar_grouping` word for `Self::automation_state`'s `settings` dump.
+fn grouping_word(grouping: SidebarGrouping) -> &'static str {
+    match grouping {
+        SidebarGrouping::None => "none",
+        SidebarGrouping::Repo => "repo",
+        SidebarGrouping::Status => "status",
+        SidebarGrouping::Pr => "pr",
+    }
+}
+
+/// One row of [`AppShell::visible_sidebar_items`]: either a group header
+/// (grouping is on) or a review card, referencing its entry by index into
+/// [`dv_core::ReviewIndex::entries`] rather than cloning the whole
+/// [`dv_core::IndexEntry`] — the list is rebuilt on every render, and an
+/// index stays valid for exactly as long as `self.index` itself doesn't
+/// mutate mid-render (true here: nothing between computing this list and
+/// consuming it touches `self.index`).
+///
+/// `Header` carries both the group `key` and the display `label` — they can
+/// legitimately diverge (`Pr` grouping keys on the full host/owner/repo/pr
+/// slug but labels on the host-stripped display string), and
+/// [`AppShell::render_sidebar_header`] must build its gpui element id from
+/// the `key`, not the `label`: two distinct groups can share an identical
+/// label (two GitHub Enterprise hosts with the same owner/repo/pr), and a
+/// `uniform_list` with two siblings at the same element id is a duplicate
+/// stateful-id hazard.
+#[derive(Debug, Clone, PartialEq)]
+enum SidebarItem {
+    Header {
+        key: SharedString,
+        label: SharedString,
+    },
+    Review(usize),
+}
+
+/// Whether `entry` currently passes `settings.sidebar_filters`
+/// (docs/phase-6-review-navigator.md deliverable 4) — an AND of two
+/// independent axes:
+/// - **PR status**: a local-only review (`entry.remote.is_none()`) passes
+///   iff `filters.unlinked` — a distinct bucket, not folded into any of the
+///   four PR-state bools (a local review isn't "no PR status", it's a
+///   different axis entirely). A PR-linked review whose `pr_status` hasn't
+///   hydrated yet (the network fetch is still in flight, or simply hasn't
+///   run this session) **passes every PR-status filter** rather than being
+///   hidden while its status is merely unknown — hiding-while-loading would
+///   read as the review having vanished, exactly the incident this phase
+///   exists to fix.
+/// - **Review status**: the review's own `state`/`verdict` against the
+///   `review_*` bools — draft counts as its own bucket (deliverable 4's
+///   flagged addition), not folded into any submitted verdict.
+/// - **Health**: an entry whose repo has gone `RepoUnavailable`/`Missing`
+///   (S6a's `apply_hydration`) always passes, regardless of the PR/review
+///   axes above. Its last-known state/verdict is preserved rather than
+///   cleared, so an unrelated filter (e.g. hiding approved reviews) could
+///   otherwise mask the row entirely — taking `render_review_card`'s
+///   unavailable-repo glyph, the only on-screen signal of the problem, out
+///   of view with it (P3 finding).
+fn entry_passes_filters(entry: &dv_core::IndexEntry, filters: &SidebarFilters) -> bool {
+    if entry.health != dv_core::EntryHealth::Ok {
+        return true;
+    }
+    let pr_ok = match &entry.remote {
+        None => filters.unlinked,
+        Some(_) => match &entry.pr_status {
+            None => true,
+            // `is_draft` only overrides the state-based bucket while the
+            // PR is still open — GitHub requires marking a PR ready
+            // before it can merge, but allows closing a still-draft PR
+            // without ever marking it ready, so a *closed* draft is
+            // representable. Letting `is_draft` win unconditionally would
+            // bucket a closed draft under `pr_draft` forever, so toggling
+            // `pr_closed` off/on could never hide/show it — bucket by the
+            // terminal state instead once the PR isn't open anymore.
+            Some(pr) => match pr.state {
+                PrState::Open if pr.is_draft => filters.pr_draft,
+                PrState::Open => filters.pr_open,
+                PrState::Merged => filters.pr_merged,
+                PrState::Closed => filters.pr_closed,
+            },
+        },
+    };
+    let review_ok = match &entry.state {
+        dv_core::ReviewState::Draft => filters.review_draft,
+        dv_core::ReviewState::Submitted { verdict, .. } => match verdict {
+            dv_core::Verdict::Comment => filters.review_comment,
+            dv_core::Verdict::Approve => filters.review_approved,
+            dv_core::Verdict::RequestChanges => filters.review_changes,
+        },
+    };
+    pr_ok && review_ok
+}
+
+/// Canonical repo identity for `SidebarGrouping::Repo` — every review
+/// sharing a repo lands under exactly one header, regardless of how many
+/// different PRs it's linked to or whether it's linked to one at all.
+/// Deliberately ignores `remote` entirely (live-verified bug in an earlier
+/// pass of this slice: passing `entry.remote` through to
+/// [`dv_core::repo_label`] made a PR-linked review key off
+/// `owner/repo` while a plain local review at the exact same
+/// `RepoLocation` keyed off the folder name — same repo, two different
+/// strings, so a repo with both a PR-linked review and a local-only one
+/// split into two headers).
+///
+/// Keys on the **full** [`RepoLocation::display_name`], not on
+/// `repo_label`'s basename-only display text. An earlier version of this
+/// function keyed on `repo_label(location, None)` (`repo_short_name`
+/// discards everything but the final path segment) specifically to absorb
+/// drive-letter/parent-dir spelling differences between entries for the
+/// SAME repo (binding orchestrator note: a location's separator/case
+/// spelling can vary between entries for the same repo, and
+/// `RepoLocation`'s `Eq` is spelling-sensitive on normal components, so
+/// grouping on the raw value would split one repo into two groups). But a
+/// basename is also just what an entirely *different* repo can happen to
+/// be named — two unrelated local repos sharing a final path segment
+/// (`D:\work\api` and `D:\clients\api`) collapsed into a single "api"
+/// header with both repos' reviews mixed underneath (confirmed P3
+/// finding). Keying on the full path fixes the over-merge while keeping
+/// the anti-false-split property via the same normalization, applied to
+/// the whole string instead of just the last segment.
+///
+/// Separator style is unified to `\` and, for `Local`, the result is
+/// lowercased: Windows/macOS filesystems are case-insensitive and
+/// case-preserving, so the exact same repo can be recorded across two
+/// `RepoLocation::Local` entries differing only in case (a stale
+/// `recent.json` seed vs. a freshly-typed or dialog-picked path, say).
+/// `Wsl` locations keep their POSIX `path` byte-for-byte (no separator
+/// rewrite, no folding — ext4 paths are genuinely case-sensitive, so
+/// folding there would wrongly merge distinct repos), but the `distro`
+/// segment IS lowercased: WSL distro registration is itself
+/// case-insensitive at the OS level, so the same distro can show up
+/// spelled differently across two entries (a `recent.json` seed vs. a
+/// `\\wsl.localhost\<distro>\...` path picked from Explorer, or a
+/// hand-typed `--wsl` arg) — left unfolded, that splits one repo into two
+/// groups exactly like the Local case this function already guards
+/// against. Only the *key* is normalized — the header label
+/// (`visible_sidebar_items` tracks it separately, still derived from
+/// `repo_label`'s basename for compactness) keeps its own display
+/// spelling, so nothing on screen reads artificially lowercased or
+/// full-path-verbose.
+fn repo_group_key(location: &RepoLocation) -> String {
+    match location {
+        RepoLocation::Local(_) => location.display_name().replace('/', "\\").to_lowercase(),
+        RepoLocation::Wsl { distro, path } => format!("{}:{}", distro.to_lowercase(), path),
+    }
+}
+
+/// Canonical PR identity for `SidebarGrouping::Pr` — keys on the PR's full
+/// `host/owner/repo#<pr>` slug (`RemoteRef::slug` is `host/owner/repo`),
+/// never the host-stripped display string `dv_core::repo_label` produces.
+/// Two different GitHub Enterprise hosts can coincidentally share an
+/// identical owner/repo name and PR number (a multi-host GHE + github.com
+/// setup); keying on the label alone would merge their reviews into one
+/// group even though they're unrelated repos. The header text itself
+/// still uses the host-stripped label (`visible_sidebar_items` tracks key
+/// and label separately) — that's unchanged and can still render
+/// identically for two such colliding repos, but each now gets its own
+/// header with only its own reviews under it.
+///
+/// The slug itself is lowercased before keying: [`RepoSlug::parse_remote_url`]
+/// only lowercases the host, so `remote.slug` preserves whatever owner/repo
+/// casing was in the origin URL at the moment each review was created — but
+/// GitHub's owner/repo path segments are themselves case-insensitive, so the
+/// exact same PR can be recorded under two differently-cased slugs across
+/// two reviews (e.g. one created while `origin` was `KyleKZ/difftest`,
+/// another after the remote was normalized to `kylekz/difftest`). Left
+/// unfolded, that splits one PR into two headers — the same failure mode
+/// `repo_group_key` above is deliberately hardened against. Case-folding the
+/// key only (the header label keeps its original casing) mirrors the
+/// case-insensitive slug comparisons already used elsewhere (`workspace.rs`,
+/// `main.rs`).
+fn pr_group_key(location: &RepoLocation, remote: Option<&RemoteRef>) -> String {
+    match remote {
+        Some(remote) => format!("{}#{}", remote.slug.to_lowercase(), remote.pr),
+        // No PR: falls back to the same per-repo bucket `Repo` grouping
+        // would give it, including that bucket's case-folding.
+        None => repo_group_key(location),
+    }
+}
+
+/// `SidebarGrouping::Status`'s group-header word — one bucket per
+/// review-status axis, the same four buckets `SidebarFilters`'s `review_*`
+/// fields filter on (Draft / Comment / Approved / Changes Requested),
+/// independent of any PR-status axis. Automation asserts these exact
+/// strings (docs/phase-6-review-navigator.md S6d verification) — treat
+/// them as a stable contract once shipped.
+fn status_group_label(state: &dv_core::ReviewState) -> &'static str {
+    match state {
+        dv_core::ReviewState::Draft => "Draft",
+        dv_core::ReviewState::Submitted {
+            verdict: dv_core::Verdict::Comment,
+            ..
+        } => "Comment",
+        dv_core::ReviewState::Submitted {
+            verdict: dv_core::Verdict::Approve,
+            ..
+        } => "Approved",
+        dv_core::ReviewState::Submitted {
+            verdict: dv_core::Verdict::RequestChanges,
+            ..
+        } => "Changes Requested",
+    }
+}
+
+/// Static table backing the filter popover's PR-status rows
+/// ([`AppShell::render_sidebar_filter_popover`]) and the `"sidebar_filters"`
+/// automation mirror: `(row id, label, getter, setter)`. A table rather
+/// than nine hand-written rows/match arms — `get`/`set` are plain field
+/// accessors (not closures), so this stays a `const` despite being built
+/// from function "pointers".
+type FilterAccessor = (
+    &'static str,
+    &'static str,
+    fn(&SidebarFilters) -> bool,
+    fn(&mut SidebarFilters, bool),
+);
+const PR_FILTER_ROWS: &[FilterAccessor] = &[
+    (
+        "sidebar-filter-pr-draft",
+        "PR: draft",
+        |f| f.pr_draft,
+        |f, v| f.pr_draft = v,
+    ),
+    (
+        "sidebar-filter-pr-open",
+        "PR: open",
+        |f| f.pr_open,
+        |f, v| f.pr_open = v,
+    ),
+    (
+        "sidebar-filter-pr-merged",
+        "PR: merged",
+        |f| f.pr_merged,
+        |f, v| f.pr_merged = v,
+    ),
+    (
+        "sidebar-filter-pr-closed",
+        "PR: closed",
+        |f| f.pr_closed,
+        |f, v| f.pr_closed = v,
+    ),
+    (
+        "sidebar-filter-unlinked",
+        "Unlinked (local only)",
+        |f| f.unlinked,
+        |f, v| f.unlinked = v,
+    ),
+];
+/// Same shape as [`PR_FILTER_ROWS`], for the review-status axis.
+const REVIEW_FILTER_ROWS: &[FilterAccessor] = &[
+    (
+        "sidebar-filter-review-draft",
+        "Review: draft",
+        |f| f.review_draft,
+        |f, v| f.review_draft = v,
+    ),
+    (
+        "sidebar-filter-review-comment",
+        "Review: comment",
+        |f| f.review_comment,
+        |f, v| f.review_comment = v,
+    ),
+    (
+        "sidebar-filter-review-approved",
+        "Review: approved",
+        |f| f.review_approved,
+        |f, v| f.review_approved = v,
+    ),
+    (
+        "sidebar-filter-review-changes",
+        "Review: changes requested",
+        |f| f.review_changes,
+        |f, v| f.review_changes = v,
+    ),
+];
 
 /// Compact relative time for a review card's line-1 age (docs/phase-6-
 /// review-navigator.md deliverable 2's sketch: "2h", "3d") — measured from
@@ -337,6 +624,13 @@ pub struct AppShell {
     /// the handle's hitbox — without this gate every click in the window
     /// would rewrite settings.json.
     sidebar_dragging: bool,
+    /// True while the sidebar's filter popover (docs/phase-6-review-
+    /// navigator.md deliverable 4) is open. Pure mouse — every row is a
+    /// click target, nothing here binds a key — so unlike the theme
+    /// picker/settings panel overlays, opening this never needs to
+    /// `window.focus` anything onto the shell (cross-cutting risk E: no
+    /// key bindings means no dispatch-path ambiguity to sidestep).
+    filter_popover_open: bool,
     /// Keeps the active workspace's ReviewChanged subscription alive.
     _ws_subscription: Option<Subscription>,
     /// Keeps the active workspace's `SummaryWidthChanged` subscription
@@ -449,6 +743,7 @@ impl AppShell {
             index: dv_core::ReviewIndex::load(),
             index_hydration_gens: HashMap::new(),
             sidebar_dragging: false,
+            filter_popover_open: false,
             _ws_subscription: None,
             _ws_summary_subscription: None,
             settings,
@@ -1139,6 +1434,13 @@ impl AppShell {
         if self.theme_picker.is_some() || self.settings_panel.is_some() {
             return;
         }
+        // The sidebar filter popover is a third shell-level overlay that
+        // doesn't go through this guard (it's mouse-only, so it never moves
+        // focus and this action can fire while it's open) — close it so its
+        // full-window backdrop can't end up painted on top of the picker
+        // (review finding: the two overlays stacking swallows the picker's
+        // first click).
+        self.filter_popover_open = false;
         let selected = themes::names()
             .position(|n| n == self.settings.theme)
             .unwrap_or(0);
@@ -1355,13 +1657,23 @@ impl AppShell {
             // `hydrate_index`/`refresh_all_badges`).
             "recent": self.known_locations().iter().map(|l| l.display_name()).collect::<Vec<_>>(),
             "selected_review_id": self.selected_review_id,
-            // Ordered review ids as the sidebar actually renders them —
-            // S6c is a flat list (last_opened_ms desc, same order as
-            // `index` below); S6d's grouping/filtering will make this
-            // diverge from `index`'s own order, which is why this exists
-            // as its own field rather than something scripts derive by
-            // re-sorting `index` themselves.
-            "sidebar": self.index.entries().iter().map(|e| e.review_id.clone()).collect::<Vec<_>>(),
+            // The sidebar's actual rendered row list (docs/phase-6-review-
+            // navigator.md deliverables 3/4), in render order — filtered by
+            // `settings.sidebar_filters` and, when `sidebar_grouping` isn't
+            // `none`, grouped with a header above each run:
+            // `{"header": "..."}` / `{"review_id": "..."}`. As of S6c this
+            // diverges from `index`'s own order/coverage (headers, and a
+            // filtered-out review is present in `index` but absent here),
+            // which is why this exists as its own field rather than
+            // something scripts derive by re-sorting/filtering `index`
+            // themselves. See `Self::visible_sidebar_items`, the single
+            // function both this and the real `uniform_list` render from.
+            "sidebar": self.visible_sidebar_items().iter().map(|item| match item {
+                SidebarItem::Header { label, .. } => json!({"header": label}),
+                SidebarItem::Review(idx) => json!({
+                    "review_id": self.index.entries()[*idx].review_id,
+                }),
+            }).collect::<Vec<_>>(),
             "workspace": self.active.as_ref().map(|ws| ws.read(cx).automation_state()),
             // Per-location badge dump (docs/phase-3-github.md deliverable
             // 3/4), same order/coverage as `recent` above — see that
@@ -1442,6 +1754,19 @@ impl AppShell {
                 // render state, not a shell-level layout knob.
                 "sidebar_width": self.settings.sidebar_width,
                 "summary_width": self.settings.summary_width,
+                // Sidebar grouping/filtering (deliverables 3/4).
+                "sidebar_grouping": grouping_word(self.settings.sidebar_grouping),
+                "sidebar_filters": json!({
+                    "pr_draft": self.settings.sidebar_filters.pr_draft,
+                    "pr_open": self.settings.sidebar_filters.pr_open,
+                    "pr_merged": self.settings.sidebar_filters.pr_merged,
+                    "pr_closed": self.settings.sidebar_filters.pr_closed,
+                    "unlinked": self.settings.sidebar_filters.unlinked,
+                    "review_draft": self.settings.sidebar_filters.review_draft,
+                    "review_comment": self.settings.sidebar_filters.review_comment,
+                    "review_approved": self.settings.sidebar_filters.review_approved,
+                    "review_changes": self.settings.sidebar_filters.review_changes,
+                }),
             }),
             "settings_open": self.settings_panel.is_some(),
         })
@@ -1604,6 +1929,24 @@ impl AppShell {
                     as f32;
                 self.set_summary_width(width, cx);
             }
+            "sidebar_grouping" => {
+                let requested = value
+                    .as_str()
+                    .ok_or_else(|| anyhow::anyhow!("sidebar_grouping must be a string"))?;
+                let grouping = match requested {
+                    "none" => SidebarGrouping::None,
+                    "repo" => SidebarGrouping::Repo,
+                    "status" => SidebarGrouping::Status,
+                    "pr" => SidebarGrouping::Pr,
+                    other => anyhow::bail!("unknown sidebar_grouping: {other}"),
+                };
+                self.set_sidebar_grouping(grouping, cx);
+            }
+            "sidebar_filters" => {
+                let filters: SidebarFilters = serde_json::from_value(value)
+                    .map_err(|e| anyhow::anyhow!("invalid sidebar_filters: {e}"))?;
+                self.set_sidebar_filters(filters, cx);
+            }
             other => anyhow::bail!("unknown setting: {other}"),
         }
         Ok(())
@@ -1615,6 +1958,11 @@ impl AppShell {
         if self.settings_panel.is_some() || self.theme_picker.is_some() {
             return;
         }
+        // See `on_open_theme_picker`'s matching comment: the filter popover
+        // isn't part of this guard's own is_some() checks (mouse-only, no
+        // focus move), so it can still be open here — close it so its
+        // backdrop doesn't stack on top of the settings panel.
+        self.filter_popover_open = false;
         let input =
             cx.new(|cx| InputState::new(window, cx).default_value(self.settings.mono_font.clone()));
         let subscription = cx.subscribe_in(
@@ -1807,6 +2155,106 @@ impl AppShell {
         cx.notify();
     }
 
+    /// The sidebar's actual rendered row list, in order: `self.index`'s
+    /// entries filtered by `settings.sidebar_filters`
+    /// ([`entry_passes_filters`]), then — when `sidebar_grouping` isn't
+    /// `SidebarGrouping::None` — partitioned into named runs with a
+    /// [`SidebarItem::Header`] above each (deliverables 3/4). Groups appear
+    /// in first-encounter order; entries within a group, and ungrouped
+    /// entries, keep `self.index.entries()`'s own relative order (already
+    /// `last_opened_ms` descending). Both [`Render::render`]'s
+    /// `uniform_list` and [`Self::automation_state`]'s `"sidebar"` field are
+    /// built from this one function, so what a script asserts is exactly
+    /// what's on screen.
+    fn visible_sidebar_items(&self) -> Vec<SidebarItem> {
+        let filters = &self.settings.sidebar_filters;
+        let entries = self.index.entries();
+        let visible: Vec<usize> = (0..entries.len())
+            .filter(|&i| entry_passes_filters(&entries[i], filters))
+            .collect();
+
+        if self.settings.sidebar_grouping == SidebarGrouping::None {
+            return visible.into_iter().map(SidebarItem::Review).collect();
+        }
+
+        // First-encounter order for headers, preserving each group's own
+        // internal `entries()` order — a plain `HashMap<String, Vec<_>>`
+        // has no ordering of its own, hence the separate `order` list.
+        // `key` (the dedup/grouping identity) and `label` (the header
+        // text) are tracked separately: a key sometimes needs to
+        // disambiguate information the display label deliberately omits
+        // (case-folding for `Repo`, the GitHub host for `Pr` — see
+        // `repo_group_key`/`pr_group_key`), so two entries can share one
+        // group while the header still renders the first-encountered
+        // entry's original label text.
+        let mut order: Vec<String> = Vec::new();
+        let mut labels: HashMap<String, String> = HashMap::new();
+        let mut groups: HashMap<String, Vec<usize>> = HashMap::new();
+        for i in visible {
+            let entry = &entries[i];
+            let (key, label) = match self.settings.sidebar_grouping {
+                SidebarGrouping::None => unreachable!("handled above"),
+                SidebarGrouping::Repo => (
+                    repo_group_key(&entry.location),
+                    dv_core::repo_label(&entry.location, None),
+                ),
+                SidebarGrouping::Status => {
+                    let label = status_group_label(&entry.state).to_string();
+                    (label.clone(), label)
+                }
+                // All rounds of the same PR share one header; a
+                // local-only review falls back to the same per-repo
+                // header `Repo` grouping would give it —
+                // `dv_core::repo_label` already produces exactly that
+                // when `remote` is `None`.
+                SidebarGrouping::Pr => (
+                    pr_group_key(&entry.location, entry.remote.as_ref()),
+                    dv_core::repo_label(&entry.location, entry.remote.as_ref()),
+                ),
+            };
+            if !groups.contains_key(&key) {
+                order.push(key.clone());
+                labels.insert(key.clone(), label);
+            }
+            groups.entry(key).or_default().push(i);
+        }
+
+        let mut items = Vec::with_capacity(entries.len() + order.len());
+        for key in order {
+            let label = labels.remove(&key).unwrap_or_else(|| key.clone());
+            let idxs = groups.remove(&key);
+            items.push(SidebarItem::Header {
+                key: SharedString::from(key),
+                label: SharedString::from(label),
+            });
+            if let Some(idxs) = idxs {
+                items.extend(idxs.into_iter().map(SidebarItem::Review));
+            }
+        }
+        items
+    }
+
+    /// Sidebar grouping control (docs/phase-6-review-navigator.md
+    /// deliverable 3, [`Self::render_sidebar_grouping_control`]) —
+    /// mouse-only, so no `window.focus` re-home is needed (cross-cutting
+    /// risk E).
+    fn set_sidebar_grouping(&mut self, grouping: SidebarGrouping, cx: &mut Context<Self>) {
+        self.settings.sidebar_grouping = grouping;
+        self.settings.save();
+        cx.notify();
+    }
+
+    /// Sidebar filter popover (deliverable 4,
+    /// [`Self::render_sidebar_filter_popover`]) — replaces the whole
+    /// [`SidebarFilters`] at once; each row click computes its own toggled
+    /// copy first (see [`Self::render_filter_row`]), so this stays a single
+    /// dumb setter shared by every row and by `automation_set_setting`.
+    fn set_sidebar_filters(&mut self, filters: SidebarFilters, cx: &mut Context<Self>) {
+        self.settings.sidebar_filters = filters;
+        self.settings.save();
+        cx.notify();
+    }
+
     /// One two-line review card (docs/phase-6-review-navigator.md
     /// deliverable 2's user sketch): line 1 is `repo_label`(muted) left +
     /// `relative_age`(muted) right; line 2 is the review's derived title
@@ -1841,6 +2289,8 @@ impl AppShell {
         v_flex()
             .id(SharedString::from(format!("review-card-{review_id}")))
             .w_full()
+            .h(px(SIDEBAR_ROW_HEIGHT))
+            .justify_center()
             .px_2()
             .py_1p5()
             .gap_0p5()
@@ -1920,6 +2370,228 @@ impl AppShell {
                             }),
                     ),
             )
+    }
+
+    /// A group header row, sitting above a run of cards when
+    /// `sidebar_grouping` is non-`None` (docs/phase-6-review-navigator.md
+    /// deliverable 3) — fixed to [`SIDEBAR_ROW_HEIGHT`], the same height as
+    /// [`Self::render_review_card`] (see that constant's doc comment for
+    /// why `uniform_list`'s scroll math requires it).
+    ///
+    /// The gpui element id is built from `key`, never `label`: two distinct
+    /// groups can share an identical display label (`Pr` grouping's label
+    /// is host-stripped, so two different GitHub Enterprise hosts with the
+    /// same owner/repo/pr collide on label text while their keys — the
+    /// full slug — still differ). Building the id from `label` would give
+    /// two `uniform_list` siblings the same stateful element id, a gpui
+    /// duplicate-id hazard (confirmed P3 finding).
+    fn render_sidebar_header(
+        &self,
+        key: SharedString,
+        label: SharedString,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let muted = cx.theme().muted_foreground;
+        let id = SharedString::from(format!("sidebar-header-{key}"));
+        div()
+            .id(id)
+            .w_full()
+            .h(px(SIDEBAR_ROW_HEIGHT))
+            .flex()
+            .items_center()
+            .px_2()
+            .text_xs()
+            .font_semibold()
+            .text_color(muted)
+            .truncate()
+            .child(label)
+    }
+
+    /// Sidebar grouping segmented control (docs/phase-6-review-navigator.md
+    /// deliverable 3): four small ghost buttons, mouse-only — no key
+    /// binding captures anything here, so no `window.focus` re-home is
+    /// needed the way the theme picker/settings panel overlays require
+    /// (cross-cutting risk E).
+    fn render_sidebar_grouping_control(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let current = self.settings.sidebar_grouping;
+        let row = |id: &'static str,
+                   label: &'static str,
+                   value: SidebarGrouping,
+                   cx: &mut Context<Self>| {
+            Button::new(id)
+                .ghost()
+                .xsmall()
+                .selected(current == value)
+                .label(label)
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    this.set_sidebar_grouping(value, cx);
+                }))
+        };
+        h_flex()
+            .gap_1()
+            .child(row("sidebar-group-none", "Flat", SidebarGrouping::None, cx))
+            .child(row("sidebar-group-repo", "Repo", SidebarGrouping::Repo, cx))
+            .child(row(
+                "sidebar-group-status",
+                "Status",
+                SidebarGrouping::Status,
+                cx,
+            ))
+            .child(row("sidebar-group-pr", "PR", SidebarGrouping::Pr, cx))
+    }
+
+    /// Sidebar filter-popover toggle button (deliverable 4) — same
+    /// mouse-only reasoning as the grouping control above.
+    fn render_sidebar_filter_button(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        Button::new("sidebar-filter-toggle")
+            .ghost()
+            .xsmall()
+            .selected(self.filter_popover_open)
+            .label("Filter")
+            .on_click(cx.listener(|this, _, _, cx| {
+                // Mirror `on_open_theme_picker`/`on_open_settings`'s own
+                // mutual-exclusion guards: don't stack this popover's
+                // full-window backdrop on top of either overlay (review
+                // finding — the button is always rendered, so it's
+                // reachable even while one of them is open).
+                if this.settings_panel.is_some() || this.theme_picker.is_some() {
+                    return;
+                }
+                this.filter_popover_open = !this.filter_popover_open;
+                cx.notify();
+            }))
+    }
+
+    /// One filter-popover checkbox row (deliverable 4): a checkmark glyph
+    /// (success color when on) + label. Clicking computes the toggled copy
+    /// of the whole [`SidebarFilters`] and replaces it via
+    /// [`Self::set_sidebar_filters`] — `get`/`set` come from
+    /// [`PR_FILTER_ROWS`]/[`REVIEW_FILTER_ROWS`], so this one function
+    /// renders all nine rows rather than one hand-written row per field.
+    #[allow(clippy::too_many_arguments)]
+    fn render_filter_row(
+        &self,
+        id: &'static str,
+        label: &'static str,
+        get: fn(&SidebarFilters) -> bool,
+        set: fn(&mut SidebarFilters, bool),
+        hover: Hsla,
+        success: Hsla,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement + use<> {
+        let on = get(&self.settings.sidebar_filters);
+        h_flex()
+            .id(id)
+            .w_full()
+            .gap_2()
+            .items_center()
+            .px_2()
+            .py_1()
+            .rounded_sm()
+            .cursor_pointer()
+            .hover(move |el| el.bg(hover.opacity(0.5)))
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(move |this, _, _, cx| {
+                    let mut filters = this.settings.sidebar_filters.clone();
+                    let toggled = !get(&filters);
+                    set(&mut filters, toggled);
+                    this.set_sidebar_filters(filters, cx);
+                }),
+            )
+            .child(
+                div()
+                    .flex_none()
+                    .w(px(16.))
+                    .text_color(success)
+                    .child(if on { "\u{2713}" } else { "" }),
+            )
+            .child(div().flex_1().text_sm().child(label))
+    }
+
+    /// The sidebar's filter popover (deliverable 4), when open: a small
+    /// panel anchored under the "Filter" toggle button, listing every PR-
+    /// status and review-status checkbox row. A full-window, invisible
+    /// backdrop closes it on any outside click (same swallow-the-click
+    /// pattern as `render_settings_panel`'s backdrop); the popover's own
+    /// content stops propagation so a click inside it doesn't also close
+    /// it. Pure mouse throughout — no key binding, so (cross-cutting risk
+    /// E) no `window.focus` re-home on open/close, unlike the theme
+    /// picker/settings panel.
+    ///
+    /// Mutual exclusion with those two overlays is enforced on the *other*
+    /// side rather than here: `render_sidebar_filter_button`'s `on_click`
+    /// won't open this popover while either is up, and
+    /// `on_open_theme_picker`/`on_open_settings` close this popover on
+    /// entry — otherwise this backdrop, being the last child mounted (see
+    /// the bottom of `Render for AppShell`), would paint/hit-test on top of
+    /// the settings panel or theme picker and swallow their first click
+    /// (review finding).
+    fn render_sidebar_filter_popover(&self, cx: &mut Context<Self>) -> Option<Div> {
+        if !self.filter_popover_open {
+            return None;
+        }
+        let theme = cx.theme();
+        let border = theme.border;
+        let popover = theme.popover;
+        let popover_fg = theme.popover_foreground;
+        let muted = theme.muted_foreground;
+        let accent = theme.accent;
+        let success = theme.success;
+
+        Some(
+            div()
+                .absolute()
+                .inset_0()
+                .occlude()
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(|this, _, _, cx| {
+                        this.filter_popover_open = false;
+                        cx.notify();
+                    }),
+                )
+                .child(
+                    div().absolute().top(px(88.)).left(px(12.)).child(
+                        v_flex()
+                            .id("sidebar-filter-popover")
+                            .w(px(240.))
+                            .max_h(px(420.))
+                            .overflow_hidden()
+                            .p_2()
+                            .gap_1()
+                            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                            .bg(popover)
+                            .text_color(popover_fg)
+                            .border_1()
+                            .border_color(border)
+                            .rounded_lg()
+                            .shadow_lg()
+                            .child(
+                                div()
+                                    .px_2()
+                                    .pt_1()
+                                    .text_xs()
+                                    .text_color(muted)
+                                    .child("PR STATUS"),
+                            )
+                            .children(PR_FILTER_ROWS.iter().map(|(id, label, get, set)| {
+                                self.render_filter_row(id, label, *get, *set, accent, success, cx)
+                            }))
+                            .child(
+                                div()
+                                    .px_2()
+                                    .pt_2()
+                                    .text_xs()
+                                    .text_color(muted)
+                                    .child("REVIEW STATUS"),
+                            )
+                            .children(REVIEW_FILTER_ROWS.iter().map(|(id, label, get, set)| {
+                                self.render_filter_row(id, label, *get, *set, accent, success, cx)
+                            })),
+                    ),
+                ),
+        )
     }
 
     /// The sidebar's inner-edge drag handle (Phase 4 deliverable 5): a 6px
@@ -2446,7 +3118,14 @@ impl AppShell {
 impl Render for AppShell {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme();
-        let review_count = self.index.entries().len();
+        // Computed once per render (mirrors the old `review_count`'s own
+        // one-per-render computation) and `move`d into the `uniform_list`
+        // processor below, rather than recomputed per visible range —
+        // `visible_sidebar_items` is what both this render pass and
+        // `Self::automation_state`'s `"sidebar"` field build from, so
+        // what a script asserts is exactly what's on screen.
+        let sidebar_items = self.visible_sidebar_items();
+        let sidebar_items_len = sidebar_items.len();
 
         let active_title = self
             .selected_review_id
@@ -2565,21 +3244,46 @@ impl Render for AppShell {
                                             })),
                                     ),
                             )
+                            // Grouping/filtering control row (docs/phase-6-
+                            // review-navigator.md deliverables 3/4) — mouse-
+                            // only throughout (cross-cutting risk E).
+                            .child(
+                                h_flex()
+                                    .px_2()
+                                    .pb_1()
+                                    .gap_1()
+                                    .items_center()
+                                    .child(self.render_sidebar_grouping_control(cx))
+                                    .child(div().flex_1())
+                                    .child(self.render_sidebar_filter_button(cx)),
+                            )
                             .child(
                                 uniform_list(
                                     "review-list",
-                                    review_count,
-                                    cx.processor(|this, range: std::ops::Range<usize>, _, cx| {
-                                        range
-                                            .map(|i| {
-                                                let entry = &this.index.entries()[i];
-                                                let selected = this.selected_review_id.as_deref()
-                                                    == Some(entry.review_id.as_str());
-                                                this.render_review_card(entry, selected, cx)
-                                                    .into_any_element()
-                                            })
-                                            .collect::<Vec<_>>()
-                                    }),
+                                    sidebar_items_len,
+                                    cx.processor(
+                                        move |this, range: std::ops::Range<usize>, _, cx| {
+                                            range
+                                                .map(|i| match &sidebar_items[i] {
+                                                    SidebarItem::Header { key, label } => this
+                                                        .render_sidebar_header(
+                                                            key.clone(),
+                                                            label.clone(),
+                                                            cx,
+                                                        )
+                                                        .into_any_element(),
+                                                    SidebarItem::Review(idx) => {
+                                                        let entry = &this.index.entries()[*idx];
+                                                        let selected =
+                                                            this.selected_review_id.as_deref()
+                                                                == Some(entry.review_id.as_str());
+                                                        this.render_review_card(entry, selected, cx)
+                                                            .into_any_element()
+                                                    }
+                                                })
+                                                .collect::<Vec<_>>()
+                                        },
+                                    ),
                                 )
                                 .flex_1()
                                 .px_1(),
@@ -2599,6 +3303,7 @@ impl Render for AppShell {
             )
             .children(self.render_theme_picker(cx))
             .children(self.render_settings_panel(cx))
+            .children(self.render_sidebar_filter_popover(cx))
     }
 }
 
@@ -2683,5 +3388,389 @@ mod tests {
             Some(20),
             "pr_number tracks the new latest review"
         );
+    }
+
+    // --- entry_passes_filters / repo_group_key / status_group_label
+    // (docs/phase-6-review-navigator.md deliverables 3/4) -----------------
+
+    use super::{
+        SidebarFilters, entry_passes_filters, grouping_word, pr_group_key, repo_group_key,
+        status_group_label,
+    };
+    use crate::settings::SidebarGrouping;
+    use std::path::PathBuf;
+
+    fn local(name: &str) -> dv_core::RepoLocation {
+        dv_core::RepoLocation::Local(PathBuf::from(format!("D:\\code\\{name}")))
+    }
+
+    fn remote_ref(pr: u64) -> dv_core::RemoteRef {
+        dv_core::RemoteRef {
+            provider: "github".to_string(),
+            slug: "github.com/kylekz/difftest".to_string(),
+            pr,
+            url: format!("https://github.com/kylekz/difftest/pull/{pr}"),
+            submitted_review_id: None,
+            submitted_url: None,
+        }
+    }
+
+    fn sample_index_entry(id: &str) -> dv_core::IndexEntry {
+        dv_core::IndexEntry {
+            review_id: id.to_string(),
+            location: local("difftest"),
+            source: dv_core::DiffSource::WorkingTree,
+            title: "working tree".to_string(),
+            state: dv_core::ReviewState::Draft,
+            open_comments: 0,
+            remote: None,
+            pr_status: None,
+            updated_ms: 1,
+            last_opened_ms: 1,
+            health: dv_core::EntryHealth::Ok,
+        }
+    }
+
+    fn cached_pr(is_draft: bool, state: PrState) -> dv_core::CachedPrStatus {
+        dv_core::CachedPrStatus {
+            state,
+            is_draft,
+            decision: None,
+            checks: ChecksSummary::None,
+        }
+    }
+
+    #[test]
+    fn entry_passes_filters_unlinked_review_checked_against_unlinked_bucket_only() {
+        let entry = sample_index_entry("r-1");
+        assert!(entry.remote.is_none());
+        let mut filters = SidebarFilters::default();
+        assert!(entry_passes_filters(&entry, &filters));
+        filters.unlinked = false;
+        assert!(
+            !entry_passes_filters(&entry, &filters),
+            "a local-only review must be gated by `unlinked`, not any pr_* bool"
+        );
+    }
+
+    #[test]
+    fn entry_passes_filters_pr_linked_not_yet_hydrated_always_passes_pr_axis() {
+        // cross-cutting: a PR-linked review whose `pr_status` hasn't landed
+        // yet must not be hidden by ANY pr_* filter being off — "unknown"
+        // is not "filtered out".
+        let mut entry = sample_index_entry("r-1");
+        entry.remote = Some(remote_ref(7));
+        entry.pr_status = None;
+        let filters = SidebarFilters {
+            pr_draft: false,
+            pr_open: false,
+            pr_merged: false,
+            pr_closed: false,
+            ..SidebarFilters::default()
+        };
+        assert!(
+            entry_passes_filters(&entry, &filters),
+            "an un-hydrated PR-linked review must pass regardless of pr_* filters"
+        );
+    }
+
+    #[test]
+    fn entry_passes_filters_pr_linked_buckets_by_draft_then_state() {
+        let mut entry = sample_index_entry("r-1");
+        entry.remote = Some(remote_ref(7));
+
+        entry.pr_status = Some(cached_pr(true, PrState::Open));
+        let filters = SidebarFilters {
+            pr_draft: false,
+            ..SidebarFilters::default()
+        };
+        assert!(
+            !entry_passes_filters(&entry, &filters),
+            "is_draft must win over PrState::Open — a draft PR is filtered by pr_draft, not pr_open"
+        );
+
+        entry.pr_status = Some(cached_pr(false, PrState::Merged));
+        let mut filters = SidebarFilters {
+            pr_merged: false,
+            ..SidebarFilters::default()
+        };
+        assert!(!entry_passes_filters(&entry, &filters));
+        filters.pr_merged = true;
+        assert!(entry_passes_filters(&entry, &filters));
+    }
+
+    #[test]
+    fn entry_passes_filters_closed_draft_pr_buckets_by_pr_closed_not_pr_draft() {
+        // GitHub allows closing a draft PR without ever marking it ready
+        // for review, so `is_draft: true, state: Closed` is a reachable
+        // combination — it must be gated by `pr_closed`, not `pr_draft`,
+        // or toggling either filter independently stops matching what it
+        // promises for this entry.
+        let mut entry = sample_index_entry("r-1");
+        entry.remote = Some(remote_ref(7));
+        entry.pr_status = Some(cached_pr(true, PrState::Closed));
+
+        let filters = SidebarFilters {
+            pr_draft: false,
+            pr_closed: true,
+            ..SidebarFilters::default()
+        };
+        assert!(
+            entry_passes_filters(&entry, &filters),
+            "a closed draft must stay visible when pr_closed is on, even with pr_draft off"
+        );
+
+        let filters = SidebarFilters {
+            pr_draft: true,
+            pr_closed: false,
+            ..SidebarFilters::default()
+        };
+        assert!(
+            !entry_passes_filters(&entry, &filters),
+            "a closed draft must be hidden when pr_closed is off, even with pr_draft on"
+        );
+    }
+
+    #[test]
+    fn entry_passes_filters_review_status_buckets_draft_and_each_verdict() {
+        let mut entry = sample_index_entry("r-1");
+        let filters = SidebarFilters {
+            review_draft: false,
+            ..SidebarFilters::default()
+        };
+        assert!(!entry_passes_filters(&entry, &filters));
+
+        entry.state = dv_core::ReviewState::Submitted {
+            verdict: dv_core::Verdict::Approve,
+            at_ms: 1,
+        };
+        let mut filters = SidebarFilters::default();
+        assert!(entry_passes_filters(&entry, &filters));
+        filters.review_approved = false;
+        assert!(!entry_passes_filters(&entry, &filters));
+        // A different verdict bucket must be unaffected by
+        // `review_approved` being off.
+        entry.state = dv_core::ReviewState::Submitted {
+            verdict: dv_core::Verdict::RequestChanges,
+            at_ms: 1,
+        };
+        assert!(entry_passes_filters(&entry, &filters));
+        filters.review_changes = false;
+        assert!(!entry_passes_filters(&entry, &filters));
+    }
+
+    #[test]
+    fn entry_passes_filters_unavailable_repo_bypasses_every_axis() {
+        // A WSL-hosted review whose distro stopped (or whose path vanished)
+        // keeps its last-known state/verdict per `apply_hydration`'s
+        // contract (crates/core/src/index/mod.rs) — an unrelated filter
+        // (e.g. hiding approved reviews) must not be able to hide the row
+        // and take the sidebar's only unavailable-repo glyph out of view
+        // with it (P3 finding).
+        let mut entry = sample_index_entry("r-1");
+        entry.state = dv_core::ReviewState::Submitted {
+            verdict: dv_core::Verdict::Approve,
+            at_ms: 1,
+        };
+        entry.remote = Some(remote_ref(7));
+        entry.pr_status = Some(cached_pr(false, PrState::Closed));
+        entry.health = dv_core::EntryHealth::RepoUnavailable;
+
+        let filters = SidebarFilters {
+            review_approved: false,
+            pr_closed: false,
+            unlinked: false,
+            ..SidebarFilters::default()
+        };
+        assert!(
+            entry_passes_filters(&entry, &filters),
+            "an unavailable/missing repo's entry must stay visible regardless of PR/review filters"
+        );
+
+        entry.health = dv_core::EntryHealth::Missing;
+        assert!(
+            entry_passes_filters(&entry, &filters),
+            "Missing health must bypass filters the same way RepoUnavailable does"
+        );
+    }
+
+    #[test]
+    fn repo_group_key_ignores_remote_so_every_review_at_a_location_shares_one_group() {
+        // Live-verified regression (see the function's own doc comment):
+        // an earlier version of this key passed `remote` through to
+        // `repo_label`, so a PR-linked review (`owner/repo`) and a
+        // local-only review at the exact same location (folder name) split
+        // into two different Repo-grouping headers for what is genuinely
+        // one repo.
+        let loc = local("difftest");
+        let key_unlinked = repo_group_key(&loc);
+        assert_eq!(key_unlinked, "d:\\code\\difftest");
+
+        // Two different PRs at the same location, plus the unlinked case
+        // above, must all key identically — `repo_group_key` doesn't even
+        // take a `remote` argument, so this is really just confirming the
+        // key is a pure function of `location`.
+        assert_eq!(repo_group_key(&local("difftest")), key_unlinked);
+    }
+
+    #[test]
+    fn repo_group_key_keys_on_full_path_not_just_basename() {
+        // Confirmed P3/P2 finding: keying on `repo_label`'s basename-only
+        // output merged two entirely different repos that happen to share
+        // a final path segment (e.g. an employer's repo and an unrelated
+        // personal repo both named "api") into one Repo-grouping header.
+        // Two different parent directories must produce two different
+        // keys even though `local()` in these tests, and the finding's own
+        // repro, share the trailing folder name.
+        let work_api = dv_core::RepoLocation::Local(PathBuf::from(r"D:\work\api"));
+        let side_api = dv_core::RepoLocation::Local(PathBuf::from(r"D:\side-projects\api"));
+        assert_ne!(
+            repo_group_key(&work_api),
+            repo_group_key(&side_api),
+            "two distinct repos sharing only a basename must not collapse into one group"
+        );
+    }
+
+    #[test]
+    fn repo_group_key_case_folds_local_but_not_wsl() {
+        // Windows/macOS is case-insensitive+case-preserving: the same
+        // repo can be recorded with two different-case full paths (e.g. a
+        // stale `recent.json` seed vs. a freshly-typed path) — the key
+        // must still land both in one group.
+        assert_eq!(
+            repo_group_key(&local("Difftest")),
+            repo_group_key(&local("difftest")),
+            "Local locations must key case-insensitively on the full path"
+        );
+
+        let wsl_lower = dv_core::RepoLocation::Wsl {
+            distro: "Ubuntu".to_string(),
+            path: "/home/kyle/difftest".to_string(),
+        };
+        let wsl_upper = dv_core::RepoLocation::Wsl {
+            distro: "Ubuntu".to_string(),
+            path: "/home/kyle/Difftest".to_string(),
+        };
+        assert_ne!(
+            repo_group_key(&wsl_lower),
+            repo_group_key(&wsl_upper),
+            "WSL POSIX paths are genuinely case-sensitive — folding here would merge distinct repos"
+        );
+
+        // The distro name, unlike the POSIX path, IS case-insensitive at
+        // the OS level — two entries for the same repo differing only in
+        // distro-name spelling (e.g. a `recent.json` seed vs. a
+        // `\\wsl.localhost\UBUNTU\...` Explorer path) must still land in
+        // one group.
+        let distro_upper = dv_core::RepoLocation::Wsl {
+            distro: "UBUNTU".to_string(),
+            path: "/home/kyle/difftest".to_string(),
+        };
+        assert_eq!(
+            repo_group_key(&wsl_lower),
+            repo_group_key(&distro_upper),
+            "WSL distro names are case-insensitive — differing distro spelling must not split the group"
+        );
+
+        // A different POSIX path under the *same* (case-folded) distro
+        // must still be a distinct group.
+        let other_path_same_distro = dv_core::RepoLocation::Wsl {
+            distro: "ubuntu".to_string(),
+            path: "/home/kyle/other-repo".to_string(),
+        };
+        assert_ne!(
+            repo_group_key(&wsl_lower),
+            repo_group_key(&other_path_same_distro),
+            "distinct POSIX paths under the same distro must still key differently"
+        );
+    }
+
+    #[test]
+    fn pr_group_key_disambiguates_by_full_slug_not_just_owner_repo_pr() {
+        // Two different GitHub Enterprise hosts sharing an identical
+        // owner/repo name and PR number must NOT collide into one key,
+        // even though `repo_label`'s display string (host-stripped) would
+        // be identical for both.
+        let github_com = dv_core::RemoteRef {
+            provider: "github".to_string(),
+            slug: "github.com/acme/widgets".to_string(),
+            pr: 7,
+            url: "https://github.com/acme/widgets/pull/7".to_string(),
+            submitted_review_id: None,
+            submitted_url: None,
+        };
+        let ghe = dv_core::RemoteRef {
+            slug: "ghe.internal.example.com/acme/widgets".to_string(),
+            ..github_com.clone()
+        };
+        let loc = local("irrelevant"); // pr_group_key ignores location when remote is Some
+        assert_ne!(
+            pr_group_key(&loc, Some(&github_com)),
+            pr_group_key(&loc, Some(&ghe)),
+            "identical owner/repo/pr on two different hosts must key differently"
+        );
+    }
+
+    #[test]
+    fn pr_group_key_case_folds_the_slug_so_owner_repo_casing_drift_stays_one_group() {
+        // Two reviews of the *same* PR, recorded while `origin`'s owner/repo
+        // casing differed (e.g. before/after the remote URL was
+        // retyped/normalized), must still land under one header.
+        let mixed_case = dv_core::RemoteRef {
+            provider: "github".to_string(),
+            slug: "github.com/KyleKZ/difftest".to_string(),
+            pr: 7,
+            url: "https://github.com/KyleKZ/difftest/pull/7".to_string(),
+            submitted_review_id: None,
+            submitted_url: None,
+        };
+        let lower_case = dv_core::RemoteRef {
+            slug: "github.com/kylekz/difftest".to_string(),
+            url: "https://github.com/kylekz/difftest/pull/7".to_string(),
+            ..mixed_case.clone()
+        };
+        let loc = local("irrelevant"); // pr_group_key ignores location when remote is Some
+        assert_eq!(
+            pr_group_key(&loc, Some(&mixed_case)),
+            pr_group_key(&loc, Some(&lower_case)),
+            "owner/repo casing drift between two reviews of the same PR must not split the group"
+        );
+    }
+
+    #[test]
+    fn status_group_label_covers_draft_and_every_verdict() {
+        assert_eq!(status_group_label(&dv_core::ReviewState::Draft), "Draft");
+        assert_eq!(
+            status_group_label(&dv_core::ReviewState::Submitted {
+                verdict: dv_core::Verdict::Comment,
+                at_ms: 1,
+            }),
+            "Comment"
+        );
+        assert_eq!(
+            status_group_label(&dv_core::ReviewState::Submitted {
+                verdict: dv_core::Verdict::Approve,
+                at_ms: 1,
+            }),
+            "Approved"
+        );
+        assert_eq!(
+            status_group_label(&dv_core::ReviewState::Submitted {
+                verdict: dv_core::Verdict::RequestChanges,
+                at_ms: 1,
+            }),
+            "Changes Requested"
+        );
+    }
+
+    #[test]
+    fn grouping_word_matches_automation_set_setting_strings() {
+        // `automation_set_setting`'s "sidebar_grouping" arm accepts exactly
+        // these four strings back in — round-trip sanity so the two sides
+        // of the wire format can't silently drift apart.
+        assert_eq!(grouping_word(SidebarGrouping::None), "none");
+        assert_eq!(grouping_word(SidebarGrouping::Repo), "repo");
+        assert_eq!(grouping_word(SidebarGrouping::Status), "status");
+        assert_eq!(grouping_word(SidebarGrouping::Pr), "pr");
     }
 }

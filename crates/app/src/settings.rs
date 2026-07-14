@@ -79,6 +79,99 @@ pub enum ViewModeSetting {
     Split,
 }
 
+/// Which axis groups sidebar review cards, if any
+/// (docs/phase-6-review-navigator.md deliverable 3). `None` is a flat,
+/// last-opened-desc list — today's behavior, kept as the default so a
+/// settings.json that never sets this renders byte-identical to before
+/// grouping existed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SidebarGrouping {
+    #[default]
+    None,
+    /// Every review sharing a repo under one header, regardless of how
+    /// many (or how few) linked PRs it spans.
+    Repo,
+    /// One header per review-status bucket (draft / comment / approved /
+    /// changes requested) — the same four buckets `SidebarFilters`'s
+    /// `review_*` fields filter on.
+    Status,
+    /// All rounds of the same PR grouped together (one header per
+    /// repo+PR); local-only reviews fall back to a per-repo header, same
+    /// as `Repo` grouping.
+    Pr,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+/// Multi-axis sidebar visibility filters (docs/phase-6-review-navigator.md
+/// deliverable 4): PR status (draft / open / merged / closed, plus a
+/// visible "unlinked" bucket for local-only reviews with no PR at all) and
+/// review status (the three submitted verdicts, plus unsubmitted draft —
+/// an addition to the user's original three-verdict ask, flagged rather
+/// than silently folded in, so an in-progress draft doesn't disappear
+/// under a verdict filter). Both axes AND together — see
+/// `shell.rs::entry_passes_filters`.
+///
+/// Every field defaults to `true` ("shown"). This is the highest-risk part
+/// of this slice (cross-cutting risk D): a plain `#[serde(default)]` on a
+/// bare `bool` field yields `false` on a missing key, which would hide
+/// EVERY review in an upgraded user's settings.json the instant this
+/// shipped. Two defenses, both required, covering two different "missing"
+/// shapes:
+/// - the field-level `#[serde(default = "default_true")]` below covers a
+///   *partially* old/hand-edited `sidebar_filters` object (some keys
+///   present, some missing);
+/// - the manual [`Default`] impl (not `#[derive(Default)]`, which would
+///   give every field `false`) covers a settings.json predating this
+///   slice entirely, where the whole `sidebar_filters` key is absent —
+///   `Settings`'s own container-level `#[serde(default)]` falls back to
+///   `Settings::default()` for any wholly-missing field, which calls this
+///   impl.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SidebarFilters {
+    #[serde(default = "default_true")]
+    pub pr_draft: bool,
+    #[serde(default = "default_true")]
+    pub pr_open: bool,
+    #[serde(default = "default_true")]
+    pub pr_merged: bool,
+    #[serde(default = "default_true")]
+    pub pr_closed: bool,
+    /// Local-only reviews (no linked PR) — a distinct axis, not folded
+    /// into any of the four PR-state bools above: a local review isn't
+    /// "no PR status", it's a different kind of review entirely.
+    #[serde(default = "default_true")]
+    pub unlinked: bool,
+    /// Unsubmitted draft.
+    #[serde(default = "default_true")]
+    pub review_draft: bool,
+    #[serde(default = "default_true")]
+    pub review_comment: bool,
+    #[serde(default = "default_true")]
+    pub review_approved: bool,
+    #[serde(default = "default_true")]
+    pub review_changes: bool,
+}
+
+impl Default for SidebarFilters {
+    fn default() -> Self {
+        Self {
+            pr_draft: true,
+            pr_open: true,
+            pr_merged: true,
+            pr_closed: true,
+            unlinked: true,
+            review_draft: true,
+            review_comment: true,
+            review_approved: true,
+            review_changes: true,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Settings {
@@ -125,6 +218,12 @@ pub struct Settings {
     /// its inner (left) edge. Clamped to
     /// `SUMMARY_WIDTH_MIN..=SUMMARY_WIDTH_MAX`.
     pub summary_width: f32,
+    /// Sidebar grouping (docs/phase-6-review-navigator.md deliverable 3) —
+    /// `shell.rs`'s grouping control, plus `set_setting`.
+    pub sidebar_grouping: SidebarGrouping,
+    /// Sidebar filters (deliverable 4) — `shell.rs`'s filter popover, plus
+    /// `set_setting`.
+    pub sidebar_filters: SidebarFilters,
 }
 
 impl Default for Settings {
@@ -140,6 +239,8 @@ impl Default for Settings {
             view_mode_default: ViewModeSetting::Unified,
             sidebar_width: DEFAULT_SIDEBAR_WIDTH,
             summary_width: DEFAULT_SUMMARY_WIDTH,
+            sidebar_grouping: SidebarGrouping::None,
+            sidebar_filters: SidebarFilters::default(),
         }
     }
 }
@@ -237,6 +338,24 @@ mod tests {
         assert_eq!(s.view_mode_default, ViewModeSetting::Unified);
         assert_eq!(s.sidebar_width, 280.0);
         assert_eq!(s.summary_width, 320.0);
+        assert_eq!(s.sidebar_grouping, SidebarGrouping::None);
+        assert_eq!(s.sidebar_filters, SidebarFilters::default());
+        assert!(
+            [
+                s.sidebar_filters.pr_draft,
+                s.sidebar_filters.pr_open,
+                s.sidebar_filters.pr_merged,
+                s.sidebar_filters.pr_closed,
+                s.sidebar_filters.unlinked,
+                s.sidebar_filters.review_draft,
+                s.sidebar_filters.review_comment,
+                s.sidebar_filters.review_approved,
+                s.sidebar_filters.review_changes,
+            ]
+            .into_iter()
+            .all(|shown| shown),
+            "every filter defaults to shown — nothing hidden out of the box"
+        );
     }
 
     #[test]
@@ -252,6 +371,12 @@ mod tests {
             view_mode_default: ViewModeSetting::Split,
             sidebar_width: 340.0,
             summary_width: 400.0,
+            sidebar_grouping: SidebarGrouping::Pr,
+            sidebar_filters: SidebarFilters {
+                pr_draft: false,
+                review_approved: false,
+                ..SidebarFilters::default()
+            },
         };
         let json = serde_json::to_string(&settings).unwrap();
         let back: Settings = serde_json::from_str(&json).unwrap();
@@ -289,6 +414,62 @@ mod tests {
         assert_eq!(parsed.view_mode_default, ViewModeSetting::Unified);
         assert_eq!(parsed.sidebar_width, DEFAULT_SIDEBAR_WIDTH);
         assert_eq!(parsed.summary_width, DEFAULT_SUMMARY_WIDTH);
+        assert_eq!(parsed.sidebar_grouping, SidebarGrouping::None);
+        assert_eq!(parsed.sidebar_filters, SidebarFilters::default());
+    }
+
+    // --- sidebar_grouping / sidebar_filters (docs/phase-6-review-navigator.md
+    // deliverables 3/4; cross-cutting risk D — the serde-default-false
+    // footgun) -----------------------------------------------------------
+
+    #[test]
+    fn settings_json_missing_sidebar_fields_entirely_hides_nothing() {
+        // The exact upgrade scenario cross-cutting risk D calls out: a
+        // settings.json from before this slice, with neither
+        // `sidebar_grouping` nor `sidebar_filters` present at all. Every
+        // filter must still come back `true` (shown) — a `false` here
+        // would silently empty an upgraded user's entire sidebar.
+        let parsed: Settings =
+            serde_json::from_str(r#"{"theme":"Dracula","sidebar_width":300}"#).unwrap();
+        assert_eq!(parsed.sidebar_grouping, SidebarGrouping::None);
+        assert_eq!(parsed.sidebar_filters, SidebarFilters::default());
+        assert!(
+            [
+                parsed.sidebar_filters.pr_draft,
+                parsed.sidebar_filters.pr_open,
+                parsed.sidebar_filters.pr_merged,
+                parsed.sidebar_filters.pr_closed,
+                parsed.sidebar_filters.unlinked,
+                parsed.sidebar_filters.review_draft,
+                parsed.sidebar_filters.review_comment,
+                parsed.sidebar_filters.review_approved,
+                parsed.sidebar_filters.review_changes,
+            ]
+            .into_iter()
+            .all(|shown| shown)
+        );
+    }
+
+    #[test]
+    fn sidebar_filters_object_with_only_some_keys_defaults_the_rest_to_shown() {
+        // A *partially* present `sidebar_filters` object (e.g. a
+        // hand-edited settings.json, or a future field this build predates)
+        // — every field this build doesn't recognize as present must still
+        // land on `true`, not `false`. This is the field-level
+        // `#[serde(default = "default_true")]` half of cross-cutting risk
+        // D; the previous test covers the container-level half (the whole
+        // key missing).
+        let filters: SidebarFilters =
+            serde_json::from_str(r#"{"pr_open":false,"review_approved":false}"#).unwrap();
+        assert!(!filters.pr_open);
+        assert!(!filters.review_approved);
+        assert!(filters.pr_draft);
+        assert!(filters.pr_merged);
+        assert!(filters.pr_closed);
+        assert!(filters.unlinked);
+        assert!(filters.review_draft);
+        assert!(filters.review_comment);
+        assert!(filters.review_changes);
     }
 
     // --- clamp_numeric_fields (Phase 4 deliverable 5: sidebar/summary drag

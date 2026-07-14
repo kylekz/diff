@@ -504,6 +504,22 @@ fn cancel_submit_flow_outcome(
 
 pub struct Workspace {
     focus_handle: FocusHandle,
+    /// A weak handle to the owning `AppShell`, captured at construction.
+    /// Read-only here — used solely by [`Self::on_open_pr_picker`] to ask
+    /// `AppShell::overlay_open` whether a shell-level overlay (theme picker
+    /// / settings panel) is genuinely open right now (review finding P1,
+    /// refined by finding P3: the original guard used
+    /// `shell_focus_handle.is_focused()` as a proxy for "an overlay is
+    /// open", but ordinary sidebar-chrome clicks — e.g. a group header,
+    /// with no `on_click`/`track_focus` of their own — also bubble focus
+    /// onto the shell handle with no overlay open at all, so that proxy
+    /// silently declined legitimate mouse-triggered opens). Declining to
+    /// open the PR picker while an overlay genuinely is open (mirroring
+    /// `on_open_theme_picker` declining while `settings_panel` is open)
+    /// prevents the two overlays from ever stacking, which is what let a
+    /// still-open theme picker end up keyboard-trapped behind the PR picker
+    /// once this workspace's own `escape` bindings started outranking it.
+    shell: WeakEntity<crate::shell::AppShell>,
     source: DiffSource,
     /// Bumped every time [`Self::open_pr`] is dispatched — never on a plain
     /// file switch. `open_pr` and `request_diff` completions capture the
@@ -1094,6 +1110,7 @@ impl Workspace {
         context_lines: u32,
         font_size: f32,
         summary_width: f32,
+        shell: WeakEntity<crate::shell::AppShell>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
@@ -1113,6 +1130,7 @@ impl Workspace {
 
         let this = Self {
             focus_handle: cx.focus_handle(),
+            shell,
             title: location.display_name().into(),
             source_desc: source_label(&source).into(),
             location: location.clone(),
@@ -1541,6 +1559,18 @@ impl Workspace {
     /// before that. Same `pub(crate)` reasoning as [`Self::review`].
     pub(crate) fn location(&self) -> &RepoLocation {
         &self.location
+    }
+
+    /// Whether this workspace's own PR picker overlay is currently open.
+    /// `pub(crate)` so `AppShell::on_open_theme_picker`/`on_open_settings`
+    /// can decline opening a shell-level overlay on top of it (review
+    /// finding P2: `on_open_pr_picker`'s own guard against the shell
+    /// overlays — see its comment above — was one-directional; ctrl-shift-t
+    /// / ctrl-, could still stack a shell overlay over an already-open PR
+    /// picker, stranding it visually and, for the settings panel's modal
+    /// backdrop, blocking it entirely).
+    pub(crate) fn pr_picker_open(&self) -> bool {
+        self.pr_picker.is_some()
     }
 
     /// Whether the active review is submitted — suppresses mutation of its
@@ -2127,22 +2157,64 @@ impl Workspace {
 
     // ---- PR picker -----------------------------------------------------
 
-    fn on_open_pr_picker(
-        &mut self,
-        _: &OpenPrPicker,
-        _window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
+    fn on_open_pr_picker(&mut self, _: &OpenPrPicker, window: &mut Window, cx: &mut Context<Self>) {
         if self.pr_picker.is_some() {
+            return;
+        }
+        // Decline while a shell-level overlay (theme picker / settings
+        // panel) is genuinely open, the same way `on_open_theme_picker`
+        // declines if `settings_panel` is already up (review finding P1).
+        // Ask `AppShell` directly via `overlay_open` rather than inferring
+        // it from focus location (review finding P3): ordinary
+        // sidebar-chrome clicks — a group header, the "REVIEWS" label,
+        // empty padding, none of which carry their own `track_focus` —
+        // also bubble focus onto the shell handle with no overlay open at
+        // all, so `shell_focus_handle.is_focused()` was declining
+        // legitimate mouse-triggered opens too. Without this guard, a
+        // mouse click on the "PRs · ctrl-g" hint button (which calls this
+        // as a plain method, bypassing the `browse` key-context gate a
+        // keystroke would need) could stack the PR picker on top of an
+        // already-open theme picker; closing the PR picker afterwards
+        // would then strand the theme picker keyboard-trapped behind it,
+        // since this workspace's own `escape` bindings outrank the
+        // shell's once focus is back on this handle.
+        if self
+            .shell
+            .upgrade()
+            .is_some_and(|shell| shell.read(cx).overlay_open())
+        {
             return;
         }
         let Some(repo) = self.repo.clone() else {
             return;
         };
+        // The sidebar filter popover is a third shell-level overlay that
+        // doesn't go through the `overlay_open` guard above (it's
+        // mouse-only and never moves focus, so it can still be open here)
+        // — close it so its full-window backdrop can't end up painted on
+        // top of the picker (review finding: the two overlays stacking
+        // swallows the picker's first click). Mirrors
+        // `on_open_theme_picker`/`on_open_settings`'s matching guard.
+        if let Some(shell) = self.shell.upgrade() {
+            shell.update(cx, |shell, cx| shell.close_filter_popover(cx));
+        }
         self.pr_picker = Some(PrPicker {
             state: PrPickerState::Loading,
             selected: 0,
         });
+        // Capture focus onto the workspace's own handle while the picker is
+        // open (Phase 7 D0 fix). `PrPickerChoose`'s Enter binding is scoped
+        // `"Workspace && PrPickerOpen"` — that context is only on the
+        // dispatch path if focus actually rests on this handle. This is the
+        // mirror image of `on_open_theme_picker`/`on_open_settings` in
+        // shell.rs, which capture the *shell's* handle because their
+        // bindings are `"AppShell && ..."`; do not copy that pattern here.
+        // Without this, a caller that opens the picker while focus rests
+        // elsewhere (e.g. the mouse "PRs · ctrl-g" hint button, which calls
+        // this as a plain method bypassing the browse-context gate) leaves
+        // Enter a no-op — the regression this fixes. Mirrors
+        // `close_pr_picker`, which already restores focus symmetrically.
+        window.focus(&self.focus_handle, cx);
         cx.notify();
 
         cx.spawn(async move |this, cx| {

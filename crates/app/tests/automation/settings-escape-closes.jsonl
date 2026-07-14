@@ -1,0 +1,6 @@
+{"id":1,"cmd":"wait_ready","timeout_ms":20000}
+{"id":2,"cmd":"key","keystroke":"ctrl-,"}
+{"id":3,"cmd":"state"}
+{"id":4,"cmd":"key","keystroke":"escape"}
+{"id":5,"cmd":"state"}
+{"id":6,"cmd":"quit"}

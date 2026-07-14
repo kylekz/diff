@@ -842,6 +842,10 @@ impl AppShell {
         let context_lines = self.settings.context_lines;
         let font_size = self.settings.mono_font_size;
         let summary_width = self.settings.summary_width;
+        // Captured before `cx.new`'s closure, whose own `cx` parameter
+        // shadows this one — `self`/this outer `cx` are the only handles on
+        // `AppShell` itself available to hand to the new `Workspace`.
+        let shell = cx.weak_entity();
         let workspace = cx.new(|cx| {
             Workspace::new(
                 location,
@@ -852,6 +856,7 @@ impl AppShell {
                 context_lines,
                 font_size,
                 summary_width,
+                shell,
                 window,
                 cx,
             )
@@ -1467,13 +1472,27 @@ impl AppShell {
         if self.theme_picker.is_some() || self.settings_panel.is_some() {
             return;
         }
+        // Decline while the active workspace's own PR picker is open (review
+        // finding P2: `on_open_pr_picker`'s guard against these two shell
+        // overlays only ran in that one direction — opening ctrl-shift-t
+        // over an already-open PR picker was still possible, painting the
+        // theme picker directly on top of it and, on close, leaving the PR
+        // picker's own bindings live again only after an extra, unexplained
+        // `escape`). Mirrors `on_open_pr_picker`'s `overlay_open` check.
+        if self
+            .active
+            .as_ref()
+            .is_some_and(|ws| ws.read(cx).pr_picker_open())
+        {
+            return;
+        }
         // The sidebar filter popover is a third shell-level overlay that
         // doesn't go through this guard (it's mouse-only, so it never moves
         // focus and this action can fire while it's open) — close it so its
         // full-window backdrop can't end up painted on top of the picker
         // (review finding: the two overlays stacking swallows the picker's
         // first click).
-        self.filter_popover_open = false;
+        self.close_filter_popover(cx);
         let selected = themes::names()
             .position(|n| n == self.settings.theme)
             .unwrap_or(0);
@@ -1672,6 +1691,57 @@ impl AppShell {
         // with Phase 2.
         if let Ok(location) = RepoLocation::from_path_arg(&path.to_string_lossy()) {
             self.open_review(location, DiffSource::WorkingTree, None, None, window, cx);
+        }
+    }
+
+    /// Which focus handle currently owns window focus, as a stable label
+    /// for `--automation` assertions (Phase 7 D0: the PR-picker Enter
+    /// regression was invisible because focus location wasn't assertable).
+    /// `"workspace"` means the active `Workspace`'s own handle holds focus
+    /// (so its `Workspace && PrPickerOpen` Enter binding is on the
+    /// dispatch path); `"shell"` means `AppShell`'s handle (theme picker /
+    /// settings panel); `"none"` otherwise.
+    pub(crate) fn focus_label(&self, window: &Window, cx: &App) -> &'static str {
+        if let Some(ws) = &self.active
+            && ws.focus_handle(cx).is_focused(window)
+        {
+            return "workspace";
+        }
+        if self.focus_handle.is_focused(window) {
+            return "shell";
+        }
+        "none"
+    }
+
+    /// Whether a shell-level overlay that must not be stacked under the PR
+    /// picker is currently open. `Workspace::on_open_pr_picker` consults
+    /// this directly (review finding P3: `shell_focus_handle.is_focused()`
+    /// was a false proxy for "an overlay is open" — ordinary sidebar-chrome
+    /// clicks with no overlay open also bubble focus onto the shell handle,
+    /// since none of that chrome is itself focusable, which silently
+    /// declined a legitimate mouse-triggered PR-picker open). Only the
+    /// theme picker is a genuine stacking hazard (non-modal, so a click can
+    /// reach the "PRs · ctrl-g" hint button behind it); the settings panel
+    /// is a modal `inset_0().occlude()` overlay that click can never reach
+    /// in the first place, but it's included anyway for symmetry with
+    /// `on_open_theme_picker`'s own decline guard.
+    pub(crate) fn overlay_open(&self) -> bool {
+        self.theme_picker.is_some() || self.settings_panel.is_some()
+    }
+
+    /// Closes the sidebar filter popover if open, notifying on change. The
+    /// popover is pure-mouse (no `window.focus` involved, cross-cutting
+    /// risk E), but its `inset_0().occlude()` backdrop is mounted last
+    /// (bottom of `Render for AppShell`) and will paint/hit-test on top of
+    /// whichever overlay opens after it unless that overlay's own opener
+    /// closes this first — `on_open_theme_picker`/`on_open_settings` (this
+    /// file) and `Workspace::on_open_pr_picker` (workspace.rs, via this
+    /// method — `filter_popover_open` itself is private to this module) all
+    /// call this on entry (review finding).
+    pub(crate) fn close_filter_popover(&mut self, cx: &mut Context<Self>) {
+        if self.filter_popover_open {
+            self.filter_popover_open = false;
+            cx.notify();
         }
     }
 
@@ -1991,11 +2061,23 @@ impl AppShell {
         if self.settings_panel.is_some() || self.theme_picker.is_some() {
             return;
         }
+        // Decline while the active workspace's own PR picker is open — same
+        // reasoning and same review finding (P2) as `on_open_theme_picker`'s
+        // matching guard just above; the settings panel's `inset_0().occlude()`
+        // modal would otherwise fully cover the PR picker instead of merely
+        // overlapping it.
+        if self
+            .active
+            .as_ref()
+            .is_some_and(|ws| ws.read(cx).pr_picker_open())
+        {
+            return;
+        }
         // See `on_open_theme_picker`'s matching comment: the filter popover
         // isn't part of this guard's own is_some() checks (mouse-only, no
         // focus move), so it can still be open here — close it so its
         // backdrop doesn't stack on top of the settings panel.
-        self.filter_popover_open = false;
+        self.close_filter_popover(cx);
         let input =
             cx.new(|cx| InputState::new(window, cx).default_value(self.settings.mono_font.clone()));
         let subscription = cx.subscribe_in(
@@ -2484,10 +2566,21 @@ impl AppShell {
             .on_click(cx.listener(|this, _, _, cx| {
                 // Mirror `on_open_theme_picker`/`on_open_settings`'s own
                 // mutual-exclusion guards: don't stack this popover's
-                // full-window backdrop on top of either overlay (review
-                // finding — the button is always rendered, so it's
-                // reachable even while one of them is open).
-                if this.settings_panel.is_some() || this.theme_picker.is_some() {
+                // full-window backdrop on top of any of the other three
+                // overlays (review finding — the button is always
+                // rendered, so it's reachable even while one is open). The
+                // PR picker isn't modal like the other two, so it doesn't
+                // occlude the sidebar and this button stays clickable while
+                // it's up — without this check the filter popover's
+                // `inset_0().occlude()` backdrop, mounted last, would paint
+                // on top of the picker and swallow its first click.
+                if this.settings_panel.is_some()
+                    || this.theme_picker.is_some()
+                    || this
+                        .active
+                        .as_ref()
+                        .is_some_and(|ws| ws.read(cx).pr_picker_open())
+                {
                     return;
                 }
                 this.filter_popover_open = !this.filter_popover_open;

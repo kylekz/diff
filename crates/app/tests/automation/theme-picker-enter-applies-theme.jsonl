@@ -1,0 +1,15 @@
+{"id":1,"cmd":"wait_ready","timeout_ms":20000}
+{"id":2,"cmd":"state"}
+{"id":3,"cmd":"key","keystroke":"ctrl-shift-t"}
+{"id":4,"cmd":"state"}
+{"id":5,"cmd":"key","keystroke":"up"}
+{"id":6,"cmd":"key","keystroke":"up"}
+{"id":7,"cmd":"key","keystroke":"up"}
+{"id":8,"cmd":"key","keystroke":"enter"}
+{"id":9,"cmd":"state"}
+{"id":10,"cmd":"key","keystroke":"ctrl-shift-t"}
+{"id":11,"cmd":"state"}
+{"id":12,"cmd":"key","keystroke":"down"}
+{"id":13,"cmd":"key","keystroke":"enter"}
+{"id":14,"cmd":"state"}
+{"id":15,"cmd":"quit"}

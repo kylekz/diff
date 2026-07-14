@@ -204,13 +204,18 @@ async fn handle(
     match cmd {
         Cmd::State => cx.update_window(window, |_, window, cx| {
             let viewport = window.viewport_size();
+            // The `focus` field (Phase 7 D0) needs `window` to resolve
+            // `is_focused`, which `AppShell::automation_state` doesn't take
+            // — inject it here, where both `window` and `cx` are in scope.
+            let mut shell_state = shell.read(cx).automation_state(cx);
+            shell_state["focus"] = json!(shell.read(cx).focus_label(window, cx));
             json!({
                 "window": {
                     "w": f32::from(viewport.width),
                     "h": f32::from(viewport.height),
                     "scale": window.scale_factor(),
                 },
-                "shell": shell.read(cx).automation_state(cx),
+                "shell": shell_state,
             })
         }),
 

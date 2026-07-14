@@ -228,3 +228,25 @@ that per-slice reviews couldn't see; all fixed. DEFERRED to backlog
 (P3s): read-only thread mutation buttons render but no-op (dim/hide);
 card absolute-timestamp hover tooltip (no tooltip idiom in this crate);
 location-canonicalization double-hydrate; flaky host watch test.
+Phase 7 complete (performance, docs/phase-7-performance.md § Acceptance
+results): seven slices S7-0..S7-6 — fix-first PR-picker Enter regression
+(focus the workspace handle, not the shell; + `state.focus` + committed
+keyboard-dispatch regression scripts under crates/app/tests/automation/)
+(S7-0), perf instrumentation last_switch_ms/last_pr_list_ms/last_pr_open_ms
+(S7-1), PR-picker list cache with stale-while-revalidate (warm ctrl-g
+last_pr_list_ms=0 vs cold ~2378, no spinner) (S7-2), workspace-state LRU
+keeping Workspace entities alive — dual count(6)/byte(128MiB) cap, keyed by
+review id — for instant reactivation (last_switch_ms ~2ms vs cold rebuild)
+(S7-3), background revalidation on reactivation catching Local worktree
+edits (S7-4), content-addressed PR-reopen diff cache keyed by
+(merge_base,head_oid) (S7-5), and audit+eviction-policy docs (S7-6). Honest
+finding: the PR-reopen ROUND-TRIP stays network-bound (content-addressing
+must fetch head_oid to validate) — the win is skipping the tree-sitter diff
+recompute, not a network-free reopen. Caches wire eviction to the existing
+Phase-2 store watcher + Phase-5 worktree watcher (no polling); the LRU
+keeps a parked entity's watchers alive so Phase-2/5 live-update holds while
+parked. Capstone integration review caught 2 cross-slice bugs (stale-theme
+diff on parked-WSL-no-host reactivation; a revalidate/store-watch review-id
+race) — both fixed. DEFERRED (backlog): background the pr_meta fetch for a
+truly instant reopen; runtime-exercise the byte-triggered eviction with a
+large diff.

@@ -16,7 +16,7 @@ use gpui_component::{
     ActiveTheme, Selectable as _, Sizable as _, StyledExt, TitleBar, h_flex, v_flex,
 };
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 
 use crate::recent::RecentStore;
 use crate::settings::{
@@ -570,6 +570,181 @@ pub fn init(cx: &mut App) {
     cx.bind_keys([KeyBinding::new("escape", SettingsClose, settings_panel)]);
 }
 
+/// Maximum number of recently-active workspaces the [`WorkspaceCache`] LRU
+/// keeps alive at once (Phase 7 D1). Also caps concurrent parked
+/// store/worktree watchers — each cached entry's `_watcher`/
+/// `_worktree_watcher` stays subscribed while parked (see
+/// `AppShell::stash_active`), so this is effectively the app's concurrent
+/// WSL-host-watch ceiling too, well within the host's per-distro cap.
+const MAX_CACHED_WORKSPACES: usize = 6;
+/// Maximum total estimated rendered-diff bytes (`Workspace::
+/// estimated_diff_bytes`) across every cached (parked) workspace — a
+/// handful of huge diffs must not blow the memory budget just because
+/// they fit under the count cap above.
+const MAX_CACHE_BYTES: usize = 128 * 1024 * 1024;
+
+/// Retains recently-active-but-not-shown workspaces so switching back to
+/// one paints instantly (Phase 7 deliverable 1) instead of rebuilding from
+/// zero via `Workspace::new`. Strict LRU with a DUAL cap: never more than
+/// `max_entries` entries AND never more than `max_bytes` of estimated
+/// rendered-diff bytes — see [`Self::evict_to_budget`]. Eviction drops the
+/// entry, and with it the LAST strong `Entity<Workspace>` ref for a parked
+/// workspace, tearing down its store/worktree watchers via `Drop`
+/// (cross-cutting risk A — `AppShell::active` is the only other place a
+/// strong ref to a live `Workspace` lives, so between the two there is
+/// never a workspace with zero or two owners). Keyed by review id, not
+/// `RepoLocation` — sidesteps the case-canonicalization hazard the Phase-6
+/// review index already learned to avoid (cross-cutting risk E; see
+/// `AppShell::stash_active`'s doc comment).
+struct WorkspaceCache {
+    entries: HashMap<String, CachedWorkspace>,
+    /// Front = most-recently used, back = evict next.
+    lru: VecDeque<String>,
+    max_entries: usize,
+    max_bytes: usize,
+}
+
+/// One parked workspace kept alive by the [`WorkspaceCache`].
+struct CachedWorkspace {
+    entity: Entity<Workspace>,
+    /// Keeps this PARKED workspace's `ReviewChanged` feeding badges + the
+    /// review index while it isn't active — the single-slot
+    /// `AppShell::_ws_subscription`/`_ws_summary_subscription` only ever
+    /// track the ACTIVE workspace (cross-cutting risk B: `Subscription` is
+    /// a single RAII guard, not a registry, so each parked entry needs its
+    /// own). See `AppShell::on_cached_review_changed`.
+    _sub: Subscription,
+}
+
+impl WorkspaceCache {
+    fn new(max_entries: usize, max_bytes: usize) -> Self {
+        Self {
+            entries: HashMap::new(),
+            lru: VecDeque::new(),
+            max_entries,
+            max_bytes,
+        }
+    }
+
+    /// Remove and return `key`'s cached entry, if any — the reactivation
+    /// path (`AppShell::open_review`'s cache-hit fast path). Drops it out
+    /// of LRU order too; the caller either reinstalls it as active right
+    /// away or lets it fall out of the cache entirely.
+    fn take(&mut self, key: &str) -> Option<CachedWorkspace> {
+        let entry = self.entries.remove(key)?;
+        self.lru.retain(|k| k != key);
+        Some(entry)
+    }
+
+    /// Park `entry` under `key` as most-recently-used.
+    fn insert(&mut self, key: String, entry: CachedWorkspace) {
+        self.lru.retain(|k| k != &key);
+        self.lru.push_front(key.clone());
+        self.entries.insert(key, entry);
+    }
+
+    /// Move the entry stored under `old_key` to `new_key` in place —
+    /// same entity, corrected identity (cross-cutting risk E; see
+    /// `AppShell::on_cached_review_changed`, the only caller). LRU
+    /// position is preserved rather than bumped to MRU: this corrects a
+    /// stale mapping, it isn't a fresh access.
+    ///
+    /// A PARKED entity's own store watcher can drift it onto a review id
+    /// that's ALSO already parked here (two drafts of the same repo, both
+    /// cached, one gets externally deleted and the other's watcher
+    /// re-resolves to the id the sibling already occupies — review
+    /// finding). Without dropping that pre-existing occupant first, the
+    /// plain `entries.insert` below would silently overwrite (and leak —
+    /// its `_sub`/entity torn down outside `evict_to_budget`'s accounting)
+    /// the sibling, while the `lru` rewrite loop leaves TWO occurrences of
+    /// `new_key` against a single `entries` slot, permanently desyncing
+    /// `lru.len()` from `entries.len()`. `drop_stale` is the same teardown
+    /// `AppShell::install_active`'s active-side collision already uses for
+    /// exactly this "resolves to an id already parked" case.
+    fn rekey(&mut self, old_key: String, new_key: String) {
+        let Some(entry) = self.entries.remove(&old_key) else {
+            return;
+        };
+        if new_key != old_key {
+            self.drop_stale(&new_key);
+        }
+        for k in self.lru.iter_mut() {
+            if *k == old_key {
+                *k = new_key.clone();
+            }
+        }
+        self.entries.insert(new_key, entry);
+    }
+
+    /// Drop `key`'s cached entry, if any, without returning it — used when
+    /// the active workspace resolves to a review id that's ALSO (stale-)
+    /// parked here: a non-pinned open (folder picker / `dv pr`) skips the
+    /// pinned-only cache-hit fast path in `AppShell::open_review`, so it
+    /// can build a brand-new live `Workspace` for a review that's already
+    /// sitting cached from an earlier switch-away (P3 review finding). Two
+    /// live entities would otherwise both watch the same review id until
+    /// the next unrelated switch-away silently overwrote one (cross-cutting
+    /// risk A: one strong-ref owner per review) — this closes that window
+    /// as soon as the duplication is detected, from
+    /// `AppShell::install_active`'s `ReviewChanged` closure.
+    fn drop_stale(&mut self, key: &str) {
+        if self.entries.remove(key).is_some() {
+            self.lru.retain(|k| k != key);
+        }
+    }
+
+    /// Estimated total bytes across every cached entry's rendered diffs
+    /// (cross-cutting risk F — `Workspace::estimated_diff_bytes` already
+    /// counts both unified and split rows per entry).
+    fn total_bytes(&self, cx: &App) -> usize {
+        self.entries
+            .values()
+            .map(|e| e.entity.read(cx).estimated_diff_bytes())
+            .sum()
+    }
+
+    /// Every parked entity, for fanning a global settings change (theme,
+    /// context lines, font size) out to workspaces that aren't currently
+    /// active. Without this, a setting changed while a workspace sits
+    /// parked never reaches it — its `RenderedDiff` cache keeps whatever
+    /// colors/hunk-structure it was baked with, and its `context_lines`/
+    /// `font_size` fields stay frozen — so reactivating it later paints
+    /// stale content under the *new* global theme (review finding: visibly
+    /// wrong, potentially low-contrast, until an unrelated file-select
+    /// happens to recompute it). Cloned rather than borrowed: the caller
+    /// needs to call back into each entity with the very `cx` this method
+    /// would otherwise have to borrow from `self` to iterate.
+    fn cached_entities(&self) -> Vec<Entity<Workspace>> {
+        self.entries.values().map(|e| e.entity.clone()).collect()
+    }
+
+    /// Evict least-recently-used entries until both the count and byte
+    /// budgets are satisfied. Each `entries.remove` here is the LAST strong
+    /// `Entity<Workspace>` drop for that parked workspace (cross-cutting
+    /// risk A) — its watchers tear down right here, which is correct: an
+    /// evicted workspace shouldn't keep an OS/host watch running for a
+    /// review nobody can instantly return to anymore.
+    ///
+    /// `total_bytes` is computed once up front rather than re-summed on
+    /// every loop condition check — this runs off `AppShell::stash_active`
+    /// on essentially every switch (the sub-50ms path this slice exists
+    /// for), and re-walking every row of every cached `RenderedDiff` just
+    /// to confirm the byte budget is satisfied — even when nothing needs
+    /// evicting — was an avoidable full-cache traversal (P3 review
+    /// finding). Decremented locally as entries are popped instead.
+    fn evict_to_budget(&mut self, cx: &App) {
+        let mut bytes = self.total_bytes(cx);
+        while self.lru.len() > self.max_entries || bytes > self.max_bytes {
+            let Some(key) = self.lru.pop_back() else {
+                break;
+            };
+            if let Some(entry) = self.entries.remove(&key) {
+                bytes = bytes.saturating_sub(entry.entity.read(cx).estimated_diff_bytes());
+            }
+        }
+    }
+}
+
 pub struct AppShell {
     focus_handle: FocusHandle,
     recent: RecentStore,
@@ -669,6 +844,17 @@ pub struct AppShell {
     /// load, so this alone doesn't mean the workspace has finished loading
     /// (check `workspace.settled`/`workspace.status` for that).
     last_switch_ms: Option<u64>,
+    /// Whether the most recent [`Self::open_review`] reactivated a parked
+    /// [`WorkspaceCache`] entry (`true`) or built a fresh `Workspace` from
+    /// zero (`false`) — Phase 7 D1/D4: the signal `last_switch_ms` alone
+    /// can't give, since a cache MISS can still finish its synchronous body
+    /// quickly (the async load just hasn't landed yet). `None` only before
+    /// the first ever `open_review` call.
+    last_switch_cache_hit: Option<bool>,
+    /// LRU of recently-active workspaces, kept alive so re-selecting one
+    /// paints instantly (Phase 7 deliverable 1). See [`WorkspaceCache`]'s
+    /// doc comment for the eviction policy.
+    workspace_cache: WorkspaceCache,
 }
 
 /// The theme picker overlay, while open.
@@ -759,6 +945,8 @@ impl AppShell {
             settings_panel: None,
             _appearance_subscription: None,
             last_switch_ms: None,
+            last_switch_cache_hit: None,
+            workspace_cache: WorkspaceCache::new(MAX_CACHED_WORKSPACES, MAX_CACHE_BYTES),
         };
         // Live follow-OS updates (docs/phase-4-settings-and-theming.md
         // deliverable 2): `Window::observe_window_appearance`'s registration
@@ -806,16 +994,23 @@ impl AppShell {
         this
     }
 
-    /// Open a review: spin up a fresh Workspace for `location`/`source` and
-    /// focus it so keyboard nav is live. `pending_pr` is only ever `Some` on
-    /// the very first review a freshly launched `dv pr <number|url>` opens.
+    /// Open a review: reactivate a cached workspace if one exists for
+    /// `pinned_review_id` (Phase 7 D1 — [`Self::install_active`]'s doc
+    /// comment covers the shared subscription-wiring; this cache-hit branch
+    /// only does the reactivation-specific bookkeeping), or else spin up a
+    /// fresh `Workspace` for `location`/`source` from zero and focus it so
+    /// keyboard nav is live. `pending_pr` is only ever `Some` on the very
+    /// first review a freshly launched `dv pr <number|url>` opens.
     /// `pinned_review_id`, when set, is an explicit user pick (a sidebar row
     /// click via [`Self::open_review_row`], or `{"cmd":"select_review"}`)
     /// that `Workspace::pick_review` must honor over its own auto-selection
     /// — including a SUBMITTED review, opened read-only
     /// (docs/phase-6-review-navigator.md's headline incident fix). The two
     /// are mutually exclusive by construction: every caller passes at most
-    /// one.
+    /// one — and only a `pinned_review_id` open can ever be a cache hit
+    /// (doc deviation 5: a brand-new repo / `pending_pr` open has no key to
+    /// look up yet, so it keeps today's loading state, though it IS stashed
+    /// on exit by its resolved review id so a later switch-back hits).
     fn open_review(
         &mut self,
         location: RepoLocation,
@@ -833,16 +1028,37 @@ impl AppShell {
         // Persist an absolute path: a relative one (`dv .`) would resolve
         // against whatever cwd the app is next launched from.
         let location = absolutize(location);
+        // Captured BEFORE the assignment below overwrites it — the
+        // self-reselect guard a few lines down needs to know whether
+        // `pinned_review_id` was *already* the active review's id, not
+        // whether it's about to be (those are trivially equal after the
+        // overwrite either way). Requires an actual pin (`pinned_review_id.
+        // is_some()`): `selected_review_id` is `None` for any workspace
+        // with no review loaded yet (a brand-new/unreviewed repo), and
+        // every non-pinned open (New Review picker, `automation_open`, a
+        // bare launch) also passes `pinned_review_id = None` — without this
+        // guard, `None == None` would misfire as "already active" and
+        // silently drop the open of a completely different unreviewed repo
+        // (P1 review finding).
+        let already_active = self.active.is_some()
+            && pinned_review_id.is_some()
+            && self.selected_review_id == pinned_review_id;
         // A pin is known to be the selected review right away; anything
         // else (a brand-new repo, `pending_pr`, a plain re-open) doesn't
         // know which review will actually land until the workspace's own
-        // `ReviewChanged` reports it (see `_ws_subscription`, below).
+        // `ReviewChanged` reports it (see `Self::install_active`, below).
+        // The cache-hit branch below overwrites this with the same value
+        // once the reactivation actually lands.
         self.selected_review_id = pinned_review_id.clone();
         // Review-open refresh (docs/phase-3-github.md deliverable 3): not
         // WSL-skipped — opening this specific review already implies its
         // distro (if any) is live, so there's no cold-boot backlog hazard
         // the way there is walking every recent entry at startup. Full
         // refresh (local + network) — see `refresh_badge`'s doc comment.
+        // Runs on a cache hit too: a parked workspace's own `ReviewChanged`
+        // handler (`Self::on_cached_review_changed`) never fetches remotely
+        // (cross-cutting risk D — no background sweep of the whole cache),
+        // so its badge can be as stale as the last time it was active.
         self.refresh_badge(location.clone(), true, cx);
         // Fold this location's fresh review set into the index right away
         // too — don't wait for the broader `hydrate_index` walk, which may
@@ -851,6 +1067,87 @@ impl AppShell {
         // gotten to it yet. Not WSL-gated, same "opening it implies it's
         // live" reasoning as `refresh_badge`'s `fetch_remote: true` above.
         self.hydrate_index_location(location.clone(), cx);
+
+        // Re-selecting the review that's already active (e.g. clicking its
+        // own already-highlighted sidebar row again) is a content no-op —
+        // the active entity's own live watchers already keep it current, so
+        // there's nothing to reload. The active workspace is never itself
+        // present in `workspace_cache` (only PARKED ones are — see that
+        // struct's doc comment), so without this guard the lookup below
+        // would always miss and fall into the cache-miss path: that would
+        // stash the still-live active entity into the LRU under its own key
+        // (spuriously counting against — and potentially evicting an
+        // unrelated entry from — the eviction budget) AND build a brand-new
+        // duplicate `Workspace` for the same review, leaving two
+        // independently-watching live entities for one review until the
+        // next distinct switch-away silently drops the stale one (review
+        // finding: re-clicking the active row could later resurrect that
+        // stale duplicate instead of the one actually being used).
+        if already_active {
+            if let Some(ws) = &self.active {
+                let handle = ws.focus_handle(cx);
+                window.focus(&handle, cx);
+            }
+            self.last_switch_cache_hit = Some(true);
+            self.last_switch_ms = Some(t0.elapsed().as_millis() as u64);
+            cx.notify();
+            return;
+        }
+
+        // Phase 7 D1 cache-hit fast path: reactivate a parked workspace
+        // instead of rebuilding from zero. Keyed by review id (cross-cutting
+        // risk E) — `pinned_review_id` IS that id for every caller that can
+        // possibly hit (see this method's doc comment).
+        if let Some(key) = pinned_review_id.as_ref()
+            && let Some(cached) = self.workspace_cache.take(key)
+        {
+            self.stash_active(cx);
+            let ws = cached.entity;
+            let handle = ws.focus_handle(cx);
+            // S7-0's fix depends on this: a reactivated entity keeps its
+            // ORIGINAL `FocusHandle` (minted once in its `Workspace::new`),
+            // so the PR picker's `Workspace && PrPickerOpen` Enter binding
+            // (and every other workspace-scoped binding) only dispatches
+            // once this call actually lands focus back on it.
+            window.focus(&handle, cx);
+            // No `pending_pr` on a reactivation — mutually exclusive with
+            // `pinned_review_id` by construction (this method's doc
+            // comment), and there is nothing left to "await" for an entity
+            // that already has a review loaded.
+            self.install_active(ws, None, cx);
+            self.selected_review_id = Some(key.clone());
+            // Reactivating an already-loaded entity emits no `ReviewChanged`
+            // (nothing about it changed) — `install_active`'s closure is the
+            // ONLY place that stamps `last_opened_ms` (via
+            // `self.index.upsert(entry, true)`), and it only runs off a
+            // future event, which a plain reactivation never produces. Stamp
+            // recency explicitly here, mirroring that closure, so a warm
+            // switch-back counts as a real user pick for the sidebar's
+            // recency order the same way a cold open does (review finding:
+            // without this, re-selecting a parked review left it stuck at
+            // its old sidebar position forever, both in-session and across
+            // restarts via the persisted index).
+            if let Some(entry) = self.index.get(key).cloned() {
+                self.index.upsert(entry, true);
+                // Re-dispatch rather than relying on the hydration already
+                // dispatched above (line 984): that one was dispatched
+                // *before* this stamp landed and would apply a pre-bump
+                // snapshot over it (same race `install_active`'s closure
+                // documents for its own upsert-then-hydrate pair) —
+                // `hydrate_index_location` bumps its own generation, so this
+                // call supersedes that stale one.
+                self.hydrate_index_location(location.clone(), cx);
+            }
+            self.last_switch_cache_hit = Some(true);
+            self.last_switch_ms = Some(t0.elapsed().as_millis() as u64);
+            cx.notify();
+            return;
+        }
+
+        // Cache miss (or no key to look up at all) — stash whatever was
+        // active before building the replacement, same as the cache-hit
+        // branch above.
+        self.stash_active(cx);
 
         let view_mode_default = self.settings.view_mode_default;
         let context_lines = self.settings.context_lines;
@@ -877,6 +1174,72 @@ impl AppShell {
         });
         let handle = workspace.focus_handle(cx);
         window.focus(&handle, cx);
+        self.install_active(workspace, pending_pr, cx);
+        self.last_switch_cache_hit = Some(false);
+        self.last_switch_ms = Some(t0.elapsed().as_millis() as u64);
+        cx.notify();
+    }
+
+    /// Stash whatever workspace is currently active into the [`WorkspaceCache`]
+    /// LRU (Phase 7 D1) instead of letting it drop, then evict down to
+    /// budget. Keyed by the OUTGOING workspace's CURRENT review id,
+    /// recomputed here rather than reused from whatever it was
+    /// pinned/loaded with (cross-cutting risk E) — a workspace can switch to
+    /// a *different* review mid-life (the in-app PR picker, a watcher-driven
+    /// reload), and stashing under a stale id would make a later
+    /// switch-back miss the cache. A workspace with no review loaded yet
+    /// (still mid-load, or its store came up empty) has nothing worth
+    /// caching under and is simply dropped, same as before this cache
+    /// existed. Every [`Self::open_review`] call site — cache hit, cache
+    /// miss, and a bare app-launch/`New Review` open with `self.active`
+    /// already `None` (a no-op here) — routes through this so eviction and
+    /// the parked `ReviewChanged` wiring are the single choke point.
+    fn stash_active(&mut self, cx: &mut Context<Self>) {
+        let Some(ws) = self.active.take() else {
+            return;
+        };
+        // These two are single-slot and track only the ACTIVE workspace
+        // (cross-cutting risk B) — clear them before the entity moves into
+        // the cache so a parked workspace's `ReviewChanged` never runs the
+        // active-only closure (which stamps `selected_review_id`/recency —
+        // parked != selected) after this point. `install_active` (for
+        // whatever becomes active next, if anything) installs its own fresh
+        // pair.
+        self._ws_subscription = None;
+        self._ws_summary_subscription = None;
+        let key = ws.read(cx).review().map(|r| r.id.clone());
+        if let Some(key) = key {
+            let sub = cx.subscribe(&ws, Self::on_cached_review_changed);
+            self.workspace_cache.insert(
+                key,
+                CachedWorkspace {
+                    entity: ws,
+                    _sub: sub,
+                },
+            );
+            self.workspace_cache.evict_to_budget(cx);
+        }
+        // else: mid-load or empty-store — nothing worth caching; `ws` drops
+        // here, tearing down its watchers same as it always has.
+    }
+
+    /// Install `ws` as the active workspace: wires the active-only
+    /// `ReviewChanged`/`SummaryWidthChanged` subscriptions and assigns
+    /// `self.active`. The `ReviewChanged` closure is moved here VERBATIM
+    /// from before this slice's refactor (Phase 7 S7-3) — every documented
+    /// invariant (`transient_pr_wait`, `stamped_review_id`, `pending_pr`'s
+    /// two-event handling) is preserved unchanged; only its home moved.
+    /// Callers are responsible for focusing `ws`'s handle and for
+    /// `Self::stash_active`-ing whatever was active before this call — a
+    /// cache-hit reactivation and a brand-new `Workspace::new` both need
+    /// those, but in a different order relative to `ws`'s own construction,
+    /// so neither belongs inside this shared tail.
+    fn install_active(
+        &mut self,
+        workspace: Entity<Workspace>,
+        pending_pr: Option<u64>,
+        cx: &mut Context<Self>,
+    ) {
         // Tracks the review id the *last* recency stamp was for — `None`
         // until the first stamp. Every `ReviewChanged` on the same
         // workspace whose review id is unchanged from the last stamp (a
@@ -959,6 +1322,15 @@ impl AppShell {
                     // row pin, `pick_review`'s auto-selection, or a watcher
                     // swap all funnel through here).
                     this.selected_review_id = Some(review_id.clone());
+                    // See `WorkspaceCache::drop_stale`'s doc comment (P3
+                    // review finding): this workspace is now the one true
+                    // owner of `review_id` — if an earlier switch-away left
+                    // a stale duplicate parked under the same id (reachable
+                    // only via a non-pinned open, which skips the cache-hit
+                    // fast path), drop it now rather than letting it linger
+                    // as a second live watcher until the next unrelated
+                    // switch-away happens to overwrite it.
+                    this.workspace_cache.drop_stale(&review_id);
                     // A `pending_pr` launch (`dv pr <n>`) produces TWO
                     // `ReviewChanged` events for one `open_review` call: the
                     // initial load's own `pick_review` fallback (no PR
@@ -1061,8 +1433,90 @@ impl AppShell {
             },
         ));
         self.active = Some(workspace);
-        self.last_switch_ms = Some(t0.elapsed().as_millis() as u64);
-        cx.notify();
+    }
+
+    /// Lighter `ReviewChanged` handler for a PARKED [`WorkspaceCache`] entry
+    /// (cross-cutting risk B) — keeps its badge and review-index entry
+    /// current while it isn't shown (the Phase-2 store watcher / an agent
+    /// CLI edit still streams in via `Workspace::_watcher`, which stays
+    /// subscribed for as long as the entity is cached; see
+    /// `Self::stash_active`), but deliberately does NOT stamp recency the
+    /// way [`Self::install_active`]'s active-only closure does:
+    /// `selected_review_id` and the sidebar's recency order are the ACTIVE
+    /// workspace's concern only — a parked workspace, by definition, isn't
+    /// what the sidebar currently has selected.
+    fn on_cached_review_changed(
+        &mut self,
+        ws: Entity<Workspace>,
+        _: &ReviewChanged,
+        cx: &mut Context<Self>,
+    ) {
+        let location = ws.read(cx).location().clone();
+        // Cross-cutting risk E again: a PARKED entity's own review can
+        // drift out from under the key it was stashed under — an unpinned
+        // entity's `pick_review` fallback re-floats to a different draft
+        // when a sibling draft appears (or its pinned review is deleted),
+        // and this handler is exactly the signal that a drift happened.
+        // Re-key the cache entry so a later reactivation-by-id
+        // (`Self::open_review`'s `workspace_cache.take(key)`) finds this
+        // entity under the review it's ACTUALLY showing now, instead of
+        // silently reactivating it under a stale id while the sidebar
+        // still highlights the id it was originally parked under (P2
+        // review finding). LRU position is preserved — this is a same-
+        // entity identity fixup, not a new access.
+        if let Some(new_id) = ws.read(cx).review().map(|r| r.id.clone()) {
+            let old_key = self
+                .workspace_cache
+                .entries
+                .iter()
+                .find(|(_, cached)| cached.entity.entity_id() == ws.entity_id())
+                .map(|(k, _)| k.clone());
+            if let Some(old_key) = old_key
+                && old_key != new_id
+            {
+                self.workspace_cache.rekey(old_key, new_id);
+            }
+        }
+        // Local-only, no network (cross-cutting risk D — no background
+        // sweep over the whole cache; see `refresh_badge`'s doc comment for
+        // why `fetch_remote: false` is the right choice for a live-update
+        // subscription regardless of active/parked).
+        self.refresh_badge(location.clone(), false, cx);
+        let entry = {
+            let ws = ws.read(cx);
+            ws.review().map(|review| {
+                // Same pr_status carry-forward as `Self::install_active`'s
+                // active closure — see its doc comment for why this can't
+                // just adopt `this.badges[location].pr` unconditionally.
+                let pr_status = review.remote.as_ref().and_then(|remote| {
+                    self.badges
+                        .get(&location)
+                        .filter(|b| b.pr_number == Some(remote.pr))
+                        .and_then(|b| b.pr)
+                        .map(|pr| dv_core::CachedPrStatus {
+                            state: pr.state,
+                            is_draft: pr.is_draft,
+                            decision: pr.decision,
+                            checks: pr.checks,
+                        })
+                        .or_else(|| self.index.get(&review.id).and_then(|e| e.pr_status.clone()))
+                });
+                let mut entry = dv_core::IndexEntry::from_review(&location, review);
+                entry.pr_status = pr_status;
+                entry
+            })
+        };
+        if let Some(entry) = entry {
+            // `opened: false` — reactivation (which stamps `true`) happens
+            // through `Self::open_review`'s cache-hit branch instead, once
+            // this entry is actually selected again, not on every live edit
+            // while it merely sits parked.
+            self.index.upsert(entry, false);
+            self.hydrate_index_location(location, cx);
+        }
+        // No `else` clearing `selected_review_id` here (unlike the active
+        // closure) — a parked entry's review store going empty says nothing
+        // about what the sidebar currently has selected.
     }
 
     /// Recompute one entry's badge off-thread (store I/O may hit WSL):
@@ -1619,9 +2073,32 @@ impl AppShell {
         // UI chrome picks up the new theme for free (reads `cx.theme()`
         // fresh every render), but the active workspace's diff pane cached
         // its syntax highlighting with the *old* theme's concrete colors
-        // baked in — see `Workspace::on_theme_changed`.
+        // baked in — see `Workspace::on_theme_changed`. `eager: true`: the
+        // user is looking at this one right now, so recompute unconditionally
+        // regardless of WSL host reachability (review finding — gating this
+        // on `has_running_host` left the visible diff pane silently
+        // blank/stale whenever the distro had no *host* connection, even
+        // though `request_diff`'s own per-command `wsl.exe` fallback would
+        // have worked fine).
         if let Some(ws) = &self.active {
-            ws.update(cx, |ws, cx| ws.on_theme_changed(cx));
+            ws.update(cx, |ws, cx| ws.on_theme_changed(true, cx));
+        }
+        // Every PARKED workspace's diff pane has the exact same stale-bake
+        // problem — it just isn't on screen right now (review finding: a
+        // theme change made while workspace B is active left A's cached
+        // rows painted in the OLD theme when A was later reactivated,
+        // since only `self.active` ever got `on_theme_changed`). Safe to
+        // fan out unconditionally to every cached entry regardless of
+        // location/host state: `eager: false` makes
+        // `Workspace::invalidate_diff_cache` gate the actual git-touching
+        // recompute on the repo being reachable (cross-cutting risk D — a
+        // stopped WSL distro must never get booted just to repaint a
+        // workspace nobody is looking at), so this loop only ever does
+        // cheap in-memory cache invalidation for an unreachable parked
+        // entry — and leaves the existing (stale) cache alone rather than
+        // clearing it with nothing to replace it when unreachable.
+        for ws in self.workspace_cache.cached_entities() {
+            ws.update(cx, |ws, cx| ws.on_theme_changed(false, cx));
         }
     }
 
@@ -1780,6 +2257,23 @@ impl AppShell {
             // body only — see the field's doc comment for what a small
             // value here does and doesn't prove.
             "last_switch_ms": self.last_switch_ms,
+            // Phase 7 D1 instrumentation: whether that switch reactivated a
+            // parked `WorkspaceCache` entry (`true`) or built a fresh
+            // `Workspace` from zero (`false`) — see the field's doc comment
+            // for why `last_switch_ms` alone can't tell a script this.
+            "last_switch_cache_hit": self.last_switch_cache_hit,
+            // Phase 7 D1: the workspace LRU's live occupancy, for asserting
+            // the dual count/byte budget holds (`entries <= max_entries`,
+            // `bytes <= max_bytes`, always) and that eviction actually drops
+            // entries — `keys` (review ids, MRU-first) lets a script check
+            // *which* entry survived a forced eviction.
+            "workspace_cache": json!({
+                "entries": self.workspace_cache.entries.len(),
+                "bytes": self.workspace_cache.total_bytes(cx),
+                "keys": self.workspace_cache.lru.iter().collect::<Vec<_>>(),
+                "max_entries": self.workspace_cache.max_entries,
+                "max_bytes": self.workspace_cache.max_bytes,
+            }),
             // The sidebar's actual rendered row list (docs/phase-6-review-
             // navigator.md deliverables 3/4), in render order — filtered by
             // `settings.sidebar_filters` and, when `sidebar_grouping` isn't
@@ -2159,7 +2653,17 @@ impl AppShell {
         self.settings.context_lines = n;
         self.settings.save();
         if let Some(ws) = &self.active {
-            ws.update(cx, |ws, cx| ws.set_context_lines(n, cx));
+            ws.update(cx, |ws, cx| ws.set_context_lines(n, true, cx));
+        }
+        // Same staleness problem as `Self::apply_resolved_theme` (review
+        // finding), but sharper here: an unstamped parked workspace's
+        // `context_lines` field itself is wrong, not just its baked colors,
+        // so even a lazily-recomputed unselected file would use the old
+        // value until this runs. Same `eager: false` host-reachability gate
+        // on the eager recompute as the theme case — see
+        // `Workspace::invalidate_diff_cache`.
+        for ws in self.workspace_cache.cached_entities() {
+            ws.update(cx, |ws, cx| ws.set_context_lines(n, false, cx));
         }
         cx.notify();
     }
@@ -2197,6 +2701,12 @@ impl AppShell {
         self.settings.mono_font_size = size;
         self.settings.save();
         if let Some(ws) = &self.active {
+            ws.update(cx, |ws, cx| ws.set_font_size(size, cx));
+        }
+        // Same reasoning as `Self::set_context_lines` — a parked workspace's
+        // `font_size` field is frozen otherwise, so reactivating it later
+        // paints rows measured for the old size (review finding).
+        for ws in self.workspace_cache.cached_entities() {
             ws.update(cx, |ws, cx| ws.set_font_size(size, cx));
         }
         cx.notify();

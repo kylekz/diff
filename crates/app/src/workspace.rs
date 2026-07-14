@@ -204,6 +204,48 @@ struct RenderedDiff {
     error: bool,
 }
 
+impl RenderedDiff {
+    /// Estimated heap footprint of this one cached diff — text bytes plus a
+    /// rough per-row/per-run overhead, not an exact allocator accounting.
+    /// Feeds [`Workspace::estimated_diff_bytes`], the S7-3 workspace LRU's
+    /// memory budget. Counts BOTH `unified` AND `split` (cross-cutting risk
+    /// F: split view doubles the per-file footprint — old side and new side
+    /// each carry their own text/runs — so a diff viewed in split mode
+    /// costs roughly twice what unified-only would suggest).
+    fn estimated_bytes(&self) -> usize {
+        let unified: usize = self
+            .unified
+            .iter()
+            .map(|r| match r {
+                Row::Line { text, runs, .. } => {
+                    text.len() + runs.len() * std::mem::size_of::<(Range<usize>, HighlightStyle)>()
+                }
+                Row::HunkHeader { label, .. } => label.len(),
+                Row::Binary | Row::NoChanges => 0,
+            })
+            .sum::<usize>()
+            + self.unified.len() * std::mem::size_of::<Row>();
+        let split: usize = self
+            .split
+            .iter()
+            .map(|r| match r {
+                SplitRow::Pair { left, right } => [left, right]
+                    .iter()
+                    .flat_map(|c| c.iter())
+                    .map(|c| {
+                        c.text.len()
+                            + c.runs.len() * std::mem::size_of::<(Range<usize>, HighlightStyle)>()
+                    })
+                    .sum::<usize>(),
+                SplitRow::HunkHeader { label, .. } => label.len(),
+                SplitRow::Binary | SplitRow::NoChanges => 0,
+            })
+            .sum::<usize>()
+            + self.split.len() * std::mem::size_of::<SplitRow>();
+        unified + split + (self.hunk_rows_unified.len() + self.hunk_rows_split.len()) * 8
+    }
+}
+
 /// Which side of the diff a line (and so a comment anchor) lives on.
 /// Mirrors dv-core's review-side notion; unified rows resolve to New when
 /// the line exists there, Old only for pure removals.
@@ -1627,6 +1669,17 @@ impl Workspace {
         &self.location
     }
 
+    /// Estimated bytes of every cached [`RenderedDiff`] this workspace is
+    /// holding right now — what the S7-3 `AppShell::WorkspaceCache` LRU
+    /// budgets against (`pub(crate)` so `shell.rs` can read it without a
+    /// getter round trip through a private field). Cross-cutting risk F: a
+    /// PR-reopen diff cache would need to be folded in here too so the
+    /// budget doesn't silently undercount — none exists yet as of this
+    /// slice.
+    pub(crate) fn estimated_diff_bytes(&self) -> usize {
+        self.diffs.values().map(|d| d.estimated_bytes()).sum()
+    }
+
     /// Whether this workspace's own PR picker overlay is currently open.
     /// `pub(crate)` so `AppShell::on_open_theme_picker`/`on_open_settings`
     /// can decline opening a shell-level overlay on top of it (review
@@ -1818,8 +1871,12 @@ impl Workspace {
     /// visually complete immediately; any other (currently unselected) file
     /// simply recomputes lazily — under the new theme — the next time it's
     /// picked, same as a first-ever view of it.
-    pub(crate) fn on_theme_changed(&mut self, cx: &mut Context<Self>) {
-        self.invalidate_diff_cache(cx);
+    /// `eager` distinguishes the ACTIVE workspace (always `true`) from a
+    /// PARKED fan-out entry (always `false`) — see
+    /// [`Self::invalidate_diff_cache`]'s doc comment for why the two must
+    /// not share the same recompute policy.
+    pub(crate) fn on_theme_changed(&mut self, eager: bool, cx: &mut Context<Self>) {
+        self.invalidate_diff_cache(eager, cx);
     }
 
     /// Drop every cached [`RenderedDiff`] and recompute the currently
@@ -1828,12 +1885,55 @@ impl Workspace {
     /// changed, so the cache is stale in a much more literal sense). Any
     /// other (currently unselected) file simply recomputes lazily under the
     /// new settings the next time it's picked, same as a first-ever view.
-    fn invalidate_diff_cache(&mut self, cx: &mut Context<Self>) {
+    ///
+    /// This also runs for PARKED workspaces (`AppShell::apply_resolved_theme`/
+    /// `set_context_lines` fan out to every cached entry, not just
+    /// `self.active` — see those methods' doc comments), and the two cases
+    /// need different policies:
+    ///
+    /// - `eager == true` (the ACTIVE workspace, on screen right now) always
+    ///   clears and recomputes unconditionally, exactly as before this
+    ///   cache existed. `request_diff` already falls back safely to a
+    ///   per-command `wsl.exe -d <distro>` when there's no live host
+    ///   connection — that's the same fallback every other selection-driven
+    ///   diff load uses — so there is no boot-storm risk here: the user is
+    ///   actively looking at this repo, so its distro is already live in
+    ///   practice (review finding: gating this on `has_running_host` left
+    ///   the ACTIVE diff pane silently blank/stale whenever the distro had
+    ///   no *host* connection, even though ordinary git access worked fine).
+    /// - `eager == false` (a parked fan-out entry nobody is looking at)
+    ///   gates the recompute on the repo actually being reachable without
+    ///   side effects: for a `RepoLocation::Wsl` whose distro has no live
+    ///   host connection, `request_diff` would shell `wsl.exe -d <distro>`,
+    ///   which boots a stopped distro as a side effect of a routine
+    ///   theme/context-lines change on a workspace nobody is even looking at
+    ///   (cross-cutting risk D — the same boot-storm hazard
+    ///   `AppShell::refresh_all_badges` guards against via
+    ///   `has_running_host`). When the host isn't reachable, the existing
+    ///   cache is left in place (stale bake/hunks) rather than cleared with
+    ///   nothing to replace it — a cache-hit reactivation
+    ///   (`AppShell::open_review`'s pinned-key fast path) never re-selects
+    ///   or otherwise retries the request, so clearing here without
+    ///   recomputing would leave the pane permanently blank until the user
+    ///   manually reselects the file (review finding). The stale-but-cached
+    ///   rows get a real recompute the next time this entity is genuinely
+    ///   reselected, same as any workspace that's simply never been
+    ///   switched to since the theme/context change.
+    fn invalidate_diff_cache(&mut self, eager: bool, cx: &mut Context<Self>) {
         self.highlight_epoch += 1;
-        self.diffs.clear();
-        self.diff_pending.clear();
-        if let Some(index) = self.selected {
-            self.request_diff(index, cx);
+        let host_reachable = eager
+            || match &self.location {
+                RepoLocation::Wsl { distro, .. } => {
+                    dv_core::remote::manager::has_running_host(distro)
+                }
+                RepoLocation::Local(_) => true,
+            };
+        if host_reachable {
+            self.diffs.clear();
+            self.diff_pending.clear();
+            if let Some(index) = self.selected {
+                self.request_diff(index, cx);
+            }
         }
         cx.notify();
     }
@@ -1841,12 +1941,18 @@ impl Workspace {
     /// Settings-panel/`set_setting` live update for "Context lines" — see
     /// `settings::Settings::context_lines`. A no-op when unchanged, so a
     /// stepper click that hits a clamp boundary doesn't pay for a recompute.
-    pub(crate) fn set_context_lines(&mut self, context_lines: u32, cx: &mut Context<Self>) {
+    /// `eager` — see [`Self::on_theme_changed`]/[`Self::invalidate_diff_cache`].
+    pub(crate) fn set_context_lines(
+        &mut self,
+        context_lines: u32,
+        eager: bool,
+        cx: &mut Context<Self>,
+    ) {
         if self.context_lines == context_lines {
             return;
         }
         self.context_lines = context_lines;
-        self.invalidate_diff_cache(cx);
+        self.invalidate_diff_cache(eager, cx);
     }
 
     /// Settings-panel/`set_setting` live update for "Font size" — see

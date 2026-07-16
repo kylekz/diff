@@ -129,5 +129,9 @@
       "variable.special": { "color": "#cda35a" },
       "variant": { "color": "#6fa8a0" }
     }
+  },
+  "dv": {
+    "recess_bg": "#191817",
+    "text_secondary": "#c5c3bc"
   }
 }

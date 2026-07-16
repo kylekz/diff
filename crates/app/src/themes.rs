@@ -115,10 +115,12 @@ pub fn apply_theme(name: &str, mono_font: &str, window: Option<&mut Window>, cx:
 /// The alpha-composite tokens (word tints, `void_bg`, `backdrop`) are always
 /// *computed*, never stored.
 ///
-/// This slice (R1a) lands the tokens and their derivation only — no render
-/// call site reads them yet, hence the blanket `allow(dead_code)` below;
-/// R1b onward (pill/badge unification, title bar, diff pane, sidebar) is
-/// where every field gets a consumer.
+/// R1a landed the tokens and their derivation only; R1b is the first
+/// consumer (`shell::state_pill`'s `accent_alt` use for the merged-PR /
+/// renamed-file pill). The other fields (`recess_bg`, `text_secondary`,
+/// the word tints, `void_bg`, `backdrop`) still have no render call site —
+/// title bar, diff pane, and sidebar restyles (R1c-R1e) are where those get
+/// consumers — hence the blanket `allow(dead_code)` staying put below.
 #[allow(dead_code)]
 #[derive(Debug, Clone, Copy)]
 pub struct DvTheme {
@@ -222,8 +224,7 @@ impl DvTheme {
 /// before the first [`apply_theme`] (mirrors `Theme::global`'s own contract —
 /// there is always a theme applied before any window exists).
 ///
-/// No call site yet — R1b onward is where the restyle starts reading this.
-#[allow(dead_code)]
+/// First read at R1b (`shell::state_pill`'s callers, for `accent_alt`).
 pub fn dv_theme(cx: &App) -> &DvTheme {
     cx.global::<DvTheme>()
 }

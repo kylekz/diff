@@ -13,6 +13,7 @@ use gpui::prelude::FluentBuilder;
 use gpui::*;
 use gpui_component::button::{Button, ButtonVariants};
 use gpui_component::input::{Input, InputEvent, InputState};
+use gpui_component::tag::Tag;
 use gpui_component::{
     ActiveTheme, Selectable as _, Sizable as _, StyledExt, TitleBar, h_flex, v_flex,
 };
@@ -552,14 +553,29 @@ pub(crate) fn relative_age(updated_ms: u64) -> String {
     }
 }
 
-/// Sidebar PR-status glyph cluster: state dot (draft/open/merged/closed),
-/// review-decision marker, CI marker — subtle, one glyph each. The state
-/// glyph and the CI marker deliberately use different shapes (round dot vs.
-/// small square), not just different colors — an open PR (green ●) with
-/// passing checks (used to also be a green ●) was otherwise two
-/// indistinguishable dots side by side (review finding P3-2, from the
-/// retired per-repo `render_recent_row`; this is that same cluster,
-/// factored out for [`AppShell::render_review_card`]).
+/// The one pill recipe every state indicator in the app renders through —
+/// PR state, file status, review-decision and submitted-review markers
+/// alike — so a color and a label always render identically: `Tag::custom
+/// (color @ 0.15, color, color @ 0.4).small()`, the one badge/pill recipe.
+/// `Tag`'s `Custom` variant uses `color` verbatim for the background (see
+/// gpui-component's `TagVariant::bg`), so the caller passes the
+/// *already-tinted* background, not the base hue.
+pub(crate) fn state_pill(color: Hsla, label: impl Into<SharedString>) -> Tag {
+    Tag::custom(color.opacity(0.15), color, color.opacity(0.4))
+        .small()
+        .child(label.into())
+}
+
+/// Sidebar PR-status pill cluster: state (draft/open/merged/closed),
+/// review-decision marker, CI marker. Colors per the
+/// Badges/pills' mapping (open=success, merged=`accent_alt`, closed=danger,
+/// draft=muted): the merged badge deliberately shares the "purple link"
+/// hue with the renamed-file pill (`render_file_row`) rather than reusing
+/// `primary` as the old glyph cluster did. The decision and CI markers keep
+/// their own compact glyphs (✓/±/▪) rather than spelling out full words —
+/// unlike the title bar (R1c), this cluster can carry three pills at once
+/// in a two-line sidebar card, so content stays short by design (the
+/// slice's own flagged risk: pill weight overpowering a dense row).
 #[allow(clippy::too_many_arguments)]
 fn render_pr_glyphs(
     is_draft: bool,
@@ -568,20 +584,20 @@ fn render_pr_glyphs(
     checks: ChecksSummary,
     muted: Hsla,
     success: Hsla,
-    primary: Hsla,
     danger: Hsla,
     warning: Hsla,
+    accent_alt: Hsla,
 ) -> impl IntoElement {
-    let (state_glyph, state_color) = if is_draft {
-        ("\u{25d0}", muted) // draft
+    let (state_label, state_color) = if is_draft {
+        ("draft", muted)
     } else {
         match state {
-            PrState::Merged => ("\u{21d7}", primary), // merged
-            PrState::Open => ("\u{25cf}", success),   // open
-            PrState::Closed => ("\u{25cf}", danger),  // closed
+            PrState::Merged => ("merged", accent_alt),
+            PrState::Open => ("open", success),
+            PrState::Closed => ("closed", danger),
         }
     };
-    let decision_glyph = match decision {
+    let decision_pill = match decision {
         Some(ReviewDecision::Approved) => Some(("\u{2713}", success)),
         Some(ReviewDecision::ChangesRequested) => Some(("\u{b1}", danger)),
         Some(ReviewDecision::ReviewRequired) | None => None,
@@ -597,14 +613,13 @@ fn render_pr_glyphs(
         .flex_none()
         .gap_1()
         .items_center()
-        .text_xs()
-        .child(div().text_color(state_color).child(state_glyph))
-        .children(decision_glyph.map(|(glyph, color)| div().text_color(color).child(glyph)))
-        .children(
-            // Small square (▪), not a dot — see the doc comment above on
-            // why this must not share the state glyph's shape.
-            ci_color.map(|color| div().text_color(color).child("\u{25aa}")),
-        )
+        .child(state_pill(state_color, state_label))
+        .children(decision_pill.map(|(glyph, color)| state_pill(color, glyph)))
+        // Small square (▪), not a dot — kept from the old glyph cluster so
+        // the CI marker never reads as a second, indistinguishable copy of
+        // the state pill's own color (review finding P3-2, from the retired
+        // per-repo `render_recent_row`; this is that same cluster).
+        .children(ci_color.map(|color| state_pill(color, "\u{25aa}")))
 }
 
 pub fn init(cx: &mut App) {
@@ -3723,6 +3738,7 @@ impl AppShell {
         let success = theme.success;
         let warning = theme.warning;
         let danger = theme.danger;
+        let accent_alt = themes::dv_theme(cx).accent_alt;
 
         let review_id = entry.review_id.clone();
         let repo = dv_core::repo_label(&entry.location, entry.remote.as_ref());
@@ -3790,28 +3806,15 @@ impl AppShell {
                                     pr.checks,
                                     muted,
                                     success,
-                                    primary,
                                     danger,
                                     warning,
+                                    accent_alt,
                                 )
                             }))
                             .child(if open_comments > 0 {
-                                div()
-                                    .flex_none()
-                                    .px_1p5()
-                                    .rounded_full()
-                                    .bg(primary.opacity(0.25))
-                                    .text_xs()
-                                    .text_color(primary)
-                                    .child(format!("{open_comments}"))
-                                    .into_any_element()
+                                state_pill(primary, format!("{open_comments}")).into_any_element()
                             } else if submitted {
-                                div()
-                                    .flex_none()
-                                    .text_xs()
-                                    .text_color(success)
-                                    .child("\u{2713}")
-                                    .into_any_element()
+                                state_pill(success, "\u{2713}").into_any_element()
                             } else {
                                 div().into_any_element()
                             }),

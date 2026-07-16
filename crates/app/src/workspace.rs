@@ -7027,9 +7027,13 @@ impl Workspace {
 
     /// The compact PR header band, shown above the diff area whenever a PR
     /// is open (docs/phase-3-github.md deliverable 2): `#N title`, author,
-    /// `base ← head`, a state chip, a CI dot, the review decision, and a
-    /// "details" toggle that expands the PR body underneath.
+    /// `base ← head`, a state pill, a CI pill, a review-decision pill, and a
+    /// "details" toggle that expands the PR body underneath. Same
+    /// `state_pill` recipe as the sidebar's `render_pr_glyphs` (R1b review
+    /// finding: this band used to render checks/decision as a bare glyph and
+    /// plain text while the sidebar had already moved to pills).
     fn render_pr_header(&self, cx: &mut Context<Self>) -> Option<Div> {
+        use crate::shell::state_pill;
         use gpui_component::Sizable as _;
         use gpui_component::button::{Button, ButtonVariants as _};
         let pr = self.pr.as_ref()?;
@@ -7045,20 +7049,19 @@ impl Workspace {
         let success = theme.success;
         let danger = theme.danger;
         let warning = theme.warning;
-        // `accent_foreground` (near-white) reads as barely distinct from
-        // DRAFT's gray chip. The Aura theme has no dedicated magenta/violet
-        // token, but `primary` (`#a277ff`, a violet) already *is* the
-        // theme's accent color and isn't used by any other chip/glyph in
-        // this header — closest match to GitHub's purple "Merged" badge.
-        let merged = theme.primary;
+        // Same "purple link" hue as the sidebar's PR state pill
+        // (`shell::render_pr_glyphs`) and the renamed-file pill
+        // (`render_file_row`) — one recipe, one color per state everywhere
+        // it's shown (the badge-mapping rule).
+        let merged = crate::themes::dv_theme(cx).accent_alt;
 
         let (chip_label, chip_color) = if pr.is_draft {
-            ("DRAFT", muted)
+            ("draft", muted)
         } else {
             match pr.state {
-                PrState::Open => ("OPEN", success),
-                PrState::Merged => ("MERGED", merged),
-                PrState::Closed => ("CLOSED", danger),
+                PrState::Open => ("open", success),
+                PrState::Merged => ("merged", merged),
+                PrState::Closed => ("closed", danger),
             }
         };
         let checks_glyph = match pr.checks {
@@ -7102,24 +7105,13 @@ impl Workspace {
                                 .child(format!("#{number}")),
                         )
                         .child(div().flex_1().min_w(px(0.)).truncate().child(title))
-                        .child(
-                            div()
-                                .flex_none()
-                                .px_1p5()
-                                .rounded_full()
-                                .text_xs()
-                                .bg(chip_color.opacity(0.16))
-                                .text_color(chip_color)
-                                .child(chip_label),
+                        .child(state_pill(chip_color, chip_label).flex_none())
+                        .children(
+                            checks_glyph.map(|(glyph, color)| state_pill(color, glyph).flex_none()),
                         )
                         .children(
-                            checks_glyph.map(|(glyph, color)| {
-                                div().flex_none().text_color(color).child(glyph)
-                            }),
+                            decision.map(|(label, color)| state_pill(color, label).flex_none()),
                         )
-                        .children(decision.map(|(label, color)| {
-                            div().flex_none().text_xs().text_color(color).child(label)
-                        }))
                         .child(
                             div()
                                 .flex_none()
@@ -7176,6 +7168,8 @@ impl Workspace {
     /// as [`Self::render_palette`], but no text input — a background `gh pr
     /// list` call and up/down/enter/escape over whatever it returns.
     fn render_pr_picker(&self, cx: &mut Context<Self>) -> Option<Div> {
+        use crate::shell::state_pill;
+
         let picker = self.pr_picker.as_ref()?;
 
         let theme = cx.theme();
@@ -7297,13 +7291,7 @@ impl Workspace {
                                             .child(pr.title.clone()),
                                     )
                                     .when(pr.is_draft, |el| {
-                                        el.child(
-                                            div()
-                                                .flex_none()
-                                                .text_xs()
-                                                .text_color(muted)
-                                                .child("draft"),
-                                        )
+                                        el.child(state_pill(muted, "draft").flex_none())
                                     })
                                     .child(
                                         div()
@@ -7379,15 +7367,28 @@ impl Workspace {
     }
 
     fn render_file_row(&self, index: usize, cx: &mut Context<Self>) -> impl IntoElement + use<> {
+        use crate::shell::state_pill;
+
         let file = &self.files[index];
         let theme = cx.theme();
         let selected = self.selected == Some(index);
+        // Colors snapshotted up front alongside `theme`'s fields (both plain
+        // `&Theme`/`&DvTheme` reads, so they coexist fine) — the `cx.listener`
+        // below needs `cx` mutably, so nothing borrowed from it can still be
+        // live by then (this file's usual gpui gotcha).
+        let accent_alt = crate::themes::dv_theme(cx).accent_alt;
+        // Badge-mapping rule: renamed shares the
+        // merged-PR pill's `accent_alt` "purple link" hue (`shell::
+        // render_pr_glyphs`); copied is grouped with it (also a path-linkage
+        // status, no separate slot in the spec's table). Type-change/unmerged/
+        // unknown aren't in that table either — kept at their pre-restyle
+        // colors (the same warning/danger/muted buckets they already used).
         let (glyph, color) = match file.status {
             ChangeStatus::Added => ("A", theme.success),
             ChangeStatus::Deleted => ("D", theme.danger),
-            ChangeStatus::Renamed => ("R", theme.info),
-            ChangeStatus::Copied => ("C", theme.info),
-            ChangeStatus::Modified => ("M", theme.warning),
+            ChangeStatus::Renamed => ("R", accent_alt),
+            ChangeStatus::Copied => ("C", accent_alt),
+            ChangeStatus::Modified => ("M", theme.primary),
             ChangeStatus::TypeChanged => ("T", theme.warning),
             ChangeStatus::Unmerged => ("U", theme.danger),
             ChangeStatus::Unknown(_) => ("?", theme.muted_foreground),
@@ -7410,14 +7411,7 @@ impl Workspace {
                 MouseButton::Left,
                 cx.listener(move |this, _, window, cx| this.select_file(index, window, cx)),
             )
-            .child(
-                div()
-                    .w_4()
-                    .flex_none()
-                    .font_family(theme.mono_font_family.clone())
-                    .text_color(color)
-                    .child(glyph),
-            )
+            .child(state_pill(color, glyph).flex_none())
             .child(div().text_sm().truncate().child(label))
     }
 

@@ -1369,6 +1369,11 @@ impl AppShell {
         // pair.
         self._ws_subscription = None;
         self._ws_summary_subscription = None;
+        // Parking is not closing — but a live vtsls child must not outlive
+        // the switch-away just because the LRU keeps this entity around
+        // for instant reactivation (P3 finding: `Workspace::park_lsp_session`'s
+        // doc comment).
+        ws.update(cx, |ws, cx| ws.park_lsp_session(cx));
         let key = ws.read(cx).review().map(|r| r.id.clone());
         if let Some(key) = key {
             let sub = cx.subscribe(&ws, Self::on_cached_review_changed);

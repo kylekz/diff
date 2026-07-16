@@ -9,6 +9,7 @@ anyhow.workspace = true
 base64.workspace = true
 dirs = "6.0.0"
 imara-diff = "0.2.0"
+lsp-types.workspace = true
 notify.workspace = true
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.150"

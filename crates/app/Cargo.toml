@@ -8,6 +8,7 @@ publish.workspace = true
 anyhow.workspace = true
 dv-cli.workspace = true
 dv-core.workspace = true
+lsp-types.workspace = true
 gpui.workspace = true
 gpui_platform.workspace = true
 gpui-component.workspace = true

@@ -1,5 +1,7 @@
+use std::cell::Cell;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::ops::Range;
+use std::rc::Rc;
 use std::sync::Arc;
 
 use dv_cli::submit::{self, SubmissionOutcome, Violation};
@@ -42,7 +44,17 @@ actions!(
         PrPickerPrev,
         PrPickerClose,
         PrPickerChoose,
-        RefreshPr
+        RefreshPr,
+        // S8f (docs/phase-8-lsp-and-polish.md § LSP): read-only target-viewer
+        // navigation. `NavBack`/`NavForward` walk `Workspace::nav_stack`
+        // (populated by go-to-definition jumps); `CloseTargetViewer` closes
+        // the overlay `render_target_viewer` paints. Not gated behind the
+        // `automation` feature — this is real product surface, not a test
+        // seam (mirrors `JumpToFile`/`OpenPrPicker` sitting in this same
+        // ungated list).
+        NavBack,
+        NavForward,
+        CloseTargetViewer
     ]
 );
 
@@ -80,18 +92,54 @@ fn row_height(font_size: f32) -> f32 {
 fn gutter_width(font_size: f32) -> f32 {
     font_size * 3.5
 }
+
+/// Byte offset → UTF-16 code-unit count, up to (and excluding) `byte_offset`
+/// — LSP's `Position.character` is defined in UTF-16 code units regardless
+/// of source encoding (the client never advertised `positionEncoding:
+/// "utf-8"` in `initialize`, so the server defaults to UTF-16; see
+/// `dv_core::lsp::client`'s `initialize` params). Byte offset and UTF-16
+/// count coincide for plain ASCII (the overwhelming common case for a
+/// clicked identifier), but this converts correctly regardless.
+fn utf16_column(text: &str, byte_offset: usize) -> u32 {
+    let clamped = byte_offset.min(text.len());
+    match text.get(..clamped) {
+        Some(prefix) => prefix.encode_utf16().count() as u32,
+        // `byte_offset` landed mid-character (shouldn't happen — it comes
+        // from `hit_test_byte_column`'s glyph-index lookup, which only ever
+        // returns a char-boundary-aligned byte offset) — back up to the
+        // nearest valid boundary rather than panic.
+        None => {
+            let mut boundary = clamped;
+            while boundary > 0 && !text.is_char_boundary(boundary) {
+                boundary -= 1;
+            }
+            text[..boundary].encode_utf16().count() as u32
+        }
+    }
+}
 /// Extra identifier stamped onto the workspace node while the jump-to-file
 /// palette is open. Single-char bindings are scoped to `!PaletteOpen` so
 /// they keep bubbling into the palette's text input instead of firing.
 const PALETTE_CONTEXT: &str = "PaletteOpen";
 /// Same mechanism as [`PALETTE_CONTEXT`], for the PR picker (`ctrl-g`).
 const PR_PICKER_CONTEXT: &str = "PrPickerOpen";
+/// Stamped onto the workspace node while the S8f read-only target viewer
+/// (`Workspace::target_viewer`) is open — scopes its `escape`-to-close
+/// binding the same way [`PALETTE_CONTEXT`] scopes the palette's.
+const TARGET_VIEWER_CONTEXT: &str = "TargetViewerOpen";
 
 pub fn init(cx: &mut App) {
-    let browse = Some("Workspace && !PaletteOpen && !EditorOpen && !PrPickerOpen");
+    let browse =
+        Some("Workspace && !PaletteOpen && !EditorOpen && !PrPickerOpen && !TargetViewerOpen");
     let palette = Some("Workspace && PaletteOpen");
     let editor = Some("Workspace && EditorOpen");
     let pr_picker = Some("Workspace && PrPickerOpen");
+    let target_viewer = Some("Workspace && TargetViewerOpen");
+    // Nav back/forward (S8f) stay live both while browsing the diff AND
+    // while the target viewer itself is open (jumping BACK from a target
+    // viewer to the diff is the common case) — everything `browse` excludes
+    // except `TargetViewerOpen`.
+    let nav = Some("Workspace && !PaletteOpen && !EditorOpen && !PrPickerOpen");
     cx.bind_keys([KeyBinding::new("escape", CancelComment, editor)]);
     cx.bind_keys([
         KeyBinding::new("j", NextFile, browse),
@@ -114,6 +162,11 @@ pub fn init(cx: &mut App) {
         KeyBinding::new("up", PrPickerPrev, pr_picker),
         KeyBinding::new("escape", PrPickerClose, pr_picker),
         KeyBinding::new("enter", PrPickerChoose, pr_picker),
+        KeyBinding::new("escape", CloseTargetViewer, target_viewer),
+        KeyBinding::new("cmd-[", NavBack, nav),
+        KeyBinding::new("ctrl-[", NavBack, nav),
+        KeyBinding::new("cmd-]", NavForward, nav),
+        KeyBinding::new("ctrl-]", NavForward, nav),
     ]);
 }
 
@@ -452,6 +505,77 @@ enum PrPickerState {
     Loading,
     Loaded(Vec<PrSummary>),
     Error(String),
+}
+
+/// The S8f read-only "jumped to a definition" overlay, while open — plain
+/// text, no syntax highlighting or editing (docs/phase-8-lsp-and-polish.md
+/// § LSP: "open target file read-only at the location"). Distinct from the
+/// diff pane's own `RenderedDiff`: this shows a WHOLE file's current
+/// worktree content, not a diff against anything.
+struct TargetViewer {
+    /// Repo-relative path, for the header + re-resolving on a future nav
+    /// hop.
+    path: String,
+    /// The file's lines, already split (no trailing `\n` per entry) — capped
+    /// at `MAX_TARGET_VIEWER_LINES` so a pathologically large target (a
+    /// generated `.d.ts`, say) can't make this plain, unvirtualized-list-free
+    /// render pathologically slow. `uniform_list` below IS virtualized
+    /// (only visible rows render), so the cap is a memory/scroll-length
+    /// safety net, not a render-cost one.
+    lines: Vec<SharedString>,
+    /// The file's REAL line count, captured before `Self::open_target_at`
+    /// pushes the "… (file truncated)" notice row onto `lines` — the header
+    /// reports this, not `lines.len()`, so a truncated file's header doesn't
+    /// count the notice row as if it were file content (P3 finding).
+    total_lines: usize,
+    /// 0-based line to highlight and scroll to on open (LSP's own
+    /// coordinate system — see `crate::lsp::Location`).
+    highlight_line: u32,
+    scroll: UniformListScrollHandle,
+    /// Set once, right after construction, so the very first render scrolls
+    /// to `highlight_line` — subsequent renders leave the user's own scroll
+    /// position alone. Also pre-set `true` (skipping the scroll entirely)
+    /// when `highlight_line` itself falls beyond `MAX_TARGET_VIEWER_LINES`:
+    /// `scroll_to_item` would otherwise silently clamp to the last row with
+    /// no highlight and no explanation (P3 finding) — see
+    /// `Self::open_target_at`.
+    scrolled_to_highlight: bool,
+}
+
+/// Files larger than this are truncated in the target viewer with a notice
+/// rather than rendered whole — mirrors `highlight::MAX_HIGHLIGHT_LINE`'s
+/// "don't choke on a pathological file" posture, just for line COUNT here
+/// rather than a single line's length.
+const MAX_TARGET_VIEWER_LINES: usize = 20_000;
+
+/// How long after a go-to-definition session first reaches `Ready` an EMPTY
+/// `definition` result is treated as "vtsls is still warming up" rather
+/// than "genuinely no definition" and retried (see
+/// `Workspace::run_definition_request`'s warm-up retry — P2 finding).
+/// vtsls's project load can legitimately take several seconds; a warm
+/// session's genuinely-empty answer stays instant once this window has
+/// passed.
+const LSP_WARMUP_WINDOW: std::time::Duration = std::time::Duration::from_secs(8);
+/// Bound on extra empty-result retries `run_definition_request` performs
+/// inside `LSP_WARMUP_WINDOW` before giving up and reporting "no
+/// definition found" for real.
+const LSP_WARMUP_RETRIES: u32 = 6;
+/// Delay between each of `LSP_WARMUP_RETRIES`'s retries.
+const LSP_WARMUP_RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(500);
+
+/// A go-to-definition request stashed while `Workspace::lsp_session` is
+/// still `Spawning` — see `Workspace::lsp_pending_definition`'s doc comment
+/// for the two races this fixes. Carries exactly the arguments
+/// `Workspace::run_definition_request` needs, captured at click time.
+struct PendingDefinition {
+    repo: Arc<GitRepo>,
+    rel_path: String,
+    uri: String,
+    language_id: &'static str,
+    position: lsp_types::Position,
+    from: crate::lsp::Location,
+    range_head: Option<String>,
+    epoch: u64,
 }
 
 /// Everything a PR's background open resolves, applied to the workspace in
@@ -901,6 +1025,101 @@ pub struct Workspace {
     /// reason `pr_error` is: the workspace stays exactly as usable as it was
     /// before the attempt. Cleared on the next attempt.
     source_switch_error: Option<String>,
+    /// S8f (docs/phase-8-lsp-and-polish.md § LSP) go-to-definition session,
+    /// spawned at most once for this workspace's lifetime — see
+    /// `crate::lsp`'s module doc for the lazy-spawn/kill-on-drop contract.
+    /// `Workspace` never has more than one live [`dv_core::lsp::LspHandle`]
+    /// clone at a time; dropping the workspace drops this field, which
+    /// drops the last `Arc` and kills the vtsls child.
+    lsp_session: crate::lsp::LspSessionState,
+    /// Bumped on every event that supersedes whatever go-to-definition
+    /// round trip is currently in flight — a fresh symbol click, a
+    /// `NavBack`/`NavForward` press, a file switch, or closing the target
+    /// viewer. Every async LSP completion (`Self::run_definition_request`'s
+    /// definition round trip, `Self::open_target_at`'s blob read) captures
+    /// the epoch at the moment it was kicked off and re-checks it before
+    /// mutating `lsp_session`/`nav_stack`/`target_viewer`, discarding the
+    /// result silently on a mismatch (P3 findings: two rapid `NavBack`
+    /// presses both peeking the same stack entry and both committing —
+    /// desyncing history; and a slow completion reopening the target-viewer
+    /// modal after the user closed it or moved to another file/click).
+    lsp_request_epoch: u64,
+    /// Back/forward history over target-viewer jumps — see
+    /// `crate::lsp::NavStack`'s doc comment.
+    nav_stack: crate::lsp::NavStack,
+    /// The read-only "jumped to a definition" overlay, if one is open.
+    target_viewer: Option<TargetViewer>,
+    /// Human-readable reason the most recent go-to-definition attempt
+    /// didn't land (no session, request failed, empty result, non-honest
+    /// view, non-TS file, …) — surfaced as a small status line rather than
+    /// a hard error (docs/phase-8-lsp-and-polish.md § LSP: "surface a
+    /// gentle warning ... don't fail"). Cleared on every successful jump
+    /// and on every file switch (`Self::select_file_inner`) so it can't go
+    /// stale.
+    lsp_status: Option<SharedString>,
+    /// A go-to-definition request received while `lsp_session` is still
+    /// `Spawning` — the click that FIRST triggers `Unattempted -> Spawning`
+    /// stashes its own request here too (rather than closing over it
+    /// directly), so every completion path replays whatever request is
+    /// CURRENTLY stashed, not necessarily the one that happened to kick the
+    /// spawn off. Fixes two related P3 races: (a) a second click arriving
+    /// while still `Spawning` used to just show "starting…" and be dropped,
+    /// requiring a third click once the session came up; (b) parking mid-
+    /// spawn and reactivating with a fresh click could let the FIRST spawn
+    /// attempt land, install `Ready`, and then discard the reactivated
+    /// click's own request because its epoch no longer matched the first
+    /// attempt's. Only one request is ever stashed at a time — a later click
+    /// simply replaces it, the same superseding posture `lsp_request_epoch`
+    /// uses everywhere else in this module. Taken (and re-checked against
+    /// the current epoch) by whichever spawn attempt completes first.
+    lsp_pending_definition: Option<PendingDefinition>,
+    /// Bumped every time a NEW vtsls spawn attempt is kicked off (the
+    /// `Unattempted -> Spawning` transition in `Self::on_symbol_click`) or
+    /// the session is parked (`Self::park_lsp_session`) — stamped onto that
+    /// attempt's async completion closure and re-checked before installing
+    /// `Ready`/`Unavailable`. A bare `matches!(lsp_session, Spawning)` check
+    /// can't tell two overlapping attempts apart: park+reactivate (or two
+    /// rapid clicks racing the `Unattempted` guard) can have a STALE first
+    /// attempt's completion land after a second attempt has already started
+    /// — under the old `Spawning`-only guard, the stale attempt's `Err`
+    /// could install `Unavailable` and clear the second attempt's stashed
+    /// click, even though the second attempt goes on to succeed (whose
+    /// handle then gets silently discarded) (P3 finding). Only the attempt
+    /// whose captured generation still matches this field when it completes
+    /// is allowed to mutate `lsp_session`/`lsp_pending_definition`; every
+    /// other attempt's result (`Ok` or `Err`) is discarded outright.
+    lsp_spawn_generation: u64,
+    /// Stamped the moment `lsp_session` first reaches `Ready` for the
+    /// current spawn attempt (and cleared on `Self::park_lsp_session`) —
+    /// `Self::run_definition_request` uses it to tell "vtsls is still
+    /// warming up" apart from "genuinely no definition" for an empty
+    /// result: vtsls's project load can legitimately take several seconds
+    /// after `didOpen`, and a session that JUST reached `Ready` is exactly
+    /// the case where the very first click races that load (docs/
+    /// phase-8-lsp-and-polish.md § LSP.1; P2 finding — this used to map any
+    /// empty result straight to "no definition found", including that
+    /// common cold-first-click case, with no retry or loading state).
+    lsp_ready_since: Option<std::time::Instant>,
+    /// Set once, right after a session first reaches `Ready`, when this
+    /// repo's `node_modules` couldn't be found — package-symbol lookups
+    /// (anything resolving into a dependency) silently return an empty
+    /// result without it installed, which otherwise reads to the user as
+    /// "no definition found" rather than "the project isn't installed"
+    /// (docs/phase-8-lsp-and-polish.md § LSP.1: "surface a gentle warning
+    /// when absent, don't fail" — P2 finding: this warning didn't exist at
+    /// all). Unlike `lsp_status`, this is a persistent, session-level note
+    /// (not cleared by a successful jump or a file switch) — it stays until
+    /// the session itself is reset (`Self::park_lsp_session`).
+    lsp_node_modules_warning: Option<SharedString>,
+    /// The worktree's current `HEAD` oid, refreshed off-thread on initial
+    /// load and every [`Self::revalidate`] pass — the cache
+    /// `Self::lsp_view_is_honest` compares a `DiffSource::Range`'s `head`
+    /// against (the plan's key_signature: "WorkingTree || New-side head oid
+    /// == worktree HEAD") without a synchronous git round trip per click.
+    /// `None` until the first successful `git rev-parse HEAD` (never-fail-
+    /// hard: a resolve failure just leaves `Range` views ungated, not a
+    /// crash).
+    worktree_head_oid: Option<String>,
 }
 
 /// Which blob a comment on `side` of `path` anchors to, given the review's
@@ -1395,6 +1614,16 @@ impl Workspace {
             submit: None,
             submit_epoch: 0,
             source_switch_error: None,
+            lsp_session: crate::lsp::LspSessionState::Unattempted,
+            lsp_request_epoch: 0,
+            nav_stack: crate::lsp::NavStack::default(),
+            target_viewer: None,
+            lsp_status: None,
+            lsp_pending_definition: None,
+            lsp_spawn_generation: 0,
+            lsp_ready_since: None,
+            lsp_node_modules_warning: None,
+            worktree_head_oid: None,
         };
 
         cx.spawn(async move |this, cx| {
@@ -1553,6 +1782,12 @@ impl Workspace {
                 .spawn(async move {
                     let repo = GitRepo::open(location.clone())?;
                     let head = repo.head_label().unwrap_or_default();
+                    // Full HEAD oid, cached for `Self::lsp_view_is_honest`'s
+                    // Range-view comparison (never-fail-hard: an unresolved
+                    // HEAD — e.g. a brand-new repo with no commits yet —
+                    // just leaves Range views ungated for LSP, not a load
+                    // failure).
+                    let worktree_head_oid = repo.resolve("HEAD").ok();
                     // Resolve a merge-base range to a concrete two-dot range
                     // once here, so both the file list and every per-file
                     // old-side blob load from the merge base rather than from
@@ -1584,6 +1819,7 @@ impl Workspace {
                     anyhow::Ok((
                         Arc::new(repo),
                         head,
+                        worktree_head_oid,
                         files,
                         source,
                         review,
@@ -1595,9 +1831,19 @@ impl Workspace {
 
             this.update_in(cx, |this, window, cx| {
                 match loaded {
-                    Ok((repo, head, files, source, review, store_location, author)) => {
+                    Ok((
+                        repo,
+                        head,
+                        worktree_head_oid,
+                        files,
+                        source,
+                        review,
+                        store_location,
+                        author,
+                    )) => {
                         this.repo = Some(repo);
                         this.head = head.into();
+                        this.worktree_head_oid = worktree_head_oid;
                         this.files = files;
                         this.source = source;
                         this.review = review;
@@ -1938,7 +2184,7 @@ impl Workspace {
             .map(|r| (r.id.clone(), r.updated_ms, r.comments.len()));
 
         cx.spawn(async move |this, cx| {
-            let (review, files) = cx
+            let (review, files, worktree_head_oid) = cx
                 .background_executor()
                 .spawn(async move {
                     let review = pick_review(
@@ -1950,7 +2196,13 @@ impl Workspace {
                         pinned_id.as_deref(),
                     );
                     let files = is_working_tree.then(|| repo.changed_files(&source));
-                    (review, files)
+                    // Refreshed unconditionally (not just for a `WorkingTree`
+                    // source) — this is the cache `Self::lsp_view_is_honest`
+                    // compares a `DiffSource::Range`'s `head` against, and
+                    // reactivation is exactly the "git round trips already
+                    // happen off-thread" moment to keep it current.
+                    let worktree_head_oid = repo.resolve("HEAD").ok();
+                    (review, files, worktree_head_oid)
                 })
                 .await;
 
@@ -1979,6 +2231,10 @@ impl Workspace {
                 } else {
                     false
                 };
+
+                if worktree_head_oid.is_some() {
+                    this.worktree_head_oid = worktree_head_oid;
+                }
 
                 // ---- worktree half: `apply_worktree_reload` is the exact
                 // same body the worktree-watch consumer (`Self::new`, above)
@@ -2094,6 +2350,17 @@ impl Workspace {
         // switch_source_and_jump (P3 finding: it used to persist across
         // unrelated successful navigation).
         self.source_switch_error = None;
+        // A go-to-definition status banner belongs to the file/position it
+        // was raised on — carrying it across a file switch would leave a
+        // stale "code intelligence unavailable"/"no definition found" up
+        // for a click that never happened on the new file (P2 finding).
+        self.lsp_status = None;
+        // Invalidate any in-flight go-to-def round trip: its completion
+        // (definition request or target-file read) must not reopen the
+        // target-viewer modal for a click on a file the user has since
+        // navigated away from (P3 finding — see `lsp_request_epoch`'s doc
+        // comment).
+        self.lsp_request_epoch += 1;
         self.selected = Some(index);
         self.current_hunk = 0;
         self.file_scroll
@@ -3270,6 +3537,29 @@ impl Workspace {
                     "verdict": verdict_automation_word(*verdict),
                     "message": message,
                 }),
+            }),
+            // S8f (docs/phase-8-lsp-and-polish.md § LSP): go-to-definition
+            // session/nav-stack/target-viewer state, so a script can assert
+            // the degrade path (no node/vtsls → "unavailable", never a
+            // crash) without a screenshot.
+            "lsp": json!({
+                "session": match &self.lsp_session {
+                    crate::lsp::LspSessionState::Unattempted => "unattempted".to_string(),
+                    crate::lsp::LspSessionState::Spawning => "spawning".to_string(),
+                    crate::lsp::LspSessionState::Ready(_) => "ready".to_string(),
+                    crate::lsp::LspSessionState::Unavailable(reason) => {
+                        format!("unavailable: {reason}")
+                    }
+                },
+                "status": self.lsp_status,
+                "node_modules_warning": self.lsp_node_modules_warning,
+                "nav_back": self.nav_stack.can_go_back(),
+                "nav_forward": self.nav_stack.can_go_forward(),
+                "target_viewer": self.target_viewer.as_ref().map(|v| json!({
+                    "path": v.path,
+                    "highlight_line": v.highlight_line,
+                    "lines": v.lines.len(),
+                })),
             }),
         })
     }
@@ -4838,6 +5128,1001 @@ impl Workspace {
         }
     }
 
+    // ---- Go-to-definition (S8f, docs/phase-8-lsp-and-polish.md § LSP) --
+    //
+    // Scope note: the honest-view gate below matches the phase plan's
+    // key_signatures exactly — "WorkingTree, or a Range whose head oid
+    // equals the checked-out worktree HEAD" — using
+    // `Self::worktree_head_oid`, a cache refreshed off-thread on initial
+    // load and every `Self::revalidate` pass rather than an extra
+    // `git rev-parse` round trip per click. Still scoped to the New side of
+    // a line (see `Self::row_anchor`: New is exactly "this line's bytes are
+    // what's on disk right now"); a stale/absent cache just declines the
+    // Range case (never a wrong answer, only a missed one).
+
+    /// Whether the diff pane is showing bytes that match what `vtsls` (which
+    /// always reads the on-disk checked-out worktree) will actually answer
+    /// about — see this section's scope note above.
+    fn lsp_view_is_honest(&self) -> bool {
+        match &self.source {
+            DiffSource::WorkingTree => true,
+            DiffSource::Range { head, .. } => {
+                self.worktree_head_oid.as_deref() == Some(head.as_str())
+            }
+            DiffSource::Staged | DiffSource::Commit(_) => false,
+        }
+    }
+
+    fn selected_file_path(&self) -> Option<String> {
+        self.selected
+            .and_then(|i| self.files.get(i))
+            .map(|f| f.path.clone())
+    }
+
+    /// Column-hit-test a click inside a rendered diff line: shapes `text`
+    /// with the SAME font/size the row actually rendered at (so this is
+    /// glyph-accurate, not an approximate monospace-width guess) and finds
+    /// the closest byte offset to `local_x` (relative to the text content's
+    /// own left edge — see `Self::wrap_symbol_click_target`'s bounds
+    /// capture for how that's obtained).
+    fn hit_test_byte_column(
+        text: &str,
+        font_family: SharedString,
+        font_size: f32,
+        local_x: Pixels,
+        window: &mut Window,
+    ) -> usize {
+        if text.is_empty() {
+            return 0;
+        }
+        let run = TextRun {
+            len: text.len(),
+            font: font(font_family),
+            ..Default::default()
+        };
+        // `layout_line` lives on `WindowTextSystem` (per-window glyph atlas
+        // state), not the App-level `TextSystem` `cx.text_system()` hands
+        // back — hence taking `&mut Window` here rather than `&mut App`/`cx`.
+        let layout = window
+            .text_system()
+            .layout_line(text, px(font_size), &[run], None);
+        layout.closest_index_for_x(local_x.max(px(0.)))
+    }
+
+    /// Wrap `content` (a rendered line's text div) so a ctrl/cmd-click
+    /// inside it drives go-to-definition. Only ever called for a row/cell
+    /// that's on the New side with a real line number (see `render_diff_row`/
+    /// `render_split_cell`'s call sites) — Removed-only unified rows and Old
+    /// split cells never get this wrapper at all, which is what enforces
+    /// the New-side half of `Self::lsp_view_is_honest`'s scope.
+    fn wrap_symbol_click_target(
+        &self,
+        content: Div,
+        new_line: u32,
+        text: SharedString,
+        cx: &Context<Self>,
+    ) -> Div {
+        let font_family = cx.theme().mono_font_family.clone();
+        let font_size = self.font_size;
+        // Captures this row's own on-screen bounds at paint time (a plain
+        // `MouseDownEvent` only carries a WINDOW-relative position, not an
+        // element-relative one) — read back at click time to turn the
+        // click's x into a column via `hit_test_byte_column`. Cheap: one
+        // `Rc<Cell<..>>` per visible row, only for rows this wrapper is
+        // even called on (New-side, real line number).
+        let bounds: Rc<Cell<Option<Bounds<Pixels>>>> = Rc::new(Cell::new(None));
+        let bounds_for_paint = Rc::clone(&bounds);
+        let bounds_for_click = Rc::clone(&bounds);
+        let probe = canvas(
+            move |b, _, _| {
+                bounds_for_paint.set(Some(b));
+            },
+            |_, _, _, _| {},
+        )
+        .absolute()
+        .size_full();
+
+        div()
+            .relative()
+            .size_full()
+            .child(probe)
+            .child(content)
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(move |this, ev: &MouseDownEvent, window, cx| {
+                    if !ev.modifiers.secondary() {
+                        return; // plain click — normal text/selection, not go-to-def
+                    }
+                    let Some(row_bounds) = bounds_for_click.get() else {
+                        return;
+                    };
+                    let local_x = ev.position.x - row_bounds.origin.x;
+                    let byte_col = Self::hit_test_byte_column(
+                        &text,
+                        font_family.clone(),
+                        font_size,
+                        local_x,
+                        window,
+                    );
+                    this.on_symbol_click(new_line, byte_col, text.clone(), window, cx);
+                    cx.stop_propagation();
+                }),
+            )
+    }
+
+    /// Entry point for a ctrl/cmd-click on an eligible (New-side, real line)
+    /// diff row/cell — `new_line` is the 1-based diff line number, `byte_col`
+    /// a byte offset into `line_text` from `Self::hit_test_byte_column`.
+    /// Every early-out sets `self.lsp_status` to a short, human-readable
+    /// reason rather than silently doing nothing (docs/phase-8-lsp-and-polish.md
+    /// § LSP: "surface a gentle warning ... don't fail" — this is that
+    /// warning's UI-visible half).
+    fn on_symbol_click(
+        &mut self,
+        new_line: u32,
+        byte_col: usize,
+        line_text: SharedString,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.lsp_view_is_honest() {
+            self.lsp_status =
+                Some("code intelligence: only available on the working-tree view".into());
+            cx.notify();
+            return;
+        }
+        let RepoLocation::Wsl {
+            distro,
+            path: root_path,
+        } = self.location.clone()
+        else {
+            self.lsp_status = Some(
+                "code intelligence: WSL repos only (docs/phase-8-lsp-and-polish.md § LSP)".into(),
+            );
+            cx.notify();
+            return;
+        };
+        let Some(rel_path) = self.selected_file_path() else {
+            return;
+        };
+        let Some(language_id) = dv_core::lsp::language_id_for_path(&rel_path) else {
+            self.lsp_status = Some("code intelligence: not a TypeScript/JavaScript file".into());
+            cx.notify();
+            return;
+        };
+        let Some(repo) = self.repo.clone() else {
+            return;
+        };
+
+        let character = utf16_column(&line_text, byte_col);
+        let position = lsp_types::Position {
+            line: new_line.saturating_sub(1),
+            character,
+        };
+        let root_trimmed = root_path.trim_end_matches('/').to_string();
+        let uri = dv_core::lsp::file_uri(&format!("{root_trimmed}/{rel_path}"));
+        let from_location = crate::lsp::Location {
+            uri: uri.clone(),
+            line: position.line,
+            character: position.character,
+        };
+        // This click supersedes any earlier in-flight go-to-def round trip
+        // (definition request, target-file read, or a queued click still
+        // waiting on `Spawning`) — see `lsp_request_epoch`'s doc comment.
+        self.lsp_request_epoch += 1;
+        let epoch = self.lsp_request_epoch;
+        // `Self::lsp_view_is_honest` only compares the WHOLE view's oid
+        // against the worktree HEAD; for a `Range` view that still leaves a
+        // per-file gap — the displayed bytes are `head`'s committed blob,
+        // but vtsls always reads THIS file's on-disk bytes, which can carry
+        // uncommitted local edits even when `head == worktree HEAD` (P3
+        // finding). `run_definition_request` re-checks this file specifically
+        // (in the background, alongside the sync it already does) before
+        // ever asking vtsls anything.
+        let range_head = match &self.source {
+            DiffSource::Range { head, .. } => Some(head.clone()),
+            _ => None,
+        };
+
+        // A vtsls child that died mid-session (crash, `wsl --terminate`,
+        // OOM) otherwise leaves `Ready` installed forever: the reader thread
+        // flips `is_alive()` false, but nothing else observes it, so every
+        // click here would keep failing with "lsp connection lost" until the
+        // workspace is parked or a fresh one is opened (P3 finding). Reset
+        // to `Unattempted` so THIS click falls straight into the same lazy
+        // respawn path below a brand-new workspace would take.
+        if let crate::lsp::LspSessionState::Ready(handle) = &self.lsp_session
+            && !handle.is_alive()
+        {
+            self.lsp_session = crate::lsp::LspSessionState::Unattempted;
+            self.lsp_ready_since = None;
+        }
+
+        match &self.lsp_session {
+            crate::lsp::LspSessionState::Ready(handle) => {
+                let handle = handle.clone();
+                let ready_since = self.lsp_ready_since;
+                self.run_definition_request(
+                    handle,
+                    repo,
+                    rel_path,
+                    uri,
+                    language_id,
+                    position,
+                    from_location,
+                    range_head,
+                    epoch,
+                    ready_since,
+                    cx,
+                );
+            }
+            crate::lsp::LspSessionState::Spawning => {
+                self.lsp_status = Some("code intelligence: starting…".into());
+                // Stash this click's request rather than dropping it — see
+                // `Self::lsp_pending_definition`'s doc comment for the races
+                // this fixes. A later click while still `Spawning` simply
+                // replaces whatever was stashed before.
+                self.lsp_pending_definition = Some(PendingDefinition {
+                    repo,
+                    rel_path,
+                    uri,
+                    language_id,
+                    position,
+                    from: from_location,
+                    range_head,
+                    epoch,
+                });
+                cx.notify();
+            }
+            crate::lsp::LspSessionState::Unavailable(reason) => {
+                self.lsp_status = Some(format!("code intelligence unavailable: {reason}").into());
+                cx.notify();
+            }
+            crate::lsp::LspSessionState::Unattempted => {
+                self.lsp_session = crate::lsp::LspSessionState::Spawning;
+                self.lsp_status = Some("code intelligence: starting…".into());
+                // Stash this click's request the same way the `Spawning` arm
+                // above does — this click happens to be the one that
+                // triggers the spawn, but the completion below always
+                // replays whatever's CURRENTLY stashed rather than assuming
+                // it's still this one (see `Self::lsp_pending_definition`'s
+                // doc comment — a park+reactivate racing two spawn attempts
+                // is exactly the case that requires this).
+                self.lsp_pending_definition = Some(PendingDefinition {
+                    repo,
+                    rel_path,
+                    uri,
+                    language_id,
+                    position,
+                    from: from_location,
+                    range_head,
+                    epoch,
+                });
+                cx.notify();
+                self.lsp_spawn_generation += 1;
+                let spawn_gen = self.lsp_spawn_generation;
+                let root_uri = dv_core::lsp::file_uri(&root_trimmed);
+                let location = self.location.clone();
+                cx.spawn(async move |this, cx| {
+                    let spawned = cx
+                        .background_spawn(async move {
+                            match dv_core::provision::detect_node_vtsls(&distro, None) {
+                                Ok(nv) if nv.vtsls_path.is_some() => {
+                                    dv_core::lsp::LspHandle::spawn(&location, &nv, &root_uri).map(
+                                        |handle| {
+                                            // docs/phase-8-lsp-and-polish.md §
+                                            // LSP.1: "surface a gentle warning
+                                            // when absent, don't fail" — run
+                                            // this bounded check in the same
+                                            // background task, before the
+                                            // handle is ever handed back to
+                                            // the UI thread (P2 finding: this
+                                            // warning didn't exist at all).
+                                            let node_modules_missing =
+                                                !dv_core::lsp::node_modules_present(&location);
+                                            (handle, node_modules_missing)
+                                        },
+                                    )
+                                }
+                                Ok(_) => Err(dv_core::lsp::LspError::Unavailable(
+                                    "node found but vtsls is not installed for this distro"
+                                        .to_string(),
+                                )),
+                                Err(err) => Err(dv_core::lsp::LspError::Unavailable(format!(
+                                    "node/vtsls detection failed: {err:#}"
+                                ))),
+                            }
+                        })
+                        .await;
+
+                    this.update(cx, |this, cx| {
+                        // The workspace was parked (`Self::park_lsp_session`
+                        // resets `Spawning` -> `Unattempted` AND bumps the
+                        // generation) or a later click already kicked off
+                        // its OWN spawn attempt (also bumping the
+                        // generation) while this attempt was in flight —
+                        // either way, this attempt has been superseded and
+                        // must not mutate `lsp_session`/
+                        // `lsp_pending_definition` at all: not to install
+                        // `Ready`/`Unavailable` (would resurrect a vtsls
+                        // child, or permanently poison retry, on a session
+                        // nobody's looking at anymore — P2 finding), and not
+                        // even to clear `lsp_pending_definition` on `Err`
+                        // (would eat whatever the winning attempt has
+                        // stashed — P3 finding: a bare `Spawning`-only guard
+                        // couldn't tell two overlapping attempts apart, so a
+                        // stale attempt's `Err` could clobber a second,
+                        // still-in-flight attempt's state, discarding its
+                        // click even though that second attempt goes on to
+                        // succeed). Discard `spawned`'s `Ok` handle off the
+                        // UI thread rather than dropping it inline here:
+                        // `LspClient`'s `Drop` runs a bounded but real
+                        // shutdown handshake (up to ~1.5s if vtsls is
+                        // wedged) that must never block the thread driving
+                        // this update — often the UI thread (P3 finding).
+                        if this.lsp_spawn_generation != spawn_gen {
+                            if let Ok((handle, _)) = spawned {
+                                cx.background_spawn(async move { drop(handle) }).detach();
+                            }
+                            return;
+                        }
+                        match spawned {
+                            Ok((handle, node_modules_missing)) => {
+                                this.lsp_session =
+                                    crate::lsp::LspSessionState::Ready(handle.clone());
+                                this.lsp_status = None;
+                                this.lsp_ready_since = Some(std::time::Instant::now());
+                                this.lsp_node_modules_warning = node_modules_missing.then(|| {
+                                    SharedString::from(
+                                        "code intelligence: node_modules not installed — \
+                                         definitions into packages may be unavailable",
+                                    )
+                                });
+                                // Replay whichever request is CURRENTLY
+                                // stashed — not necessarily this attempt's
+                                // own triggering click (see
+                                // `Self::lsp_pending_definition`'s doc
+                                // comment) — and only if nothing has
+                                // superseded it since (another click, a nav,
+                                // a file switch).
+                                if let Some(pending) = this.lsp_pending_definition.take()
+                                    && this.lsp_request_epoch == pending.epoch
+                                {
+                                    let ready_since = this.lsp_ready_since;
+                                    this.run_definition_request(
+                                        handle,
+                                        pending.repo,
+                                        pending.rel_path,
+                                        pending.uri,
+                                        pending.language_id,
+                                        pending.position,
+                                        pending.from,
+                                        pending.range_head,
+                                        pending.epoch,
+                                        ready_since,
+                                        cx,
+                                    );
+                                }
+                                // See the `Err` arm below — this closure has
+                                // no other reason to repaint (the replay
+                                // above, if any, notifies on its own once
+                                // the definition round trip resolves), but
+                                // the banner/warning just changed either way
+                                // (P3 finding: this was missing here, so a
+                                // superseded pending click left the "code
+                                // intelligence: starting…" status and the
+                                // freshly set node_modules warning both
+                                // stuck on-screen until some unrelated
+                                // repaint).
+                                cx.notify();
+                            }
+                            Err(err) => {
+                                this.lsp_status =
+                                    Some(format!("code intelligence unavailable: {err}").into());
+                                this.lsp_session =
+                                    crate::lsp::LspSessionState::Unavailable(err.to_string());
+                                this.lsp_pending_definition = None;
+                                cx.notify();
+                            }
+                        }
+                    })
+                    .ok();
+                })
+                .detach();
+            }
+        }
+    }
+
+    /// `LspHandle::sync_document` (best-effort — vtsls needs the file open,
+    /// and current, before it can answer `definition` at all; see that
+    /// method's doc comment for why this isn't a flat `didOpen`) +
+    /// `textDocument/definition`, off the UI thread. `from` is where the
+    /// click originated, pushed onto `nav_stack` only on a SUCCESSFUL jump
+    /// (see `Self::handle_definition_result`). `epoch` is `lsp_request_epoch`
+    /// as of the click that kicked this off — re-checked on completion so a
+    /// click the user has since moved on from (closed the viewer, selected
+    /// another file, clicked again) can't reopen the target viewer with a
+    /// stale answer (P3 finding; see `lsp_request_epoch`'s doc comment).
+    ///
+    /// `range_head`, when `Some`, is the `Range` view's `head` rev — this
+    /// file's displayed bytes are `head`'s committed blob, but vtsls always
+    /// answers about the on-disk working copy, so before asking it anything
+    /// this compares the two blob shas and declines (same message as
+    /// `Self::lsp_view_is_honest`'s coarser, whole-view gate) on a mismatch
+    /// (P3 finding: an uncommitted local edit to this one file otherwise
+    /// produced a confident wrong-symbol answer even though the view as a
+    /// whole passed the honest-view gate).
+    #[allow(clippy::too_many_arguments)]
+    fn run_definition_request(
+        &mut self,
+        handle: dv_core::lsp::LspHandle,
+        repo: Arc<GitRepo>,
+        rel_path: String,
+        uri: String,
+        language_id: &'static str,
+        position: lsp_types::Position,
+        from: crate::lsp::Location,
+        range_head: Option<String>,
+        epoch: u64,
+        ready_since: Option<std::time::Instant>,
+        cx: &mut Context<Self>,
+    ) {
+        cx.spawn(async move |this, cx| {
+            let result = cx
+                .background_spawn(async move {
+                    if let Some(head) = range_head {
+                        let head_sha = repo
+                            .blob_sha(&BlobSpec::Rev {
+                                rev: head,
+                                path: rel_path.clone(),
+                            })
+                            .ok()
+                            .flatten();
+                        let working_sha = repo
+                            .blob_sha(&BlobSpec::Working {
+                                path: rel_path.clone(),
+                            })
+                            .ok()
+                            .flatten();
+                        if head_sha != working_sha {
+                            return Err(dv_core::lsp::LspError::Unavailable(
+                                "this file has uncommitted changes since the reviewed \
+                                 revision — only available on the working-tree view"
+                                    .to_string(),
+                            ));
+                        }
+                    }
+                    let text = repo
+                        .blob_bytes(&BlobSpec::Working {
+                            path: rel_path.clone(),
+                        })
+                        .ok()
+                        .flatten()
+                        .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
+                        .unwrap_or_default();
+                    let _ = handle.sync_document(&uri, language_id, &text);
+                    let mut links = handle.definition(&uri, position)?;
+                    // vtsls's project load can legitimately still be in
+                    // progress for several seconds after a session first
+                    // reaches `Ready` (docs/phase-8-lsp-and-polish.md §
+                    // LSP.1) — an EMPTY answer that early is far more likely
+                    // "still indexing" than "genuinely no definition" (P2
+                    // finding). Retry a handful of times, same bounded
+                    // pattern the live test uses
+                    // (`crates/core/tests/wsl_lsp_definition.rs`), rather
+                    // than reporting "no definition found" on the very
+                    // first click against a cold server. Only within
+                    // `LSP_WARMUP_WINDOW` of `Ready`, so a warm session's
+                    // genuinely-empty answer stays instant.
+                    if links.is_empty()
+                        && ready_since.is_some_and(|since| since.elapsed() < LSP_WARMUP_WINDOW)
+                    {
+                        for _ in 0..LSP_WARMUP_RETRIES {
+                            std::thread::sleep(LSP_WARMUP_RETRY_DELAY);
+                            links = handle.definition(&uri, position)?;
+                            if !links.is_empty() {
+                                break;
+                            }
+                        }
+                    }
+                    Ok(links)
+                })
+                .await;
+
+            this.update(cx, |this, cx| {
+                if this.lsp_request_epoch != epoch {
+                    return; // superseded — see this fn's doc comment
+                }
+                this.handle_definition_result(result, from, epoch, cx)
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    fn handle_definition_result(
+        &mut self,
+        result: Result<Vec<lsp_types::LocationLink>, dv_core::lsp::LspError>,
+        from: crate::lsp::Location,
+        epoch: u64,
+        cx: &mut Context<Self>,
+    ) {
+        match result {
+            Ok(links) if !links.is_empty() => {
+                let target = crate::lsp::Location::from_link(&links[0]);
+                self.lsp_status = None;
+                // Deferred to `open_target_at`'s success arm — see
+                // `crate::lsp::NavCommit`'s doc comment — rather than
+                // pushed here, so a target read that fails doesn't leave
+                // `nav_stack` claiming a jump happened that never actually
+                // displayed (P3 finding).
+                self.open_target_at(target, Some(crate::lsp::NavCommit::Push(from)), epoch, cx);
+            }
+            Ok(_) => {
+                self.lsp_status = Some("no definition found".into());
+                cx.notify();
+            }
+            Err(err) => {
+                self.lsp_status = Some(format!("go-to-definition failed: {err}").into());
+                cx.notify();
+            }
+        }
+    }
+
+    /// Open (or re-point) the read-only target viewer at `target`, reading
+    /// its current worktree content via the same `BlobSpec::Working` path
+    /// the diff pane's own `WorkingTree` side uses (`compute_diff`'s
+    /// `new_spec` arm) — honest by construction, since that's the same
+    /// on-disk bytes vtsls itself just read.
+    ///
+    /// `nav` describes the `nav_stack` mutation the CALLER wants applied —
+    /// a fresh jump's `Push`, or the `Back`/`Forward` step a `NavBack`/
+    /// `NavForward` action already peeked at — and is only actually applied
+    /// in the success arm below, once the viewer has really updated. Every
+    /// early-out above that (an unrecognized URI, a non-WSL location, a
+    /// target outside the repo) and the async failure arms (`Ok(None)`/
+    /// `Err`) simply drop it, leaving `nav_stack` exactly as it was (P3
+    /// finding: applying the mutation at the call site desynced history
+    /// from a target read that then failed).
+    ///
+    /// `epoch` is `lsp_request_epoch` as of the moment the caller decided to
+    /// navigate here; re-checked once the blob read actually completes and
+    /// discarded silently on a mismatch. This is what makes two rapid
+    /// `NavBack`/`NavForward` presses (or a click racing a nav, or either
+    /// racing a file switch/viewer close) commit at most once instead of
+    /// desyncing `nav_stack`/`target_viewer` from what's actually on screen
+    /// (P3 finding — see `lsp_request_epoch`'s doc comment).
+    fn open_target_at(
+        &mut self,
+        target: crate::lsp::Location,
+        nav: Option<crate::lsp::NavCommit>,
+        epoch: u64,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(posix_path) = dv_core::lsp::path_from_file_uri(&target.uri) else {
+            self.lsp_status = Some("go-to-definition: unrecognized target URI".into());
+            cx.notify();
+            return;
+        };
+        let RepoLocation::Wsl {
+            path: root_path, ..
+        } = &self.location
+        else {
+            return;
+        };
+        let root_prefix = format!("{}/", root_path.trim_end_matches('/'));
+        let Some(rel_path) = posix_path.strip_prefix(&root_prefix) else {
+            self.lsp_status = Some(
+                "go-to-definition: target is outside this repo (e.g. a bundled library file) \
+                 — not shown"
+                    .into(),
+            );
+            cx.notify();
+            return;
+        };
+        let Some(repo) = self.repo.clone() else {
+            return;
+        };
+        let rel_path = rel_path.to_string();
+        let highlight_line = target.line;
+
+        cx.spawn(async move |this, cx| {
+            let rel_path_for_read = rel_path.clone();
+            let content = cx
+                .background_spawn(async move {
+                    repo.blob_bytes(&BlobSpec::Working {
+                        path: rel_path_for_read,
+                    })
+                })
+                .await;
+
+            this.update(cx, |this, cx| {
+                if this.lsp_request_epoch != epoch {
+                    return; // superseded — see this fn's doc comment
+                }
+                match content {
+                    Ok(Some(bytes)) => {
+                        let text = String::from_utf8_lossy(&bytes).into_owned();
+                        let mut lines: Vec<SharedString> =
+                            text.lines().map(|l| l.to_string().into()).collect();
+                        // Captured BEFORE the truncation-notice row is
+                        // pushed below, so the header reports the file's
+                        // real size rather than one-more-for-the-notice (P3
+                        // finding).
+                        let total_lines = lines.len();
+                        let truncated = total_lines > MAX_TARGET_VIEWER_LINES;
+                        if truncated {
+                            lines.truncate(MAX_TARGET_VIEWER_LINES);
+                            lines.push("… (file truncated)".into());
+                        }
+                        // A target beyond the cap (a huge generated `.d.ts`,
+                        // say) would otherwise have `scroll_to_item` clamp
+                        // silently to the last row with no highlighted line
+                        // and no explanation (P3 finding) — surface it
+                        // instead, and skip the scroll attempt entirely
+                        // (`scrolled_to_highlight: true` up front) rather
+                        // than land on a bottom that isn't actually the
+                        // target.
+                        let beyond_cap =
+                            truncated && highlight_line as usize >= MAX_TARGET_VIEWER_LINES;
+                        this.target_viewer = Some(TargetViewer {
+                            path: rel_path,
+                            lines,
+                            total_lines,
+                            highlight_line,
+                            scroll: UniformListScrollHandle::new(),
+                            scrolled_to_highlight: beyond_cap,
+                        });
+                        this.lsp_status = if beyond_cap {
+                            Some(
+                                format!(
+                                    "target line {} is beyond the {MAX_TARGET_VIEWER_LINES}-line \
+                                     display cap",
+                                    highlight_line + 1
+                                )
+                                .into(),
+                            )
+                        } else {
+                            None
+                        };
+                        match nav {
+                            Some(crate::lsp::NavCommit::Push(from)) => {
+                                this.nav_stack.push(from);
+                            }
+                            Some(crate::lsp::NavCommit::Back(current)) => {
+                                this.nav_stack.go_back(current);
+                            }
+                            Some(crate::lsp::NavCommit::Forward(current)) => {
+                                this.nav_stack.go_forward(current);
+                            }
+                            None => {}
+                        }
+                    }
+                    Ok(None) => {
+                        this.lsp_status =
+                            Some("go-to-definition: target file not found on disk".into());
+                    }
+                    Err(err) => {
+                        this.lsp_status = Some(
+                            format!("go-to-definition: reading target failed: {err:#}").into(),
+                        );
+                    }
+                }
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// The target viewer's OWN current location, if it's open — the "where
+    /// am I now" `Self::on_nav_back`/`Self::on_nav_forward` file onto the
+    /// opposite stack. `None` (a no-op nav) while the viewer is closed:
+    /// back/forward navigate within definition-jump history, which only
+    /// exists once a jump has actually opened the viewer.
+    fn current_nav_location(&self) -> Option<crate::lsp::Location> {
+        let viewer = self.target_viewer.as_ref()?;
+        let RepoLocation::Wsl {
+            path: root_path, ..
+        } = &self.location
+        else {
+            return None;
+        };
+        let uri = dv_core::lsp::file_uri(&format!(
+            "{}/{}",
+            root_path.trim_end_matches('/'),
+            viewer.path
+        ));
+        Some(crate::lsp::Location {
+            uri,
+            line: viewer.highlight_line,
+            character: 0,
+        })
+    }
+
+    fn on_nav_back(&mut self, _: &NavBack, _window: &mut Window, cx: &mut Context<Self>) {
+        let Some(current) = self.current_nav_location() else {
+            return;
+        };
+        // `peek_back` only READS the back stack — the actual pop (moving
+        // `current` onto forward) happens in `open_target_at`'s success arm
+        // via the `NavCommit::Back` it's handed here, so a target read that
+        // fails never desyncs `nav_stack` from what's on screen. Bumping the
+        // epoch here (before the peek/read) is what makes a second rapid
+        // `NavBack` press — which would otherwise peek the same back-stack
+        // entry a first press hasn't committed yet — supersede the first
+        // instead of both completions committing a pop (P3 finding; see
+        // `lsp_request_epoch`'s doc comment).
+        self.lsp_request_epoch += 1;
+        let epoch = self.lsp_request_epoch;
+        if let Some(target) = self.nav_stack.peek_back() {
+            self.open_target_at(
+                target,
+                Some(crate::lsp::NavCommit::Back(current)),
+                epoch,
+                cx,
+            );
+        }
+    }
+
+    fn on_nav_forward(&mut self, _: &NavForward, _window: &mut Window, cx: &mut Context<Self>) {
+        let Some(current) = self.current_nav_location() else {
+            return;
+        };
+        // See `Self::on_nav_back`'s comment on the epoch bump.
+        self.lsp_request_epoch += 1;
+        let epoch = self.lsp_request_epoch;
+        if let Some(target) = self.nav_stack.peek_forward() {
+            self.open_target_at(
+                target,
+                Some(crate::lsp::NavCommit::Forward(current)),
+                epoch,
+                cx,
+            );
+        }
+    }
+
+    fn on_close_target_viewer(
+        &mut self,
+        _: &CloseTargetViewer,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.target_viewer = None;
+        // Closing the viewer supersedes any in-flight click/nav that would
+        // otherwise reopen it later with a stale target (P3 finding; see
+        // `lsp_request_epoch`'s doc comment).
+        self.lsp_request_epoch += 1;
+        cx.notify();
+    }
+
+    /// Tear down this workspace's LSP session when it's about to be
+    /// PARKED (`AppShell::stash_active`, Phase-7 S7-3's workspace-LRU
+    /// cache) rather than actually closed. The LRU deliberately keeps a
+    /// parked `Workspace` entity alive for instant reactivation — which
+    /// means its `lsp_session` field, and the only long-lived
+    /// [`dv_core::lsp::LspHandle`] clone it holds, would otherwise live for
+    /// the rest of the session too, leaking a vtsls `node` process in WSL
+    /// for every distinct WSL TS review the user has ever ctrl-clicked in
+    /// (P3 finding — parking is neither close nor eviction, and vtsls
+    /// memory isn't counted against the LRU's own byte cap). Resets to
+    /// `Unattempted` immediately so reactivation — a fresh ctrl-click —
+    /// lazily respawns exactly as a brand-new workspace would; the spawn is
+    /// already lazy and self-healing, so parking loses nothing but the warm
+    /// process.
+    ///
+    /// The graceful `shutdown()` handshake (a bounded request/response round
+    /// trip) and the drop of the last `LspHandle` clone it triggers (which
+    /// runs `LspClient`'s own `Drop` — a SECOND shutdown round trip plus an
+    /// up-to-`SHUTDOWN_GRACE` wait for the child to exit) are both handed to
+    /// `cx.background_spawn` rather than run inline: this fn runs on the UI
+    /// thread on every review switch (`AppShell::stash_active`, Phase-7's
+    /// ~2ms hot path) and `Drop`'s own wait alone can cost up to a second
+    /// (worse if vtsls is wedged) — a P2 finding this was the fix for.
+    pub(crate) fn park_lsp_session(&mut self, cx: &mut Context<Self>) {
+        let previous = std::mem::replace(
+            &mut self.lsp_session,
+            crate::lsp::LspSessionState::Unattempted,
+        );
+        // A pending click and the node_modules warning both belong to the
+        // session being torn down here — a fresh reactivation respawns (and,
+        // if relevant, re-detects node_modules) from scratch, so carrying
+        // either forward would only ever be stale.
+        self.lsp_pending_definition = None;
+        self.lsp_node_modules_warning = None;
+        self.lsp_ready_since = None;
+        // Invalidate any spawn attempt still in flight from before this
+        // park — without this, a stale attempt completing after parking
+        // (but before any reactivation click starts a new one) would still
+        // see its captured generation match and could install `Ready`/
+        // `Unavailable` on a session nobody's looking at anymore (same
+        // rationale as `lsp_spawn_generation`'s own doc comment).
+        self.lsp_spawn_generation += 1;
+        if let crate::lsp::LspSessionState::Ready(handle) = previous {
+            cx.background_spawn(async move {
+                handle.shutdown();
+                // `handle` (and, once every other clone is gone, the
+                // `LspClient` it wraps) drops here, off the UI thread.
+            })
+            .detach();
+        }
+    }
+
+    /// One line of the target viewer: a fixed-width line-number gutter +
+    /// the raw (unhighlighted — see `TargetViewer`'s doc comment) text,
+    /// with the jumped-to line tinted.
+    fn render_target_line(&self, idx: usize, cx: &mut Context<Self>) -> Div {
+        let Some(viewer) = self.target_viewer.as_ref() else {
+            return div();
+        };
+        let theme = cx.theme();
+        let Some(text) = viewer.lines.get(idx) else {
+            return div();
+        };
+        let highlighted = idx as u32 == viewer.highlight_line;
+        h_flex()
+            .w_full()
+            .font_family(theme.mono_font_family.clone())
+            .text_size(px(self.font_size))
+            .when(highlighted, |el| el.bg(theme.primary.opacity(0.18)))
+            .child(
+                div()
+                    .w(px(gutter_width(self.font_size) * 1.4))
+                    .flex_none()
+                    .pr_2()
+                    .text_right()
+                    .text_color(theme.muted_foreground.opacity(0.8))
+                    .child((idx + 1).to_string()),
+            )
+            .child(div().whitespace_nowrap().child(text.clone()))
+    }
+
+    /// The S8f read-only target-viewer overlay — same modal backdrop
+    /// pattern as `AppShell::render_onboarding`/`render_settings_panel`:
+    /// `inset_0().occlude()` plus a click-to-close backdrop, with
+    /// `stop_propagation()` on the card itself.
+    fn render_target_viewer(&mut self, cx: &mut Context<Self>) -> Option<Div> {
+        use gpui_component::Sizable as _;
+        use gpui_component::button::{Button, ButtonVariants as _};
+
+        let viewer = self.target_viewer.as_mut()?;
+        if !viewer.scrolled_to_highlight {
+            viewer
+                .scroll
+                .scroll_to_item(viewer.highlight_line as usize, ScrollStrategy::Center);
+            // Only ever fire the scroll-into-view once per open target —
+            // flipped immediately (this method takes `&mut self`, unlike
+            // the sibling `render_palette`/`render_pr_picker`, specifically
+            // so this can be a plain field write instead of a `cx.spawn`
+            // one-shot) so it never fights the user's own manual scroll on
+            // later renders of the same viewer.
+            viewer.scrolled_to_highlight = true;
+        }
+        let viewer = self.target_viewer.as_ref()?;
+        let theme = cx.theme();
+        let border = theme.border;
+        let popover = theme.popover;
+        let popover_fg = theme.popover_foreground;
+        let muted = theme.muted_foreground;
+        // The list's own row count (includes the truncation-notice row when
+        // present) vs. the header's — see `TargetViewer::total_lines`'s doc
+        // comment for why these two differ (P3 finding).
+        let line_count = viewer.lines.len();
+        let header_line_count = viewer.total_lines;
+
+        Some(
+            div()
+                .absolute()
+                .inset_0()
+                .flex()
+                .items_center()
+                .justify_center()
+                .bg(theme.background.opacity(0.6))
+                .occlude()
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(|this, _, window, cx| {
+                        this.on_close_target_viewer(&CloseTargetViewer, window, cx);
+                        cx.stop_propagation();
+                    }),
+                )
+                .child(
+                    v_flex()
+                        .id("target-viewer")
+                        .w(px(880.))
+                        .max_w_full()
+                        .h(px(640.))
+                        .max_h_full()
+                        .overflow_hidden()
+                        .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                        .bg(popover)
+                        .text_color(popover_fg)
+                        .border_1()
+                        .border_color(border)
+                        .rounded_lg()
+                        .shadow_lg()
+                        .child(
+                            h_flex()
+                                .justify_between()
+                                .items_center()
+                                .px_3()
+                                .py_2()
+                                .border_b_1()
+                                .border_color(border)
+                                .child(
+                                    div()
+                                        .min_w(px(0.))
+                                        .flex_1()
+                                        .truncate()
+                                        .text_sm()
+                                        .font_semibold()
+                                        .child(viewer.path.clone()),
+                                )
+                                .child(
+                                    h_flex()
+                                        .gap_1()
+                                        .child(
+                                            Button::new("target-viewer-back")
+                                                .ghost()
+                                                .xsmall()
+                                                .label("< back")
+                                                .disabled(!self.nav_stack.can_go_back())
+                                                .on_click(cx.listener(|this, _, window, cx| {
+                                                    this.on_nav_back(&NavBack, window, cx);
+                                                })),
+                                        )
+                                        .child(
+                                            Button::new("target-viewer-forward")
+                                                .ghost()
+                                                .xsmall()
+                                                .label("forward >")
+                                                .disabled(!self.nav_stack.can_go_forward())
+                                                .on_click(cx.listener(|this, _, window, cx| {
+                                                    this.on_nav_forward(&NavForward, window, cx);
+                                                })),
+                                        )
+                                        .child(
+                                            Button::new("target-viewer-close")
+                                                .ghost()
+                                                .xsmall()
+                                                .label("Close")
+                                                .on_click(cx.listener(|this, _, window, cx| {
+                                                    this.on_close_target_viewer(
+                                                        &CloseTargetViewer,
+                                                        window,
+                                                        cx,
+                                                    );
+                                                })),
+                                        ),
+                                ),
+                        )
+                        .child(
+                            div()
+                                .px_2()
+                                .pt_1()
+                                .text_xs()
+                                .text_color(muted)
+                                .child(format!("{header_line_count} lines · read-only")),
+                        )
+                        .child(
+                            div().flex_1().min_h(px(0.)).child(
+                                uniform_list(
+                                    "target-viewer-lines",
+                                    line_count,
+                                    cx.processor(|this, range: Range<usize>, _, cx| {
+                                        range
+                                            .map(|i| this.render_target_line(i, cx))
+                                            .collect::<Vec<_>>()
+                                    }),
+                                )
+                                .track_scroll(&viewer.scroll)
+                                .size_full(),
+                            ),
+                        ),
+                ),
+        )
+    }
+
     // ---- Jump-to-file palette ----------------------------------------
 
     fn on_jump_to_file(&mut self, _: &JumpToFile, window: &mut Window, cx: &mut Context<Self>) {
@@ -6393,6 +7678,16 @@ impl Workspace {
                         .whitespace_nowrap()
                         .child(StyledText::new(text.clone()).with_highlights(runs.iter().cloned()))
                 };
+                // Go-to-definition (S8f) only ever wraps a New-side line —
+                // see `Self::lsp_view_is_honest`'s scope note: a pure
+                // Removed row (`new_line: None`) has no on-disk counterpart
+                // vtsls could ever answer honestly about.
+                let content = match new_line {
+                    Some(new_line) => {
+                        self.wrap_symbol_click_target(content, *new_line, text.clone(), cx)
+                    }
+                    None => content,
+                };
 
                 let anchor = Self::row_anchor(*old_line, *new_line);
                 let selected_bg = anchor
@@ -6549,6 +7844,15 @@ impl Workspace {
                 StyledText::new(cell.text.clone()).with_highlights(cell.runs.iter().cloned()),
             )
         };
+        // Go-to-definition (S8f): only the New column ever gets the
+        // click-target wrapper — same New-side-only scope as
+        // `render_diff_row`'s unified path (see `Self::lsp_view_is_honest`).
+        let content = match (side, cell.line) {
+            (DiffSide::New, Some(line)) => {
+                self.wrap_symbol_click_target(content, line, cell.text.clone(), cx)
+            }
+            _ => content,
+        };
 
         let gutter = div()
             .id((
@@ -6597,7 +7901,17 @@ impl Workspace {
 
 /// Rewrite a `base...head` (merge-base) range to a concrete two-dot range
 /// anchored at the actual merge base, resolved with one `git merge-base`
-/// call. Other sources pass through unchanged.
+/// call, and resolve `head` to a full oid (`git rev-parse --verify`) so
+/// `Self::lsp_view_is_honest`'s oid comparison against
+/// `Self::worktree_head_oid` actually has a chance to match. Without this,
+/// a user-supplied `--range base..feature` (a symbolic ref, not already an
+/// oid) could never satisfy that comparison — `worktree_head_oid` is
+/// always a full SHA — even when `feature` is exactly what's checked out
+/// (P3 finding). A `head` that fails to resolve (e.g. names something that
+/// doesn't exist) is left as-is: `lsp_view_is_honest`'s comparison then
+/// simply never matches, the existing decline-on-mismatch behavior, rather
+/// than failing the whole diff load over an LSP-only affordance. Other
+/// sources pass through unchanged.
 fn resolve_source(repo: &GitRepo, source: DiffSource) -> anyhow::Result<DiffSource> {
     match source {
         DiffSource::Range {
@@ -6606,8 +7920,21 @@ fn resolve_source(repo: &GitRepo, source: DiffSource) -> anyhow::Result<DiffSour
             merge_base: true,
         } => {
             let merged = repo.merge_base(&base, &head)?;
+            let head = repo.resolve(&head).unwrap_or(head);
             Ok(DiffSource::Range {
                 base: merged,
+                head,
+                merge_base: false,
+            })
+        }
+        DiffSource::Range {
+            base,
+            head,
+            merge_base: false,
+        } => {
+            let head = repo.resolve(&head).unwrap_or(head);
+            Ok(DiffSource::Range {
+                base,
                 head,
                 merge_base: false,
             })
@@ -7091,6 +8418,10 @@ impl Render for Workspace {
             key_context.push(' ');
             key_context.push_str(PR_PICKER_CONTEXT);
         }
+        if self.target_viewer.is_some() {
+            key_context.push(' ');
+            key_context.push_str(TARGET_VIEWER_CONTEXT);
+        }
 
         v_flex()
             .size_full()
@@ -7115,6 +8446,9 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::on_pr_picker_close))
             .on_action(cx.listener(Self::on_pr_picker_choose))
             .on_action(cx.listener(Self::on_refresh_pr))
+            .on_action(cx.listener(Self::on_nav_back))
+            .on_action(cx.listener(Self::on_nav_forward))
+            .on_action(cx.listener(Self::on_close_target_viewer))
             .child(
                 // Per-review header strip (the window title bar is the
                 // shell's; this shows which review is active).
@@ -7160,6 +8494,24 @@ impl Render for Workspace {
                                 .text_color(theme.danger)
                                 .truncate()
                                 .child(format!("Jump: {err}")),
+                        )
+                    })
+                    .when_some(self.lsp_status.clone(), |el, status| {
+                        el.child(
+                            div()
+                                .text_sm()
+                                .text_color(theme.muted_foreground)
+                                .truncate()
+                                .child(status),
+                        )
+                    })
+                    .when_some(self.lsp_node_modules_warning.clone(), |el, warning| {
+                        el.child(
+                            div()
+                                .text_sm()
+                                .text_color(theme.muted_foreground)
+                                .truncate()
+                                .child(warning),
                         )
                     })
                     .child(div().flex_1())
@@ -7208,6 +8560,7 @@ impl Render for Workspace {
             .child(body)
             .children(self.render_palette(cx))
             .children(self.render_pr_picker(cx))
+            .children(self.render_target_viewer(cx))
     }
 }
 

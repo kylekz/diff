@@ -11,6 +11,7 @@
 mod automation;
 mod fuzzy;
 mod highlight;
+mod lsp;
 mod onboarding;
 mod recent;
 mod settings;

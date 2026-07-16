@@ -12,6 +12,7 @@ pub mod git;
 pub mod github;
 pub mod index;
 pub mod location;
+pub mod lsp;
 pub mod provision;
 pub mod remote;
 pub mod review;

@@ -51,6 +51,13 @@ sha2 = "0.10"
 # Declared once here so dv-core and dv-host can't drift onto different
 # `notify` versions.
 notify = "8"
+# LSP wire types (S8f, crates/core/src/lsp/): `Position`/`Location`/
+# `LocationLink` for the vtsls go-to-definition client. gpui-component
+# already resolves this exact version transitively for its own editor LSP
+# provider traits (doc-deviation 1 — we don't get those traits, only the
+# types), so declaring it here unifies onto the copy already in Cargo.lock
+# rather than resolving a second fluent-uri/bitflags stack.
+lsp-types = "0.97"
 
 # GPUI is unusably janky fully unoptimized; optimize dependencies even in dev.
 # Our own crates stay at opt-level 0 for fast incremental builds.

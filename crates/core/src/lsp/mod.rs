@@ -1,8 +1,9 @@
-//! Minimal LSP client for Phase 8's go-to-definition
-//! (docs/phase-8-lsp-and-polish.md § LSP). Speaks just enough of the
-//! Language Server Protocol over stdio to drive `vtsls` (the TypeScript
-//! server Zed itself wraps): `initialize`, `textDocument/didOpen`,
-//! `textDocument/definition`, `shutdown`/`exit`.
+//! Minimal LSP client for Phase 8's go-to-definition, hover, and
+//! find-references (docs/phase-8-lsp-and-polish.md § LSP). Speaks just
+//! enough of the Language Server Protocol over stdio to drive `vtsls` (the
+//! TypeScript server Zed itself wraps): `initialize`, `textDocument/didOpen`,
+//! `textDocument/definition`, `textDocument/hover`,
+//! `textDocument/references`, `shutdown`/`exit`.
 //!
 //! **Transport DEVIATION (plan doc-deviation 2, binding).** `dv-host`'s
 //! `proc/exec` and every [`crate::command::CommandBuilder::run`]-family
@@ -35,12 +36,14 @@
 //! `initialize`, and a bare `null` there is a protocol violation that can
 //! corrupt its settings handling (P2 finding: `dispatch_message` special-
 //! cases it, replying with an array of nulls sized to `params.items`
-//! instead). Enough for go-to-definition (S8f); hover/find-references
-//! (S8g, not this slice) reuse the same transport.
+//! instead). Go-to-definition landed in S8f; S8g adds hover and
+//! find-references ([`client::LspHandle::hover`]/
+//! [`client::LspHandle::references`]) reusing this exact same transport —
+//! no second `vtsls` spawn, no new client type.
 
 pub mod client;
 
-pub use client::{LspClient, LspError, LspHandle, node_modules_present};
+pub use client::{LspClient, LspError, LspHandle, hover_contents_to_text, node_modules_present};
 
 /// Map a repo path to the `languageId` vtsls expects in
 /// `textDocument/didOpen` — restricted to the TypeScript family (this

@@ -54,10 +54,29 @@ enum Cmd {
         y: f32,
         #[serde(default)]
         button: Option<String>,
-        /// Hold shift during the click (range selection etc.).
+        /// Hold shift during the click (range selection etc.). Kept
+        /// alongside `modifiers` (rather than folded into it) for backward
+        /// compatibility with existing scripts; the two OR together.
         #[serde(default)]
         shift: bool,
+        /// Dash-separated modifier names held during the click — e.g.
+        /// `"ctrl"`, `"cmd"`, `"ctrl-shift"` (S8g: exercising ctrl/cmd-click
+        /// go-to-definition, which reads `MouseDownEvent::modifiers.secondary()`,
+        /// end-to-end needed a way to hold a real modifier through the
+        /// synthesized click — see [`parse_modifiers`]). Accepted names:
+        /// `ctrl`/`control`, `alt`/`option`, `shift`, `cmd`/`platform`/
+        /// `super`/`win`, `fn`/`function`.
+        #[serde(default)]
+        modifiers: Option<String>,
     },
+    /// Move the mouse to window coordinates (logical pixels) with no button
+    /// pressed — the scripted stand-in for a hover (S8g: triggers the diff
+    /// pane's hover-popover path the same real `MouseMoveEvent` a physical
+    /// mouse sweep would, unlike `Cmd::Click`'s own internal move-then-click,
+    /// which never lingers). Follow with `wait` (past the hover debounce)
+    /// then `state`/`screenshot` — this command itself only dispatches the
+    /// move and returns immediately.
+    MouseMove { x: f32, y: f32 },
     /// Resize the window content area (logical pixels).
     Resize { w: f32, h: f32 },
     /// Synthesize a click-drag from `from` to `to` (window coordinates,
@@ -125,10 +144,28 @@ enum Cmd {
 /// command.
 const MAX_WAIT_MS: u64 = 60_000;
 
+/// `true` once [`start`] has wired the channel — i.e. this process is being
+/// driven by a script, not a mouse. Exists for the one place synthetic
+/// input and platform reality disagree: `Window::is_window_hovered()` is a
+/// PLATFORM-level signal (WM_MOUSELEAVE-tracked, real OS cursor), so it
+/// stays `false` for a scripted `mouse_move` no matter what events we
+/// dispatch — which would make every hover-popover raise self-discard
+/// under automation (the real cursor sits over the driver's terminal).
+/// `Workspace`'s hover completion consults this to skip that one check
+/// when scripted; every other input path hit-tests dispatched positions
+/// and needs no such carve-out.
+static ACTIVE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Whether this process is running under `--automation` (see [`ACTIVE`]).
+pub fn is_active() -> bool {
+    ACTIVE.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// Wire up the channel: a thread pumps stdin lines into the foreground
 /// executor, which handles commands strictly in order (a command finishes
 /// before the next is read, so scripts need no client-side pacing).
 pub fn start(window: WindowHandle<Root>, shell: Entity<AppShell>, cx: &mut App) {
+    ACTIVE.store(true, std::sync::atomic::Ordering::Relaxed);
     let (tx, mut rx) = mpsc::unbounded::<String>();
     std::thread::Builder::new()
         .name("automation-stdin".into())
@@ -253,6 +290,7 @@ async fn handle(
             y,
             button,
             shift,
+            modifiers,
         } => {
             let button = match button.as_deref() {
                 None | Some("left") => MouseButton::Left,
@@ -260,12 +298,13 @@ async fn handle(
                 Some("middle") => MouseButton::Middle,
                 Some(other) => bail!("unknown button: {other}"),
             };
+            let mut modifiers = match modifiers.as_deref() {
+                Some(spec) => parse_modifiers(spec)?,
+                None => Modifiers::default(),
+            };
+            modifiers.shift |= shift; // OR, not overwrite — see the field's own doc comment
             cx.update_window(window, |_, window, cx| {
                 let position = point(px(x), px(y));
-                let modifiers = Modifiers {
-                    shift,
-                    ..Modifiers::default()
-                };
                 // Move first so hover state matches what a real click sees.
                 window.dispatch_event(
                     PlatformInput::MouseMove(MouseMoveEvent {
@@ -297,6 +336,19 @@ async fn handle(
                 json!({"clicked": {"x": x, "y": y}})
             })
         }
+
+        Cmd::MouseMove { x, y } => cx.update_window(window, |_, window, cx| {
+            let position = point(px(x), px(y));
+            window.dispatch_event(
+                PlatformInput::MouseMove(MouseMoveEvent {
+                    position,
+                    pressed_button: None,
+                    modifiers: Modifiers::default(),
+                }),
+                cx,
+            );
+            json!({"moved": {"x": x, "y": y}})
+        }),
 
         Cmd::Resize { w, h } => cx.update_window(window, |_, window, _| {
             window.resize(size(px(w), px(h)));
@@ -459,6 +511,31 @@ async fn handle(
     }
 }
 
+/// Parse a dash-separated modifier spec (`"ctrl"`, `"ctrl-shift"`, `"cmd"`,
+/// …) into [`Modifiers`] — `Cmd::Click`'s `modifiers` field (S8g: added so a
+/// script can drive real ctrl/cmd-click go-to-definition end-to-end, the
+/// same real `MouseDownEvent::modifiers.secondary()` path a physical click
+/// exercises). Named after each field's own meaning rather than the
+/// platform key that happens to produce it on this OS, since a script
+/// should read the same regardless of which desk it's driven from:
+/// `ctrl`/`control` -> `control`, `alt`/`option` -> `alt`, `shift` -> `shift`,
+/// `cmd`/`platform`/`super`/`win` -> `platform`, `fn`/`function` -> `function`.
+/// An unknown token is a hard error (bad script, not a silent no-op).
+fn parse_modifiers(spec: &str) -> anyhow::Result<Modifiers> {
+    let mut modifiers = Modifiers::default();
+    for token in spec.split(['-', '+']) {
+        match token.to_ascii_lowercase().as_str() {
+            "ctrl" | "control" => modifiers.control = true,
+            "alt" | "option" => modifiers.alt = true,
+            "shift" => modifiers.shift = true,
+            "cmd" | "platform" | "super" | "win" => modifiers.platform = true,
+            "fn" | "function" => modifiers.function = true,
+            other => bail!("unknown modifier: {other}"),
+        }
+    }
+    Ok(modifiers)
+}
+
 /// Accept either a full action name or a unique short name: "ToggleSplit"
 /// resolves to "workspace::ToggleSplit" as long as no other namespace also
 /// registers a ToggleSplit.
@@ -486,7 +563,7 @@ fn resolve_action_name(names: &[&'static str], query: &str) -> anyhow::Result<St
 
 #[cfg(test)]
 mod tests {
-    use super::{Cmd, parse_line, resolve_action_name};
+    use super::{Cmd, parse_line, parse_modifiers, resolve_action_name};
 
     #[test]
     fn parse_line_echoes_id_and_decodes() {
@@ -528,5 +605,48 @@ mod tests {
         let names: &[&'static str] = &["a::Go", "b::Go"];
         let err = resolve_action_name(names, "Go").unwrap_err().to_string();
         assert!(err.contains("ambiguous"), "{err}");
+    }
+
+    #[test]
+    fn parse_modifiers_single_ctrl() {
+        let modifiers = parse_modifiers("ctrl").unwrap();
+        assert!(modifiers.control);
+        assert!(!modifiers.platform && !modifiers.shift && !modifiers.alt);
+    }
+
+    #[test]
+    fn parse_modifiers_accepts_cmd_alias_for_platform() {
+        assert!(parse_modifiers("cmd").unwrap().platform);
+        assert!(parse_modifiers("super").unwrap().platform);
+        assert!(parse_modifiers("win").unwrap().platform);
+    }
+
+    #[test]
+    fn parse_modifiers_combines_dash_separated_tokens() {
+        let modifiers = parse_modifiers("ctrl-shift").unwrap();
+        assert!(modifiers.control);
+        assert!(modifiers.shift);
+        assert!(!modifiers.platform);
+    }
+
+    #[test]
+    fn parse_modifiers_rejects_unknown_token() {
+        let err = parse_modifiers("meta").unwrap_err().to_string();
+        assert!(err.contains("unknown modifier"), "{err}");
+    }
+
+    #[test]
+    fn click_command_parses_optional_modifiers_field() {
+        let (_, cmd) = parse_line(r#"{"cmd":"click","x":1.0,"y":2.0,"modifiers":"ctrl"}"#);
+        let Ok(Cmd::Click { modifiers, .. }) = cmd else {
+            panic!("expected Cmd::Click");
+        };
+        assert_eq!(modifiers.as_deref(), Some("ctrl"));
+    }
+
+    #[test]
+    fn mouse_move_command_parses() {
+        let (_, cmd) = parse_line(r#"{"cmd":"mouse_move","x":10.0,"y":20.0}"#);
+        assert!(matches!(cmd, Ok(Cmd::MouseMove { x, y }) if x == 10.0 && y == 20.0));
     }
 }

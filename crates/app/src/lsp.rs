@@ -1,10 +1,11 @@
-//! Go-to-definition client-side model (docs/phase-8-lsp-and-polish.md §
-//! LSP). The pure data types that don't need field access into `Workspace`
-//! live here; the gpui wiring — the honest-view gate (needs `self.source`),
-//! click hit-testing, the lazy per-workspace `LspHandle` spawn, and the
-//! read-only target-viewer render — lives in `workspace.rs` alongside the
-//! rest of `Workspace`'s private state (this module has no `Workspace`
-//! field access, by construction).
+//! Go-to-definition (S8f) and hover (S8g) client-side model
+//! (docs/phase-8-lsp-and-polish.md § LSP). The pure data types that don't
+//! need field access into `Workspace` live here; the gpui wiring — the
+//! honest-view gate (needs `self.source`), click/hover hit-testing, the
+//! lazy per-workspace `LspHandle` spawn, and the read-only target-viewer +
+//! hover-popover renders — lives in `workspace.rs` alongside the rest of
+//! `Workspace`'s private state (this module has no `Workspace` field
+//! access, by construction).
 //!
 //! **Lazy, per-workspace spawn.** `Workspace::lsp_session` is spawned at
 //! most once per `Workspace` entity — never eagerly at repo-open, only on
@@ -107,6 +108,24 @@ pub(crate) enum NavCommit {
     Push(Location),
     Back(Location),
     Forward(Location),
+}
+
+/// The S8g hover popover, while shown — anchored to the WINDOW-relative
+/// point the triggering mouse move landed at (`workspace.rs`'s
+/// `render_hover_popover` converts this to a position relative to the
+/// workspace root at render time, since that's the nearest positioned
+/// ancestor an `.absolute()` overlay child resolves against — see that
+/// method's doc comment). `line` is the 1-based diff line this popover was
+/// raised on, carried purely so `Workspace::on_symbol_hover_leave` can tell
+/// "the row I'm leaving still owns the shown popover" apart from "a fresher
+/// hover (on a different row) has already replaced it" — order-independent
+/// against the two racing sources of truth (this row's own mouse-exit vs.
+/// another row's mouse-move), unlike clearing unconditionally on any exit.
+#[derive(Debug, Clone)]
+pub(crate) struct HoverPopover {
+    pub(crate) anchor: gpui::Point<gpui::Pixels>,
+    pub(crate) line: u32,
+    pub(crate) markdown: String,
 }
 
 /// `Workspace::lsp_session`'s persistent state — spawned at most once per

@@ -578,6 +578,15 @@ struct PendingDefinition {
     epoch: u64,
 }
 
+/// How long a mouse-move over an eligible token waits, with no further
+/// move, before `Self::on_symbol_hover` actually issues a `textDocument/hover`
+/// round trip (S8g) — mirrors gpui-component's own hover-tooltip debounce so
+/// a mouse sweep across a line doesn't fire one request per pixel (this
+/// slice's gpui gotcha). Deliberately much shorter than
+/// [`LSP_WARMUP_WINDOW`]'s multi-second scale: this is a per-move
+/// UI-responsiveness debounce, not a server-warm-up wait.
+const HOVER_DEBOUNCE: std::time::Duration = std::time::Duration::from_millis(150);
+
 /// Everything a PR's background open resolves, applied to the workspace in
 /// one shot on the UI thread once it lands.
 struct PrOpenOutcome {
@@ -1120,6 +1129,47 @@ pub struct Workspace {
     /// hard: a resolve failure just leaves `Range` views ungated, not a
     /// crash).
     worktree_head_oid: Option<String>,
+    /// S8g (docs/phase-8-lsp-and-polish.md § LSP) hover popover, if one is
+    /// currently shown — reuses `lsp_session`'s already-`Ready` handle (see
+    /// `Self::on_symbol_hover`'s doc comment: hover never spawns its own
+    /// session). `None` covers both "nothing hovered yet" and "the last
+    /// hover answer was empty/failed/gated".
+    hover_popover: Option<crate::lsp::HoverPopover>,
+    /// Bumped on every mouse-move over an eligible (New-side) diff token —
+    /// the debounce+supersede counterpart to `lsp_request_epoch`, kept
+    /// separate so a hover sweep never cancels an in-flight go-to-definition
+    /// round trip (and vice versa: opening the target viewer doesn't need
+    /// to invalidate a hover that happens to still be in flight elsewhere).
+    /// A debounced hover request re-checks this after its sleep, and again
+    /// after the round trip itself, discarding silently on any mismatch —
+    /// same posture as every other epoch in this file.
+    hover_request_epoch: u64,
+    /// The diff line `hover_request_epoch`'s current value was bumped FOR —
+    /// i.e. which row owns the in-flight debounced request, if any. Exists
+    /// so `Self::on_symbol_hover_leave` can tell "the epoch I'd invalidate is
+    /// still mine" apart from "a fresher hover (on some other row) already
+    /// superseded it" (P3 finding): gpui dispatches bubble-phase mouse
+    /// listeners in reverse PAINT order (`window.rs`'s mouse dispatch
+    /// `.rev()`s the bubble pass), and rows paint top-to-bottom, so a single
+    /// `MouseMoveEvent` jumping the cursor DOWN from a hovered row to a row
+    /// painted later fires the destination row's `on_mouse_move` (which
+    /// bumps the epoch and claims this field) BEFORE the origin row's own
+    /// `.on_hover` leave listener runs. Without this guard the leave's own
+    /// unconditional bump would re-supersede the epoch the destination row
+    /// JUST claimed, discarding its own answer once the debounce elapses —
+    /// silently, direction-dependent, and only self-healing on a SECOND
+    /// mouse move (which a one-shot automation `mouse_move` command never
+    /// sends).
+    hover_request_line: Option<u32>,
+    /// This workspace's own root element's on-screen bounds, refreshed every
+    /// paint via a zero-size `canvas` probe in `Self::render` — the nearest
+    /// positioned (`.relative()`) ancestor an `.absolute()` hover-popover
+    /// child resolves against. `Self::render_hover_popover` subtracts this
+    /// origin from `HoverPopover::anchor` (a WINDOW-relative point, the only
+    /// kind a raw `MouseMoveEvent` carries) to get a position relative to
+    /// THIS root, mirroring how `Self::wrap_symbol_click_target`'s own probe
+    /// turns a window-relative click into a row-relative column.
+    root_bounds: Rc<Cell<Option<Bounds<Pixels>>>>,
 }
 
 /// Which blob a comment on `side` of `path` anchors to, given the review's
@@ -1624,6 +1674,10 @@ impl Workspace {
             lsp_ready_since: None,
             lsp_node_modules_warning: None,
             worktree_head_oid: None,
+            hover_popover: None,
+            hover_request_epoch: 0,
+            hover_request_line: None,
+            root_bounds: Rc::new(Cell::new(None)),
         };
 
         cx.spawn(async move |this, cx| {
@@ -1910,6 +1964,32 @@ impl Workspace {
                 cx.notify();
             })
             .ok();
+        })
+        .detach();
+
+        // P3 finding: a shown hover popover has no other way to clear when
+        // the window loses OS focus (alt-tab away, clicking another app) —
+        // no further in-window `MouseMoveEvent` ever arrives to run
+        // `Self::on_symbol_hover_leave`, so without this it would sit
+        // rendered over a backgrounded window until focus returns AND the
+        // pointer happens to cross an eligible row again. Registered once,
+        // for this workspace's whole lifetime — the SubscriberSet drops it
+        // on its own once `view.update` starts failing (workspace gone).
+        cx.observe_window_activation(window, |this, window, cx| {
+            if !window.is_window_active() {
+                // Bump the epoch and release the claimed row UNCONDITIONALLY
+                // (not just when a popover is already shown) — an in-flight
+                // debounced hover request that hasn't landed yet must still
+                // be superseded here, or its answer can land after focus
+                // returns and pop a stale popover the deactivation was
+                // supposed to prevent (P2 finding). `cx.notify()` stays
+                // conditional: nothing to repaint if no popover was showing.
+                this.hover_request_epoch += 1;
+                this.hover_request_line = None;
+                if this.hover_popover.take().is_some() {
+                    cx.notify();
+                }
+            }
         })
         .detach();
 
@@ -2361,6 +2441,11 @@ impl Workspace {
         // navigated away from (P3 finding — see `lsp_request_epoch`'s doc
         // comment).
         self.lsp_request_epoch += 1;
+        // Same reasoning for the S8g hover popover: it belongs to a token on
+        // the file being left, not the one about to be shown.
+        self.hover_popover = None;
+        self.hover_request_epoch += 1;
+        self.hover_request_line = None;
         self.selected = Some(index);
         self.current_hunk = 0;
         self.file_scroll
@@ -2448,7 +2533,7 @@ impl Workspace {
                 if this.selected == Some(index) {
                     let jumped = this.reset_diff_list(cx);
                     if !jumped {
-                        this.scroll_to_current_hunk();
+                        this.scroll_to_current_hunk(cx);
                     }
                 }
                 cx.notify();
@@ -2620,7 +2705,7 @@ impl Workspace {
         // Row count and indices differ between the views; re-sync the list
         // and keep the eye on the same hunk across the toggle.
         self.reset_diff_list(cx);
-        self.scroll_to_current_hunk();
+        self.scroll_to_current_hunk(cx);
         cx.notify();
     }
 
@@ -3560,6 +3645,17 @@ impl Workspace {
                     "highlight_line": v.highlight_line,
                     "lines": v.lines.len(),
                 })),
+                // S8g: hover popover state, so a script can assert the
+                // degrade path (old-side view / no session → never shown)
+                // and the shown case (a non-empty `markdown`) without a
+                // screenshot — see `Self::hover_popover_visible`'s doc
+                // comment for why this reads that (not the raw field): a
+                // stale hover answer sitting behind an open modal must
+                // report as absent here too, matching what's on screen.
+                "hover": self.hover_popover_visible().map(|h| json!({
+                    "line": h.line,
+                    "markdown": h.markdown,
+                })),
             }),
         })
     }
@@ -3691,6 +3787,28 @@ impl Workspace {
     /// the local `Thread` card once its matching remote thread gets
     /// deduped out below.
     fn reset_diff_list(&mut self, cx: &mut Context<Self>) -> bool {
+        // Every path into this fn (view-mode toggle, expand-hunk-gap
+        // recompute, a watcher-driven reload, a summary jump) can move the
+        // diff content under an already-shown hover popover — the same
+        // defect class `on_scroll_wheel` already guards against for wheel
+        // scrolls (P3 finding: this fn was one of the paths that missed
+        // it). `Self::select_file_inner` already clears this explicitly
+        // before calling in, so this is a harmless no-op there; every other
+        // caller gets the fix here instead of needing its own copy.
+        //
+        // Bump the epoch/release the claimed row UNCONDITIONALLY — an
+        // in-flight debounced hover request that hasn't answered yet must
+        // also be superseded (not just an already-shown popover cleared),
+        // or its answer can land after the reload and pop a stale popover
+        // anchored to content that just moved/reflowed away (P2 finding).
+        // `cx.notify()` stays conditional on there being an existing
+        // popover to actually clear.
+        self.hover_request_epoch += 1;
+        self.hover_request_line = None;
+        if self.hover_popover.take().is_some() {
+            cx.notify();
+        }
+
         let row_count = self.diff_row_count();
         let file_path = self.selected.map(|i| self.files[i].path.clone());
 
@@ -3977,7 +4095,7 @@ impl Workspace {
         .detach();
     }
 
-    fn scroll_to_current_hunk(&mut self) {
+    fn scroll_to_current_hunk(&mut self, cx: &mut Context<Self>) {
         let current = self.current_hunk;
         if let Some(&row) = self.hunk_rows().and_then(|rows| rows.get(current))
             && let Some(&display_ix) = self.diff_to_display.get(row)
@@ -3987,6 +4105,25 @@ impl Workspace {
                 offset_in_item: px(0.),
             });
         }
+        // A hunk jump (keyboard next/prev-hunk, or a view-mode toggle
+        // re-anchoring on the current hunk) moves the diff content under a
+        // shown hover popover exactly like the wheel-scroll case
+        // `on_scroll_wheel` already guards against (P3 finding: this path
+        // was missed) — the popover's anchored row can end up scrolled away
+        // or simply no longer under the pointer, and if it scrolled out of
+        // the list viewport its `.on_hover` leave listener is gone too, so
+        // nothing else would ever clear it on keyboard-only navigation.
+        //
+        // Bump the epoch/release the claimed row UNCONDITIONALLY — an
+        // in-flight debounced hover request must also be superseded here,
+        // not just an already-shown popover cleared, or its answer can land
+        // after the jump and pop a stale popover over the new hunk (P2
+        // finding). `cx.notify()` stays conditional on an existing popover.
+        self.hover_request_epoch += 1;
+        self.hover_request_line = None;
+        if self.hover_popover.take().is_some() {
+            cx.notify();
+        }
     }
 
     fn on_next_hunk(&mut self, _: &NextHunk, _: &mut Window, cx: &mut Context<Self>) {
@@ -3995,7 +4132,7 @@ impl Workspace {
             return;
         }
         self.current_hunk = (self.current_hunk + 1).min(count - 1);
-        self.scroll_to_current_hunk();
+        self.scroll_to_current_hunk(cx);
         cx.notify();
     }
 
@@ -4004,7 +4141,7 @@ impl Workspace {
             return;
         }
         self.current_hunk = self.current_hunk.saturating_sub(1);
-        self.scroll_to_current_hunk();
+        self.scroll_to_current_hunk(cx);
         cx.notify();
     }
 
@@ -5159,6 +5296,32 @@ impl Workspace {
             .map(|f| f.path.clone())
     }
 
+    /// Whether `rel_path`'s on-disk (working-tree) bytes still match its
+    /// blob at `head_rev` — the per-file honest-view re-check both
+    /// `Self::run_definition_request` and `Self::on_symbol_hover` perform
+    /// before trusting any vtsls answer on a `DiffSource::Range` view.
+    /// `Self::lsp_view_is_honest`'s whole-view gate alone can't see an
+    /// uncommitted LOCAL edit to just this one file (P3 finding: vtsls
+    /// always reads on-disk bytes, so a `head == worktree HEAD` view can
+    /// still be showing this file's stale, committed blob at the displayed
+    /// line numbers).
+    fn range_head_matches_working(repo: &GitRepo, rel_path: &str, head_rev: &str) -> bool {
+        let head_sha = repo
+            .blob_sha(&BlobSpec::Rev {
+                rev: head_rev.to_string(),
+                path: rel_path.to_string(),
+            })
+            .ok()
+            .flatten();
+        let working_sha = repo
+            .blob_sha(&BlobSpec::Working {
+                path: rel_path.to_string(),
+            })
+            .ok()
+            .flatten();
+        head_sha == working_sha
+    }
+
     /// Column-hit-test a click inside a rendered diff line: shapes `text`
     /// with the SAME font/size the row actually rendered at (so this is
     /// glyph-accurate, not an approximate monospace-width guess) and finds
@@ -5194,14 +5357,19 @@ impl Workspace {
     /// that's on the New side with a real line number (see `render_diff_row`/
     /// `render_split_cell`'s call sites) — Removed-only unified rows and Old
     /// split cells never get this wrapper at all, which is what enforces
-    /// the New-side half of `Self::lsp_view_is_honest`'s scope.
+    /// the New-side half of `Self::lsp_view_is_honest`'s scope. Returns
+    /// `AnyElement`, not `Div`: the wrapper needs `.id()` to use `.on_hover`
+    /// (P2 finding fix — see that call site's comment), which turns it into
+    /// a `Stateful<Div>`, a different type than the un-wrapped `Div` its
+    /// callers' `_ => content` arms produce; erasing both to `AnyElement`
+    /// keeps those `match` arms type-uniform.
     fn wrap_symbol_click_target(
         &self,
         content: Div,
         new_line: u32,
         text: SharedString,
         cx: &Context<Self>,
-    ) -> Div {
+    ) -> AnyElement {
         let font_family = cx.theme().mono_font_family.clone();
         let font_size = self.font_size;
         // Captures this row's own on-screen bounds at paint time (a plain
@@ -5213,6 +5381,7 @@ impl Workspace {
         let bounds: Rc<Cell<Option<Bounds<Pixels>>>> = Rc::new(Cell::new(None));
         let bounds_for_paint = Rc::clone(&bounds);
         let bounds_for_click = Rc::clone(&bounds);
+        let bounds_for_hover = Rc::clone(&bounds);
         let probe = canvas(
             move |b, _, _| {
                 bounds_for_paint.set(Some(b));
@@ -5222,7 +5391,14 @@ impl Workspace {
         .absolute()
         .size_full();
 
+        // S8g: hover shares this exact wrapper (same New-side/real-line
+        // scope, same bounds probe) rather than a second one — cloned ahead
+        // of the `on_mouse_down` closure below, which moves its own copies.
+        let text_for_hover = text.clone();
+        let font_family_for_hover = font_family.clone();
+
         div()
+            .id(("symbol-hover-target", new_line as usize))
             .relative()
             .size_full()
             .child(probe)
@@ -5248,6 +5424,60 @@ impl Workspace {
                     cx.stop_propagation();
                 }),
             )
+            .on_mouse_move(cx.listener(move |this, ev: &MouseMoveEvent, window, cx| {
+                // A button held during this move means a drag (e.g. the
+                // summary-panel resize handle), not a hover-intent rest —
+                // and gpui's `.on_hover` below forces `is_hovered` to
+                // `false` for the whole drag (`div.rs`'s hover listener
+                // checks `!cx.has_active_drag()`), so a popover raised here
+                // mid-drag would never get a matching leave and would stick
+                // after release (P3 finding). `.on_hover`'s leave side
+                // already effectively enforces this; mirror it here on the
+                // raise side too.
+                if ev.pressed_button.is_some() {
+                    return;
+                }
+                let Some(row_bounds) = bounds_for_hover.get() else {
+                    return;
+                };
+                let local_x = ev.position.x - row_bounds.origin.x;
+                let byte_col = Self::hit_test_byte_column(
+                    &text_for_hover,
+                    font_family_for_hover.clone(),
+                    font_size,
+                    local_x,
+                    window,
+                );
+                this.on_symbol_hover(new_line, byte_col, text_for_hover.clone(), ev.position, cx);
+            }))
+            // NOT `.on_mouse_exit(MouseExitEvent)` (P2 finding, live-verified
+            // stuck-popover): gpui's Windows backend never dispatches
+            // `PlatformInput::MouseExited` at all (only the mac/linux/web
+            // backends do — `gpui_windows`'s WM_MOUSELEAVE handler only
+            // flips the window's own hovered flag), so that listener was
+            // dead code on the only platform dv ships on. `.on_hover`
+            // instead recomputes this element's own hitbox-hover state from
+            // `hitbox.is_hovered(window)` on every `MouseMoveEvent` anywhere
+            // in the window (see gpui's `div.rs`), so it correctly flips to
+            // `false` on pointer-out on every platform — requires `.id()`
+            // above (on_hover is stateful). NOTE this is registered against
+            // `MouseMoveEvent`/`MouseExitEvent` only, same as gpui's own
+            // hover machinery — it does NOT flip on a scroll-wheel event
+            // with the mouse stationary (a wheel scroll dispatches
+            // `ScrollWheelEvent`, never a synthetic move), and once this row
+            // scrolls out of the `uniform_list`/`list` viewport its listener
+            // stops being registered at all, so neither a wheel-scroll nor a
+            // later move over some OTHER, ineligible surface can ever fire
+            // this row's own leave again (P2 finding, corrected: the popover
+            // used to be claimed self-healing here — it is not). The diff
+            // pane's own `.on_scroll_wheel` (see its container in `render`)
+            // is what actually clears a popover left behind by a scroll.
+            .on_hover(cx.listener(move |this, hovered: &bool, _window, cx| {
+                if !*hovered {
+                    this.on_symbol_hover_leave(new_line, cx);
+                }
+            }))
+            .into_any_element()
     }
 
     /// Entry point for a ctrl/cmd-click on an eligible (New-side, real line)
@@ -5533,6 +5763,222 @@ impl Workspace {
         }
     }
 
+    // ---- Hover (S8g, docs/phase-8-lsp-and-polish.md § LSP) -------------
+    //
+    // Same honest-view gate and New-side-only scope as go-to-definition
+    // (`Self::wrap_symbol_click_target`'s callers), but deliberately does
+    // NOT spawn a session: unlike a ctrl/cmd-click, a hover is a passive
+    // side-effect of just moving the mouse across the diff — spawning a
+    // `vtsls` child for every stray sweep over a WSL TypeScript file would
+    // be a surprising, unrequested cost (and, worse, a boot-storm vector if
+    // it happened while merely reviewing without ever meaning to use code
+    // intelligence). Hover only ever activates once something else (a
+    // click) has already brought the session to `Ready`.
+
+    /// Entry point for a plain (no modifier needed) mouse-move over an
+    /// eligible diff token — mirrors `Self::on_symbol_click`'s argument
+    /// shape (`new_line`/`byte_col`/`line_text`) plus the WINDOW-relative
+    /// `anchor` point the popover renders at. Silent on every early-out
+    /// (no status banner, unlike `on_symbol_click`'s "surface a gentle
+    /// warning" posture) — a hover that declines to answer is the ordinary
+    /// case on every plain mouse sweep across a diff, not a user action
+    /// worth narrating.
+    fn on_symbol_hover(
+        &mut self,
+        new_line: u32,
+        byte_col: usize,
+        line_text: SharedString,
+        anchor: Point<Pixels>,
+        cx: &mut Context<Self>,
+    ) {
+        // Bump first, unconditionally: even a gated-off hover (wrong view,
+        // no session yet, …) must supersede whatever earlier hover request
+        // is still in flight for this exact spot, or a slow stale answer
+        // could pop the popover back up after the mouse has already left.
+        self.hover_request_epoch += 1;
+        let epoch = self.hover_request_epoch;
+        // Claim this epoch for `new_line` — see `hover_request_line`'s doc
+        // comment for why `on_symbol_hover_leave` needs to know this.
+        self.hover_request_line = Some(new_line);
+
+        if !self.lsp_view_is_honest() {
+            return;
+        }
+        let RepoLocation::Wsl {
+            path: root_path, ..
+        } = self.location.clone()
+        else {
+            return;
+        };
+        let Some(rel_path) = self.selected_file_path() else {
+            return;
+        };
+        let Some(language_id) = dv_core::lsp::language_id_for_path(&rel_path) else {
+            return;
+        };
+        let Some(repo) = self.repo.clone() else {
+            return;
+        };
+        // Hover never spawns — see this section's scope note above.
+        let crate::lsp::LspSessionState::Ready(handle) = &self.lsp_session else {
+            return;
+        };
+        let handle = handle.clone();
+
+        let character = utf16_column(&line_text, byte_col);
+        let position = lsp_types::Position {
+            line: new_line.saturating_sub(1),
+            character,
+        };
+        let uri =
+            dv_core::lsp::file_uri(&format!("{}/{}", root_path.trim_end_matches('/'), rel_path));
+        // Same per-file re-check `Self::run_definition_request` performs
+        // (P3 finding: hover captured no `range_head` at all and skipped
+        // this entirely) — `Self::lsp_view_is_honest`'s whole-view gate
+        // above only compares the view's oid against the worktree HEAD, so
+        // a `Range` view with an uncommitted LOCAL edit to just this file
+        // would otherwise show a confidently wrong tooltip.
+        let range_head = match &self.source {
+            DiffSource::Range { head, .. } => Some(head.clone()),
+            _ => None,
+        };
+        // Captured here, not read fresh inside the background task (which
+        // has no `&self`) — same pattern `Self::on_symbol_click` uses before
+        // calling `Self::run_definition_request`.
+        let ready_since = self.lsp_ready_since;
+
+        cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(HOVER_DEBOUNCE).await;
+            // Re-check BEFORE doing any work at all (the debounce's whole
+            // point — see `HOVER_DEBOUNCE`'s doc comment): a mouse sweep
+            // spawns one of these per pixel, and only the one still current
+            // once the debounce elapses should ever reach vtsls.
+            let still_current = this
+                .update(cx, |this, _| this.hover_request_epoch == epoch)
+                .unwrap_or(false);
+            if !still_current {
+                return;
+            }
+
+            let result = cx
+                .background_spawn(async move {
+                    if let Some(head) = &range_head
+                        && !Self::range_head_matches_working(&repo, &rel_path, head)
+                    {
+                        // Silently decline — same posture as any other
+                        // gated-off hover (no status banner; see this
+                        // section's scope note above).
+                        return Ok::<_, dv_core::lsp::LspError>(None);
+                    }
+                    let text = repo
+                        .blob_bytes(&BlobSpec::Working {
+                            path: rel_path.clone(),
+                        })
+                        .ok()
+                        .flatten()
+                        .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
+                        .unwrap_or_default();
+                    let _ = handle.sync_document(&uri, language_id, &text);
+                    let mut hover = handle.hover(&uri, position)?;
+                    // Same warm-up posture as `Self::run_definition_request`
+                    // (P3 finding: this used to be missing here entirely) —
+                    // vtsls's semantic tsserver can still be indexing for a
+                    // few seconds after a session first reaches `Ready`, and
+                    // its fast syntax tsserver answers hover with `null` in
+                    // the meantime. Retrying a handful of times only within
+                    // `LSP_WARMUP_WINDOW` keeps a warm session's genuinely
+                    // empty answer (hovering whitespace, say) instant.
+                    if hover.is_none()
+                        && ready_since.is_some_and(|since| since.elapsed() < LSP_WARMUP_WINDOW)
+                    {
+                        for _ in 0..LSP_WARMUP_RETRIES {
+                            std::thread::sleep(LSP_WARMUP_RETRY_DELAY);
+                            hover = handle.hover(&uri, position)?;
+                            if hover.is_some() {
+                                break;
+                            }
+                        }
+                    }
+                    Ok(hover)
+                })
+                .await;
+
+            this.update_in(cx, |this, window, cx| {
+                if this.hover_request_epoch != epoch {
+                    return; // superseded while the round trip was in flight
+                }
+                // The pointer can leave the window entirely while this round
+                // trip is in flight with no in-window `MouseMoveEvent` ever
+                // following to supersede `epoch` (P3 finding) — gpui's
+                // Windows backend never dispatches a `MouseExited` INPUT
+                // event (see `Self::wrap_symbol_click_target`'s own doc
+                // comment), so a debounced hover answer landing after an
+                // alt-tab-away or a flick off the window's edge would
+                // otherwise pop a popover up over a window nothing is
+                // pointing at. `Window::is_window_hovered` is a separate,
+                // platform-level signal (WM_MOUSELEAVE on Windows) that
+                // stays accurate even though the input event doesn't fire.
+                // Under `--automation` that same accuracy is the problem:
+                // the REAL cursor sits over the driving terminal, so this
+                // check would discard every scripted hover — skip it there
+                // (`automation::is_active`'s doc has the full story; found
+                // when the S8g consolidation rerun showed hover null while
+                // the pre-fix live run had verified it visually).
+                #[cfg(feature = "automation")]
+                let window_hovered = window.is_window_hovered() || crate::automation::is_active();
+                #[cfg(not(feature = "automation"))]
+                let window_hovered = window.is_window_hovered();
+                if !window_hovered {
+                    return;
+                }
+                this.hover_popover =
+                    match result {
+                        Ok(Some(hover)) => dv_core::lsp::hover_contents_to_text(&hover.contents)
+                            .map(|markdown| crate::lsp::HoverPopover {
+                                anchor,
+                                line: new_line,
+                                markdown,
+                            }),
+                        Ok(None) | Err(_) => None,
+                    };
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// The mouse left an eligible token's row — clear the popover, but only
+    /// if it's still the one THIS row raised (see `crate::lsp::HoverPopover`'s
+    /// doc comment: this check is what makes the clear order-independent
+    /// against a fresher hover on a different row racing in either order).
+    fn on_symbol_hover_leave(&mut self, new_line: u32, cx: &mut Context<Self>) {
+        // Supersede any in-flight debounced hover THIS row itself kicked off
+        // — leaving before it resolves must not have it pop back up. Only
+        // when the in-flight epoch is still this row's own claim, though
+        // (see `hover_request_line`'s doc comment): gpui's bubble-phase
+        // mouse dispatch runs in reverse paint order, so a single downward
+        // `MouseMoveEvent` (hovered row -> a row painted later) fires the
+        // DESTINATION row's `on_symbol_hover` — which already bumped the
+        // epoch and claimed `hover_request_line` for itself — before this
+        // (origin) row's own leave listener runs. Bumping unconditionally
+        // here would re-supersede that fresher claim and silently drop the
+        // destination row's answer; skip the bump entirely when some other
+        // row already owns the current epoch.
+        if self.hover_request_line == Some(new_line) {
+            self.hover_request_epoch += 1;
+            self.hover_request_line = None;
+        }
+        if self
+            .hover_popover
+            .as_ref()
+            .is_some_and(|popover| popover.line == new_line)
+        {
+            self.hover_popover = None;
+            cx.notify();
+        }
+    }
+
     /// `LspHandle::sync_document` (best-effort — vtsls needs the file open,
     /// and current, before it can answer `definition` at all; see that
     /// method's doc comment for why this isn't a flat `didOpen`) +
@@ -5570,27 +6016,14 @@ impl Workspace {
         cx.spawn(async move |this, cx| {
             let result = cx
                 .background_spawn(async move {
-                    if let Some(head) = range_head {
-                        let head_sha = repo
-                            .blob_sha(&BlobSpec::Rev {
-                                rev: head,
-                                path: rel_path.clone(),
-                            })
-                            .ok()
-                            .flatten();
-                        let working_sha = repo
-                            .blob_sha(&BlobSpec::Working {
-                                path: rel_path.clone(),
-                            })
-                            .ok()
-                            .flatten();
-                        if head_sha != working_sha {
-                            return Err(dv_core::lsp::LspError::Unavailable(
-                                "this file has uncommitted changes since the reviewed \
-                                 revision — only available on the working-tree view"
-                                    .to_string(),
-                            ));
-                        }
+                    if let Some(head) = &range_head
+                        && !Self::range_head_matches_working(&repo, &rel_path, head)
+                    {
+                        return Err(dv_core::lsp::LspError::Unavailable(
+                            "this file has uncommitted changes since the reviewed \
+                             revision — only available on the working-tree view"
+                                .to_string(),
+                        ));
                     }
                     let text = repo
                         .blob_bytes(&BlobSpec::Working {
@@ -5931,6 +6364,12 @@ impl Workspace {
         self.lsp_pending_definition = None;
         self.lsp_node_modules_warning = None;
         self.lsp_ready_since = None;
+        // The S8g hover popover (and any debounced request still chasing an
+        // answer) belongs to the session being torn down here too — hover
+        // never outlives the `Ready` handle it was answered against.
+        self.hover_popover = None;
+        self.hover_request_epoch += 1;
+        self.hover_request_line = None;
         // Invalidate any spawn attempt still in flight from before this
         // park — without this, a stale attempt completing after parking
         // (but before any reactivation click starts a new one) would still
@@ -5975,6 +6414,126 @@ impl Workspace {
                     .child((idx + 1).to_string()),
             )
             .child(div().whitespace_nowrap().child(text.clone()))
+    }
+
+    /// The hover popover as it should actually be SHOWN right now — `None`
+    /// while any modal overlay (target viewer, palette, PR picker) is open,
+    /// even if `self.hover_popover` itself still holds a value.
+    ///
+    /// Live-verification finding (S8g): `Cmd::Click`'s own "move first so
+    /// hover state matches what a real click sees" (a real physical click
+    /// does the same — the cursor arrives at the spot before the button
+    /// goes down) means EVERY ctrl/cmd-click also fires this exact hover
+    /// path for the very same token, immediately before the click opens the
+    /// target-viewer modal on top of it. Without this gate, the stale
+    /// popover from that incidental hover kept rendering ON TOP of the
+    /// modal (both are children of the same workspace root, and the
+    /// popover — added after the target viewer in `Self::render`'s child
+    /// order — painted over it) instead of being covered by it. Gating at
+    /// render time, rather than hunting every call site that opens an
+    /// overlay, is what makes this correct regardless of which overlay:
+    /// `self.hover_popover` is left alone as a plain "last hover answer"
+    /// cache that a later render (once the overlay closes, if the mouse is
+    /// still over that same token) can still show.
+    fn hover_popover_visible(&self) -> Option<&crate::lsp::HoverPopover> {
+        if self.target_viewer.is_some() || self.palette.is_some() || self.pr_picker.is_some() {
+            return None;
+        }
+        self.hover_popover.as_ref()
+    }
+
+    /// The S8g hover popover — a small, non-modal floating card (unlike the
+    /// target viewer's centered backdrop-modal) positioned near the token
+    /// that raised it. `HoverPopover::anchor` is a WINDOW-relative point (the
+    /// only kind a raw `MouseMoveEvent` carries); `self.root_bounds` (kept
+    /// current by a `canvas` probe in `Self::render`) is this workspace's own
+    /// root element's WINDOW-relative bounds, the nearest positioned
+    /// ancestor an `.absolute()` child here resolves against — subtracting
+    /// its origin converts the anchor into a position relative to that root.
+    /// `.occlude()` (not `.on_mouse_down` capture) so the popover doesn't
+    /// eat clicks meant for the diff underneath it while still not itself
+    /// stealing keyboard focus (this slice's gpui gotcha: position-only
+    /// overlay, no focus grab).
+    fn render_hover_popover(&self, cx: &mut Context<Self>) -> Option<Div> {
+        // Which edge the popover is anchored from — see the flip-above
+        // branch below for why this can't just always be `Top`.
+        enum VerticalOffset {
+            Top(Pixels),
+            Bottom(Pixels),
+        }
+
+        let popover_state = self.hover_popover_visible()?;
+        let theme = cx.theme();
+        let root_bounds = self.root_bounds.get();
+        let root_origin = root_bounds
+            .map(|b| b.origin)
+            .unwrap_or_else(|| point(px(0.), px(0.)));
+        const POPOVER_WIDTH: Pixels = px(480.);
+        const POPOVER_MAX_HEIGHT: Pixels = px(280.);
+        let mut left = (popover_state.anchor.x - root_origin.x).max(px(0.));
+        // Clamp to the root's own right edge (live-verification finding:
+        // hovering a token near the window's right side otherwise left the
+        // popover's own right portion rendered off-window and unreadable,
+        // since `left` alone never accounted for the box's width).
+        if let Some(root_width) = root_bounds.map(|b| b.size.width) {
+            left = left.min((root_width - POPOVER_WIDTH).max(px(0.)));
+        }
+        // A little below and right of the cursor, same convention as an OS
+        // tooltip — sitting exactly under the pointer would have the
+        // pointer itself obscure the popover's own top-left corner.
+        let anchor_y = popover_state.anchor.y - root_origin.y;
+        let top = anchor_y + px(20.);
+        // Mirror the horizontal clamp above, but flip ABOVE the anchor
+        // instead of just clamping — clamping `top` down to fit would slide
+        // the card up so it no longer points at the hovered token at all.
+        // (P3 finding: hovering a token on the bottom rows otherwise
+        // rendered the popover partially or entirely below the window, the
+        // same defect class the horizontal clamp fixed, left unhandled
+        // vertically.)
+        //
+        // The flip anchors the popover's BOTTOM edge to the token instead of
+        // its top (`.bottom(..)` instead of `.top(..)` — both set gpui's
+        // `inset`, so only one of the two is ever applied). Anchoring `top`
+        // at a fixed `POPOVER_MAX_HEIGHT` offset (P3 finding, corrected)
+        // assumed the card always rendered at that max height, but `max_h`
+        // only caps it — a typical short 1-3 line vtsls answer shrinks to
+        // content, leaving its real bottom edge (and thus its visual
+        // connection to the hovered token) up to `POPOVER_MAX_HEIGHT` away
+        // from the cursor. Anchoring the bottom edge instead keeps the card
+        // adjacent to the token regardless of how tall the content actually
+        // renders.
+        let vertical_offset = match root_bounds.map(|b| b.size.height) {
+            Some(root_height) if top + POPOVER_MAX_HEIGHT > root_height => {
+                VerticalOffset::Bottom((root_height - anchor_y + px(4.)).max(px(0.)))
+            }
+            _ => VerticalOffset::Top(top),
+        };
+
+        let popover = div()
+            .absolute()
+            .left(left)
+            .occlude()
+            .max_w(POPOVER_WIDTH)
+            .max_h(POPOVER_MAX_HEIGHT)
+            .overflow_hidden()
+            .p_2()
+            .bg(theme.popover)
+            .text_color(theme.popover_foreground)
+            .border_1()
+            .border_color(theme.border)
+            .rounded_md()
+            .shadow_lg()
+            .text_xs()
+            .font_family(theme.mono_font_family.clone())
+            .child(
+                div()
+                    .whitespace_normal()
+                    .child(popover_state.markdown.clone()),
+            );
+        Some(match vertical_offset {
+            VerticalOffset::Top(top) => popover.top(top),
+            VerticalOffset::Bottom(bottom) => popover.bottom(bottom),
+        })
     }
 
     /// The S8f read-only target-viewer overlay — same modal backdrop
@@ -7686,7 +8245,7 @@ impl Workspace {
                     Some(new_line) => {
                         self.wrap_symbol_click_target(content, *new_line, text.clone(), cx)
                     }
-                    None => content,
+                    None => content.into_any_element(),
                 };
 
                 let anchor = Self::row_anchor(*old_line, *new_line);
@@ -7851,7 +8410,7 @@ impl Workspace {
             (DiffSide::New, Some(line)) => {
                 self.wrap_symbol_click_target(content, line, cell.text.clone(), cx)
             }
-            _ => content,
+            _ => content.into_any_element(),
         };
 
         let gutter = div()
@@ -8390,14 +8949,53 @@ impl Render for Workspace {
                                 .size_full(),
                             ),
                     )
-                    .child(div().h_full().flex_1().min_w(px(0.)).child({
-                        let this = cx.weak_entity();
-                        list(self.diff_list.clone(), move |ix, _window, cx| {
-                            this.update(cx, |this, cx| this.render_display_row(ix, cx))
-                                .unwrap_or_else(|_| div().into_any_element())
-                        })
-                        .size_full()
-                    }))
+                    .child(
+                        div()
+                            .h_full()
+                            .flex_1()
+                            .min_w(px(0.))
+                            // P2 finding: `Self::wrap_symbol_click_target`'s
+                            // `.on_hover` leave never fires for a wheel
+                            // scroll with the mouse stationary — gpui
+                            // dispatches a distinct `ScrollWheelEvent` for
+                            // that, never a synthetic `MouseMoveEvent` —
+                            // and once the raising row scrolls out of this
+                            // list's viewport its listener isn't even
+                            // registered anymore, so nothing else would ever
+                            // clear a popover left behind by a scroll.
+                            // Dropping it here (rather than repositioning
+                            // it) matches `on_symbol_hover_leave`'s own
+                            // posture: a stale popover is worth clearing,
+                            // not worth chasing across a scroll.
+                            //
+                            // Bump the epoch/release the claimed row
+                            // UNCONDITIONALLY — an in-flight debounced hover
+                            // request (up to ~3.3s inside the LSP warm-up
+                            // retry window) must also be superseded here,
+                            // not just an already-shown popover cleared, or
+                            // its answer can land after the scroll and pop a
+                            // stale, wrongly-anchored popover over whatever
+                            // is now under the stationary pointer (P2
+                            // finding). `cx.notify()` stays conditional on
+                            // an existing popover to actually clear.
+                            .on_scroll_wheel(cx.listener(
+                                |this, _: &ScrollWheelEvent, _window, cx| {
+                                    this.hover_request_epoch += 1;
+                                    this.hover_request_line = None;
+                                    if this.hover_popover.take().is_some() {
+                                        cx.notify();
+                                    }
+                                },
+                            ))
+                            .child({
+                                let this = cx.weak_entity();
+                                list(self.diff_list.clone(), move |ix, _window, cx| {
+                                    this.update(cx, |this, cx| this.render_display_row(ix, cx))
+                                        .unwrap_or_else(|_| div().into_any_element())
+                                })
+                                .size_full()
+                            }),
+                    )
                     .children(summary),
             ),
         };
@@ -8423,11 +9021,27 @@ impl Render for Workspace {
             key_context.push_str(TARGET_VIEWER_CONTEXT);
         }
 
+        // S8g: keeps `self.root_bounds` current every paint — the nearest
+        // positioned ancestor `Self::render_hover_popover`'s `.absolute()`
+        // child resolves against (see that method's doc comment). Zero-size,
+        // paint-only, same `canvas` idiom `Self::wrap_symbol_click_target`
+        // uses for its own per-row bounds probe.
+        let root_bounds_for_paint = Rc::clone(&self.root_bounds);
+        let root_bounds_probe = canvas(
+            move |b, _, _| {
+                root_bounds_for_paint.set(Some(b));
+            },
+            |_, _, _, _| {},
+        )
+        .absolute()
+        .size_full();
+
         v_flex()
             .size_full()
             .relative()
             .track_focus(&self.focus_handle)
             .key_context(key_context.as_str())
+            .child(root_bounds_probe)
             .on_action(cx.listener(Self::on_next_file))
             .on_action(cx.listener(Self::on_prev_file))
             .on_action(cx.listener(Self::on_next_hunk))
@@ -8561,6 +9175,7 @@ impl Render for Workspace {
             .children(self.render_palette(cx))
             .children(self.render_pr_picker(cx))
             .children(self.render_target_viewer(cx))
+            .children(self.render_hover_popover(cx))
     }
 }
 

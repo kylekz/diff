@@ -33,6 +33,17 @@ const INITIALIZE_TIMEOUT: Duration = Duration::from_secs(30);
 /// spurious timeout — never-fail-hard (see [`super::provision`]'s module
 /// doc for the same posture on the WSL detection side).
 const DEFINITION_TIMEOUT: Duration = Duration::from_secs(15);
+/// Bound for a `textDocument/hover` round trip (S8g) — same generous,
+/// never-fail-hard posture as [`DEFINITION_TIMEOUT`], just a little
+/// tighter: unlike a deliberate ctrl/cmd-click, a hover answer this slow no
+/// longer matches a mouse that's very likely moved on to somewhere else by
+/// the time it would arrive.
+const HOVER_TIMEOUT: Duration = Duration::from_secs(10);
+/// Bound for a `textDocument/references` round trip (S8g stretch) — the
+/// most expensive of the three request kinds this client speaks (a
+/// project-wide search rather than a single-file lookup), so the most
+/// generous ceiling.
+const REFERENCES_TIMEOUT: Duration = Duration::from_secs(20);
 /// Bound for the best-effort `shutdown` request issued by [`LspHandle::shutdown`]
 /// and [`LspClient`]'s `Drop` — short, because a child that doesn't answer
 /// this quickly is simply killed right after (see `Drop`'s doc).
@@ -83,14 +94,20 @@ pub struct LspClient {
     next_id: AtomicI64,
     pending: Pending,
     alive: Arc<AtomicBool>,
-    /// URI -> the version last announced to vtsls via `didOpen`/`didChange`.
-    /// Keyed so [`LspHandle::sync_document`] can tell "first time we've
-    /// touched this file" (send `didOpen`) apart from "already open,
-    /// content may have moved on" (send `didChange` with a bumped version)
-    /// — sending a second `didOpen` for an already-open document is an LSP
-    /// protocol violation (P3 finding: a repeat click on the same file used
-    /// to resend `didOpen` with a constant `version: 1` every time).
-    open_docs: Mutex<HashMap<String, i32>>,
+    /// URI -> (the version last announced to vtsls via `didOpen`/`didChange`,
+    /// a hash of the text sent with that version). Keyed so
+    /// [`LspHandle::sync_document`] can tell "first time we've touched this
+    /// file" (send `didOpen`) apart from "already open, content may have
+    /// moved on" (send `didChange` with a bumped version) — sending a
+    /// second `didOpen` for an already-open document is an LSP protocol
+    /// violation (P3 finding: a repeat click on the same file used to
+    /// resend `didOpen` with a constant `version: 1` every time). The hash
+    /// half lets a call whose text is BYTE-IDENTICAL to what's already open
+    /// skip the `didChange` (and the version bump) entirely (P3 finding:
+    /// every settled hover — one per ~150ms mouse rest — used to re-send the
+    /// whole file and bump the version even when nothing had changed,
+    /// forcing vtsls to re-analyze an unchanged document on every hover).
+    open_docs: Mutex<HashMap<String, (i32, u64)>>,
 }
 
 /// Cheap-to-clone handle onto a [`LspClient`] — the only long-lived clone
@@ -190,6 +207,14 @@ impl LspHandle {
                 },
                 "textDocument": {
                     "definition": { "linkSupport": true },
+                    // S8g additions — hover/references. Neither needs
+                    // `linkSupport` (that's a `definition`-only wire
+                    // wrinkle); `hover.contentFormat` tells vtsls we can
+                    // take either shape so it doesn't have to guess (this
+                    // client normalizes both anyway — see
+                    // `hover_contents_to_text`).
+                    "hover": { "contentFormat": ["markdown", "plaintext"] },
+                    "references": {},
                     "synchronization": {
                         "dynamicRegistration": false,
                         "didSave": false,
@@ -244,27 +269,45 @@ impl LspHandle {
     }
 
     /// Tell vtsls about `uri`'s current content, choosing `didOpen` (the
-    /// first time this handle has ever touched `uri`) or `didChange` (every
-    /// subsequent time) so a repeat click on an already-opened file never
-    /// resends `didOpen` — see [`LspClient::open_docs`]'s doc comment for
-    /// why that matters. Always the right call before a [`Self::definition`]
+    /// first time this handle has ever touched `uri`), `didChange` (already
+    /// open, and `text` has moved on since the last call), or nothing at all
+    /// (already open with this EXACT `text` already announced) so a repeat
+    /// call on an already-opened, unchanged file never resends `didOpen` —
+    /// see [`LspClient::open_docs`]'s doc comment for why either matters.
+    /// Always the right call before a [`Self::definition`]/[`Self::hover`]
     /// request; callers no longer need to track document lifecycle
     /// themselves.
     pub fn sync_document(&self, uri: &str, language_id: &str, text: &str) -> Result<(), LspError> {
+        let text_hash = hash_text(text);
+        // Hold `open_docs` locked across the send itself (not just the
+        // peek): two concurrent first-time syncs of the same `uri` (e.g. a
+        // hover and a ctrl-click definition request racing on a
+        // just-selected file) must never both observe "not open" and both
+        // send `didOpen` — that's the exact LSP protocol violation
+        // `open_docs` exists to prevent (P2 finding). There is no
+        // lock-order hazard: `did_open`/`did_change` only ever touch the
+        // separate stdin mutex, never `open_docs`. On a send failure we
+        // simply don't commit — no rollback needed, the map still reflects
+        // reality and the next call resyncs normally.
         let mut docs = self.0.open_docs.lock().unwrap_or_else(|e| e.into_inner());
-        match docs.get_mut(uri) {
-            Some(version) => {
-                *version += 1;
-                let version = *version;
-                drop(docs);
-                self.did_change(uri, version, text)
+        let intended_version = match docs.get(uri) {
+            Some((_version, last_hash)) if *last_hash == text_hash => {
+                // Byte-identical to what vtsls was last told — no version
+                // bump, no `didChange` at all (see this fn's doc comment).
+                return Ok(());
             }
-            None => {
-                docs.insert(uri.to_string(), 1);
-                drop(docs);
-                self.did_open(uri, language_id, 1, text)
-            }
+            Some((version, _last_hash)) => *version + 1,
+            None => 1,
+        };
+
+        if intended_version == 1 {
+            self.did_open(uri, language_id, intended_version, text)?;
+        } else {
+            self.did_change(uri, intended_version, text)?;
         }
+
+        docs.insert(uri.to_string(), (intended_version, text_hash));
+        Ok(())
     }
 
     /// `textDocument/definition`, normalized to `Vec<LocationLink>`
@@ -285,6 +328,51 @@ impl LspHandle {
             DEFINITION_TIMEOUT,
         )?;
         Ok(normalize_definition_result(value))
+    }
+
+    /// `textDocument/hover` (S8g). `Ok(None)` covers both wire shapes that
+    /// mean "nothing to show here": a `null` result (vtsls's answer for
+    /// whitespace/no-symbol positions) and a response that fails to parse
+    /// as `Hover` at all — never-fail-hard, same posture as
+    /// [`normalize_definition_result`] (a malformed answer reads as "no
+    /// hover", not an error the caller has to handle separately from the
+    /// ordinary empty case).
+    pub fn hover(
+        &self,
+        uri: &str,
+        pos: lsp_types::Position,
+    ) -> Result<Option<lsp_types::Hover>, LspError> {
+        let value = self.0.request(
+            "textDocument/hover",
+            json!({
+                "textDocument": { "uri": uri },
+                "position": { "line": pos.line, "character": pos.character },
+            }),
+            HOVER_TIMEOUT,
+        )?;
+        Ok(serde_json::from_value::<Option<lsp_types::Hover>>(value).unwrap_or(None))
+    }
+
+    /// `textDocument/references` (S8g stretch), always requesting
+    /// `includeDeclaration: true` — the declaration site is itself a
+    /// reference worth showing in a results list. Normalized the same
+    /// never-a-panic way as [`normalize_definition_result`]: a malformed or
+    /// `null` result reads as "no references", never an error.
+    pub fn references(
+        &self,
+        uri: &str,
+        pos: lsp_types::Position,
+    ) -> Result<Vec<lsp_types::Location>, LspError> {
+        let value = self.0.request(
+            "textDocument/references",
+            json!({
+                "textDocument": { "uri": uri },
+                "position": { "line": pos.line, "character": pos.character },
+                "context": { "includeDeclaration": true },
+            }),
+            REFERENCES_TIMEOUT,
+        )?;
+        Ok(serde_json::from_value::<Vec<lsp_types::Location>>(value).unwrap_or_default())
     }
 
     /// `true` while the reader thread hasn't yet observed EOF/an I/O error
@@ -517,6 +605,53 @@ fn location_to_link(location: lsp_types::Location) -> lsp_types::LocationLink {
     }
 }
 
+/// Cheap content fingerprint for [`LspClient::open_docs`] — collisions would
+/// only ever cost a missed `didChange` (a stale-answer risk no worse than
+/// the debounce/epoch races every LSP call site already guards against with
+/// a re-check on completion), so a fast non-cryptographic hash is the right
+/// tool, not a cryptographic digest.
+fn hash_text(text: &str) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    text.hash(&mut hasher);
+    hasher.finish()
+}
+
+/// Normalize `textDocument/hover`'s `Hover.contents` (S8g) — one of three
+/// wire shapes (a single `MarkedString`, a `MarkedString[]`, or a
+/// `MarkupContent`) — into plain-ish text for the app's minimal hover
+/// popover (docs/phase-8-lsp-and-polish.md § LSP: "hover for types/docs";
+/// this is deliberately NOT a markdown renderer — a `LanguageString`/code
+/// fence keeps its backtick delimiters as literal text, readable as-is in
+/// the popover's monospace font rather than actually rendered). `None` when
+/// every shape normalizes to empty text — the caller's cue to show no
+/// popover at all rather than an empty box (the same "hover empty space ->
+/// no popover" case a `null` `Hover` response covers at the [`LspHandle::hover`]
+/// layer).
+pub fn hover_contents_to_text(contents: &lsp_types::HoverContents) -> Option<String> {
+    let text = match contents {
+        lsp_types::HoverContents::Scalar(marked) => marked_string_to_text(marked),
+        lsp_types::HoverContents::Array(list) => list
+            .iter()
+            .map(marked_string_to_text)
+            .filter(|s| !s.is_empty())
+            .collect::<Vec<_>>()
+            .join("\n\n"),
+        lsp_types::HoverContents::Markup(markup) => markup.value.clone(),
+    };
+    let trimmed = text.trim();
+    (!trimmed.is_empty()).then(|| trimmed.to_string())
+}
+
+fn marked_string_to_text(marked: &lsp_types::MarkedString) -> String {
+    match marked {
+        lsp_types::MarkedString::String(s) => s.clone(),
+        lsp_types::MarkedString::LanguageString(ls) => {
+            format!("```{}\n{}\n```", ls.language, ls.value)
+        }
+    }
+}
+
 /// The reply body for a `workspace/configuration` request: an array with
 /// exactly as many entries as `params.items` had, each `null` (we don't
 /// actually implement configuration — see [`super`]'s module doc — but the
@@ -739,6 +874,21 @@ mod tests {
         assert!(normalize_definition_result(Value::Null).is_empty());
     }
 
+    // --- hash_text: the fingerprint sync_document's dedup depends on -----
+
+    #[test]
+    fn hash_text_is_deterministic_for_identical_text() {
+        assert_eq!(
+            hash_text("function greet(): void {}"),
+            hash_text("function greet(): void {}")
+        );
+    }
+
+    #[test]
+    fn hash_text_differs_for_different_text() {
+        assert_ne!(hash_text("a"), hash_text("b"));
+    }
+
     // --- workspace_configuration_reply: the spec's array requirement -----
 
     #[test]
@@ -797,6 +947,65 @@ mod tests {
     #[test]
     fn normalize_unrecognized_shape_is_empty_not_a_panic() {
         assert!(normalize_definition_result(json!({"unexpected": true})).is_empty());
+    }
+
+    // --- hover_contents_to_text: the three `Hover.contents` wire shapes ---
+
+    #[test]
+    fn hover_contents_scalar_string() {
+        let contents = lsp_types::HoverContents::Scalar(lsp_types::MarkedString::String(
+            "a type signature".to_string(),
+        ));
+        assert_eq!(
+            hover_contents_to_text(&contents).as_deref(),
+            Some("a type signature")
+        );
+    }
+
+    #[test]
+    fn hover_contents_scalar_language_string_keeps_the_code_fence() {
+        let contents = lsp_types::HoverContents::Scalar(lsp_types::MarkedString::LanguageString(
+            lsp_types::LanguageString {
+                language: "typescript".to_string(),
+                value: "function greet(): void".to_string(),
+            },
+        ));
+        assert_eq!(
+            hover_contents_to_text(&contents).as_deref(),
+            Some("```typescript\nfunction greet(): void\n```")
+        );
+    }
+
+    #[test]
+    fn hover_contents_array_joins_non_empty_entries() {
+        let contents = lsp_types::HoverContents::Array(vec![
+            lsp_types::MarkedString::String("first".to_string()),
+            lsp_types::MarkedString::String(String::new()),
+            lsp_types::MarkedString::String("second".to_string()),
+        ]);
+        assert_eq!(
+            hover_contents_to_text(&contents).as_deref(),
+            Some("first\n\nsecond")
+        );
+    }
+
+    #[test]
+    fn hover_contents_markup_uses_the_value_verbatim() {
+        let contents = lsp_types::HoverContents::Markup(lsp_types::MarkupContent {
+            kind: lsp_types::MarkupKind::Markdown,
+            value: "**bold** docs".to_string(),
+        });
+        assert_eq!(
+            hover_contents_to_text(&contents).as_deref(),
+            Some("**bold** docs")
+        );
+    }
+
+    #[test]
+    fn hover_contents_all_empty_is_none_not_an_empty_popover() {
+        let contents =
+            lsp_types::HoverContents::Scalar(lsp_types::MarkedString::String("   ".to_string()));
+        assert!(hover_contents_to_text(&contents).is_none());
     }
 
     // --- read_framed / write_framed: the Content-Length wire format ------

@@ -96,6 +96,13 @@ enum Cmd {
     /// matches `Settings`'s JSON field names (`theme`, `mono_font_size`,
     /// `view_mode_default`, ...).
     SetSetting { key: String, value: Value },
+    /// Click the onboarding page's consent-install button on the row at
+    /// index `row` (`state.shell.onboarding.rows[row]`), the scripted
+    /// stand-in for clicking "Install" (`AppShell::
+    /// automation_onboarding_consent`) — a coordinate `click` isn't
+    /// deterministic since the button's position depends on how many rows
+    /// precede it.
+    OnboardingConsent { row: usize },
     /// Write a PNG of the window to `path`; responds with physical pixel
     /// dimensions.
     Screenshot { path: PathBuf },
@@ -390,6 +397,14 @@ async fn handle(
                 shell
                     .automation_set_setting(&key, value, window, cx)
                     .map(|()| json!({"key": key}))
+            })
+        })?,
+
+        Cmd::OnboardingConsent { row } => cx.update_window(window, |_, _, cx| {
+            shell.update(cx, |shell, cx| {
+                shell
+                    .automation_onboarding_consent(row, cx)
+                    .map(|()| json!({"onboarding_consent": row}))
             })
         })?,
 

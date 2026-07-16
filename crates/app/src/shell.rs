@@ -4,6 +4,7 @@
 
 use std::path::PathBuf;
 
+use dv_core::provision::{ComponentId, ConsentAction, ConsistencyReport, consistency_check};
 use dv_core::{
     ChecksSummary, DiffSource, GithubClient, PrState, RemoteRef, RepoLocation, RepoSlug,
     ReviewDecision,
@@ -16,8 +17,9 @@ use gpui_component::{
     ActiveTheme, Selectable as _, Sizable as _, StyledExt, TitleBar, h_flex, v_flex,
 };
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 
+use crate::onboarding::{OnboardingPage, RowState};
 use crate::recent::RecentStore;
 use crate::settings::{
     CONTEXT_LINES_MAX, CONTEXT_LINES_MIN, DEFAULT_SIDEBAR_WIDTH, MONO_FONT_SIZE_MAX,
@@ -27,6 +29,7 @@ use crate::settings::{
 // Only consumed by `Self::set_summary_width` (automation-only, see below).
 #[cfg(feature = "automation")]
 use crate::settings::{SUMMARY_WIDTH_MAX, SUMMARY_WIDTH_MIN};
+use crate::setup::SetupState;
 use crate::themes;
 use crate::workspace::{ReviewChanged, SummaryWidthChanged, Workspace};
 // Only consumed by `Self::automation_state`'s "badges"/"index" dump.
@@ -44,7 +47,9 @@ actions!(
         ThemePickerClose,
         ThemePickerChoose,
         OpenSettings,
-        SettingsClose
+        SettingsClose,
+        OpenOnboarding,
+        OnboardingClose
     ]
 );
 
@@ -54,6 +59,11 @@ const KEY_CONTEXT: &str = "AppShell";
 const THEME_PICKER_CONTEXT: &str = "ThemePickerOpen";
 /// Same mechanism, for the settings panel (`ctrl-,`).
 const SETTINGS_PANEL_CONTEXT: &str = "SettingsPanelOpen";
+/// Same mechanism, for the onboarding page (S8e) — no keybinding opens it
+/// (first-run/drift auto-open it, plus the sidebar's "Setup" button and
+/// `--automation`'s `OpenOnboarding` action), but `escape` still needs a
+/// context to bind against while it's up.
+const ONBOARDING_CONTEXT: &str = "OnboardingOpen";
 
 /// Fixed height, in px, of every sidebar row — both a review card
 /// ([`AppShell::render_review_card`]) and a group header
@@ -198,6 +208,46 @@ fn index_health_word(health: dv_core::EntryHealth) -> &'static str {
         dv_core::EntryHealth::Ok => "ok",
         dv_core::EntryHealth::RepoUnavailable => "repo_unavailable",
         dv_core::EntryHealth::Missing => "missing",
+    }
+}
+
+/// `id` word for `Self::automation_state`'s `onboarding.rows[].id` — snake
+/// case, matching this file's other `*_word` helpers' convention.
+#[cfg(feature = "automation")]
+fn component_id_word(id: ComponentId) -> &'static str {
+    match id {
+        ComponentId::GhCli => "gh_cli",
+        ComponentId::DvHost => "dv_host",
+        ComponentId::DvCli => "dv_cli",
+        ComponentId::NodeVtsls => "node_vtsls",
+    }
+}
+
+/// `state` word for `Self::automation_state`'s `onboarding.rows[].state`.
+#[cfg(feature = "automation")]
+fn onboarding_row_state_word(state: &RowState) -> &'static str {
+    match state {
+        RowState::Checking => "checking",
+        RowState::Ok(_) => "ok",
+        RowState::Missing(_) => "missing",
+        RowState::Consent(..) => "needs_consent",
+        RowState::Installing => "installing",
+        RowState::Failed(_) => "failed",
+        RowState::Skipped(_) => "skipped",
+    }
+}
+
+/// The human-readable detail string carried by every `RowState` variant
+/// except `Checking`/`Installing` (which have none yet) — `Self::
+/// automation_state`'s `onboarding.rows[].detail`.
+#[cfg(feature = "automation")]
+fn onboarding_row_detail(state: &RowState) -> Option<&str> {
+    match state {
+        RowState::Checking | RowState::Installing => None,
+        RowState::Ok(s) | RowState::Missing(s) | RowState::Failed(s) | RowState::Skipped(s) => {
+            Some(s.as_str())
+        }
+        RowState::Consent(_, detail) => Some(detail.as_str()),
     }
 }
 
@@ -561,6 +611,7 @@ pub fn init(cx: &mut App) {
     let shell = Some(KEY_CONTEXT);
     let theme_picker = Some("AppShell && ThemePickerOpen");
     let settings_panel = Some("AppShell && SettingsPanelOpen");
+    let onboarding = Some("AppShell && OnboardingOpen");
     cx.bind_keys([
         KeyBinding::new("cmd-n", NewReview, shell),
         KeyBinding::new("ctrl-n", NewReview, shell),
@@ -574,6 +625,7 @@ pub fn init(cx: &mut App) {
         KeyBinding::new("enter", ThemePickerChoose, theme_picker),
     ]);
     cx.bind_keys([KeyBinding::new("escape", SettingsClose, settings_panel)]);
+    cx.bind_keys([KeyBinding::new("escape", OnboardingClose, onboarding)]);
 }
 
 /// Maximum number of recently-active workspaces the [`WorkspaceCache`] LRU
@@ -861,6 +913,48 @@ pub struct AppShell {
     /// paints instantly (Phase 7 deliverable 1). See [`WorkspaceCache`]'s
     /// doc comment for the eviction policy.
     workspace_cache: WorkspaceCache,
+    /// The onboarding overlay (S8e), when open — shown on true first run
+    /// (`SetupState::is_first_run`) and auto-surfaced later whenever a
+    /// consistency check finds something needing a human (see
+    /// [`Self::apply_consistency_report`]).
+    onboarding: Option<OnboardingPage>,
+    /// Monotonic guard against out-of-order [`consistency_check`]
+    /// completions — the same reasoning as `index_hydration_gens` (a launch
+    /// check and an `open_review` check for the same distro can overlap on
+    /// `cx.background_executor()`'s real thread pool with no ordering
+    /// guarantee). Bumped and captured at dispatch time in
+    /// [`Self::spawn_consistency_check`]; a completion only applies if its
+    /// captured value still matches.
+    onboarding_check_gen: u64,
+    /// Session-scoped "the user has already seen and closed a drift-
+    /// surfaced onboarding page" latch (S8e review, P2). Without this, every
+    /// subsequent per-launch/`open_review` consistency check that still
+    /// finds drift (a declined vtsls consent, an unauthenticated `gh`, ...)
+    /// re-opens the page in [`Self::apply_consistency_report`]'s
+    /// already-closed branch, even for re-selecting the already-active
+    /// review — the user can never permanently decline. Set only by
+    /// [`Self::close_onboarding_page`] when the page it's closing actually
+    /// showed a row that needed a human (`OnboardingPage::has_needs_human_row`
+    /// — S8e review, P2: closing a drift-free page, e.g. the first-run
+    /// welcome page with no WSL distro live, must NOT suppress a later,
+    /// genuinely different drift), and cleared only by an explicit manual
+    /// reopen ([`Self::open_onboarding_page`]), so a deliberate look re-arms
+    /// the auto-surface for that fresh session of checks.
+    drift_page_dismissed: bool,
+    /// Titles ([`OnboardingPage::installing`]'s merge key) with a
+    /// consent-triggered `install_vtsls` genuinely in flight right now,
+    /// persisted here at the SHELL level rather than only on the
+    /// [`OnboardingPage`] itself (S8e review, P3). The page is rebuilt from
+    /// scratch on every open/reopen ([`Self::open_onboarding_page`]), so a
+    /// page-only marker forgets an install that outlives a close/reopen
+    /// (up to 180s) — the reopened page's fresh check re-detects the
+    /// half-written `npm install` as `NeedsConsent` and a second click would
+    /// start a second concurrent install into the same distro. Every new
+    /// page is seeded from this set ([`OnboardingPage::seed_installing`]);
+    /// entries are added in [`Self::on_onboarding_consent_install`] and
+    /// removed once that install's own background task completes (success
+    /// or failure).
+    onboarding_installing: HashSet<String>,
 }
 
 /// The theme picker overlay, while open.
@@ -961,6 +1055,10 @@ impl AppShell {
             last_switch_ms: None,
             last_switch_cache_hit: None,
             workspace_cache: WorkspaceCache::new(MAX_CACHED_WORKSPACES, MAX_CACHE_BYTES),
+            onboarding: None,
+            onboarding_check_gen: 0,
+            drift_page_dismissed: false,
+            onboarding_installing: HashSet::new(),
         };
         // Live follow-OS updates (docs/phase-4-settings-and-theming.md
         // deliverable 2): `Window::observe_window_appearance`'s registration
@@ -1004,6 +1102,32 @@ impl AppShell {
             // the advertised Ctrl+N binding (in the shell's key context) has
             // no focused node on its dispatch path and never fires.
             None => window.focus(&this.focus_handle, cx),
+        }
+        // Onboarding spine (S8e). True first run always shows the page —
+        // EXCEPT under `--automation`: cross-cutting risk, a script's
+        // `wait_ready` would wedge behind a page nothing in the script ever
+        // dismisses (the orchestrator notes call this out explicitly).
+        // Every other launch runs the identical check silently in the
+        // background; it only resurfaces the page itself if something
+        // actually needs a human (`Self::apply_consistency_report`) — dv's
+        // own bits (`dv-host`/`dv-cli`) repair themselves silently as a side
+        // effect of this same call, no page required.
+        //
+        // Deliberately placed AFTER `match seed` (S8e review, P2): a seeded
+        // WSL open's `open_review` call above ends by focusing the freshly
+        // built workspace (`Self::open_review`'s `window.focus(&handle,
+        // cx)`); `open_onboarding_page`'s own `window.focus(&self.
+        // focus_handle, cx)` must land LAST so the shell — not the dimmed
+        // workspace underneath — actually holds focus when the "Welcome to
+        // dv" modal is the first thing on screen. Otherwise the workspace's
+        // own deeper `escape` binding (`ClearSelection`) outranks the
+        // shell's `OnboardingClose` once focus is on that deeper node, and
+        // only the mouse-only Close button/backdrop can dismiss the modal.
+        if SetupState::load().is_first_run() && !automation {
+            this.open_onboarding_page(window, cx);
+        } else {
+            let distros_allowed = this.live_wsl_distros();
+            this.spawn_consistency_check(distros_allowed, cx);
         }
         this
     }
@@ -1106,6 +1230,21 @@ impl AppShell {
             self.last_switch_ms = Some(t0.elapsed().as_millis() as u64);
             cx.notify();
             return;
+        }
+
+        // Onboarding spine (S8e): the "user is opening this WSL repo right
+        // now" boot-storm exception the provision module's own doc calls
+        // out — this distro is live by implication, so it's always safe to
+        // check regardless of `has_running_host` (unlike the launch-time
+        // walk in `Self::new`/`Self::live_wsl_distros`, which must gate on
+        // it). Silently re-provisions `dv-host`/`dv-cli` on drift and
+        // refreshes/auto-surfaces the onboarding page for a `node`/`vtsls`
+        // consent row exactly like the launch-time check does. Placed AFTER
+        // the `already_active` early-return above (S8e review, P2): re-
+        // selecting the review that's already open is a pure no-op and
+        // shouldn't spawn a fresh WSL round trip every time.
+        if let RepoLocation::Wsl { distro, .. } = &location {
+            self.spawn_consistency_check(vec![distro.clone()], cx);
         }
 
         // Phase 7 D1 cache-hit fast path: reactivate a parked workspace
@@ -1979,7 +2118,8 @@ impl AppShell {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if self.theme_picker.is_some() || self.settings_panel.is_some() {
+        if self.theme_picker.is_some() || self.settings_panel.is_some() || self.onboarding.is_some()
+        {
             return;
         }
         // Decline while the active workspace's own PR picker is open (review
@@ -2260,7 +2400,7 @@ impl AppShell {
     /// in the first place, but it's included anyway for symmetry with
     /// `on_open_theme_picker`'s own decline guard.
     pub(crate) fn overlay_open(&self) -> bool {
-        self.theme_picker.is_some() || self.settings_panel.is_some()
+        self.theme_picker.is_some() || self.settings_panel.is_some() || self.onboarding.is_some()
     }
 
     /// Closes the sidebar filter popover if open, notifying on change. The
@@ -2429,16 +2569,46 @@ impl AppShell {
                 }),
             }),
             "settings_open": self.settings_panel.is_some(),
+            // Onboarding spine (S8e): the whole page's row set, so a script
+            // can assert first-run behavior and drift-driven re-provisioning
+            // without a screenshot (`{"cmd":"action","name":"OpenOnboarding"}`
+            // opens it under automation, which never auto-opens it itself —
+            // see `AppShell::new`'s launch-time gate).
+            "onboarding": self.onboarding.as_ref().map(|page| json!({
+                "first_run": page.first_run,
+                "running": page.running,
+                "rows": page.rows.iter().map(|row| json!({
+                    "id": component_id_word(row.id),
+                    "title": row.title,
+                    "state": onboarding_row_state_word(&row.state),
+                    "detail": onboarding_row_detail(&row.state),
+                })).collect::<Vec<_>>(),
+            })),
         })
     }
 
-    /// True when nothing is loading — a bare shell counts as settled.
+    /// True when nothing is loading — a bare shell counts as settled. Also
+    /// folds in the onboarding page's own pending work (S8e review, P3):
+    /// without this, `wait_ready` returned as soon as the active workspace
+    /// settled even while the page's background `consistency_check` (gh up
+    /// to 10s, node detect up to 20s) or a consent-triggered install (up to
+    /// 180s) was still running, so a script's very next `state` could read
+    /// rows still stuck at `checking` nondeterministically — against this
+    /// codebase's "`wait_ready` makes one-shot scripts deterministic"
+    /// convention. Placeholder rows still paint immediately on open
+    /// (`OnboardingPage::placeholder`); this only delays `wait_ready`
+    /// returning until they've resolved.
     #[cfg(feature = "automation")]
     pub(crate) fn automation_settled(&self, cx: &App) -> bool {
-        match &self.active {
-            Some(ws) => ws.read(cx).automation_settled(),
-            None => true,
-        }
+        let onboarding_settled = self
+            .onboarding
+            .as_ref()
+            .is_none_or(|page| !page.running && page.installing.is_empty());
+        onboarding_settled
+            && match &self.active {
+                Some(ws) => ws.read(cx).automation_settled(),
+                None => true,
+            }
     }
 
     /// Select the nth changed file in the active review. Errors (rather
@@ -2621,7 +2791,8 @@ impl AppShell {
     // ---- Settings panel ---------------------------------------------------
 
     fn on_open_settings(&mut self, _: &OpenSettings, window: &mut Window, cx: &mut Context<Self>) {
-        if self.settings_panel.is_some() || self.theme_picker.is_some() {
+        if self.settings_panel.is_some() || self.theme_picker.is_some() || self.onboarding.is_some()
+        {
             return;
         }
         // Decline while the active workspace's own PR picker is open — same
@@ -2682,6 +2853,430 @@ impl AppShell {
         cx: &mut Context<Self>,
     ) {
         self.close_settings_panel(window, cx);
+    }
+
+    // ---- Onboarding (S8e) --------------------------------------------------
+
+    /// Every WSL distro this app currently knows a review for AND that
+    /// already has a live host connection — the boot-storm-safe distro list
+    /// for a passive/launch-time consistency check (mirrors
+    /// `Self::refresh_all_badges`/`Self::hydrate_index`'s own
+    /// `has_running_host` filter exactly; see the cross-cutting risk in
+    /// `dv_core::provision`'s module doc). `Self::open_review`'s own
+    /// per-distro check is the OTHER legitimate trigger and does NOT use
+    /// this — opening a WSL repo right now implies that distro is already
+    /// live, regardless of what this walk would report for it.
+    fn live_wsl_distros(&self) -> Vec<String> {
+        let mut distros: Vec<String> = Vec::new();
+        for location in self.known_locations() {
+            if let RepoLocation::Wsl { distro, .. } = location
+                && dv_core::remote::manager::has_running_host(&distro)
+                && !distros.contains(&distro)
+            {
+                distros.push(distro);
+            }
+        }
+        distros
+    }
+
+    /// `(ComponentId, title)` placeholders for `distros_allowed`, in the
+    /// exact title shape `dv_core::provision::consistency_check` itself
+    /// produces (`gh` once, unsuffixed; the other three per distro,
+    /// `"<base title> — <distro>"`) — so a freshly opened onboarding page
+    /// never visibly reflows into a different row set once the real
+    /// `ConsistencyReport` lands, only each row's state changing from
+    /// `Checking` to its real answer. When `distros_allowed` is empty (no
+    /// WSL distro currently running — the exact first-run-with-no-distro
+    /// case), `consistency_check` itself only ever checks `gh` (see its own
+    /// module doc: it never boots a distro to check the other three), so
+    /// this synthesizes generic, unsuffixed placeholders for `dv-host`/
+    /// `dv-cli`/`node`+`vtsls` — [`Self::pad_no_distro_rows`] fills in their
+    /// matching `Skipped` state once the report lands — so the page still
+    /// shows all four components instead of silently dropping to one (S8e
+    /// review, P2).
+    fn onboarding_titles(distros_allowed: &[String]) -> Vec<(ComponentId, String)> {
+        let mut titles = vec![(ComponentId::GhCli, ComponentId::GhCli.title().to_string())];
+        if distros_allowed.is_empty() {
+            for id in [
+                ComponentId::DvHost,
+                ComponentId::DvCli,
+                ComponentId::NodeVtsls,
+            ] {
+                titles.push((id, id.title().to_string()));
+            }
+        }
+        for distro in distros_allowed {
+            for id in [
+                ComponentId::DvHost,
+                ComponentId::DvCli,
+                ComponentId::NodeVtsls,
+            ] {
+                titles.push((id, format!("{} — {distro}", id.title())));
+            }
+        }
+        titles
+    }
+
+    /// Open the onboarding page: placeholder rows immediately (first paint
+    /// never waits on a WSL round trip), then dispatch the real check in
+    /// the background. `first_run` is read fresh from `SetupState` rather
+    /// than threaded through by every caller, so a manually reopened page
+    /// (the sidebar button, `{"cmd":"action","name":"OpenOnboarding"}`)
+    /// after the marker's already been stamped correctly shows the plain
+    /// "Setup status" header, not "Welcome to dv" again.
+    ///
+    /// The distro list unions [`Self::live_wsl_distros`] with the ACTIVE
+    /// workspace's own WSL distro: without a running host (e.g. a dev build
+    /// with no sidecar, where Stage-A `wsl.exe`-per-command routing carries
+    /// everything), `has_running_host` is false even while a WSL repo is
+    /// open and its git traffic is actively flowing — leaving the page
+    /// claiming "no WSL distro running" about a distro the user is looking
+    /// at right now. Opening the page is an explicit user action about that
+    /// exact environment, so the active repo's distro is live-by-implication
+    /// here for the same reason `Self::open_review`'s own per-distro check
+    /// is (the one non-`has_running_host` trigger `dv_core::provision`'s
+    /// boot-storm contract blesses).
+    fn open_onboarding_page(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let first_run = SetupState::load().is_first_run();
+        let mut distros_allowed = self.live_wsl_distros();
+        if let Some(ws) = &self.active
+            && let RepoLocation::Wsl { distro, .. } = ws.read(cx).location()
+            && !distros_allowed.contains(distro)
+        {
+            distros_allowed.push(distro.clone());
+        }
+        let mut page =
+            OnboardingPage::placeholder(first_run, Self::onboarding_titles(&distros_allowed));
+        // Carry forward any install still running from a PREVIOUS instance
+        // of this page (S8e review, P3) — see `Self::onboarding_installing`'s
+        // doc comment for why a fresh page can't discover this on its own.
+        page.seed_installing(&self.onboarding_installing);
+        self.onboarding = Some(page);
+        // A deliberate, explicit reopen re-arms the auto-surface latch for
+        // whatever drift this fresh look at the page turns up next (S8e
+        // review, P2) — only a later CLOSE re-latches it.
+        self.drift_page_dismissed = false;
+        window.focus(&self.focus_handle, cx);
+        self.spawn_consistency_check(distros_allowed, cx);
+        cx.notify();
+    }
+
+    fn close_onboarding_page(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(page) = self.onboarding.take() {
+            // Stamp the marker on CLOSE, not on open or on the check
+            // completing — the page must stay closable/skippable mid-check
+            // (never-fail-hard contract), and "seen it, dismissed it" is
+            // the honest definition of "first run is over" regardless of
+            // whether every row ever resolved.
+            if page.first_run {
+                SetupState::mark_complete(env!("CARGO_PKG_VERSION"));
+            }
+            // Latch the dismissal for the rest of the session (S8e review,
+            // P2) — but ONLY if this page actually showed something needing
+            // a human: the user has now explicitly seen and closed that
+            // drift report, so the next passive check finding the SAME
+            // drift (e.g. a declined vtsls consent, an unauthenticated
+            // `gh`) stays silent instead of re-popping the page on every
+            // subsequent launch/`open_review`. A page that closed with
+            // nothing but `Ok`/`Skipped`/`Checking` rows (e.g. the
+            // first-run welcome page with no WSL distro live) never showed
+            // any drift to dismiss, so it must NOT suppress a LATER,
+            // genuinely different drift from auto-surfacing. Cleared only
+            // by a fresh manual reopen (`Self::open_onboarding_page`).
+            if page.has_needs_human_row() {
+                self.drift_page_dismissed = true;
+            }
+            match &self.active {
+                Some(ws) => window.focus(&ws.focus_handle(cx), cx),
+                None => window.focus(&self.focus_handle, cx),
+            }
+            cx.notify();
+        }
+    }
+
+    fn on_open_onboarding(
+        &mut self,
+        _: &OpenOnboarding,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.onboarding.is_some() || self.settings_panel.is_some() || self.theme_picker.is_some()
+        {
+            return;
+        }
+        if self
+            .active
+            .as_ref()
+            .is_some_and(|ws| ws.read(cx).pr_picker_open())
+        {
+            return;
+        }
+        self.close_filter_popover(cx);
+        self.open_onboarding_page(window, cx);
+    }
+
+    fn on_onboarding_close(
+        &mut self,
+        _: &OnboardingClose,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.close_onboarding_page(window, cx);
+    }
+
+    /// Dispatch `dv_core::provision::consistency_check(&distros_allowed)`
+    /// off the UI thread (the module's own doc: it can block for seconds —
+    /// gh 10s, node detect 20s, an install 180s — so it must NEVER run
+    /// inline). `distros_allowed` is the caller's responsibility to have
+    /// already gated on `Self::live_wsl_distros` (a passive/launch-time
+    /// walk) or on "opening this WSL repo right now" (`Self::open_review`) —
+    /// this fn does no gating of its own, matching `consistency_check`'s own
+    /// module-doc contract.
+    fn spawn_consistency_check(&mut self, distros_allowed: Vec<String>, cx: &mut Context<Self>) {
+        self.onboarding_check_gen += 1;
+        let check_gen = self.onboarding_check_gen;
+        // Captured before the move below: `consistency_check(&[])` only
+        // ever checks `gh` (see its module doc), so an empty allow-list
+        // needs the synthesized rows `Self::pad_no_distro_rows` adds below.
+        let no_distros_allowed = distros_allowed.is_empty();
+        cx.spawn(async move |this, cx| {
+            let mut report = cx
+                .background_executor()
+                .spawn(async move { consistency_check(&distros_allowed) })
+                .await;
+            if no_distros_allowed {
+                Self::pad_no_distro_rows(&mut report);
+            }
+            this.update(cx, |this, cx| {
+                this.apply_consistency_report(check_gen, report, cx)
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// With no WSL distro currently running, `consistency_check(&[])` only
+    /// checks `gh` (it never boots a distro to check the other three — see
+    /// the module's own boot-storm-contract doc). Synthesize a generic
+    /// `Skipped` row for `dv-host`/`dv-cli`/`node`+`vtsls` so the page still
+    /// shows all four components the onboarding spine tracks, matching the
+    /// unsuffixed placeholders `Self::onboarding_titles` already produces
+    /// for this same case, instead of silently dropping to a single `gh`
+    /// row (S8e review, P2 — the acceptance case this fixes is exactly
+    /// "delete setup.json, launch with no WSL distro running").
+    fn pad_no_distro_rows(report: &mut ConsistencyReport) {
+        for id in [
+            ComponentId::DvHost,
+            ComponentId::DvCli,
+            ComponentId::NodeVtsls,
+        ] {
+            report.components.push(dv_core::provision::ComponentReport {
+                id,
+                title: id.title().to_string(),
+                state: dv_core::provision::ComponentState::Skipped {
+                    reason: "no WSL distro running".to_string(),
+                },
+            });
+        }
+    }
+
+    /// Apply a completed [`ConsistencyReport`]. `check_gen` against
+    /// `onboarding_check_gen` (see that field's doc comment) tells whether
+    /// this report was SUPERSEDED by a newer check spawned before it
+    /// completed — which happens on every first-run WSL-seeded launch
+    /// (`Self::new`'s placeholder check vs. `Self::open_review`'s per-distro
+    /// one) and can happen any time a second WSL repo is opened mid-check.
+    ///
+    /// A superseded report with the page already open is still applied — via
+    /// [`OnboardingPage::apply_report_if_unanswered`], an idempotent "first
+    /// answer wins" merge that only fills in rows still at
+    /// [`RowState::Checking`] — rather than dropped outright: this used to
+    /// be a single all-or-nothing guard that discarded the ENTIRE stale
+    /// report, permanently orphaning every row only that check would ever
+    /// have answered (e.g. the `gh` row and the generic no-distro
+    /// placeholders) at "Checking" forever, since the superseding check
+    /// covers a different, non-overlapping set of titles (S8e review, P2).
+    ///
+    /// A superseded report with NO page open is now ALSO given the same
+    /// auto-surface consideration as a non-superseded one below, rather than
+    /// dropped outright (S8e review, P2 — this was the single biggest gap:
+    /// on every non-first-run WSL-seeded launch, `Self::open_review`'s
+    /// per-distro check is spawned before `Self::new`'s own empty-distro
+    /// launch check, so it is ALWAYS superseded on arrival; if the launch
+    /// check finds no drift, the page never opens, and the seeded distro's
+    /// real answers — a `NeedsConsent`/`Failed` row the launch check never
+    /// even covered — used to be silently discarded here). Its answers are
+    /// still real data; the only question left is whether it's still
+    /// safe/useful to surface them.
+    ///
+    /// When the page is open and this IS the current check, it's simply the
+    /// next real answer ([`OnboardingPage::apply_report`]). When the page is
+    /// closed, dv's own bits have already silently repaired themselves as a
+    /// side effect of the check that produced this report
+    /// (`check_dv_host`/`check_dv_cli` delegate straight to the install
+    /// functions) — this only opens the page if `report.drift` is still true
+    /// afterward, i.e. something is left that genuinely needs a human (a
+    /// `node`/`vtsls` consent row, or a real `Failed`/`Missing`) — AND only
+    /// when the auto-surface itself is safe to do: never under
+    /// `--automation` (an unattended script has no one to dismiss a modal
+    /// that pops mid-run — S8e review, P2), never after the user already
+    /// dismissed one this session (`drift_page_dismissed` — S8e review, P2;
+    /// otherwise every subsequent launch/`open_review` check that still
+    /// finds the same drift re-pops the page the user just closed), and
+    /// never while another shell overlay (settings/theme picker/PR picker)
+    /// is up (S8e review, P2 — mirrors `Self::on_open_onboarding`'s own
+    /// guards; without this, a page popping mid-PR-picker-search violated
+    /// `render`'s "all three are mutually exclusive" invariant and its own
+    /// focus-pull yanked focus out of whatever the user was typing into).
+    fn apply_consistency_report(
+        &mut self,
+        check_gen: u64,
+        report: ConsistencyReport,
+        cx: &mut Context<Self>,
+    ) {
+        let stale = check_gen != self.onboarding_check_gen;
+        match &mut self.onboarding {
+            Some(page) if stale => page.apply_report_if_unanswered(report),
+            Some(page) => page.apply_report(report),
+            None => {
+                let overlay_blocking = self.settings_panel.is_some()
+                    || self.theme_picker.is_some()
+                    || self
+                        .active
+                        .as_ref()
+                        .is_some_and(|ws| ws.read(cx).pr_picker_open());
+                if report.drift
+                    && !self.automation
+                    && !self.drift_page_dismissed
+                    && !overlay_blocking
+                {
+                    // Mirror `Self::on_open_onboarding`'s own guard: the
+                    // sidebar filter popover's full-window backdrop renders
+                    // AFTER `render_onboarding` in `render()`, so a still-open
+                    // popover paints on top of the just-surfaced modal and
+                    // swallows its first click (S8e review, P3) — close it
+                    // rather than adding it to `overlay_blocking` above, same
+                    // as `on_open_onboarding` does.
+                    self.close_filter_popover(cx);
+                    let mut page = OnboardingPage::placeholder(false, Vec::new());
+                    page.seed_installing(&self.onboarding_installing);
+                    page.apply_report(report);
+                    self.onboarding = Some(page);
+                }
+            }
+        }
+        cx.notify();
+    }
+
+    /// The onboarding page's one mutating action: install `@vtsls/
+    /// language-server` on the row at `idx`, after the user's explicit
+    /// consent click (`dv_core::provision`'s module doc — this is the ONLY
+    /// caller of `install_vtsls` anywhere in the app). Keyed by row INDEX
+    /// at click time, not [`ComponentId`] (S8e review, P2): two different
+    /// live distros can both land on a `NodeVtsls` consent row in the same
+    /// render (`render_onboarding_row`'s own doc already calls this out for
+    /// the button's element id), and resolving by id alone would always hit
+    /// the FIRST matching row — installing into the wrong distro and
+    /// flipping every same-id row's state together. Marks only that one row
+    /// `Installing` immediately (and its title in-flight, so a concurrent
+    /// consistency check can't clobber it — `OnboardingPage::begin_install`'s
+    /// doc comment), then re-runs the normal per-distro check once the
+    /// install completes (success or failure) so the row's final state comes
+    /// from the same real detection path a plain reopen would use, rather
+    /// than the install call's own bare `Result`.
+    ///
+    /// `title` is captured up front and used for BOTH `end_install` and the
+    /// failure arm's row lookup instead of `idx` (S8e review, P3): the up-
+    /// to-180s install can outlive the page it started on (closed and
+    /// reopened with a different, shorter or differently-ordered row set —
+    /// e.g. a distro's connection dropping mid-install), so resolving by the
+    /// stale index on completion could stamp `Failed` onto a completely
+    /// different row, or silently miss it if the reopened page is shorter.
+    /// Title is stable (it's the same merge key every other apply path uses)
+    /// even across a close/reopen.
+    ///
+    /// Guards on `self.onboarding_installing` (S8e review, P3), not just the
+    /// page-local `installing` set: without this, closing the page mid-
+    /// install and reopening it builds a FRESH `OnboardingPage` (an empty
+    /// `installing` set, per `Self::open_onboarding_page`) whose own check
+    /// re-detects the half-written `npm install` as `NeedsConsent`, and a
+    /// second click here would start a SECOND concurrent `npm install -g
+    /// @vtsls/language-server` into the same distro (`install_vtsls` itself
+    /// takes no per-distro lock). Returns `Err` rather than silently
+    /// no-oping on every rejected precondition so both the button's
+    /// (discarded) click result and the automation-reachable
+    /// `Self::automation_onboarding_consent` wrapper can tell a script
+    /// exactly why a consent click didn't do anything.
+    fn on_onboarding_consent_install(
+        &mut self,
+        idx: usize,
+        cx: &mut Context<Self>,
+    ) -> anyhow::Result<()> {
+        let Some(page) = &self.onboarding else {
+            anyhow::bail!("onboarding page is not open");
+        };
+        let Some(row) = page.rows.get(idx) else {
+            anyhow::bail!("no onboarding row at index {idx}");
+        };
+        let RowState::Consent(action, _) = &row.state else {
+            anyhow::bail!("row {idx} ({}) is not awaiting consent", row.title);
+        };
+        let title = row.title.clone();
+        if !self.onboarding_installing.insert(title.clone()) {
+            anyhow::bail!("{title} already has an install in flight");
+        }
+        let ConsentAction::InstallVtsls { distro, node } = action.clone();
+        if let Some(page) = &mut self.onboarding {
+            page.begin_install(idx);
+        }
+        cx.notify();
+        cx.spawn(async move |this, cx| {
+            let distro_for_reverify = distro.clone();
+            let result = cx
+                .background_executor()
+                .spawn(async move { dv_core::provision::install_vtsls(&distro, &node) })
+                .await;
+            this.update(cx, |this, cx| {
+                // Clear both the page-local and shell-persisted in-flight
+                // markers BEFORE branching on the result (S8e review, P2/
+                // P3): the success arm's own reverify needs its report free
+                // to land on this title, and the failure arm's direct write
+                // below must not be treated as a concurrent clobber of
+                // itself.
+                if let Some(page) = &mut this.onboarding {
+                    page.end_install(&title);
+                }
+                this.onboarding_installing.remove(&title);
+                match result {
+                    Ok(()) => this.spawn_consistency_check(vec![distro_for_reverify], cx),
+                    Err(err) => {
+                        if let Some(page) = &mut this.onboarding
+                            && let Some(row) = page.rows.iter_mut().find(|r| r.title == title)
+                        {
+                            row.state = RowState::Failed(format!("{err:#}"));
+                        }
+                        cx.notify();
+                    }
+                }
+            })
+            .ok();
+        })
+        .detach();
+        Ok(())
+    }
+
+    /// `{"cmd":"onboarding_consent","row":N}`: the automation-reachable
+    /// stand-in for clicking a consent row's "Install" button (S8e review,
+    /// P3) — a coordinate `{"cmd":"click"}` on the button isn't
+    /// deterministic since its position depends on how many rows precede it,
+    /// which varies with live distros and check timing.
+    #[cfg(feature = "automation")]
+    pub(crate) fn automation_onboarding_consent(
+        &mut self,
+        row: usize,
+        cx: &mut Context<Self>,
+    ) -> anyhow::Result<()> {
+        self.on_onboarding_consent_install(row, cx)
     }
 
     /// "Default view" — applies to the workspace open right now too (not
@@ -3820,10 +4415,187 @@ impl AppShell {
                 ),
         )
     }
+
+    /// The onboarding overlay (S8e) — same modal backdrop pattern as
+    /// `render_settings_panel`/`render_theme_picker`: `inset_0().occlude()`
+    /// plus a click-to-close backdrop, with `stop_propagation()` on the
+    /// card itself so a click doesn't fall through to whatever sidebar row
+    /// sits under it (same review finding that pattern's own doc comment
+    /// describes).
+    fn render_onboarding(&self, cx: &mut Context<Self>) -> Option<Div> {
+        let page = self.onboarding.as_ref()?;
+
+        let theme = cx.theme();
+        let border = theme.border;
+        let popover = theme.popover;
+        let popover_fg = theme.popover_foreground;
+        let muted = theme.muted_foreground;
+
+        let title = if page.first_run {
+            "Welcome to dv"
+        } else {
+            "Setup status"
+        };
+        let subtitle = if page.running {
+            "Checking your setup\u{2026}"
+        } else {
+            "Everything dv needs to review code, in one place."
+        };
+
+        Some(
+            div()
+                .absolute()
+                .inset_0()
+                .flex()
+                .items_center()
+                .justify_center()
+                .bg(theme.background.opacity(0.6))
+                .occlude()
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(|this, _, window, cx| {
+                        this.close_onboarding_page(window, cx);
+                        cx.stop_propagation();
+                    }),
+                )
+                .child(
+                    v_flex()
+                        .id("onboarding-page")
+                        .w(px(520.))
+                        .max_w_full()
+                        .max_h(px(560.))
+                        .overflow_hidden()
+                        .p_4()
+                        .gap_3()
+                        .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                        .bg(popover)
+                        .text_color(popover_fg)
+                        .border_1()
+                        .border_color(border)
+                        .rounded_lg()
+                        .shadow_lg()
+                        .child(
+                            h_flex()
+                                .justify_between()
+                                .items_center()
+                                .child(div().font_semibold().child(title))
+                                .child(
+                                    Button::new("onboarding-close")
+                                        .ghost()
+                                        .xsmall()
+                                        .label("Close")
+                                        .on_click(cx.listener(|this, _, window, cx| {
+                                            this.close_onboarding_page(window, cx);
+                                        })),
+                                ),
+                        )
+                        .child(div().text_xs().text_color(muted).child(subtitle))
+                        .child(
+                            v_flex().gap_2().children(
+                                page.rows
+                                    .iter()
+                                    .enumerate()
+                                    .map(|(idx, row)| self.render_onboarding_row(idx, row, cx)),
+                            ),
+                        ),
+                ),
+        )
+    }
+
+    /// One onboarding row: a status glyph + title on the first line, an
+    /// optional detail/guidance string on the second, and (only for a
+    /// `RowState::Consent` row) an "Install" button running
+    /// `Self::on_onboarding_consent_install` — the app's ONLY UI entry
+    /// point into `dv_core::provision::install_vtsls`. `idx` (the row's
+    /// position, not its `ComponentId`) keys the install button's element
+    /// id: two DIFFERENT distros can both land on a `NodeVtsls` consent row
+    /// in the same render, and `ComponentId` alone would collide.
+    fn render_onboarding_row(
+        &self,
+        idx: usize,
+        row: &crate::onboarding::Row,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement + use<> {
+        let theme = cx.theme();
+        let success = theme.success;
+        let danger = theme.danger;
+        let warning = theme.warning;
+        let muted = theme.muted_foreground;
+        let (glyph, glyph_color, detail, detail_color): (&str, Hsla, Option<String>, Hsla) =
+            match &row.state {
+                RowState::Checking => ("\u{25cb}", muted, None, muted),
+                RowState::Ok(detail) => ("\u{25cf}", success, Some(detail.clone()), muted),
+                RowState::Missing(guidance) => {
+                    ("\u{25cb}", warning, Some(guidance.clone()), warning)
+                }
+                RowState::Consent(_, detail) => {
+                    ("\u{25cf}", warning, Some(detail.clone()), warning)
+                }
+                RowState::Installing => (
+                    "\u{25cf}",
+                    warning,
+                    Some("installing\u{2026}".to_string()),
+                    muted,
+                ),
+                RowState::Failed(error) => ("\u{2715}", danger, Some(error.clone()), danger),
+                RowState::Skipped(reason) => ("\u{25cb}", muted, Some(reason.clone()), muted),
+            };
+        let show_install = matches!(row.state, RowState::Consent(..));
+
+        v_flex()
+            .gap_0p5()
+            .child(
+                h_flex()
+                    .justify_between()
+                    .items_center()
+                    .gap_2()
+                    .child(
+                        h_flex()
+                            .gap_2()
+                            .items_center()
+                            .child(div().text_color(glyph_color).child(glyph))
+                            .child(div().text_sm().child(row.title.clone())),
+                    )
+                    .when(show_install, |el| {
+                        el.child(
+                            Button::new(SharedString::from(format!("onboarding-install-{idx}")))
+                                .ghost()
+                                .xsmall()
+                                .label("Install")
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    // Errors here are precondition rejections
+                                    // (page closed, row no longer awaiting
+                                    // consent, install already in flight) —
+                                    // nothing new for a mouse click to show;
+                                    // `Self::automation_onboarding_consent`
+                                    // surfaces the same `Err` to a script.
+                                    let _ = this.on_onboarding_consent_install(idx, cx);
+                                })),
+                        )
+                    }),
+            )
+            .children(detail.map(|d| div().text_xs().text_color(detail_color).child(d)))
+    }
 }
 
 impl Render for AppShell {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // Onboarding spine (S8e review, P2): a drift page auto-surfaced by
+        // `Self::apply_consistency_report` is set from inside a background
+        // task's `Entity::update`, which has no `Window` to focus with
+        // directly — unlike the theme picker/settings panel/first-run open,
+        // none of which have this gap, since each of THEIR open paths always
+        // runs with a real `Window` in hand and focuses the shell as its
+        // last step. Pull focus back onto the shell here instead, every
+        // render while the page is open (`is_focused` makes this a no-op
+        // once it's already true). Without it, keyboard input — most
+        // importantly `escape` — keeps going wherever it already was (a
+        // workspace's own deeper `escape` binding outranks the shell's
+        // `OnboardingClose` once focus is on that deeper node), and the
+        // modal is only dismissible by mouse.
+        if self.onboarding.is_some() && !self.focus_handle.is_focused(window) {
+            window.focus(&self.focus_handle, cx);
+        }
         let theme = cx.theme();
         // Computed once per render (mirrors the old `review_count`'s own
         // one-per-render computation) and `move`d into the `uniform_list`
@@ -3855,12 +4627,12 @@ impl Render for AppShell {
                 .into_any_element(),
         };
 
-        // While the theme picker or settings panel is open the shell node
-        // carries an extra identifier, flipping which key bindings apply
-        // (see `init`) — same mechanism `workspace.rs` uses for its own
-        // overlays. The two overlays are mutually exclusive (see
-        // `on_open_theme_picker`/`on_open_settings`'s guards), so at most
-        // one of these ever applies.
+        // While the theme picker, settings panel, or onboarding page is open
+        // the shell node carries an extra identifier, flipping which key
+        // bindings apply (see `init`) — same mechanism `workspace.rs` uses
+        // for its own overlays. All three are mutually exclusive (see
+        // `on_open_theme_picker`/`on_open_settings`/`on_open_onboarding`'s
+        // guards), so at most one of these ever applies.
         let mut key_context = KEY_CONTEXT.to_string();
         if self.theme_picker.is_some() {
             key_context.push(' ');
@@ -3869,6 +4641,10 @@ impl Render for AppShell {
         if self.settings_panel.is_some() {
             key_context.push(' ');
             key_context.push_str(SETTINGS_PANEL_CONTEXT);
+        }
+        if self.onboarding.is_some() {
+            key_context.push(' ');
+            key_context.push_str(ONBOARDING_CONTEXT);
         }
 
         v_flex()
@@ -3885,6 +4661,8 @@ impl Render for AppShell {
             .on_action(cx.listener(Self::on_theme_picker_choose))
             .on_action(cx.listener(Self::on_open_settings))
             .on_action(cx.listener(Self::on_settings_close))
+            .on_action(cx.listener(Self::on_open_onboarding))
+            .on_action(cx.listener(Self::on_onboarding_close))
             .child(
                 TitleBar::new().child(
                     h_flex()
@@ -3929,6 +4707,7 @@ impl Render for AppShell {
                                 h_flex()
                                     .px_2()
                                     .py_1()
+                                    .gap_1()
                                     .items_center()
                                     .child(
                                         div()
@@ -3936,6 +4715,21 @@ impl Render for AppShell {
                                             .text_xs()
                                             .text_color(theme.muted_foreground)
                                             .child("REVIEWS"),
+                                    )
+                                    .child(
+                                        // Manual reopen of the onboarding page
+                                        // (S8e) — the only other entry point
+                                        // besides true first run / an
+                                        // auto-surfaced drift page /
+                                        // `--automation`'s `OpenOnboarding`
+                                        // action (`Self::on_open_onboarding`).
+                                        Button::new("open-onboarding")
+                                            .ghost()
+                                            .xsmall()
+                                            .label("Setup")
+                                            .on_click(cx.listener(|this, _, window, cx| {
+                                                this.on_open_onboarding(&OpenOnboarding, window, cx)
+                                            })),
                                     )
                                     .child(
                                         // Manual badge refresh (docs/phase-3-github.md
@@ -4010,6 +4804,7 @@ impl Render for AppShell {
             )
             .children(self.render_theme_picker(cx))
             .children(self.render_settings_panel(cx))
+            .children(self.render_onboarding(cx))
             .children(self.render_sidebar_filter_popover(cx))
     }
 }

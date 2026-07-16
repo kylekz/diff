@@ -11,8 +11,10 @@
 mod automation;
 mod fuzzy;
 mod highlight;
+mod onboarding;
 mod recent;
 mod settings;
+mod setup;
 mod shell;
 mod themes;
 mod workspace;

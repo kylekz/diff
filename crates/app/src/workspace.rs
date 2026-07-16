@@ -150,9 +150,22 @@ pub fn init(cx: &mut App) {
         KeyBinding::new("p", PrevHunk, browse),
         KeyBinding::new("s", ToggleSplit, browse),
         KeyBinding::new("r", ToggleSummary, browse),
-        KeyBinding::new("f", JumpToFile, browse),
-        KeyBinding::new("ctrl-p", JumpToFile, browse),
+        // cmd-p registered first: gpui's mac menu builder picks a menu
+        // item's NSMenu key equivalent via the FIRST binding whose predicate
+        // matches (`bindings_for_action(...).find_or_first(...)`, keymap.rs)
+        // — all three of these share the same `browse` predicate, so
+        // registration order alone decides. Putting the bare "f" binding
+        // first would hand the Go > "Jump to File" menu item the key
+        // equivalent "f" with an EMPTY modifier mask, which on macOS
+        // intercepts every plain "f" keystroke app-wide (performKeyEquivalent
+        // beats normal text-input delivery). cmd-p first keeps the display
+        // AND the interception target on ⌘P, harmless as a menu accelerator.
         KeyBinding::new("cmd-p", JumpToFile, browse),
+        KeyBinding::new("ctrl-p", JumpToFile, browse),
+        KeyBinding::new("f", JumpToFile, browse),
+        // cmd- twin added S8i (docs/phase-8-lsp-and-polish.md §macOS) —
+        // mirrors the cmd-p/ctrl-p pair just above. Additive only.
+        KeyBinding::new("cmd-g", OpenPrPicker, browse),
         KeyBinding::new("ctrl-g", OpenPrPicker, browse),
         KeyBinding::new("escape", ClearSelection, browse),
         KeyBinding::new("down", PaletteNext, palette),
@@ -3160,6 +3173,16 @@ impl Workspace {
 
     fn on_open_pr_picker(&mut self, _: &OpenPrPicker, window: &mut Window, cx: &mut Context<Self>) {
         if self.pr_picker.is_some() {
+            return;
+        }
+        // Decline while the comment editor or a thread-reply input is open
+        // (review finding P3, hardening the same class of hole this
+        // function's `overlay_open` guard below already closes for the
+        // shell overlays): the macOS menu bar (S8i) dispatches `OpenPrPicker`
+        // straight to this handler with no key-context gate at all, so a
+        // `Go > Open PR...` click while a comment is mid-edit would stack
+        // the picker over the editor with both key contexts live.
+        if self.editor.is_some() || self.thread_input.is_some() {
             return;
         }
         // Decline while a shell-level overlay (theme picker / settings
@@ -6687,6 +6710,27 @@ impl Workspace {
     fn on_jump_to_file(&mut self, _: &JumpToFile, window: &mut Window, cx: &mut Context<Self>) {
         use gpui_component::input::{InputEvent, InputState};
         if self.files.is_empty() {
+            return;
+        }
+        // Decline while another overlay already has the screen (review
+        // finding P3). The `browse` key-context predicate normally keeps
+        // this action from firing while the PR picker/comment editor/shell
+        // overlays are up, but the macOS menu bar (S8i) dispatches straight
+        // to this handler with no key-context gate at all — menu dispatch
+        // bypasses the keymap entirely, same as every other `on_*` handler
+        // here, so the guard has to live in the handler itself. Mirrors
+        // `on_open_pr_picker`'s decline set: its own overlay, the comment
+        // editor/thread-reply input (same pair `render`'s `key_context`
+        // computation treats as "editor open"), and the shell-level
+        // overlays via `overlay_open`.
+        if self.pr_picker.is_some()
+            || self.editor.is_some()
+            || self.thread_input.is_some()
+            || self
+                .shell
+                .upgrade()
+                .is_some_and(|shell| shell.read(cx).overlay_open())
+        {
             return;
         }
         if let Some(palette) = &self.palette {

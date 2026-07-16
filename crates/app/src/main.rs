@@ -12,6 +12,7 @@ mod automation;
 mod fuzzy;
 mod highlight;
 mod lsp;
+mod menu;
 mod onboarding;
 mod recent;
 mod settings;
@@ -442,6 +443,15 @@ fn run_gui(cli: Cli) {
         gpui_component::init(cx);
         workspace::init(cx);
         shell::init(cx);
+        // S8i (docs/phase-8-lsp-and-polish.md §macOS): native app menu bar
+        // + cmd-q. Mac-only — `menu.rs` itself compiles on every target
+        // (proof of the cfg gate, see its module doc), but nothing calls
+        // into it off macOS, so Windows/Linux are byte-for-byte unchanged.
+        #[cfg(target_os = "macos")]
+        {
+            menu::init(cx);
+            cx.set_menus(menu::app_menus());
+        }
         register_fonts(cx);
         // Persisted-or-default theme (settings.json missing/corrupt falls
         // back to `themes::DEFAULT_THEME` silently — see `Settings::load`).

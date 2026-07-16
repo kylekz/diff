@@ -615,7 +615,13 @@ pub fn init(cx: &mut App) {
     cx.bind_keys([
         KeyBinding::new("cmd-n", NewReview, shell),
         KeyBinding::new("ctrl-n", NewReview, shell),
+        // cmd- twins added S8i (docs/phase-8-lsp-and-polish.md §macOS) —
+        // mirror the existing cmd-n/ctrl-n pair above. Additive only: the
+        // ctrl- bindings are unchanged, so Windows/Linux behavior doesn't
+        // move.
+        KeyBinding::new("cmd-shift-t", OpenThemePicker, shell),
         KeyBinding::new("ctrl-shift-t", OpenThemePicker, shell),
+        KeyBinding::new("cmd-,", OpenSettings, shell),
         KeyBinding::new("ctrl-,", OpenSettings, shell),
     ]);
     cx.bind_keys([

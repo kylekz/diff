@@ -140,12 +140,18 @@ pub(crate) enum LspSessionState {
     /// The lazy background spawn is in flight.
     Spawning,
     Ready(dv_core::lsp::LspHandle),
-    /// Spawn failed, or this workspace's location/file can never support
-    /// one (a local/Windows repo — go-to-def is WSL-only in this phase;
-    /// docs/phase-8-lsp-and-polish.md § LSP). Carries the human-readable
-    /// reason for `automation_state`'s dump; never retried automatically
-    /// (a fresh repo open is a fresh `Workspace`, which gets a fresh
-    /// attempt).
+    /// The lazy spawn's detection step found no usable vtsls (missing, or
+    /// node/vtsls detection itself failed), or the spawn/handshake round
+    /// trip failed outright. Carries the human-readable reason for
+    /// `automation_state`'s dump. The one call site that installs this
+    /// (`Workspace::on_symbol_click`'s spawn completion) is only ever
+    /// reached after the WSL/TS/honest-view gates earlier in that fn have
+    /// already passed, so nothing captured here is a structural, permanent
+    /// block — it can change (most commonly: a consent-triggered vtsls
+    /// install completing after this state was set). Not retried on its
+    /// own, but a fresh ctrl/cmd-click resets it back to `Unattempted`
+    /// before re-checking (see that fn's preamble) rather than trusting a
+    /// stale verdict forever (P2 finding, phase-8 capstone review).
     Unavailable(String),
 }
 

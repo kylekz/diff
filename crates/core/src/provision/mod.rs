@@ -136,6 +136,46 @@ pub struct ConsistencyReport {
     pub drift: bool,
 }
 
+impl ConsistencyReport {
+    /// A stable identity for this report's "needs a human" subset —
+    /// `(id, state KIND, title)` tuples, sorted then hashed. `None` exactly
+    /// when `drift` is `false` (nothing here needs a human at all). Kind
+    /// only, never the human-readable `guidance`/`detail`/`error` text: two
+    /// checks describing the same underlying problem (the same declined
+    /// vtsls consent, re-detected on a later launch) must fingerprint
+    /// identically even if the message wording changed across an app
+    /// version. Used by the app (`shell.rs`) to persist "the user already
+    /// dismissed exactly this" across restarts, distinguishing it from
+    /// "something genuinely new needs attention" (phase-8 capstone review,
+    /// P3: drift dismissal used to be session-only, so a permanent-by-
+    /// choice state — no `gh`, a declined vtsls consent — re-popped the
+    /// onboarding page on every single launch, forever).
+    pub fn needs_human_fingerprint(&self) -> Option<String> {
+        let mut entries: Vec<(String, &'static str, String)> = self
+            .components
+            .iter()
+            .filter_map(|c| {
+                let kind = match &c.state {
+                    ComponentState::Missing { .. } => "missing",
+                    ComponentState::NeedsConsent { .. } => "consent",
+                    ComponentState::Installing => "installing",
+                    ComponentState::Failed { .. } => "failed",
+                    ComponentState::Ok { .. } | ComponentState::Skipped { .. } => return None,
+                };
+                Some((format!("{:?}", c.id), kind, c.title.clone()))
+            })
+            .collect();
+        if entries.is_empty() {
+            return None;
+        }
+        entries.sort();
+        use std::hash::{Hash, Hasher};
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        entries.hash(&mut hasher);
+        Some(format!("{:016x}", hasher.finish()))
+    }
+}
+
 /// Check all four components: `gh` unconditionally (host-side, never boots
 /// anything), then `dv-host`/`dv-cli`/`node`+`vtsls` for every distro in
 /// `distros_allowed` — and ONLY those. See the module doc's boot-storm
@@ -367,5 +407,75 @@ mod tests {
         let report = consistency_check(&[]);
         assert_eq!(report.components.len(), 1);
         assert_eq!(report.components[0].id, ComponentId::GhCli);
+    }
+
+    #[test]
+    fn needs_human_fingerprint_is_none_when_everything_ok_or_skipped() {
+        let report = ConsistencyReport {
+            drift: false,
+            components: vec![
+                report(ComponentState::Ok {
+                    detail: "fine".to_string(),
+                }),
+                report(ComponentState::Skipped {
+                    reason: "n/a".to_string(),
+                }),
+            ],
+        };
+        assert_eq!(report.needs_human_fingerprint(), None);
+    }
+
+    #[test]
+    fn needs_human_fingerprint_is_stable_and_order_independent() {
+        let missing = report(ComponentState::Missing {
+            guidance: "x".to_string(),
+        });
+        let failed = report(ComponentState::Failed {
+            error: "y".to_string(),
+        });
+        let forward = ConsistencyReport {
+            drift: true,
+            components: vec![missing.clone(), failed.clone()],
+        };
+        let reversed = ConsistencyReport {
+            drift: true,
+            components: vec![failed, missing],
+        };
+        let fp_forward = forward.needs_human_fingerprint();
+        let fp_reversed = reversed.needs_human_fingerprint();
+        assert!(fp_forward.is_some());
+        assert_eq!(fp_forward, fp_reversed);
+    }
+
+    #[test]
+    fn needs_human_fingerprint_ignores_message_text_but_not_kind() {
+        let base = ConsistencyReport {
+            drift: true,
+            components: vec![report(ComponentState::Missing {
+                guidance: "install gh from https://cli.github.com".to_string(),
+            })],
+        };
+        let reworded = ConsistencyReport {
+            drift: true,
+            components: vec![report(ComponentState::Missing {
+                guidance: "totally different wording".to_string(),
+            })],
+        };
+        let different_kind = ConsistencyReport {
+            drift: true,
+            components: vec![report(ComponentState::Failed {
+                error: "install gh from https://cli.github.com".to_string(),
+            })],
+        };
+        assert_eq!(
+            base.needs_human_fingerprint(),
+            reworded.needs_human_fingerprint(),
+            "message wording alone must not change the fingerprint"
+        );
+        assert_ne!(
+            base.needs_human_fingerprint(),
+            different_kind.needs_human_fingerprint(),
+            "a different state kind must change the fingerprint"
+        );
     }
 }

@@ -1095,6 +1095,18 @@ pub struct Workspace {
     /// uses everywhere else in this module. Taken (and re-checked against
     /// the current epoch) by whichever spawn attempt completes first.
     lsp_pending_definition: Option<PendingDefinition>,
+    /// Count of go-to-definition async round trips currently in flight —
+    /// `Self::run_definition_request`'s definition lookup and
+    /// `Self::open_target_at`'s target-file read each increment this right
+    /// before `cx.spawn`-ing and decrement it the moment their completion
+    /// closure runs, epoch match or not (phase-8 capstone integration
+    /// review, P3). `Self::automation_settled` treats a nonzero count the
+    /// same as `Spawning`/`lsp_pending_definition.is_some()`: without this,
+    /// `wait_ready` returned "settled" while a ctrl/cmd-click's definition
+    /// lookup or the subsequent target-viewer file read was still
+    /// in-flight, making `state.lsp.target_viewer` a race between the
+    /// script and vtsls rather than a deterministic read.
+    lsp_inflight_requests: u32,
     /// Bumped every time a NEW vtsls spawn attempt is kicked off (the
     /// `Unattempted -> Spawning` transition in `Self::on_symbol_click`) or
     /// the session is parked (`Self::park_lsp_session`) — stamped onto that
@@ -1683,6 +1695,7 @@ impl Workspace {
             target_viewer: None,
             lsp_status: None,
             lsp_pending_definition: None,
+            lsp_inflight_requests: 0,
             lsp_spawn_generation: 0,
             lsp_ready_since: None,
             lsp_node_modules_warning: None,
@@ -3185,6 +3198,18 @@ impl Workspace {
         if self.editor.is_some() || self.thread_input.is_some() {
             return;
         }
+        // Decline while the S8f target viewer is open (phase-8 capstone
+        // review, P3): the `browse` key-context predicate excludes
+        // `TargetViewerOpen` for exactly this reason, but macOS menu
+        // dispatch bypasses key contexts entirely (same gap this fn's
+        // other guards above/below already exist to close for the PR
+        // picker/editor/shell overlays) — without this, `Go > Open PR...`
+        // opens the picker BEHIND the viewer's occluding backdrop (the
+        // viewer renders after the picker in `render`'s child order),
+        // invisibly stealing focus into its search input.
+        if self.target_viewer.is_some() {
+            return;
+        }
         // Decline while a shell-level overlay (theme picker / settings
         // panel) is genuinely open, the same way `on_open_theme_picker`
         // declines if `settings_panel` is already up (review finding P1).
@@ -3222,6 +3247,15 @@ impl Workspace {
         if let Some(shell) = self.shell.upgrade() {
             shell.update(cx, |shell, cx| shell.close_filter_popover(cx));
         }
+        // Supersede any in-flight go-to-definition round trip (whole-phase
+        // capstone review, P3): without this, a click stashed while
+        // `lsp_session` is `Spawning` could still complete and commit the
+        // target viewer AFTER the picker opens, painting its occluding
+        // backdrop over the picker exactly the way the reverse direction
+        // (opening the picker/palette/editor while the viewer is up) is
+        // already guarded against below/in `on_jump_to_file`/`open_editor`/
+        // `open_thread_input`. See `lsp_request_epoch`'s doc comment.
+        self.lsp_request_epoch += 1;
         self.pr_picker_epoch += 1;
         let generation = self.pr_picker_epoch;
         let t0 = std::time::Instant::now();
@@ -3706,15 +3740,29 @@ impl Workspace {
     /// True once there is nothing left in flight: repo loaded (or failed),
     /// the selected file's diff computed with no recompute pending (gap
     /// expansion keeps stale rows visible while it rebuilds), an in-flight
-    /// PR open settled (`open_pr` reuses `Status::Loading` for this), and
-    /// an open PR picker's `gh pr list` fetch finished loading. `wait_ready`
-    /// polls this.
+    /// PR open settled (`open_pr` reuses `Status::Loading` for this), an
+    /// open PR picker's `gh pr list` fetch finished loading, and no S8f
+    /// go-to-definition work outstanding (phase-8 capstone integration
+    /// review, P3 — added on top of the original set above, which predates
+    /// LSP entirely): a vtsls session still `Spawning`, a click stashed in
+    /// `lsp_pending_definition` behind that spawn, or a definition/target-
+    /// file round trip in flight (`lsp_inflight_requests`). Without this, a
+    /// scripted ctrl/cmd-click's `wait_ready` unblocked before vtsls's spawn
+    /// (up to 30s) or the definition/target-read round trip actually
+    /// landed, making `state.lsp.target_viewer` a race against the script
+    /// rather than a deterministic read. `wait_ready` polls this.
     #[cfg(feature = "automation")]
     pub(crate) fn automation_settled(&self) -> bool {
         if self
             .pr_picker
             .as_ref()
             .is_some_and(|p| matches!(p.state, PrPickerState::Loading))
+        {
+            return false;
+        }
+        if matches!(self.lsp_session, crate::lsp::LspSessionState::Spawning)
+            || self.lsp_pending_definition.is_some()
+            || self.lsp_inflight_requests > 0
         {
             return false;
         }
@@ -4258,6 +4306,12 @@ impl Workspace {
             self.reset_diff_list(cx);
             return;
         }
+        // Supersede any in-flight go-to-definition round trip (whole-phase
+        // capstone review, P3 — see `on_open_pr_picker`'s matching bump and
+        // `lsp_request_epoch`'s doc comment): otherwise a click stashed
+        // while `lsp_session` is `Spawning` could complete after this
+        // editor opens and commit the target viewer on top of it mid-type.
+        self.lsp_request_epoch += 1;
         let input = cx.new(|cx| {
             InputState::new(window, cx)
                 .multi_line(true)
@@ -5119,6 +5173,13 @@ impl Workspace {
         if self.thread_input.as_ref().is_some_and(|ti| ti.saving) {
             return;
         }
+        // Supersede any in-flight go-to-definition round trip (whole-phase
+        // capstone review, P3 — see `on_open_pr_picker`'s matching bump and
+        // `lsp_request_epoch`'s doc comment): otherwise a click stashed
+        // while `lsp_session` is `Spawning` could complete after this
+        // reply/edit box opens and commit the target viewer on top of it
+        // mid-type.
+        self.lsp_request_epoch += 1;
         let prefill = match mode {
             ThreadInputMode::Reply => String::new(),
             ThreadInputMode::EditBody => self
@@ -5591,6 +5652,27 @@ impl Workspace {
             self.lsp_ready_since = None;
         }
 
+        // An earlier attempt found vtsls missing, or the spawn/handshake
+        // itself failed. Every path that can land here already cleared the
+        // WSL/TS/honest-view gates above (unlike, say, a local/Windows repo,
+        // which bails out long before ever consulting `lsp_session`), so
+        // nothing captured in this state is a permanent, structural block —
+        // it can change. The common trigger is a ctrl-click landing mid-
+        // install (S8e's up-to-180s consent-triggered `npm install -g`,
+        // before the reverify flips the onboarding row to `Ok`): without
+        // this reset, every later click kept reading the same stale
+        // verdict forever, even once vtsls was actually installed and
+        // working, with only a park (review switch away/back) or an app
+        // restart able to heal it (P2 finding). Treat this fresh click —
+        // itself a deliberate user action, not an automatic retry — as
+        // license to re-detect rather than trust the old answer.
+        if matches!(
+            self.lsp_session,
+            crate::lsp::LspSessionState::Unavailable(_)
+        ) {
+            self.lsp_session = crate::lsp::LspSessionState::Unattempted;
+        }
+
         match &self.lsp_session {
             crate::lsp::LspSessionState::Ready(handle) => {
                 let handle = handle.clone();
@@ -5688,7 +5770,25 @@ impl Workspace {
                         })
                         .await;
 
-                    this.update(cx, |this, cx| {
+                    // `spawned` must survive past `this.update` even when the
+                    // closure below never runs at all — not just when it runs
+                    // and finds a generation mismatch. If the workspace
+                    // entity was released outright while this spawn was in
+                    // flight (e.g. a no-review workspace dropped rather than
+                    // parked by `Self::stash_active` — capstone P3 finding),
+                    // `update` returns `Err` without invoking its closure, so
+                    // a `spawned` moved directly into that closure would be
+                    // dropped right here, inline on this task's executor
+                    // (the same foreground executor driving the UI — see the
+                    // comment below on why that matters). Stash it in a cell
+                    // the closure borrows from instead, so it's still ours to
+                    // dispose of in the `Err` case after `update` returns.
+                    let spawned = std::cell::RefCell::new(Some(spawned));
+                    let updated = this.update(cx, |this, cx| {
+                        let spawned = spawned
+                            .borrow_mut()
+                            .take()
+                            .expect("update's closure runs at most once");
                         // The workspace was parked (`Self::park_lsp_session`
                         // resets `Spawning` -> `Unattempted` AND bumps the
                         // generation) or a later click already kicked off
@@ -5778,8 +5878,18 @@ impl Workspace {
                                 cx.notify();
                             }
                         }
-                    })
-                    .ok();
+                    });
+                    // `update`'s closure above takes at most once — if it
+                    // never ran at all (entity released, not just
+                    // superseded), `spawned` is still sitting in the cell;
+                    // dispose of any `Ok` handle the same way the
+                    // generation-mismatch arm does, off this task's
+                    // executor.
+                    if updated.is_err()
+                        && let Some(Ok((handle, _))) = spawned.into_inner()
+                    {
+                        cx.background_spawn(async move { drop(handle) }).detach();
+                    }
                 })
                 .detach();
             }
@@ -6036,6 +6146,10 @@ impl Workspace {
         ready_since: Option<std::time::Instant>,
         cx: &mut Context<Self>,
     ) {
+        // Decremented at the top of the completion closure below,
+        // unconditionally (epoch match or not) — see
+        // `Self::lsp_inflight_requests`'s doc comment.
+        self.lsp_inflight_requests += 1;
         cx.spawn(async move |this, cx| {
             let result = cx
                 .background_spawn(async move {
@@ -6086,6 +6200,7 @@ impl Workspace {
                 .await;
 
             this.update(cx, |this, cx| {
+                this.lsp_inflight_requests = this.lsp_inflight_requests.saturating_sub(1);
                 if this.lsp_request_epoch != epoch {
                     return; // superseded — see this fn's doc comment
                 }
@@ -6182,6 +6297,10 @@ impl Workspace {
         let rel_path = rel_path.to_string();
         let highlight_line = target.line;
 
+        // Decremented at the top of the completion closure below,
+        // unconditionally (epoch match or not) — see
+        // `Self::lsp_inflight_requests`'s doc comment.
+        self.lsp_inflight_requests += 1;
         cx.spawn(async move |this, cx| {
             let rel_path_for_read = rel_path.clone();
             let content = cx
@@ -6193,6 +6312,7 @@ impl Workspace {
                 .await;
 
             this.update(cx, |this, cx| {
+                this.lsp_inflight_requests = this.lsp_inflight_requests.saturating_sub(1);
                 if this.lsp_request_epoch != epoch {
                     return; // superseded — see this fn's doc comment
                 }
@@ -6714,18 +6834,22 @@ impl Workspace {
         }
         // Decline while another overlay already has the screen (review
         // finding P3). The `browse` key-context predicate normally keeps
-        // this action from firing while the PR picker/comment editor/shell
-        // overlays are up, but the macOS menu bar (S8i) dispatches straight
-        // to this handler with no key-context gate at all — menu dispatch
-        // bypasses the keymap entirely, same as every other `on_*` handler
-        // here, so the guard has to live in the handler itself. Mirrors
-        // `on_open_pr_picker`'s decline set: its own overlay, the comment
-        // editor/thread-reply input (same pair `render`'s `key_context`
-        // computation treats as "editor open"), and the shell-level
-        // overlays via `overlay_open`.
+        // this action from firing while the PR picker/comment editor/
+        // target viewer/shell overlays are up, but the macOS menu bar (S8i)
+        // dispatches straight to this handler with no key-context gate at
+        // all — menu dispatch bypasses the keymap entirely, same as every
+        // other `on_*` handler here, so the guard has to live in the
+        // handler itself. Mirrors `on_open_pr_picker`'s decline set: its
+        // own overlay, the comment editor/thread-reply input (same pair
+        // `render`'s `key_context` computation treats as "editor open"),
+        // the S8f target viewer (phase-8 capstone review, P3 — the viewer
+        // renders after the palette in `render`'s child order, so opening
+        // this behind it would be invisible), and the shell-level overlays
+        // via `overlay_open`.
         if self.pr_picker.is_some()
             || self.editor.is_some()
             || self.thread_input.is_some()
+            || self.target_viewer.is_some()
             || self
                 .shell
                 .upgrade()
@@ -6740,6 +6864,12 @@ impl Workspace {
             return;
         }
 
+        // Supersede any in-flight go-to-definition round trip (whole-phase
+        // capstone review, P3 — see `on_open_pr_picker`'s matching bump and
+        // `lsp_request_epoch`'s doc comment): otherwise a click stashed
+        // while `lsp_session` is `Spawning` could complete after this
+        // palette opens and commit the target viewer on top of it.
+        self.lsp_request_epoch += 1;
         let input = cx.new(|cx| InputState::new(window, cx).placeholder("Jump to file…"));
         let subscription = cx.subscribe_in(
             &input,

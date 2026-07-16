@@ -242,25 +242,51 @@ impl OnboardingPage {
                 .any(|row| row.id == id && row.title != base)
     }
 
-    /// `true` when any row is in a state that genuinely needs a human to
-    /// look at it — used by `shell.rs`'s `close_onboarding_page` to decide
-    /// whether closing this page should latch `drift_page_dismissed` (S8e
-    /// review, P2): closing a page that showed nothing but `Ok`/`Skipped`/
-    /// `Checking` rows (the common first-run-with-no-live-distro case) must
-    /// not suppress a LATER, genuinely different drift from auto-surfacing —
-    /// the latch's whole rationale ("the user has seen and dismissed a
-    /// drift report") only holds when a drift report was actually on
-    /// screen.
-    pub(crate) fn has_needs_human_row(&self) -> bool {
-        self.rows.iter().any(|row| {
-            matches!(
-                row.state,
-                RowState::Missing(_)
-                    | RowState::Consent(..)
-                    | RowState::Installing
-                    | RowState::Failed(_)
-            )
-        })
+    /// `Some` when any row is in a state that genuinely needs a human to
+    /// look at it, uniquely identifying WHICH rows (see this fn's own doc
+    /// below); `None` otherwise — used by `shell.rs`'s
+    /// `close_onboarding_page` to decide whether closing this page should
+    /// latch `drift_page_dismissed`/persist a dismissal (S8e review, P2;
+    /// phase-8 capstone review, P3): closing a page that showed nothing but
+    /// `Ok`/`Skipped`/`Checking` rows (the common first-run-with-no-live-
+    /// distro case) must not suppress a LATER, genuinely different drift
+    /// from auto-surfacing — the latch's whole rationale ("the user has
+    /// seen and dismissed a drift report") only holds when a drift report
+    /// was actually on screen.
+    ///
+    /// This page's counterpart to
+    /// [`dv_core::provision::ConsistencyReport::needs_human_fingerprint`] —
+    /// same `(id, state KIND, title)` shape, computed from this page's own
+    /// merged `rows` rather than a single raw report (a page can be the
+    /// product of several merged per-distro checks — see this module's own
+    /// doc comment). `shell.rs`'s `close_onboarding_page` persists this on
+    /// dismissal (`crate::setup::SetupState::mark_drift_dismissed`) so a
+    /// permanent-by-choice state (no `gh`, a declined vtsls consent)
+    /// doesn't re-pop the page every single launch (phase-8 capstone
+    /// review, P3).
+    pub(crate) fn needs_human_fingerprint(&self) -> Option<String> {
+        let mut entries: Vec<(String, &'static str, String)> = self
+            .rows
+            .iter()
+            .filter_map(|row| {
+                let kind = match &row.state {
+                    RowState::Missing(_) => "missing",
+                    RowState::Consent(..) => "consent",
+                    RowState::Installing => "installing",
+                    RowState::Failed(_) => "failed",
+                    RowState::Checking | RowState::Ok(_) | RowState::Skipped(_) => return None,
+                };
+                Some((format!("{:?}", row.id), kind, row.title.clone()))
+            })
+            .collect();
+        if entries.is_empty() {
+            return None;
+        }
+        entries.sort();
+        use std::hash::{Hash, Hasher};
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        entries.hash(&mut hasher);
+        Some(format!("{:016x}", hasher.finish()))
     }
 
     /// Seed rows already known to be mid-install at the shell level
@@ -390,23 +416,31 @@ mod tests {
     }
 
     #[test]
-    fn has_needs_human_row_is_false_for_ok_skipped_and_checking() {
+    fn needs_human_fingerprint_is_none_while_checking_and_once_ok_or_skipped() {
         let mut page = OnboardingPage::placeholder(
             false,
             vec![(ComponentId::GhCli, ComponentId::GhCli.title().to_string())],
         );
-        assert!(!page.has_needs_human_row(), "Checking must not count");
+        assert_eq!(
+            page.needs_human_fingerprint(),
+            None,
+            "Checking must not count"
+        );
         page.apply_report(ok_report(vec![(
             ComponentId::GhCli,
             ComponentId::GhCli.title(),
         )]));
-        assert!(!page.has_needs_human_row(), "Ok must not count");
+        assert_eq!(page.needs_human_fingerprint(), None, "Ok must not count");
         page.rows[0].state = RowState::Skipped("n/a".to_string());
-        assert!(!page.has_needs_human_row(), "Skipped must not count");
+        assert_eq!(
+            page.needs_human_fingerprint(),
+            None,
+            "Skipped must not count"
+        );
     }
 
     #[test]
-    fn has_needs_human_row_is_true_for_missing_consent_installing_and_failed() {
+    fn needs_human_fingerprint_is_some_for_missing_consent_installing_and_failed() {
         for state in [
             RowState::Missing("x".to_string()),
             RowState::Consent(
@@ -430,8 +464,59 @@ mod tests {
                 title: "x".to_string(),
                 state,
             });
-            assert!(page.has_needs_human_row());
+            assert!(page.needs_human_fingerprint().is_some());
         }
+    }
+
+    #[test]
+    fn needs_human_fingerprint_is_none_for_ok_skipped_and_checking() {
+        let mut page = OnboardingPage::placeholder(false, Vec::new());
+        for state in [
+            RowState::Checking,
+            RowState::Ok("fine".to_string()),
+            RowState::Skipped("n/a".to_string()),
+        ] {
+            page.rows = vec![Row {
+                id: ComponentId::GhCli,
+                title: "gh".to_string(),
+                state,
+            }];
+            assert_eq!(page.needs_human_fingerprint(), None);
+        }
+    }
+
+    #[test]
+    fn needs_human_fingerprint_matches_across_row_order_and_message_wording() {
+        let mut a = OnboardingPage::placeholder(false, Vec::new());
+        a.rows = vec![
+            Row {
+                id: ComponentId::GhCli,
+                title: "gh".to_string(),
+                state: RowState::Missing("install from https://cli.github.com".to_string()),
+            },
+            Row {
+                id: ComponentId::NodeVtsls,
+                title: "vtsls — Ubuntu".to_string(),
+                state: RowState::Failed("x".to_string()),
+            },
+        ];
+        let mut b = OnboardingPage::placeholder(false, Vec::new());
+        b.rows = vec![
+            Row {
+                id: ComponentId::NodeVtsls,
+                title: "vtsls — Ubuntu".to_string(),
+                state: RowState::Failed("a completely different message".to_string()),
+            },
+            Row {
+                id: ComponentId::GhCli,
+                title: "gh".to_string(),
+                state: RowState::Missing("totally reworded guidance".to_string()),
+            },
+        ];
+        let fp_a = a.needs_human_fingerprint();
+        let fp_b = b.needs_human_fingerprint();
+        assert!(fp_a.is_some());
+        assert_eq!(fp_a, fp_b);
     }
 
     /// S8e review, P3: a title persisted at the shell level must be

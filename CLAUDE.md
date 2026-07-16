@@ -250,3 +250,22 @@ diff on parked-WSL-no-host reactivation; a revalidate/store-watch review-id
 race) — both fixed. DEFERRED (backlog): background the pr_meta fetch for a
 truly instant reopen; runtime-exercise the byte-triggered eviction with a
 large diff.
+Phase 8 complete (LSP, macOS, releases; docs/phase-8-lsp-and-polish.md §
+Acceptance results): nine slices S8a-S8i — automation gated behind a
+default-on cargo feature so shipped binaries build with `--no-default-
+features` (S8a), a gpui-free `dv-cli` crate + native Linux binary (S8b),
+the content-hash installer generalized to dv-host + dv-cli (S8c),
+provisioning detection/consent/`ConsistencyReport` in dv-core (S8d), a
+first-run onboarding page with boot-storm-safe per-launch consistency
+wiring (S8e), a vtsls LSP client + go-to-definition + read-only target
+viewer (S8f), hover popover + find-references core API + scriptable
+consent modifiers (S8g), a tag-triggered release pipeline written but not
+triggered (S8h), and macOS menu/accelerator conventions written blind, no
+Mac in this sandbox (S8i). Shipped LSP scope is WSL-repos-only, narrower
+than the phase doc's original local-first prose — recorded in that doc's
+own Acceptance-results section rather than left implicit. A capstone
+integration review caught 3 cross-slice P3s (a single-fingerprint drift-
+dismissal slot defeated by a multi-shape multi-distro drift; `wait_ready`
+not spanning LSP async work; this status entry itself missing) — all
+fixed. macOS runtime stays CARRIED-FORWARD-UNVERIFIED in docs/backlog.md
+pending a real hand-run.

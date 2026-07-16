@@ -46,6 +46,15 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
+      # (Phase 8 capstone review, P3): the distributed shape
+      # (`--no-default-features`, gating the `automation` feature — S8a) is
+      # otherwise ONLY compiled at `v*` tag time by release.yml, so a
+      # missed `#[cfg(feature = "automation")]` gate would merge green here
+      # and fail the release build, blocking a tag push until a fix
+      # commit/re-tag. Clippy (not just build) so dead-code-only gate
+      # misses fail `-D warnings` too, not just hard errors.
+      - name: Clippy (distributed shape, --no-default-features)
+        run: cargo clippy -p dv --no-default-features --all-targets -- -D warnings
       - name: Test
         run: cargo test --workspace
       - name: Build (release)

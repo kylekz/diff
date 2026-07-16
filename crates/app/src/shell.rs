@@ -940,12 +940,20 @@ pub struct AppShell {
     /// already-closed branch, even for re-selecting the already-active
     /// review — the user can never permanently decline. Set only by
     /// [`Self::close_onboarding_page`] when the page it's closing actually
-    /// showed a row that needed a human (`OnboardingPage::has_needs_human_row`
-    /// — S8e review, P2: closing a drift-free page, e.g. the first-run
-    /// welcome page with no WSL distro live, must NOT suppress a later,
-    /// genuinely different drift), and cleared only by an explicit manual
-    /// reopen ([`Self::open_onboarding_page`]), so a deliberate look re-arms
-    /// the auto-surface for that fresh session of checks.
+    /// showed a row that needed a human (`OnboardingPage::
+    /// needs_human_fingerprint` returning `Some` — S8e review, P2: closing
+    /// a drift-free page, e.g. the first-run welcome page with no WSL
+    /// distro live, must NOT suppress a later, genuinely different drift),
+    /// and cleared only by an explicit manual reopen
+    /// ([`Self::open_onboarding_page`]), so a deliberate look re-arms the
+    /// auto-surface for that fresh session of checks. This latch alone is
+    /// SESSION-only — `crate::setup::SetupState::dismissed_drift_fingerprints`
+    /// is its cross-launch counterpart (phase-8 capstone review, P3; a SET
+    /// of fingerprints rather than one slot, capstone integration review,
+    /// P3, since a multi-distro machine can have more than one
+    /// simultaneously-valid dismissed shape), consulted by
+    /// [`Self::apply_consistency_report`] alongside this field rather than
+    /// replacing it.
     drift_page_dismissed: bool,
     /// Titles ([`OnboardingPage::installing`]'s merge key) with a
     /// consent-triggered `install_vtsls` genuinely in flight right now,
@@ -961,7 +969,38 @@ pub struct AppShell {
     /// removed once that install's own background task completes (success
     /// or failure).
     onboarding_installing: HashSet<String>,
+    /// Dispatch-time timestamp of the last [`Self::spawn_consistency_check`]
+    /// call that included a given key (phase-8 capstone review, P3) — a
+    /// distro name for its per-distro rows, or [`GH_COOLDOWN_KEY`] for the
+    /// unconditional `gh` row every check includes. Consulted only by
+    /// [`Self::spawn_consistency_check_throttled`] (the passive/high-
+    /// frequency callers: launch and `Self::open_review`'s per-repo-open
+    /// trigger) to collapse a redundant re-check within
+    /// [`CONSISTENCY_COOLDOWN`] — without this, rapidly triaging many WSL
+    /// reviews via the Phase-7 ~2ms cached switch fired one full check
+    /// (a `gh auth status` network round trip + several `wsl.exe` spawns)
+    /// per switch, with no dedup. A manual page (re)open
+    /// ([`Self::open_onboarding_page`]) and the post-install reverify
+    /// ([`Self::on_onboarding_consent_install`]) both call
+    /// [`Self::spawn_consistency_check`] directly, bypassing the cooldown
+    /// check (both must always see a fresh result) — but still stamp this
+    /// map via that shared fn, so a passive check right after either
+    /// doesn't immediately re-hit the same ground.
+    consistency_checked_at: HashMap<String, std::time::Instant>,
 }
+
+/// Sentinel key for `gh`'s entry in [`AppShell::consistency_checked_at`] —
+/// `gh` isn't distro-scoped (it always runs host-side, unconditionally, per
+/// `consistency_check`'s own module doc), so it needs a slot outside the
+/// real distro names that key every other entry in that map.
+const GH_COOLDOWN_KEY: &str = "\0gh";
+
+/// How long [`AppShell::spawn_consistency_check_throttled`] treats a prior
+/// check as still good enough to skip a passive re-check. Generous enough
+/// to collapse a rapid multi-review triage session into one real check per
+/// distro, short enough that genuine drift (installing vtsls, `gh auth
+/// login`/`logout`) still surfaces well within a sitting.
+const CONSISTENCY_COOLDOWN: std::time::Duration = std::time::Duration::from_secs(5 * 60);
 
 /// The theme picker overlay, while open.
 struct ThemePicker {
@@ -1065,6 +1104,7 @@ impl AppShell {
             onboarding_check_gen: 0,
             drift_page_dismissed: false,
             onboarding_installing: HashSet::new(),
+            consistency_checked_at: HashMap::new(),
         };
         // Live follow-OS updates (docs/phase-4-settings-and-theming.md
         // deliverable 2): `Window::observe_window_appearance`'s registration
@@ -1133,7 +1173,7 @@ impl AppShell {
             this.open_onboarding_page(window, cx);
         } else {
             let distros_allowed = this.live_wsl_distros();
-            this.spawn_consistency_check(distros_allowed, cx);
+            this.spawn_consistency_check_throttled(distros_allowed, cx);
         }
         this
     }
@@ -1248,9 +1288,14 @@ impl AppShell {
         // consent row exactly like the launch-time check does. Placed AFTER
         // the `already_active` early-return above (S8e review, P2): re-
         // selecting the review that's already open is a pure no-op and
-        // shouldn't spawn a fresh WSL round trip every time.
+        // shouldn't spawn a fresh WSL round trip every time. Throttled
+        // (phase-8 capstone review, P3): without `Self::
+        // spawn_consistency_check_throttled`'s cooldown, rapidly triaging
+        // many WSL reviews via the Phase-7 ~2ms cached switch fired one
+        // full check — a `gh auth status` network round trip plus several
+        // `wsl.exe` spawns — on every single switch.
         if let RepoLocation::Wsl { distro, .. } = &location {
-            self.spawn_consistency_check(vec![distro.clone()], cx);
+            self.spawn_consistency_check_throttled(vec![distro.clone()], cx);
         }
 
         // Phase 7 D1 cache-hit fast path: reactivate a parked workspace
@@ -2994,8 +3039,18 @@ impl AppShell {
             // any drift to dismiss, so it must NOT suppress a LATER,
             // genuinely different drift from auto-surfacing. Cleared only
             // by a fresh manual reopen (`Self::open_onboarding_page`).
-            if page.has_needs_human_row() {
+            //
+            // Also persist the fingerprint of exactly what was dismissed
+            // (phase-8 capstone review, P3): `drift_page_dismissed` alone
+            // only lasts the session, so a permanent-by-choice state (no
+            // `gh`, a declined vtsls consent) re-popped this same modal on
+            // every later launch — `Self::apply_consistency_report`
+            // compares each fresh report's own fingerprint against this to
+            // stay silent on a repeat of the exact same condition, while
+            // still surfacing anything genuinely different.
+            if let Some(fingerprint) = page.needs_human_fingerprint() {
                 self.drift_page_dismissed = true;
+                SetupState::mark_drift_dismissed(fingerprint);
             }
             match &self.active {
                 Some(ws) => window.focus(&ws.focus_handle(cx), cx),
@@ -3035,6 +3090,39 @@ impl AppShell {
         self.close_onboarding_page(window, cx);
     }
 
+    /// Passive-trigger front door for [`Self::spawn_consistency_check`]
+    /// (phase-8 capstone review, P3): `Self::new`'s launch-time check and
+    /// `Self::open_review`'s per-repo-open check both go through here
+    /// instead of calling `spawn_consistency_check` directly. Skips the
+    /// whole dispatch — `gh` included — when EVERY key it would touch (`gh`
+    /// plus every distro in `distros_allowed`) was already checked within
+    /// `CONSISTENCY_COOLDOWN`; otherwise runs the full, unfiltered check
+    /// exactly as `distros_allowed` was passed in (a partial re-check of
+    /// only the stale distros would make an empty `distros_allowed` look
+    /// like "no WSL distro running" to `Self::pad_no_distro_rows`, when
+    /// really every distro is just still fresh — simpler and safer to
+    /// re-check everything together than to thread that distinction
+    /// through). A manual page (re)open or the post-install reverify must
+    /// always see a fresh result, so both call `spawn_consistency_check`
+    /// directly rather than through here.
+    fn spawn_consistency_check_throttled(
+        &mut self,
+        distros_allowed: Vec<String>,
+        cx: &mut Context<Self>,
+    ) {
+        let now = std::time::Instant::now();
+        let is_fresh = |key: &str| {
+            self.consistency_checked_at
+                .get(key)
+                .is_some_and(|at| now.duration_since(*at) < CONSISTENCY_COOLDOWN)
+        };
+        let all_fresh = is_fresh(GH_COOLDOWN_KEY) && distros_allowed.iter().all(|d| is_fresh(d));
+        if all_fresh {
+            return;
+        }
+        self.spawn_consistency_check(distros_allowed, cx);
+    }
+
     /// Dispatch `dv_core::provision::consistency_check(&distros_allowed)`
     /// off the UI thread (the module's own doc: it can block for seconds —
     /// gh 10s, node detect 20s, an install 180s — so it must NEVER run
@@ -3042,8 +3130,20 @@ impl AppShell {
     /// already gated on `Self::live_wsl_distros` (a passive/launch-time
     /// walk) or on "opening this WSL repo right now" (`Self::open_review`) —
     /// this fn does no gating of its own, matching `consistency_check`'s own
-    /// module-doc contract.
+    /// module-doc contract. Stamps [`Self::consistency_checked_at`] for `gh`
+    /// and every requested distro at DISPATCH time (not completion) so two
+    /// calls issued back-to-back synchronously — e.g. a seeded launch's
+    /// `Self::open_review` immediately followed by `Self::new`'s own
+    /// unconditional check — see each other's stamp through
+    /// [`Self::spawn_consistency_check_throttled`] even before either
+    /// finishes.
     fn spawn_consistency_check(&mut self, distros_allowed: Vec<String>, cx: &mut Context<Self>) {
+        let now = std::time::Instant::now();
+        self.consistency_checked_at
+            .insert(GH_COOLDOWN_KEY.to_string(), now);
+        for distro in &distros_allowed {
+            self.consistency_checked_at.insert(distro.clone(), now);
+        }
         self.onboarding_check_gen += 1;
         let check_gen = self.onboarding_check_gen;
         // Captured before the move below: `consistency_check(&[])` only
@@ -3156,9 +3256,32 @@ impl AppShell {
                         .active
                         .as_ref()
                         .is_some_and(|ws| ws.read(cx).pr_picker_open());
+                // Persisted counterpart to `drift_page_dismissed` (S8e
+                // review, P2 — session-only): a report whose needs-human
+                // subset fingerprints matches ANY shape the user has
+                // previously explicitly dismissed (`Self::
+                // close_onboarding_page`) is a REPEAT of a permanent-by-
+                // choice condition — no `gh`, a declined vtsls consent —
+                // re-surfacing on this brand-new session, not a fresh
+                // drift. Membership in a small set, not equality against a
+                // single remembered slot (capstone integration review,
+                // P3): a multi-distro machine's drift can take more than
+                // one simultaneously-valid dismissed shape (e.g. Ubuntu
+                // and Debian both missing vtsls, dismissed one repo-open
+                // at a time), and a single slot made every launch whose
+                // shape didn't happen to match the LAST one dismissed
+                // re-pop the modal, clobbering the other shape's
+                // dismissal on close. `SetupState::load()` here is a plain
+                // JSON read, the same per-check cost every other
+                // `SetupState::load()` call site in this file already pays
+                // (phase-8 capstone review, P3).
+                let already_dismissed_persistently = report
+                    .needs_human_fingerprint()
+                    .is_some_and(|fp| SetupState::load().is_drift_dismissed(&fp));
                 if report.drift
                     && !self.automation
                     && !self.drift_page_dismissed
+                    && !already_dismissed_persistently
                     && !overlay_blocking
                 {
                     // Mirror `Self::on_open_onboarding`'s own guard: the
@@ -3259,7 +3382,29 @@ impl AppShell {
                 }
                 this.onboarding_installing.remove(&title);
                 match result {
-                    Ok(()) => this.spawn_consistency_check(vec![distro_for_reverify], cx),
+                    Ok(()) => {
+                        // Span `wait_ready` across the reverify, not just
+                        // the install itself (phase-8 capstone integration
+                        // review, P3): `end_install` above already emptied
+                        // `installing`, and `running` was already `false`
+                        // from way back when the ORIGINAL check first
+                        // populated this row as `Consent` — with neither
+                        // flag flipped here, `AppShell::automation_settled`
+                        // read "settled" immediately, before this reverify's
+                        // own report had any chance to flip the row off
+                        // `Installing`. Only when the page is still open
+                        // (it may have been closed during the up-to-180s
+                        // install) — mirrors `OnboardingPage::placeholder`'s
+                        // own `running: true` for a fresh check, and is
+                        // cleared the same way: `apply_report`'s trailing
+                        // `self.running = false` once this reverify's report
+                        // actually lands (or a still-later check's, if this
+                        // one gets superseded first).
+                        if let Some(page) = &mut this.onboarding {
+                            page.running = true;
+                        }
+                        this.spawn_consistency_check(vec![distro_for_reverify], cx)
+                    }
                     Err(err) => {
                         if let Some(page) = &mut this.onboarding
                             && let Some(row) = page.rows.iter_mut().find(|r| r.title == title)

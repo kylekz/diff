@@ -250,22 +250,32 @@ diff on parked-WSL-no-host reactivation; a revalidate/store-watch review-id
 race) — both fixed. DEFERRED (backlog): background the pr_meta fetch for a
 truly instant reopen; runtime-exercise the byte-triggered eviction with a
 large diff.
-Phase 8 complete (LSP, macOS, releases; docs/phase-8-lsp-and-polish.md §
-Acceptance results): nine slices S8a-S8i — automation gated behind a
+Phase 8 complete (LSP, distribution, macOS; docs/phase-8-lsp-and-polish.md
+§ Acceptance results): nine slices S8a–S8i — automation gated behind a
 default-on cargo feature so shipped binaries build with `--no-default-
 features` (S8a), a gpui-free `dv-cli` crate + native Linux binary (S8b),
-the content-hash installer generalized to dv-host + dv-cli (S8c),
-provisioning detection/consent/`ConsistencyReport` in dv-core (S8d), a
-first-run onboarding page with boot-storm-safe per-launch consistency
-wiring (S8e), a vtsls LSP client + go-to-definition + read-only target
-viewer (S8f), hover popover + find-references core API + scriptable
-consent modifiers (S8g), a tag-triggered release pipeline written but not
-triggered (S8h), and macOS menu/accelerator conventions written blind, no
-Mac in this sandbox (S8i). Shipped LSP scope is WSL-repos-only, narrower
-than the phase doc's original local-first prose — recorded in that doc's
-own Acceptance-results section rather than left implicit. A capstone
-integration review caught 3 cross-slice P3s (a single-fingerprint drift-
-dismissal slot defeated by a multi-shape multi-distro drift; `wait_ready`
-not spanning LSP async work; this status entry itself missing) — all
-fixed. macOS runtime stays CARRIED-FORWARD-UNVERIFIED in docs/backlog.md
-pending a real hand-run.
+the content-hash installer generalized to dv-host + dv-cli with a
+per-(component,distro) install lock (S8c), provisioning detection/consent/
+`ConsistencyReport` in dv-core, boot-storm-safe by contract (S8d), the
+first-run "Welcome to dv" onboarding page + per-launch consistency check
+with silent dv-host/dv-cli self-repair on drift and consent-gated vtsls
+install (S8e), a vtsls LSP client + ctrl-click go-to-definition + read-only
+target viewer with back/forward history, honest-view gated (S8f), hover
+popover + find-references core API + automation click modifiers/mouse_move
+(S8g), a tag-triggered release pipeline — written, deliberately never
+triggered (S8h), and macOS menu/cmd-accelerator conventions written blind
+against real gpui source, no Mac in this sandbox (S8i). Live-verified
+against real Ubuntu throughout: vtsls uninstall→consent→reinstall, cross-
+file go-to-def, hover popovers, marker-drift self-heal, and the full
+exe+sidecars bundle provisioning a distro end to end. Shipped LSP scope is
+WSL-repos-only, narrower than the phase doc's original local-first prose —
+recorded in that doc's Acceptance results rather than left implicit. The
+capstone integration review (3 rounds over the whole-phase diff) caught 10
+cross-slice findings — headline P2: a ctrl-click during the up-to-180s
+vtsls consent install latched code intelligence off permanently (S8e×S8f);
+plus consistency-check cooldowns, persisted drift dismissal, menu-dispatch
+vs target-viewer guards, and CI coverage for the shipped build shape — all
+fixed. DEFERRED (backlog): find-references UI surfacing (core API is
+live-tested, no call site); a local/Windows LSP spawn path; macOS runtime
+is CARRIED-FORWARD-UNVERIFIED pending a real Mac hand-run (checklist in
+docs/backlog.md); the real v* tag → Release cut is Kyle's to trigger.

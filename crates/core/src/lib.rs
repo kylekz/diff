@@ -12,6 +12,7 @@ pub mod git;
 pub mod github;
 pub mod index;
 pub mod location;
+pub mod provision;
 pub mod remote;
 pub mod review;
 
@@ -21,13 +22,17 @@ pub use git::{BlobSpec, ChangeStatus, ChangedFile, DiffSource, GitRepo, parse_ra
 pub use github::{
     ChecksSummary, CreatePr, CreatedPr, DraftComment, GhError, GhSide, GithubClient, PrMeta,
     PrState, PrStatus, PrSummary, RemoteComment, RemoteThread, RepoSlug, ReviewDecision,
-    ReviewEvent, ReviewSubmission, SubmittedReview,
+    ReviewEvent, ReviewSubmission, SubmittedReview, gh_status,
 };
 pub use index::{
     CachedPrStatus, EntryHealth, HydrateOutcome, IndexEntry, ReviewIndex, entry_title,
     hydrate_location, repo_label,
 };
 pub use location::RepoLocation;
+pub use provision::{
+    ComponentId, ComponentReport, ComponentState, ConsentAction, ConsistencyReport, DetectError,
+    NodeVtsls, consistency_check, detect_node_vtsls, install_vtsls,
+};
 pub use remote::{HostClient, RequestFailure};
 pub use review::{
     Comment, CommentStatus, RemoteRef, Reply, Review, ReviewState, ReviewStore, ReviewWatcher,

@@ -9,9 +9,10 @@
 //! git layer (`GitRepo::remote_url`), so a WSL repo gets GitHub support
 //! without `gh` needing to be installed in the distro at all.
 
-use std::io::Write;
-use std::path::PathBuf;
+use std::io::{Read, Write};
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::time::{Duration, Instant};
 
 use super::error::GhError;
 use super::models::{
@@ -20,6 +21,7 @@ use super::models::{
 };
 use super::slug::RepoSlug;
 use crate::git::GitRepo;
+use crate::provision::ComponentState;
 
 /// GraphQL query for [`GithubClient::pr_review_threads`] — capped at the
 /// first 100 threads and 50 comments per thread (v1 cap, not paginated; a
@@ -376,6 +378,238 @@ fn resolve_gh_path() -> Result<PathBuf, GhError> {
     Err(GhError::NotFound)
 }
 
+/// Repo-independent `gh` health check for the onboarding spine
+/// (docs/phase-8-lsp-and-polish.md's onboarding/consistency spine,
+/// [`crate::provision`]): resolves `gh`, runs `gh --version`, then BARE `gh
+/// auth status` — no `--hostname`, unlike [`GithubClient::preflight`], which
+/// is repo/slug-scoped and needs an origin remote to know which host to
+/// check. This runs before any repo is chosen at all (the onboarding page's
+/// first row), so there is no slug yet to pin to. Any non-zero exit from
+/// `gh auth status` is read as "not authenticated" — that command's entire
+/// job is checking authentication, so there's no keyword heuristic to run
+/// (same reasoning [`GithubClient::preflight`] already uses). Never a hard
+/// error: every failure mode reduces to a [`ComponentState`] (never-fail-
+/// hard — see [`crate::provision`]'s module doc). `gh` is detect-only here:
+/// this never runs `gh auth login` on the user's behalf.
+pub fn gh_status() -> ComponentState {
+    let gh_path = match resolve_gh_path() {
+        Ok(path) => path,
+        Err(err) => {
+            return ComponentState::Missing {
+                guidance: err.to_string(),
+            };
+        }
+    };
+    let version_out = match run_gh_hostless(&gh_path, &["--version"]) {
+        Ok(out) => out,
+        Err(err) => {
+            return ComponentState::Failed {
+                error: format!("gh --version failed: {err}"),
+            };
+        }
+    };
+    let version = parse_gh_version_line(&crate::command::decode_output(&version_out))
+        .unwrap_or_else(|| "unknown version".to_string());
+    match run_gh_hostless(&gh_path, &["auth", "status"]) {
+        Ok(_) => gh_component_state(&version, true),
+        // A clean non-zero exit is `gh auth status` actually answering the
+        // question: not authenticated. That's the only case that should
+        // read as `Missing`.
+        Err(HostlessGhError::Exited(_)) => gh_component_state(&version, false),
+        // Spawn failure or GH_STATUS_TIMEOUT killed it: the round trip
+        // itself failed, which says nothing about whether the user is
+        // authenticated. Mirrors `DetectError::Bounded` ->
+        // `ComponentState::Failed` in `provision::node` — mapping this to
+        // `Missing` would tell an already-authenticated user on a stalled
+        // network to re-run `gh auth login`, which wouldn't fix anything
+        // (S8d review, P2).
+        Err(err @ HostlessGhError::Bounded(_)) => ComponentState::Failed {
+            error: format!("gh auth status failed: {err}"),
+        },
+    }
+}
+
+/// Pure reduction of (version, authed) into a [`ComponentState`] — split out
+/// from [`gh_status`] so it's unit-testable with mock inputs instead of a
+/// live `gh` binary.
+fn gh_component_state(version: &str, authed: bool) -> ComponentState {
+    if authed {
+        ComponentState::Ok {
+            detail: format!("gh {version} · authed"),
+        }
+    } else {
+        ComponentState::Missing {
+            guidance: format!("gh {version} found but not authenticated — run `gh auth login`"),
+        }
+    }
+}
+
+/// Extract the version number out of `gh --version`'s first line ("gh
+/// version 2.96.0 (2025-01-01)" → "2.96.0"). `None` if the output doesn't
+/// look like that at all (an unexpected `gh` build, a wrapper script that
+/// prints something else) — [`gh_status`] falls back to "unknown version"
+/// rather than treating that as a hard failure.
+fn parse_gh_version_line(stdout: &str) -> Option<String> {
+    let mut words = stdout.lines().next()?.split_whitespace();
+    if words.next()? != "gh" || words.next()? != "version" {
+        return None;
+    }
+    Some(words.next()?.to_string())
+}
+
+/// Wall-clock bound on each [`run_gh_hostless`] invocation. `gh --version`
+/// is local and returns instantly, but `gh auth status` validates the token
+/// against the API and can stall indefinitely on a wedged/black-holed
+/// network connection (Go's default `http.Client` has no timeout of its
+/// own). [`gh_status`] runs both calls synchronously and FIRST, ahead of
+/// every WSL-distro row `consistency_check` computes — an unbounded stall
+/// here would hang the entire report, not just this one component (S8d
+/// review, P2/P3). Mirrors the bounded-command convention every WSL
+/// bootstrap command already follows
+/// ([`crate::remote::install`]'s `INSTALL_COMMAND_TIMEOUT`,
+/// [`crate::provision::node`]'s `NODE_DETECT_TIMEOUT`) even though this
+/// path runs host-side, never through a distro.
+const GH_STATUS_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Every way [`run_gh_hostless`] can fail to produce a value — split so
+/// [`gh_status`] can tell a transient/environmental failure of the round
+/// trip itself apart from a completed round trip that simply exited
+/// non-zero. Mirrors [`crate::provision::DetectError`]'s `Bounded`/clean-exit
+/// split, for the same reason: mapping a wedged-or-spawn-failed call to
+/// "definitely not authenticated" would tell an already-authenticated user
+/// to re-run `gh auth login` when the real problem was e.g. a stalled
+/// network (S8d review, P2).
+#[derive(Debug)]
+enum HostlessGhError {
+    /// Spawn failure, a missing stdout/stderr handle, or the call hit
+    /// [`GH_STATUS_TIMEOUT`] and was killed — transient/environmental, not a
+    /// verdict on whatever `gh` was asked to check.
+    Bounded(anyhow::Error),
+    /// The round trip completed (gh actually ran to exit) but reported
+    /// non-zero — a genuine failure verdict from `gh` itself, e.g. `gh auth
+    /// status` saying "not authenticated".
+    Exited(anyhow::Error),
+}
+
+impl std::fmt::Display for HostlessGhError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            HostlessGhError::Bounded(err) | HostlessGhError::Exited(err) => {
+                write!(f, "{err:#}")
+            }
+        }
+    }
+}
+
+/// Run `gh` with no repo/slug context at all — [`gh_status`]'s hostless
+/// counterpart to [`GithubClient::run_gh`]. Deliberately not a method (no
+/// `GithubClient` exists yet at this point in the onboarding flow).
+///
+/// Spawn-and-poll rather than a plain blocking `.output()` — see
+/// [`GH_STATUS_TIMEOUT`]'s doc: a wedged `gh auth status` must degrade to an
+/// error (→ [`ComponentState::Failed`]) within a bounded time instead of
+/// hanging the caller forever. stdout/stderr are drained on their own
+/// threads so a full pipe can never deadlock the `try_wait` poll loop,
+/// mirroring `CommandBuilder::run_spawn_bounded`'s shape.
+fn run_gh_hostless(gh_path: &Path, args: &[&str]) -> Result<Vec<u8>, HostlessGhError> {
+    let mut cmd = Command::new(gh_path);
+    cmd.args(args);
+    // Same non-interactive posture as GithubClient::spawn — no terminal for
+    // gh to prompt into.
+    cmd.env("GH_PROMPT_DISABLED", "1");
+    cmd.env("GH_NO_UPDATE_NOTIFIER", "1");
+    cmd.env("GH_PAGER", "cat");
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        cmd.creation_flags(crate::command::CREATE_NO_WINDOW);
+    }
+    cmd.stdin(Stdio::null());
+    cmd.stdout(Stdio::piped());
+    cmd.stderr(Stdio::piped());
+
+    let mut child = cmd.spawn().map_err(|e| {
+        HostlessGhError::Bounded(anyhow::anyhow!("failed to run gh {}: {e}", args.join(" ")))
+    })?;
+
+    let mut stdout_pipe = child.stdout.take().ok_or_else(|| {
+        HostlessGhError::Bounded(anyhow::anyhow!(
+            "gh {}: missing stdout handle",
+            args.join(" ")
+        ))
+    })?;
+    let stdout_thread = std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        let _ = stdout_pipe.read_to_end(&mut buf);
+        buf
+    });
+    let mut stderr_pipe = child.stderr.take().ok_or_else(|| {
+        HostlessGhError::Bounded(anyhow::anyhow!(
+            "gh {}: missing stderr handle",
+            args.join(" ")
+        ))
+    })?;
+    let stderr_thread = std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        let _ = stderr_pipe.read_to_end(&mut buf);
+        buf
+    });
+
+    let deadline = Instant::now() + GH_STATUS_TIMEOUT;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) if Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(25));
+            }
+            Ok(None) => {
+                // Deadline exceeded: kill and report rather than let a
+                // wedged `gh` (or the network call it's blocked on) hang
+                // this row — and, transitively, the whole `consistency_check`
+                // call — forever.
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(HostlessGhError::Bounded(anyhow::anyhow!(
+                    "gh {} timed out after {}s",
+                    args.join(" "),
+                    GH_STATUS_TIMEOUT.as_secs()
+                )));
+            }
+            Err(err) => {
+                return Err(HostlessGhError::Bounded(anyhow::anyhow!(
+                    "failed waiting for gh {}: {err}",
+                    args.join(" ")
+                )));
+            }
+        }
+    };
+
+    // The child has exited (or been killed above, which already returned) —
+    // its pipes are closed, so both reader threads are guaranteed to
+    // unblock and finish on their own now.
+    let stdout = stdout_thread.join().unwrap_or_default();
+    let stderr = stderr_thread.join().unwrap_or_default();
+
+    if !status.success() {
+        let stderr = crate::command::decode_output(&stderr);
+        // Same Option<i32> -> text mapping as `crate::command::finish`, so
+        // this reads as a clean "exit 1" / "terminated by signal" instead of
+        // `{:?}`'s `Some(1)` / `None` (S8d review, P3).
+        let code_str = match status.code() {
+            Some(code) => code.to_string(),
+            None => "terminated by signal".to_string(),
+        };
+        // A completed round trip that exited non-zero is `gh` itself
+        // answering the question (e.g. "not authenticated") — distinct from
+        // every failure above, none of which got far enough to ask.
+        return Err(HostlessGhError::Exited(anyhow::anyhow!(
+            "gh {} failed (exit {code_str}): {stderr}",
+            args.join(" ")
+        )));
+    }
+    Ok(stdout)
+}
+
 /// `where gh` (Windows) / `which gh` (unix). Host-side only, so a plain
 /// `std::process::Command` is fine here (see the module doc) — but it
 /// still needs `CREATE_NO_WINDOW` on Windows, same as every other spawn in
@@ -605,6 +839,95 @@ mod tests {
         assert_eq!(resolved, PathBuf::from(r"D:\fake\gh.exe"));
         unsafe {
             std::env::remove_var("DV_GH");
+        }
+    }
+
+    // --- gh_status: pure parsing/reduction, mocked inputs -------------------
+
+    #[test]
+    fn parse_gh_version_line_extracts_the_version_number() {
+        assert_eq!(
+            parse_gh_version_line("gh version 2.96.0 (2025-01-01)\nhttps://github.com/cli/cli"),
+            Some("2.96.0".to_string())
+        );
+    }
+
+    #[test]
+    fn parse_gh_version_line_rejects_unexpected_output() {
+        assert_eq!(parse_gh_version_line(""), None);
+        assert_eq!(parse_gh_version_line("not gh at all"), None);
+        assert_eq!(parse_gh_version_line("gh 2.96.0"), None);
+    }
+
+    #[test]
+    fn gh_component_state_authed_is_ok() {
+        match gh_component_state("2.96.0", true) {
+            ComponentState::Ok { detail } => assert_eq!(detail, "gh 2.96.0 · authed"),
+            other => panic!("expected Ok, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn gh_component_state_unauthed_is_missing_with_actionable_guidance() {
+        match gh_component_state("2.96.0", false) {
+            ComponentState::Missing { guidance } => {
+                assert!(guidance.contains("gh auth login"));
+                assert!(guidance.contains("2.96.0"));
+            }
+            other => panic!("expected Missing, got {other:?}"),
+        }
+    }
+
+    // --- run_gh_hostless: Bounded (transient) vs Exited (a real verdict) --
+
+    #[test]
+    fn run_gh_hostless_reports_bounded_on_spawn_failure() {
+        // A binary that can't be found at all never gets far enough to
+        // produce a verdict — must be Bounded, not Exited.
+        let err = run_gh_hostless(
+            Path::new("dv-this-binary-does-not-exist-anywhere"),
+            &["--version"],
+        )
+        .expect_err("a nonexistent binary must fail to spawn");
+        assert!(matches!(err, HostlessGhError::Bounded(_)));
+    }
+
+    #[test]
+    fn run_gh_hostless_reports_exited_on_a_clean_nonzero_exit() {
+        // Stand in for `gh auth status` genuinely reporting "not
+        // authenticated": the process runs to completion and exits
+        // non-zero. Must be Exited, not Bounded, so `gh_status` maps it to
+        // `ComponentState::Missing` rather than `Failed`.
+        #[cfg(windows)]
+        let (program, args) = ("cmd", ["/C", "exit 1"]);
+        #[cfg(not(windows))]
+        let (program, args) = ("sh", ["-c", "exit 1"]);
+
+        let err = run_gh_hostless(Path::new(program), &args)
+            .expect_err("a clean non-zero exit must be reported");
+        assert!(matches!(err, HostlessGhError::Exited(_)));
+    }
+
+    /// Local sanity check against the REAL `gh` binary — proves
+    /// `gh_status()` reports `Ok` on a machine that's actually installed
+    /// and authenticated (this one: gh 2.96, authed). Not run by default
+    /// (would fail on an unauthenticated CI box); run manually:
+    ///
+    /// ```text
+    /// cargo test -p dv-core --lib github::client::tests::gh_status_is_ok_on_an_authenticated_machine -- --ignored --nocapture
+    /// ```
+    #[test]
+    #[ignore = "hits the real gh binary and requires this machine to already be authenticated; run manually"]
+    fn gh_status_is_ok_on_an_authenticated_machine() {
+        match gh_status() {
+            ComponentState::Ok { detail } => {
+                println!("gh_status: {detail}");
+                assert!(detail.starts_with("gh "));
+                assert!(detail.contains("authed"));
+            }
+            other => {
+                panic!("expected ComponentState::Ok on an authenticated machine, got {other:?}")
+            }
         }
     }
 }

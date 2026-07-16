@@ -12,7 +12,7 @@ mod error;
 mod models;
 mod slug;
 
-pub use client::GithubClient;
+pub use client::{GithubClient, gh_status};
 pub use error::GhError;
 pub use models::{
     ChecksSummary, CreatePr, CreatedPr, DraftComment, GhSide, PrMeta, PrState, PrStatus, PrSummary,

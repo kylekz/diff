@@ -52,7 +52,9 @@
 //! ([`read_marker_and_binary_presence`]) so that state is drift too, never
 //! assumed-good.
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 use anyhow::anyhow;
@@ -434,6 +436,39 @@ enum ForceReinstall {
     No,
 }
 
+/// `install_lock`'s registry type, factored out so the fn signature isn't a
+/// clippy `type_complexity` violation.
+type InstallLockRegistry = Mutex<HashMap<(&'static str, String), Arc<Mutex<()>>>>;
+
+/// Process-wide per-(component, distro) mutex serializing every
+/// [`install_spec`] round trip. This is what actually prevents two
+/// concurrent installers of the SAME managed binary in the SAME distro from
+/// racing each other: without it, `manager::client_for`'s own per-distro
+/// lock only serializes callers that go through `client_for` — it never
+/// sees a caller that reaches [`install_spec`] some other way (e.g.
+/// `crate::provision::check_dv_host`/`check_dv_cli`, which call
+/// [`ensure_installed`]/[`ensure_cli_installed`] directly, outside
+/// `client_for` entirely). Two such callers for the same distro would
+/// otherwise both resolve the identical pid-suffixed tmp path (same
+/// process, only pid-suffixed, never thread-distinguished — see
+/// `install_script_generic`/`install_script_stable`), race the `cat > tmp`
+/// write, and tear each other's install (S8d review, P2). Keyed by
+/// component name rather than the whole [`ManagedSpec`] (comparing function
+/// pointers/closures in [`InstallLayout`] would be awkward) since
+/// [`HOST_SPEC`] and [`CLI_SPEC`] never share a component name and so can
+/// never collide with each other's tmp names anyway — only two calls for
+/// the SAME spec and SAME distro must serialize.
+fn install_lock(component: &'static str, distro: &str) -> Arc<Mutex<()>> {
+    static LOCKS: OnceLock<InstallLockRegistry> = OnceLock::new();
+    let registry = LOCKS.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut guard = registry.lock().unwrap_or_else(|e| e.into_inner());
+    Arc::clone(
+        guard
+            .entry((component, distro.to_string()))
+            .or_insert_with(|| Arc::new(Mutex::new(()))),
+    )
+}
+
 /// The shared install pipeline behind [`ensure_installed_spec`]/
 /// [`force_reinstall_spec`]: resolve the sidecar, resolve `spec`'s
 /// destination path(s) for its [`InstallLayout`], compare the marker
@@ -451,6 +486,13 @@ fn install_spec(
             source: HostBinarySource::DevOverride,
         });
     }
+
+    // Hold this per-(component, distro) lock across the ENTIRE marker-check
+    // + conditional stream+verify below — see `install_lock`'s doc for why
+    // this, not just `manager::client_for`'s own per-distro lock, is what
+    // closes the concurrent-installer race.
+    let lock = install_lock(spec.component, distro);
+    let _install_guard = lock.lock().unwrap_or_else(|e| e.into_inner());
 
     let (bytes, hash) = locate_and_hash_sidecar_for(spec)?;
     let builder = spawn_only_builder(distro);
@@ -1174,6 +1216,34 @@ printf %s '{hash}' > '{md}/dv.sha256'"
             "dv.sha256",
         );
         assert!(script.contains(r"mkdir -p '/tmp/o'\''brien/bin' '/tmp/o'\''brien/marker'"));
+    }
+
+    // --- install_lock: per-(component, distro) serialization ----------------
+
+    #[test]
+    fn install_lock_returns_the_same_arc_for_the_same_component_and_distro() {
+        let a = install_lock("dv-host", "Ubuntu");
+        let b = install_lock("dv-host", "Ubuntu");
+        assert!(
+            Arc::ptr_eq(&a, &b),
+            "same (component, distro) must resolve to the same mutex, or two \
+             concurrent callers could still race each other's install"
+        );
+    }
+
+    #[test]
+    fn install_lock_differs_across_components_and_across_distros() {
+        let host_ubuntu = install_lock("dv-host", "Ubuntu");
+        let cli_ubuntu = install_lock("dv-cli", "Ubuntu");
+        let host_debian = install_lock("dv-host", "Debian");
+        assert!(
+            !Arc::ptr_eq(&host_ubuntu, &cli_ubuntu),
+            "dv-host and dv-cli installs for the same distro must not share a lock"
+        );
+        assert!(
+            !Arc::ptr_eq(&host_ubuntu, &host_debian),
+            "different distros must not share a lock"
+        );
     }
 
     // --- CLI_SPEC: StablePath path resolution -------------------------------

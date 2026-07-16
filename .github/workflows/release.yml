@@ -1,0 +1,224 @@
+name: Release
+
+# Tag-triggered release pipeline (docs/phase-8-lsp-and-polish.md § Release
+# pipeline, Phase 8 S8h). Builds the DISTRIBUTED dv (windows-latest +
+# macos-latest, `--no-default-features` — depends on S8a's cargo feature
+# gate, so `--automation` is compiled out of everything this workflow
+# ships), bundles both Linux sidecars (dv-host-linux-x64 + dv-linux-x64,
+# S8b/S8c) next to the Windows binary so first-run WSL provisioning has
+# something to install from, and cuts a GitHub Release via the `gh` CLI
+# (already on every GitHub-hosted runner — same tool this repo's own
+# GitHub integration uses, per CLAUDE.md's "GitHub goes through `gh`"
+# principle).
+#
+# ONLY fires on a `v*` tag push — never on an ordinary branch push or PR —
+# so it adds no minutes to everyday CI (see ci.yml's `build`/`host-linux`/
+# `cli-linux` jobs for the always-on builds, including the release+
+# automation benchmark build the doc asks CI to keep).
+#
+# NOTE the artifact-name-vs-file-name trap (docs/backlog.md; called out
+# again in ci.yml's `cli-linux` job comment): `host-linux`/`cli-linux`
+# below upload artifacts named `dv-host-linux-x64`/`dv-cli-linux-x64`, but
+# the FILES inside are `dv-host`/`dv-cli`. The `bundle` job below renames
+# them on download to `dv-host-linux-x64`/`dv-linux-x64` — the exact names
+# `crates/core/src/remote/install.rs`'s `HOST_SPEC`/`CLI_SPEC` (via
+# `sidecar_path_for`) look for next to the running `dv.exe`. Get this
+# rename wrong and the provisioner silently reports `NoSidecar` forever.
+#
+# NOTE the other silent no-op trap: GitHub applies commit-message skip
+# directives ([skip ci], [ci skip], [skip actions], ...) to EVERY
+# push-event-triggered workflow, and a tag push is a push event evaluated
+# against the tagged commit's message. This repo's current practice ends
+# commits with "[skip ci]" — tag one of those commits and this entire
+# workflow silently never runs (no job, no failure, nothing on the Actions
+# tab; the filter runs before workflow evaluation, so nothing here can
+# override it). Tag a commit whose message does NOT contain a skip
+# directive — e.g. `git commit --allow-empty -m "release vX.Y.Z"` — then
+# `git tag vX.Y.Z` that commit and push the tag.
+#
+# `workflow_dispatch` below is the escape hatch for exactly that trap: if a
+# `v*` tag push got skip-filtered (or just needs re-running), trigger this
+# workflow manually from the Actions tab and pick the `vX.Y.Z` tag as the
+# "Use workflow from" ref — GITHUB_REF_NAME is then the tag name same as a
+# real tag push, so `version`'s check and `gh release create` behave
+# identically. This is manual-only (never fires on an ordinary push), so it
+# adds no minutes to everyday CI per the repo's CI-minutes constraint.
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+
+jobs:
+  # Fails fast (before spending any build minutes) if the pushed tag
+  # doesn't match the workspace version — doc: "Versioning from the
+  # workspace Cargo.toml".
+  version:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      version: ${{ steps.extract.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: extract
+        run: |
+          set -eu
+          v=$(grep -m1 '^version = ' Cargo.toml | sed -E 's/version = "(.*)"/\1/')
+          tag="${GITHUB_REF_NAME#v}"
+          if [ "$v" != "$tag" ]; then
+            echo "::error::tag v$tag does not match [workspace.package] version $v in Cargo.toml"
+            exit 1
+          fi
+          echo "version=$v" >> "$GITHUB_OUTPUT"
+
+  # The distributed app binary: `--no-default-features` so `automation`
+  # (default-on, S8a) is compiled out entirely — the release build must
+  # never carry the `--automation` JSON-over-stdio channel.
+  app:
+    needs: version
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    # A release gpui build is many minutes even when healthy (cold zed
+    # monorepo git-dependency fetch); bound a wedged/hung build (linker
+    # hang, stalled fetch) at roughly one healthy build's cost instead of
+    # GitHub's 360-minute default — macos-latest bills at a 10x multiplier,
+    # so an unbounded hang here is the exact billed-load blowout the
+    # binding CI-minutes constraint exists to prevent.
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - uses: Swatinem/rust-cache@v2
+      - name: Build (release, distributed — automation compiled out)
+        run: cargo build --release --locked -p dv --no-default-features
+      - name: Upload binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: dv-${{ matrix.os }}
+          path: |
+            target/release/dv.exe
+            target/release/dv
+          if-no-files-found: error
+
+  # Same musl build as ci.yml's `host-linux` job, duplicated here (rather
+  # than shared) because ci.yml only triggers on branch pushes/PRs, never
+  # on tags — a tag push needs its own copy of these two sidecar jobs to
+  # produce fresh artifacts for THIS release.
+  host-linux:
+    needs: version
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: Swatinem/rust-cache@v2
+      - name: Add musl target
+        run: rustup target add x86_64-unknown-linux-musl
+      - name: Install musl-tools
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+      - name: Build (release, musl)
+        run: cargo build --release --locked -p dv-host --target x86_64-unknown-linux-musl
+      - name: Upload dv-host sidecar
+        uses: actions/upload-artifact@v4
+        with:
+          name: dv-host-linux-x64
+          path: target/x86_64-unknown-linux-musl/release/dv-host
+          if-no-files-found: error
+
+  cli-linux:
+    needs: version
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: Swatinem/rust-cache@v2
+      - name: Add musl target
+        run: rustup target add x86_64-unknown-linux-musl
+      - name: Install musl-tools
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+      - name: Build (release, musl)
+        run: cargo build --release --locked -p dv-cli --target x86_64-unknown-linux-musl
+      - name: Upload dv-cli sidecar
+        uses: actions/upload-artifact@v4
+        with:
+          name: dv-cli-linux-x64
+          path: target/x86_64-unknown-linux-musl/release/dv-cli
+          if-no-files-found: error
+
+  # Bundle + release. Windows gets the app binary plus BOTH Linux sidecars
+  # (dv-host-linux-x64 for the Phase-5 WSL host, dv-linux-x64 for the
+  # Phase-8 native WSL CLI) so first-run provisioning has something to
+  # install from — WSL only exists on Windows, so macOS ships the bare
+  # binary alone (doc §Release only names the dv-host sidecar; doc-
+  # deviation 7 in the phase plan flags that this bundles a second one).
+  release:
+    needs: [version, app, host-linux, cli-linux]
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: write
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Bundle Windows (dv.exe + both Linux sidecars, exe-adjacent)
+        run: |
+          set -eu
+          mkdir -p dist/windows-x64
+          cp artifacts/dv-windows-latest/dv.exe dist/windows-x64/dv.exe
+          # Rename file-inside-artifact -> the exact sidecar filename
+          # install.rs's sidecar_path_for() looks for next to dv.exe.
+          cp artifacts/dv-host-linux-x64/dv-host dist/windows-x64/dv-host-linux-x64
+          cp artifacts/dv-cli-linux-x64/dv-cli dist/windows-x64/dv-linux-x64
+          chmod +x dist/windows-x64/dv-host-linux-x64 dist/windows-x64/dv-linux-x64
+          cd dist/windows-x64 && zip -r "../../dv-${{ needs.version.outputs.version }}-windows-x64.zip" .
+
+      - name: Bundle macOS (bare binary — no WSL, no sidecars to ship)
+        run: |
+          set -eu
+          # macos-latest runners are Apple Silicon (arm64), and the `app`
+          # job builds with the default host toolchain — no `--target` — so
+          # the binary is aarch64, not x64. Name the artifact accordingly.
+          mkdir -p dist/macos-arm64
+          cp artifacts/dv-macos-latest/dv dist/macos-arm64/dv
+          chmod +x dist/macos-arm64/dv
+          cd dist/macos-arm64 && tar czf "../../dv-${{ needs.version.outputs.version }}-macos-arm64.tar.gz" dv
+
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          # `release` never checks out the repo (only `artifacts/` exists in
+          # this cwd), so `gh` has no git remote to resolve the target repo
+          # from. Without this, `gh release create` fails with "could not
+          # determine base repo" — GH_REPO tells it directly.
+          GH_REPO: ${{ github.repository }}
+        run: |
+          set -eu
+          assets=(
+            "dv-${{ needs.version.outputs.version }}-windows-x64.zip"
+            "dv-${{ needs.version.outputs.version }}-macos-arm64.tar.gz"
+          )
+          # Re-run-safe: `gh release create` fails outright if the tag's
+          # release already exists (e.g. a prior run created the release
+          # then failed mid asset-upload, or this job is just being
+          # re-run). Detect that case and fall back to an upload with
+          # --clobber instead of hard-failing on "release already exists".
+          if gh release view "${{ github.ref_name }}" >/dev/null 2>&1; then
+            gh release upload "${{ github.ref_name }}" "${assets[@]}" --clobber
+          else
+            gh release create "${{ github.ref_name }}" "${assets[@]}" \
+              --title "dv ${{ github.ref_name }}" \
+              --generate-notes
+          fi

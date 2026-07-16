@@ -28,6 +28,13 @@ jobs:
       - uses: actions/checkout@v4
       - run: cargo fmt --all --check
 
+  # NOTE (Phase 8 S8h, docs/phase-8-lsp-and-polish.md § Release pipeline):
+  # this is intentionally the release+automation BENCHMARK build the doc
+  # asks CI to keep — default cargo features, so the `automation` feature
+  # (S8a) stays compiled IN. It is NOT the distributed build: the tagged
+  # release pipeline (.github/workflows/release.yml, triggers only on `v*`
+  # tags) builds the actual shipped binaries with `--no-default-features`
+  # so `--automation` is compiled OUT of anything a user downloads.
   build:
     strategy:
       fail-fast: false

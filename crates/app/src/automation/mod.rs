@@ -105,7 +105,14 @@ enum Cmd {
     /// reopens that review (`AppShell::open_review_row`), including a
     /// SUBMITTED one, read-only. `id`s come from `state.shell.index[].
     /// review_id` or `state.shell.sidebar`.
-    SelectReview { id: String },
+    /// `review_id`, not `id` — the request envelope already uses `id` for
+    /// the protocol sequence number and the command fields parse from the
+    /// same flattened map, so a payload field literally named `id` can
+    /// never coexist with a sequence number (early scripts only "worked"
+    /// via duplicate-key last-wins, which silently ate the sequence
+    /// number; no alias either — serde would report the envelope's `id`
+    /// as a duplicate of it).
+    SelectReview { review_id: String },
     /// Open PR `number` in the active review's workspace
     /// (`Workspace::open_pr`) — replies once the fetch is dispatched, not
     /// once it completes; scripts follow with `wait_ready`.
@@ -434,11 +441,11 @@ async fn handle(
             })
         })?,
 
-        Cmd::SelectReview { id } => cx.update_window(window, |_, window, cx| {
+        Cmd::SelectReview { review_id } => cx.update_window(window, |_, window, cx| {
             shell.update(cx, |shell, cx| {
                 shell
-                    .automation_select_review(id.clone(), window, cx)
-                    .map(|()| json!({"selected_review": id}))
+                    .automation_select_review(review_id.clone(), window, cx)
+                    .map(|()| json!({"selected_review": review_id}))
             })
         })?,
 

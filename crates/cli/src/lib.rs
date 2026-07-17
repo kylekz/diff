@@ -185,17 +185,21 @@ fn report_error(err: CliError, json: bool) -> i32 {
 
 type Router = fn(&str, &[String], bool, Option<RepoLocation>) -> Result<(), CliError>;
 
-/// Shared front door for both `review` and `comment`: figure out `--json`
-/// up front (so even a totally malformed invocation can still honor it),
-/// peel off the location globals (`--repo`/`--wsl`), then hand the leading
-/// token (the actual sub-subcommand: `list`, `add`, ...) and the rest to
-/// `router`.
+/// Shared front door for both `review` and `comment`: peel off the global
+/// flags (`--repo`/`--wsl`/`--json`), then hand the leading token (the
+/// actual sub-subcommand: `list`, `add`, ...) and the rest to `router`.
 fn dispatch(rest: &[String], top_usage: &'static str, router: Router) -> i32 {
-    let json = rest.iter().any(|a| a == "--json");
-
-    let (location, leftover) = match extract_location_globals(rest) {
-        Ok(pair) => pair,
-        Err(reason) => return report_error(usage_err(reason, top_usage), json),
+    let (location, json, leftover) = match extract_location_globals(rest) {
+        Ok(triple) => triple,
+        Err(reason) => {
+            // Extraction failed before `--json` could be determined
+            // properly — fall back to a plain prescan so even a malformed
+            // invocation honors the output contract (the one thing the
+            // prescan can get wrong here, a literal "--json" sitting in a
+            // value position, also implies malformed flags anyway).
+            let json = rest.iter().any(|a| a == "--json");
+            return report_error(usage_err(reason, top_usage), json);
+        }
     };
 
     let Some((sub, sub_rest)) = leftover.split_first() else {
@@ -208,21 +212,48 @@ fn dispatch(rest: &[String], top_usage: &'static str, router: Router) -> i32 {
     }
 }
 
+/// Every subcommand-level flag that consumes the NEXT token as its value.
+/// [`extract_location_globals`] must know these so a global flag appearing
+/// as a *value* — `--body "--json"`, `--author "--repo"` — is carried
+/// through verbatim instead of being stolen mid-scan (Phase-2 review P3:
+/// the old single-pass scan treated every `--json`/`--repo` token as
+/// global regardless of position).
+const VALUE_FLAGS: &[&str] = &[
+    "--file",
+    "--lines",
+    "--side",
+    "--body",
+    "--review",
+    "--author",
+    "--source",
+    "--range",
+    "--commit",
+    "--title",
+    "--base",
+    "--pr",
+    "--verdict",
+    "--status",
+    "--timeout",
+];
+
 /// Pull `--repo <path>`, `--wsl <distro>:<posix-path>`, and `--json` out of
 /// `args` wherever they appear (global flags are accepted anywhere after
 /// the `review`/`comment` subcommand), returning the resolved location
-/// override (if any) plus everything else in original order for
-/// subcommand-specific parsing.
+/// override (if any), whether `--json` was requested, plus everything else
+/// in original order for subcommand-specific parsing. Value-taking
+/// subcommand flags ([`VALUE_FLAGS`]) have their value token copied through
+/// uninterpreted, so it can never be mistaken for a global.
 fn extract_location_globals(
     args: &[String],
-) -> Result<(Option<RepoLocation>, Vec<String>), String> {
+) -> Result<(Option<RepoLocation>, bool, Vec<String>), String> {
     let mut location: Option<RepoLocation> = None;
+    let mut json = false;
     let mut leftover = Vec::with_capacity(args.len());
 
     let mut iter = args.iter();
     while let Some(arg) = iter.next() {
         match arg.as_str() {
-            "--json" => {} // already accounted for by the caller's prescan
+            "--json" => json = true,
             "--repo" => {
                 let value = iter.next().ok_or("--repo requires a path")?;
                 if location.is_some() {
@@ -237,15 +268,32 @@ fn extract_location_globals(
                 }
                 location = Some(RepoLocation::from_wsl_arg(value).map_err(|e| format!("{e:#}"))?);
             }
+            flag if VALUE_FLAGS.contains(&flag) => {
+                leftover.push(arg.clone());
+                // A missing value is the subcommand parser's error to
+                // report, with its own usage text — pass through as-is.
+                if let Some(value) = iter.next() {
+                    leftover.push(value.clone());
+                }
+            }
             _ => leftover.push(arg.clone()),
         }
     }
-    Ok((location, leftover))
+    Ok((location, json, leftover))
 }
 
 fn resolve_repo(location: Option<RepoLocation>) -> Result<GitRepo, CliError> {
     let location = location.unwrap_or_else(|| {
-        RepoLocation::Local(std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")))
+        let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+        // `dv.exe <cmd>` invoked FROM a WSL shell (interop) inherits a
+        // `\\wsl.localhost\<distro>\...` cwd. Treating that as a Local
+        // path would resolve the repo through WINDOWS git over 9P —
+        // "dubious ownership" failures and a violation of the no-9P rule —
+        // so parse it into `RepoLocation::Wsl` exactly like an explicit
+        // `--repo \\wsl.localhost\...` argument (docs/backlog.md interop
+        // item). Any other cwd (including a parse error on a weird UNC)
+        // stays Local, preserving the old behavior.
+        RepoLocation::from_path_arg(&cwd.to_string_lossy()).unwrap_or(RepoLocation::Local(cwd))
     });
     GitRepo::open(location).map_err(op_err)
 }
@@ -327,6 +375,22 @@ fn review_router(
                 }
                 other => other,
             };
+            // Validate revs NOW (Phase-2 review P3): a typo'd `--range` or
+            // `--commit` used to persist fine and only blow up when the
+            // review was later opened. The merge-base arm above validates
+            // implicitly (`merge_base` errors on unknown revs); symbolic
+            // names are kept as typed — this checks existence, it doesn't
+            // pin.
+            match &source {
+                DiffSource::Range { base, head, .. } => {
+                    repo.resolve(base).map_err(op_err)?;
+                    repo.resolve(head).map_err(op_err)?;
+                }
+                DiffSource::Commit(sha) => {
+                    repo.resolve(sha).map_err(op_err)?;
+                }
+                DiffSource::WorkingTree | DiffSource::Staged => {}
+            }
             let store = ReviewStore::open(repo.location().clone());
             let review = store.create(source).map_err(op_err)?;
             print_review(&review, json);
@@ -478,7 +542,10 @@ fn parse_comment_add(args: &[String]) -> Result<CommentAddArgs, String> {
         }
     }
 
-    let file = file.ok_or("--file is required")?;
+    // Comments anchor by repo-root-relative FORWARD-slashed paths (the
+    // `ChangedFile` convention) — normalize a Windows-style `--file` so
+    // `src\util\date.ts` matches instead of silently anchoring nowhere.
+    let file = file.ok_or("--file is required")?.replace('\\', "/");
     let lines = lines.ok_or("--lines is required")?;
     let body = body.ok_or("--body is required")?;
     let (start, end) = parse_lines(&lines)?;
@@ -509,7 +576,19 @@ fn cmd_comment_add(
     let (mut review, created) = target_review_for_add(&store, parsed.review.as_deref())?;
 
     let anchor = dv_core::anchor_spec(&review.source, parsed.side, &parsed.file);
-    let blob_sha = repo.blob_sha(&anchor).map_err(op_err)?;
+    // GUI parity (Phase-2 review P3): a blob_sha FAILURE — e.g. a Commit
+    // source whose rev has no parent, so the old side's `<sha>^` isn't a
+    // rev at all — degrades to an unverifiable anchor (warned, sha None)
+    // instead of refusing the comment; the GUI records exactly this.
+    let blob_sha = match repo.blob_sha(&anchor) {
+        Ok(sha) => sha,
+        Err(err) => {
+            eprintln!(
+                "warning: could not verify anchor ({err:#}); recording an unverifiable anchor"
+            );
+            None
+        }
+    };
     let unverifiable = blob_sha.is_none();
 
     let comment = review
@@ -544,6 +623,16 @@ fn target_review_for_add(
             .load(id)
             .map_err(op_err)?
             .ok_or_else(|| CliError::Op(format!("no review with id {id:?}")))?;
+        // Same guard the GUI grew in Phase 6: appending to a SUBMITTED
+        // review strands the comment (it will never reach GitHub — submit
+        // already happened — and the GUI shows the review read-only).
+        if matches!(review.state, ReviewState::Submitted { .. }) {
+            return Err(CliError::Op(format!(
+                "review {id} is already submitted; a comment added to it would never \
+                 reach GitHub. Create a draft (`dv review create`) or omit --review \
+                 to target the newest draft."
+            )));
+        }
         return Ok((review, false));
     }
 
@@ -1170,12 +1259,44 @@ mod tests {
             .iter()
             .map(|s| s.to_string())
             .collect();
-        let (location, rest) = extract_location_globals(&args).expect("should parse");
+        let (location, json, rest) = extract_location_globals(&args).expect("should parse");
         assert_eq!(
             location,
             Some(RepoLocation::Local(PathBuf::from("D:/some/repo")))
         );
+        assert!(json);
         assert_eq!(rest, vec!["list".to_string()]);
+    }
+
+    #[test]
+    fn extract_location_globals_never_steals_a_value_that_looks_global() {
+        // `--body "--json"` / `--author "--repo"`: the value tokens must
+        // ride through verbatim, NOT toggle json mode or eat the next arg.
+        let args: Vec<String> = [
+            "add", "--body", "--json", "--author", "--repo", "--file", "a.rs",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        let (location, json, rest) = extract_location_globals(&args).expect("should parse");
+        assert_eq!(location, None);
+        assert!(!json, "a --json sitting in a value slot is not the global");
+        assert_eq!(rest, args);
+    }
+
+    #[test]
+    fn extract_location_globals_still_finds_globals_after_value_flags() {
+        let args: Vec<String> = ["add", "--body", "hello", "--json", "--repo", "D:/r"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let (location, json, rest) = extract_location_globals(&args).expect("should parse");
+        assert_eq!(location, Some(RepoLocation::Local(PathBuf::from("D:/r"))));
+        assert!(json);
+        assert_eq!(
+            rest,
+            vec!["add".to_string(), "--body".to_string(), "hello".to_string()]
+        );
     }
 
     #[test]

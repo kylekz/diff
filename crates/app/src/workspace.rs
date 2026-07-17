@@ -516,6 +516,11 @@ struct PrHeader {
     is_draft: bool,
     base_ref: SharedString,
     head_ref: SharedString,
+    /// Only surfaced through `automation_state` since the R1c title-bar
+    /// restyle dropped the CI pill (the reference anatomy has none); kept on the
+    /// struct so scripts can still assert CI state and a future header
+    /// pill has the data without a re-fetch.
+    #[cfg_attr(not(feature = "automation"), allow(dead_code))]
     checks: ChecksSummary,
     review_decision: Option<ReviewDecision>,
     url: SharedString,
@@ -846,6 +851,9 @@ pub struct Workspace {
     source_epoch: u64,
     status: Status,
     repo: Option<Arc<GitRepo>>,
+    /// Only read by `automation_state` since the restyle (the header now
+    /// renders repo dirname / PR meta instead) — kept for scripts.
+    #[cfg_attr(not(feature = "automation"), allow(dead_code))]
     title: SharedString,
     head: SharedString,
     files: Vec<ChangedFile>,
@@ -936,9 +944,17 @@ pub struct Workspace {
     /// Comment ids whose anchored blob no longer matches the diff — the
     /// content drifted (rebase/amend/edit) since the comment was made.
     stale: HashSet<String>,
-    /// (file, review.updated_ms) the stale set was last computed for, so
-    /// repeated display rebuilds don't re-run git.
-    stale_checked: Option<(usize, u64)>,
+    /// (file, review.id, review.updated_ms) the stale set was last computed
+    /// for, so repeated display rebuilds don't re-run git. The review id is
+    /// part of the key (backlog stale-check item): a review SWITCH with the
+    /// same file index and a coincidentally-equal `updated_ms` must not
+    /// skip the recheck.
+    stale_checked: Option<(usize, String, u64)>,
+    /// Monotonic generation for in-flight [`Self::refresh_stale`] spawns —
+    /// a completion landing after a newer refresh was issued is discarded
+    /// instead of overwriting the newer verdicts (same backlog item:
+    /// racing same-file checks could land out of order).
+    stale_gen: u64,
     /// The repo location, for opening the review store off-thread.
     location: RepoLocation,
     /// An explicit sidebar-row pick (docs/phase-6-review-navigator.md S6c —
@@ -1757,6 +1773,7 @@ impl Workspace {
             pending_jump: None,
             stale: HashSet::new(),
             stale_checked: None,
+            stale_gen: 0,
             last_diff_ms: None,
             _watcher: None,
             _worktree_watcher: None,
@@ -4304,13 +4321,22 @@ impl Workspace {
         else {
             return;
         };
-        let key = (file, review.updated_ms);
-        if self.stale_checked == Some(key) {
+        let key = (file, review.id.clone(), review.updated_ms);
+        if self.stale_checked.as_ref() == Some(&key) {
             return;
         }
         self.stale_checked = Some(key);
+        self.stale_gen += 1;
+        let generation = self.stale_gen;
 
         let path = self.files[file].path.clone();
+        // Same rename-aware rule as `submit_comment`: old-side anchors on a
+        // renamed file live at the OLD path — checking the new path there
+        // would flag every (now-verifiable) old-side anchor stale.
+        let old_side_path = self.files[file]
+            .old_path
+            .clone()
+            .unwrap_or_else(|| path.clone());
         let source = review.source.clone();
         let anchored: Vec<(String, dv_core::Side, Option<String>)> = review
             .comments
@@ -4323,7 +4349,7 @@ impl Workspace {
         }
 
         cx.spawn(async move |this, cx| {
-            let (checked, stale_ids) = cx
+            let (checked, stale_ids, git_failed) = cx
                 .background_executor()
                 .spawn(async move {
                     // One git call per side present, not per comment. The
@@ -4333,14 +4359,17 @@ impl Workspace {
                     let mut current: HashMap<bool, Option<Option<String>>> = HashMap::new();
                     let mut checked = Vec::new();
                     let mut stale = Vec::new();
+                    let mut git_failed = false;
                     for (id, side, sha) in anchored {
                         let Some(sha) = sha else { continue }; // unverifiable
                         let is_new = matches!(side, dv_core::Side::New);
+                        let lookup_path = if is_new { &path } else { &old_side_path };
                         let entry = current.entry(is_new).or_insert_with(|| {
-                            repo.blob_sha(&dv_core::anchor_spec(&source, side, &path))
+                            repo.blob_sha(&dv_core::anchor_spec(&source, side, lookup_path))
                                 .ok()
                         });
                         let Some(current_sha) = entry else {
+                            git_failed = true;
                             continue; // git failed — skip, keep prior verdict
                         };
                         if current_sha.as_deref() != Some(sha.as_str()) {
@@ -4348,11 +4377,17 @@ impl Workspace {
                         }
                         checked.push(id);
                     }
-                    (checked, stale)
+                    (checked, stale, git_failed)
                 })
                 .await;
 
             this.update(cx, |this, cx| {
+                if this.stale_gen != generation {
+                    // A newer refresh was issued while this one ran (review
+                    // switch, mutation) — its verdicts are the current
+                    // ones; applying these would move staleness backwards.
+                    return;
+                }
                 // Fresh verdicts for everything checked this round; other
                 // files' verdicts are left as last computed.
                 for id in &checked {
@@ -4360,6 +4395,13 @@ impl Workspace {
                 }
                 for id in stale_ids {
                     this.stale.insert(id);
+                }
+                if git_failed && checked.is_empty() {
+                    // Every side's git call failed (transient index.lock /
+                    // WSL hiccup): clear the memo so the NEXT display
+                    // rebuild retries, instead of freezing the old verdicts
+                    // until the next review mutation.
+                    this.stale_checked = None;
                 }
                 cx.notify();
             })
@@ -5174,6 +5216,16 @@ impl Workspace {
             DiffSide::Old => dv_core::Side::Old,
             DiffSide::New => dv_core::Side::New,
         };
+        // Rename-aware anchoring (Phase-3 review item): the OLD side of a
+        // renamed file only exists under its old path, so hashing the new
+        // path there always came back `None` (silently unverifiable). The
+        // stored `Comment.path` stays the NEW path (the `ChangedFile`
+        // convention; submit-time mapping already rename-translates) — only
+        // the blob lookup switches.
+        let anchor_path = match (side, &self.files[file].old_path) {
+            (dv_core::Side::Old, Some(old)) => old.clone(),
+            _ => path.clone(),
+        };
         let (start, end) = sel.range();
         let location = self.location.clone();
         let source = self.source.clone();
@@ -5242,7 +5294,7 @@ impl Workspace {
                     // Anchor against the review's own source — it may have
                     // been created by the CLI over a different one.
                     let sha = repo
-                        .blob_sha(&dv_core::anchor_spec(&review.source, side, &path))
+                        .blob_sha(&dv_core::anchor_spec(&review.source, side, &anchor_path))
                         .ok()
                         .flatten();
                     review.add_comment(path, side, start, end, sha, body, author)?;

@@ -36,6 +36,13 @@ enum HostEntry {
     /// no `dv-host` at `DV_HOST_PATH`, proto mismatch, ...).
     Failed {
         since: Instant,
+        /// The installed binary's content hash at the point a
+        /// reinstall-then-respawn STILL proto-mismatched — i.e. the skew is
+        /// between this dv build and its own sidecar, not fixable by
+        /// re-streaming. Later rounds compare against it to skip the ~9MB
+        /// reinstall while the sidecar is unchanged (S3 review P3); a new
+        /// sidecar (dv upgraded) hashes differently and resets the cycle.
+        skew_hash: Option<String>,
     },
 }
 
@@ -240,7 +247,11 @@ pub(crate) fn client_for(distro: &str) -> Option<Arc<HostClient>> {
         None => None,
         Some(HostEntry::Alive(_)) => Some(EntryKind::Alive),
         Some(HostEntry::Dead { since }) => Some(EntryKind::Dead(*since)),
-        Some(HostEntry::Failed { since }) => Some(EntryKind::Failed(*since)),
+        Some(HostEntry::Failed { since, .. }) => Some(EntryKind::Failed(*since)),
+    };
+    let prior_skew = match &*guard {
+        Some(HostEntry::Failed { skew_hash, .. }) => skew_hash.clone(),
+        _ => None,
     };
 
     match decide_respawn(state, now, cooldown()) {
@@ -253,7 +264,10 @@ pub(crate) fn client_for(distro: &str) -> Option<Arc<HostClient>> {
             // `ensure_installed` itself checks `DV_HOST_PATH` first (dev
             // loop: skips sidecar/hash/install entirely, same as S1/S2's
             // behavior) before ever falling to the sidecar install flow.
-            let binary = match install::ensure_installed(distro) {
+            // `ensure_installed_spec` rather than the `ensure_installed`
+            // wrapper: the wrapper drops the content hash, which the
+            // persistent-skew check below needs.
+            let binary = match install::ensure_installed_spec(distro, &install::HOST_SPEC) {
                 Ok(binary) => binary,
                 // Unconfigured (no env var, no sidecar next to dv.exe) —
                 // silent, no `Failed` entry, so a sidecar that appears
@@ -262,7 +276,10 @@ pub(crate) fn client_for(distro: &str) -> Option<Arc<HostClient>> {
                 Err(install::InstallError::NoSidecar { .. }) => return None,
                 Err(err) => {
                     eprintln!("[dv-host manager] failed to install dv-host for {distro}: {err}");
-                    *guard = Some(HostEntry::Failed { since: now });
+                    *guard = Some(HostEntry::Failed {
+                        since: now,
+                        skew_hash: None,
+                    });
                     return None;
                 }
             };
@@ -284,16 +301,43 @@ pub(crate) fn client_for(distro: &str) -> Option<Arc<HostClient>> {
                     if binary.source == install::HostBinarySource::Managed
                         && client::is_proto_mismatch(&err) =>
                 {
+                    // Persistent-skew short circuit (S3 review P3): a prior
+                    // round already reinstalled EXACTLY these bytes and the
+                    // handshake still mismatched — the skew is between this
+                    // dv build and its own sidecar, and re-streaming ~9MB
+                    // every cool-down expiry can't fix it. Stay Failed
+                    // until the sidecar's content actually changes (dv
+                    // upgrade), which hashes differently and resets this.
+                    if !binary.hash.is_empty()
+                        && prior_skew.as_deref() == Some(binary.hash.as_str())
+                    {
+                        eprintln!(
+                            "[dv-host manager] proto mismatch for {distro} persists with an \
+                             unchanged sidecar (hash {}); skipping reinstall — update dv",
+                            &binary.hash[..12.min(binary.hash.len())]
+                        );
+                        *guard = Some(HostEntry::Failed {
+                            since: now,
+                            skew_hash: prior_skew,
+                        });
+                        return None;
+                    }
                     eprintln!(
                         "[dv-host manager] proto mismatch for {distro} ({err:#}); forcing one reinstall"
                     );
-                    let reinstalled = match install::force_reinstall(distro) {
+                    let reinstalled = match install::force_reinstall_spec(
+                        distro,
+                        &install::HOST_SPEC,
+                    ) {
                         Ok(binary) => binary,
                         Err(reinstall_err) => {
                             eprintln!(
                                 "[dv-host manager] reinstall failed for {distro}: {reinstall_err}"
                             );
-                            *guard = Some(HostEntry::Failed { since: now });
+                            *guard = Some(HostEntry::Failed {
+                                since: now,
+                                skew_hash: None,
+                            });
                             return None;
                         }
                     };
@@ -307,14 +351,27 @@ pub(crate) fn client_for(distro: &str) -> Option<Arc<HostClient>> {
                             eprintln!(
                                 "[dv-host manager] still failing for {distro} after reinstall: {respawn_err:#}"
                             );
-                            *guard = Some(HostEntry::Failed { since: now });
+                            // A REPEATED proto mismatch right after a
+                            // verified fresh reinstall is the inherent-skew
+                            // signal — remember the hash so the next round
+                            // skips the pointless re-stream. Any other
+                            // respawn failure keeps the ordinary retry.
+                            let skew_hash = (client::is_proto_mismatch(&respawn_err))
+                                .then(|| reinstalled.hash.clone());
+                            *guard = Some(HostEntry::Failed {
+                                since: now,
+                                skew_hash,
+                            });
                             None
                         }
                     }
                 }
                 Err(err) => {
                     eprintln!("[dv-host manager] failed to spawn host for {distro}: {err:#}");
-                    *guard = Some(HostEntry::Failed { since: now });
+                    *guard = Some(HostEntry::Failed {
+                        since: now,
+                        skew_hash: None,
+                    });
                     None
                 }
             }
@@ -373,7 +430,7 @@ pub(crate) fn mark_dead(distro: &str, failing: &Arc<HostClient>) {
             (Some(EntryKind::Alive), Arc::ptr_eq(registered, failing))
         }
         Some(HostEntry::Dead { since }) => (Some(EntryKind::Dead(*since)), false),
-        Some(HostEntry::Failed { since }) => (Some(EntryKind::Failed(*since)), false),
+        Some(HostEntry::Failed { since, .. }) => (Some(EntryKind::Failed(*since)), false),
         None => (None, false),
     };
     if should_mark_dead(current, same_instance) {

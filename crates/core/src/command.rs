@@ -246,6 +246,15 @@ impl CommandBuilder {
     /// `Route::Host` the same way [`Self::run`] does — including the same
     /// "only a Connection-kind failure falls back; Timeout/Rpc surface
     /// as-is" contract documented there.
+    ///
+    /// **General-API hazard (spawn route)**: the implementation writes ALL
+    /// of `stdin_bytes` before reading any output. A child that floods
+    /// stdout/stderr beyond the OS pipe buffer (~64KiB) before draining
+    /// stdin deadlocks: it blocks writing, we block writing to it. Fine
+    /// for every current caller (`cat > tmp`-style sinks produce no
+    /// output until stdin closes); anyone pointing this at a chatty
+    /// program must switch to concurrent drain (spawn a reader thread)
+    /// first.
     pub fn run_with_stdin(
         &self,
         program: &str,

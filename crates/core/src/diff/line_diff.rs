@@ -12,7 +12,12 @@ pub(super) fn build_hunks(
     options: &DiffOptions,
 ) -> Vec<Hunk> {
     let input = InternedInput::new(Tokens(old_lines), Tokens(new_lines));
-    let diff = Diff::compute(Algorithm::Histogram, &input);
+    let mut diff = Diff::compute(Algorithm::Histogram, &input);
+    // git's slider/indent heuristic: where a run of added/removed lines
+    // could equivalently start a line earlier or later (blank lines,
+    // repeated braces), pick the boundary a human would — matching what
+    // `git diff` itself shows (docs/backlog.md hunk-boundary item).
+    diff.postprocess_lines(&input);
     let regions: Vec<imara_diff::Hunk> = diff.hunks().collect();
     if regions.is_empty() {
         return Vec::new();

@@ -555,4 +555,33 @@ mod tests {
         assert_eq!((h.old_start, h.old_count), (3, 1));
         assert_eq!((h.new_start, h.new_count), (2, 0));
     }
+
+    // T16: the slider/indent heuristic (`postprocess_lines`). Appending a
+    // new function to a file whose functions end in identical `}\n` lines
+    // makes the added run's boundary ambiguous — it can slide to start at
+    // the old `}` or at the new `fn`. git's heuristic (and now ours) picks
+    // the block that starts at the new function, keeping the original
+    // closing brace as context.
+    #[test]
+    fn t16_indent_heuristic_slides_added_block_to_function_start() {
+        let options = DiffOptions {
+            context_lines: 0,
+            intraline: false,
+        };
+        let old = b"fn a() {\n    1\n}\n";
+        let new = b"fn a() {\n    1\n}\n\nfn b() {\n    2\n}\n";
+        let d = diff_blobs(Some(old), Some(new), &options);
+        assert_eq!(d.hunks.len(), 1);
+        let added: Vec<&str> = d.hunks[0]
+            .lines
+            .iter()
+            .filter(|l| l.kind == LineKind::Added)
+            .map(|l| l.text.as_str())
+            .collect();
+        assert_eq!(
+            added,
+            vec!["", "fn b() {", "    2", "}"],
+            "added block must start at the blank line + new fn, not slide up over the old }}"
+        );
+    }
 }

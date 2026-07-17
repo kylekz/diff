@@ -6,7 +6,9 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use dv_core::{BlobSpec, ChangeStatus, DiffSource, GitRepo, RepoLocation};
+use dv_core::{
+    BlobSpec, ChangeStatus, ConflictInfo, ConflictProbe, DiffSource, GitRepo, RepoLocation,
+};
 
 static COUNTER: AtomicU64 = AtomicU64::new(0);
 
@@ -80,6 +82,27 @@ impl TestRepo {
         self.git(&["add", "-A"]);
         self.git(&["commit", "-m", msg]);
         self.git(&["rev-parse", "HEAD"])
+    }
+
+    /// Like [`Self::git`], but never panics on a non-zero exit — for
+    /// commands the test deliberately expects to fail (e.g. `git merge`
+    /// landing in a conflict).
+    fn try_git(&self, args: &[&str]) {
+        let dir_str = self.dir.to_str().expect("temp dir path is not valid UTF-8");
+        let mut full_args = vec![
+            "-C",
+            dir_str,
+            "-c",
+            "user.name=dv-test",
+            "-c",
+            "user.email=dv@test",
+            "-c",
+            "core.autocrlf=false",
+            "-c",
+            "commit.gpgsign=false",
+        ];
+        full_args.extend_from_slice(args);
+        let _ = Command::new("git").args(&full_args).output();
     }
 }
 
@@ -610,4 +633,162 @@ fn t17_config_get_and_missing_key() {
 
     repo.git(&["config", "dv.author", "kyle"]);
     assert_eq!(git_repo.config("dv.author"), Some("kyle".to_string()));
+}
+
+// --- conflict_probe (docs/backlog.md "Merge-conflict indicator") ---------
+
+#[test]
+fn t18_conflict_probe_range_clean_when_changes_dont_overlap() {
+    let repo = TestRepo::new("t18");
+    repo.write("f.txt", b"line1\nline2\nline3\n");
+    repo.commit("base");
+    repo.git(&["checkout", "-b", "branch-a"]);
+    repo.write("f.txt", b"line1\nline2\nline3\n");
+    repo.write("only-a.txt", b"a\n");
+    repo.commit("a");
+    repo.git(&["checkout", "main"]);
+    repo.git(&["checkout", "-b", "branch-b"]);
+    repo.write("only-b.txt", b"b\n");
+    repo.commit("b");
+
+    let git_repo = open(&repo);
+    let probe = git_repo.conflict_probe(&DiffSource::Range {
+        base: "branch-a".to_string(),
+        head: "branch-b".to_string(),
+        merge_base: false,
+    });
+    assert_eq!(probe, ConflictProbe::Determined(ConflictInfo::default()));
+    assert!(!probe.is_conflicted());
+}
+
+#[test]
+fn t19_conflict_probe_range_reports_conflicting_files() {
+    let repo = TestRepo::new("t19");
+    repo.write("f.txt", b"line1\nline2\nline3\n");
+    repo.commit("base");
+    repo.git(&["checkout", "-b", "branch-a"]);
+    repo.write("f.txt", b"line1\nCHANGED-A\nline3\n");
+    repo.commit("a");
+    repo.git(&["checkout", "main"]);
+    repo.git(&["checkout", "-b", "branch-b"]);
+    repo.write("f.txt", b"line1\nCHANGED-B\nline3\n");
+    repo.commit("b");
+
+    let git_repo = open(&repo);
+    let probe = git_repo.conflict_probe(&DiffSource::Range {
+        base: "branch-a".to_string(),
+        head: "branch-b".to_string(),
+        merge_base: true,
+    });
+    assert_eq!(
+        probe,
+        ConflictProbe::Determined(ConflictInfo {
+            files: vec!["f.txt".to_string()]
+        })
+    );
+    assert!(probe.is_conflicted());
+}
+
+#[test]
+fn t20_conflict_probe_working_tree_clean_index_reports_no_conflict() {
+    let repo = TestRepo::new("t20");
+    repo.write("f.txt", b"hello\n");
+    repo.commit("seed");
+    repo.write("f.txt", b"hello modified\n");
+
+    let git_repo = open(&repo);
+    let probe = git_repo.conflict_probe(&DiffSource::WorkingTree);
+    assert_eq!(probe, ConflictProbe::Determined(ConflictInfo::default()));
+}
+
+#[test]
+fn t21_conflict_probe_working_tree_mid_merge_reports_unmerged_files() {
+    let repo = TestRepo::new("t21");
+    repo.write("f.txt", b"line1\nline2\nline3\n");
+    repo.commit("base");
+    repo.git(&["checkout", "-b", "branch-a"]);
+    repo.write("f.txt", b"line1\nCHANGED-A\nline3\n");
+    repo.commit("a");
+    repo.git(&["checkout", "main"]);
+    repo.git(&["checkout", "-b", "branch-b"]);
+    repo.write("f.txt", b"line1\nCHANGED-B\nline3\n");
+    repo.commit("b");
+    // Leave the repo mid-merge, unresolved — exactly the "user is mid-
+    // merge/rebase" case the WorkingTree/Staged probe exists for.
+    repo.try_git(&["merge", "branch-a"]);
+
+    let git_repo = open(&repo);
+    let probe = git_repo.conflict_probe(&DiffSource::WorkingTree);
+    assert_eq!(
+        probe,
+        ConflictProbe::Determined(ConflictInfo {
+            files: vec!["f.txt".to_string()]
+        })
+    );
+
+    // Staged shares the same index-based probe.
+    let probe_staged = git_repo.conflict_probe(&DiffSource::Staged);
+    assert!(probe_staged.is_conflicted());
+}
+
+#[test]
+fn t23_conflict_probe_range_with_base_resolved_to_merge_base_is_unsupported_not_a_false_clean() {
+    // Regression: `resolve_source`/CLI `review create`/`load_pr` all
+    // collapse a merge-base (`a...b`) range's `base` to the FROZEN
+    // `merge-base(a, b)` sha before storing/holding it (comment-anchor
+    // stability). Feeding THAT resolved pair straight into `merge-tree`
+    // would ALWAYS report clean (an ancestor merged into its own
+    // descendant can never conflict) — silently useless for the single
+    // most common range shape (every open PR). `conflict_probe` must
+    // recognize this and bail to `Unsupported` instead of lying.
+    let repo = TestRepo::new("t23");
+    repo.write("f.txt", b"line1\nline2\nline3\n");
+    repo.commit("base");
+    repo.git(&["checkout", "-b", "branch-a"]);
+    repo.write("f.txt", b"line1\nCHANGED-A\nline3\n");
+    repo.commit("a");
+    repo.git(&["checkout", "main"]);
+    repo.git(&["checkout", "-b", "branch-b"]);
+    repo.write("f.txt", b"line1\nCHANGED-B\nline3\n");
+    repo.commit("b");
+
+    let git_repo = open(&repo);
+    let merge_base = git_repo.merge_base("branch-a", "branch-b").unwrap();
+
+    // This is exactly what a stored PR/merge-base review's `DiffSource::
+    // Range` looks like on disk: `base` is the frozen merge-base sha,
+    // `merge_base: false` (already resolved).
+    let resolved = DiffSource::Range {
+        base: merge_base,
+        head: "branch-b".to_string(),
+        merge_base: false,
+    };
+    let probe = git_repo.conflict_probe(&resolved);
+    assert_eq!(
+        probe,
+        ConflictProbe::Unsupported,
+        "a merge-base-collapsed range must never claim 'clean' — it has no way to know"
+    );
+
+    // The unguarded escape hatch, called with the TRUE live base ref (what
+    // `Workspace::open_pr`/`Workspace::new` actually have on hand before
+    // resolution), still finds the real conflict.
+    let live_probe = git_repo.conflict_probe_live("branch-a", "branch-b");
+    assert_eq!(
+        live_probe,
+        ConflictProbe::Determined(ConflictInfo {
+            files: vec!["f.txt".to_string()]
+        })
+    );
+}
+
+#[test]
+fn t22_conflict_probe_commit_source_is_always_clean() {
+    let repo = TestRepo::new("t22");
+    repo.write("f.txt", b"hello\n");
+    let sha = repo.commit("seed");
+
+    let git_repo = open(&repo);
+    let probe = git_repo.conflict_probe(&DiffSource::Commit(sha));
+    assert_eq!(probe, ConflictProbe::Determined(ConflictInfo::default()));
 }

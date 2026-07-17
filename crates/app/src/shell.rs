@@ -1653,6 +1653,11 @@ impl AppShell {
                 // watcher).
                 let entry = {
                     let ws = ws.read(cx);
+                    // Docs/backlog.md "Merge-conflict indicator...": the
+                    // only way a PR review's conflict badge reaches the
+                    // sidebar at all — see `Workspace::conflict`'s doc
+                    // comment.
+                    let conflict = ws.conflict().cloned();
                     ws.review().map(|review| {
                         // Only a PR-linked review carries a `pr_status` at
                         // all (review finding P2-3) — `this.badges` is
@@ -1690,6 +1695,7 @@ impl AppShell {
                         });
                         let mut entry = dv_core::IndexEntry::from_review(&location, review);
                         entry.pr_status = pr_status;
+                        entry.conflict = conflict.clone();
                         (review.id.clone(), entry)
                     })
                 };
@@ -1882,6 +1888,10 @@ impl AppShell {
         self.refresh_badge(location.clone(), false, cx);
         let entry = {
             let ws = ws.read(cx);
+            // Same reasoning as `Self::install_active`'s active closure —
+            // a parked workspace's live conflict probe is just as much a
+            // real answer as an active one's.
+            let conflict = ws.conflict().cloned();
             ws.review().map(|review| {
                 // Same pr_status carry-forward as `Self::install_active`'s
                 // active closure — see its doc comment for why this can't
@@ -1901,6 +1911,7 @@ impl AppShell {
                 });
                 let mut entry = dv_core::IndexEntry::from_review(&location, review);
                 entry.pr_status = pr_status;
+                entry.conflict = conflict.clone();
                 entry
             })
         };
@@ -3098,6 +3109,16 @@ impl AppShell {
                 "diffstat": e.diffstat.map(|ds| json!({
                     "additions": ds.additions,
                     "deletions": ds.deletions,
+                })),
+                // Merge-conflict indicator (docs/backlog.md "Merge-conflict
+                // indicator..."): `null` when hydration hasn't reached a
+                // verdict yet (old git, WSL hiccup, not-yet-hydrated) —
+                // distinct from `{"conflicted": false, "files": []}`, a
+                // real "clean" verdict. See `Self::render_review_card`'s
+                // `conflict_count` for the sidebar-rendered form of this.
+                "conflict": e.conflict.as_ref().map(|c| json!({
+                    "conflicted": c.is_conflicted(),
+                    "files": c.files,
                 })),
                 "last_opened_ms": e.last_opened_ms,
                 "archived": e.archived,
@@ -4340,6 +4361,19 @@ impl AppShell {
         let repo = dv_core::repo_label(&entry.location, entry.remote.as_ref());
         let age = relative_age(entry.updated_ms);
         let diffstat = entry.diffstat;
+        // Merge-conflict indicator (docs/backlog.md "Merge-conflict
+        // indicator in the review navigator"): `Some(n)` (n > 0) once
+        // hydration has determined this review's diff source would
+        // conflict — `None` for a clean review OR one hydration hasn't
+        // reached a verdict on yet (old git, WSL hiccup, not-yet-hydrated).
+        // Deliberately not folded into `unavailable`'s glyph slot below —
+        // the two are independent axes (a repo can be unreachable with no
+        // conflict info at all, or reachable with a real conflict).
+        let conflict_count = entry
+            .conflict
+            .as_ref()
+            .filter(|c| c.is_conflicted())
+            .map(|c| c.files.len());
         let title = entry.title.clone();
         let open_comments = entry.open_comments;
         let submitted = matches!(entry.state, dv_core::ReviewState::Submitted { .. });
@@ -4475,6 +4509,30 @@ impl AppShell {
                             .when(unavailable, |el| {
                                 el.child(div().text_color(warning).child("\u{26a0}"))
                             })
+                            .children(conflict_count.map(|n| {
+                                let id = SharedString::from(format!(
+                                    "review-card-conflict-{review_id_for_age}"
+                                ));
+                                div()
+                                    .id(id)
+                                    .text_color(warning)
+                                    // Same warning triangle `unavailable`
+                                    // uses just above (proven to render —
+                                    // an exotic glyph risks the same
+                                    // font-coverage tofu R1e's visual
+                                    // review flagged for `state_pill`
+                                    // icons); the tooltip is what tells
+                                    // the two apart on hover.
+                                    .child(format!("\u{26a0} {n}"))
+                                    .tooltip(move |window, cx| {
+                                        let label = if n == 1 {
+                                            "1 file would conflict on merge".to_string()
+                                        } else {
+                                            format!("{n} files would conflict on merge")
+                                        };
+                                        Tooltip::new(label).build(window, cx)
+                                    })
+                            }))
                             .children(pr.map(|pr| {
                                 render_pr_glyphs(
                                     pr.is_draft,
@@ -6114,6 +6172,7 @@ mod tests {
             remote: None,
             pr_status: None,
             diffstat: None,
+            conflict: None,
             updated_ms: 1,
             last_opened_ms: 1,
             health: dv_core::EntryHealth::Ok,

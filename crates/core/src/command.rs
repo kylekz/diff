@@ -50,6 +50,18 @@ pub struct CommandBuilder {
     route: Route,
 }
 
+/// Full result of [`CommandBuilder::run_allow_failure`] — unlike
+/// [`CommandBuilder::run`], a non-zero exit is data, not an `Err`.
+#[derive(Debug, Clone)]
+pub struct CommandOutput {
+    pub success: bool,
+    /// `None` only for a signal-terminated child (mirrors `run`/`finish`'s
+    /// own `code: Option<i32>`).
+    pub exit_code: Option<i32>,
+    pub stdout: Vec<u8>,
+    pub stderr: Vec<u8>,
+}
+
 impl CommandBuilder {
     /// Wsl locations consult [`manager::client_if_running`] for an already-
     /// connected host; anything it doesn't hand back (disabled, no host
@@ -212,6 +224,56 @@ impl CommandBuilder {
             manager::note_spawn_fallback(&self.location, "no host route available");
         }
         self.run_spawn(program, args)
+    }
+
+    /// Like [`Self::run`], but never collapses a non-zero exit into an
+    /// `Err` — the caller gets `stdout`/`stderr`/`exit_code` regardless of
+    /// how the command exited. `Err` is reserved for a genuine failure to
+    /// even run the command (spawn failure, or a surfaced non-connection
+    /// host `Rpc`/`Timeout` error, exactly as [`Self::run`] treats those).
+    ///
+    /// [`Self::run`]'s `finish` collapses a non-zero exit into an `Err`
+    /// carrying only `stderr` text — fine for porcelain-failure commands,
+    /// but wrong for the handful (`git merge-tree --write-tree`) that
+    /// encode meaningful data in `stdout` on a non-zero exit (its conflict
+    /// file list rides on exit 1). Callers that need to tell "clean" /
+    /// "conflicted" / "genuinely failed" apart use this instead.
+    ///
+    /// Same host-fallback/idempotency contract as [`Self::run`] — a
+    /// connection-level host failure retries via Spawn, so anything routed
+    /// through this must tolerate being re-executed. `git merge-tree
+    /// --write-tree` and `git ls-files -u`, this method's only callers
+    /// today, both qualify: the former's object writes are content-
+    /// addressed (safe to redo), the latter is a pure read.
+    pub fn run_allow_failure(&self, program: &str, args: &[&str]) -> Result<CommandOutput> {
+        if let Route::Host(client) = &self.route {
+            match client.exec(program, args, None) {
+                Ok(outcome) => {
+                    return Ok(CommandOutput {
+                        success: outcome.exit_code == 0,
+                        exit_code: Some(outcome.exit_code),
+                        stdout: outcome.stdout,
+                        stderr: outcome.stderr,
+                    });
+                }
+                Err(err) if RequestFailure::is_connection_failure(&err) => {
+                    self.note_host_failure(client, &format!("proc/exec: {err:#}"));
+                }
+                Err(err) => return Err(err),
+            }
+        } else {
+            manager::note_spawn_fallback(&self.location, "no host route available");
+        }
+        let output = self
+            .command(program, args)
+            .output()
+            .with_context(|| format!("failed to run {program}: spawn failed"))?;
+        Ok(CommandOutput {
+            success: output.status.success(),
+            exit_code: output.status.code(),
+            stdout: output.stdout,
+            stderr: output.stderr,
+        })
     }
 
     /// [`Self::run`] + [`decode_output`] + trailing-whitespace trim, for
@@ -778,6 +840,32 @@ mod tests {
         // 2000-byte cap (see `truncate_lossy`) plus the surrounding format.
         assert!(text.len() < long_stderr.len());
         assert!(text.contains("failed (exit 1):"));
+    }
+
+    // --- run_allow_failure: non-zero exit is data, not `Err` -------------
+
+    #[cfg(windows)]
+    #[test]
+    fn run_allow_failure_captures_stdout_on_nonzero_exit() {
+        // `run` would collapse this into an `Err` carrying only stderr text
+        // (there is none here) — `run_allow_failure` must hand back the
+        // stdout `finish` would have discarded, plus the real exit code.
+        let builder = CommandBuilder::new(RepoLocation::Local(PathBuf::from(".")));
+        let out = builder
+            .run_allow_failure("cmd", &["/c", "echo hello&exit 7"])
+            .unwrap();
+        assert!(!out.success);
+        assert_eq!(out.exit_code, Some(7));
+        assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "hello");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn run_allow_failure_reports_success_on_zero_exit() {
+        let builder = CommandBuilder::new(RepoLocation::Local(PathBuf::from(".")));
+        let out = builder.run_allow_failure("cmd", &["/c", "exit 0"]).unwrap();
+        assert!(out.success);
+        assert_eq!(out.exit_code, Some(0));
     }
 
     // --- run_spawn_bounded: the install-bootstrap timeout (plan §5 / §8 S5)

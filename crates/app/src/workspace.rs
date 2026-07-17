@@ -722,6 +722,15 @@ struct PrOpenOutcome {
     files: Vec<ChangedFile>,
     review: dv_core::Review,
     source: DiffSource,
+    /// Merge-conflict probe (docs/backlog.md "Merge-conflict indicator in
+    /// the review navigator"), computed in [`load_pr`] against the PR's
+    /// freshly fetched `base_oid`/`head_oid` — the TRUE, current base
+    /// branch tip, not `source`'s own `base` (already collapsed to a
+    /// frozen merge-base sha by the time this struct is built; see
+    /// `GitRepo::probe_range_conflict`'s doc comment). This is the one
+    /// path in the app that can answer the PR-conflict question
+    /// correctly, since it's the one place holding a live base ref.
+    conflict: Option<dv_core::ConflictInfo>,
 }
 
 /// Everything [`Workspace::on_submit_click`] needs to actually send the
@@ -1380,6 +1389,21 @@ pub struct Workspace {
     /// hard: a resolve failure just leaves `Range` views ungated, not a
     /// crash).
     worktree_head_oid: Option<String>,
+    /// This workspace's live merge-conflict probe (docs/backlog.md
+    /// "Merge-conflict indicator in the review navigator") — ephemeral,
+    /// in-memory only (never persisted; see `dv_core::IndexEntry::
+    /// conflict`'s doc comment for the same scoping applied to the sidebar
+    /// cache). Populated by the initial load, every [`Self::revalidate`]
+    /// pass, and — for a `WorkingTree` source under a live host — the
+    /// worktree-watch consumer: the exact same triggers that already
+    /// refresh `self.files`/`worktree_head_oid`, so this never needs its
+    /// own poll. The underlying git call is one cheap subprocess (a
+    /// `merge-tree` simulation or an `ls-files` scan), so every trigger
+    /// just recomputes rather than keying off some staleness token.
+    /// `None` until the first pass completes, or forever for a source
+    /// git couldn't determine conflict state for (old git, a WSL hiccup —
+    /// `dv_core::ConflictProbe::Unsupported`).
+    conflict: Option<dv_core::ConflictInfo>,
     /// S8g (docs/phase-8-lsp-and-polish.md § LSP) hover popover, if one is
     /// currently shown — reuses `lsp_session`'s already-`Ready` handle (see
     /// `Self::on_symbol_hover`'s doc comment: hover never spawns its own
@@ -1752,6 +1776,16 @@ fn load_pr(repo: &GitRepo, number: u64, location: RepoLocation) -> anyhow::Resul
         merge_base: false,
     };
     let files = repo.changed_files(&source)?;
+    // Merge-conflict probe (docs/backlog.md "Merge-conflict indicator..."),
+    // against `meta.base_oid` — the PR's ACTUAL, just-fetched base branch
+    // tip — not `source.base` (the frozen merge-base sha above, which
+    // `GitRepo::conflict_probe` would correctly refuse to answer from; see
+    // its doc comment). `prepare_pr` already fetched both oids, so both
+    // are guaranteed locally present here.
+    let conflict = repo
+        .conflict_probe_live(&meta.base_oid, &range.head_oid)
+        .info()
+        .cloned();
 
     let store = dv_core::ReviewStore::open(location);
     let slug = client.slug().to_string();
@@ -1814,6 +1848,7 @@ fn load_pr(repo: &GitRepo, number: u64, location: RepoLocation) -> anyhow::Resul
         files,
         review,
         source,
+        conflict,
     })
 }
 
@@ -2014,6 +2049,7 @@ impl Workspace {
             lsp_ready_since: None,
             lsp_node_modules_warning: None,
             worktree_head_oid: None,
+            conflict: None,
             hover_popover: None,
             hover_request_epoch: 0,
             hover_request_line: None,
@@ -2132,9 +2168,18 @@ impl Workspace {
                     continue;
                 }
 
-                let files = cx
+                let (files, conflict) = cx
                     .background_executor()
-                    .spawn(async move { repo.changed_files(&source) })
+                    .spawn(async move {
+                        let files = repo.changed_files(&source);
+                        // The event-driven trigger for the "mid-merge/
+                        // rebase left unresolved" case (docs/backlog.md
+                        // "Merge-conflict indicator..."): an `ls-files -u`
+                        // scan is cheap enough to run on every coalesced
+                        // worktree event alongside the file-list refresh.
+                        let conflict = repo.conflict_probe(&source).info().cloned();
+                        (files, conflict)
+                    })
                     .await;
 
                 let alive = this.update(cx, |this, cx| {
@@ -2155,6 +2200,7 @@ impl Workspace {
                     if let Ok(files) = files {
                         this.apply_worktree_reload(files, cx);
                     }
+                    this.conflict = conflict;
                     // Force `refresh_stale` (called at the tail of
                     // `reset_diff_list` below) to actually re-run its git
                     // check even though neither the review nor the
@@ -2182,6 +2228,29 @@ impl Workspace {
                     // just leaves Range views ungated for LSP, not a load
                     // failure).
                     let worktree_head_oid = repo.resolve("HEAD").ok();
+                    // Merge-conflict probe (docs/backlog.md "Merge-conflict
+                    // indicator..."), computed from the INCOMING `source`
+                    // — BEFORE `resolve_source` below collapses a merge-
+                    // base range's `base` to a frozen sha. Deliberately the
+                    // GUARDED `conflict_probe`, not `conflict_probe_live`:
+                    // this same code path serves BOTH a not-yet-resolved
+                    // `--range a...b` CLI/launch argument (a genuinely
+                    // live `base` — the guard's ancestor check won't
+                    // trigger, so the real probe still runs) AND
+                    // `AppShell::open_review_row`'s sidebar-click path,
+                    // which passes the review's `IndexEntry::source`
+                    // straight through — already resolved to a merge-base
+                    // sha by whichever `review create`/`load_pr` call
+                    // persisted it. Trusting that pre-resolved `base` as
+                    // "live" (i.e. calling `conflict_probe_live` here)
+                    // would silently answer "clean" for every conflicted
+                    // review opened by clicking its sidebar card — the
+                    // single most common way a review is ever opened. See
+                    // `GitRepo::probe_range_conflict`'s doc comment for the
+                    // full reasoning. Never gates the load on success — a
+                    // probe failure just degrades to `Unsupported`
+                    // (rendered as "no indicator").
+                    let conflict = repo.conflict_probe(&source).info().cloned();
                     // Resolve a merge-base range to a concrete two-dot range
                     // once here, so both the file list and every per-file
                     // old-side blob load from the merge base rather than from
@@ -2215,6 +2284,7 @@ impl Workspace {
                         head,
                         worktree_head_oid,
                         files,
+                        conflict,
                         source,
                         review,
                         store_location,
@@ -2230,6 +2300,7 @@ impl Workspace {
                         head,
                         worktree_head_oid,
                         files,
+                        conflict,
                         source,
                         review,
                         store_location,
@@ -2239,6 +2310,7 @@ impl Workspace {
                         this.head = head.into();
                         this.worktree_head_oid = worktree_head_oid;
                         this.files = files;
+                        this.conflict = conflict;
                         this.source = source;
                         this.review = review;
                         this.pinned_review_id =
@@ -2346,6 +2418,19 @@ impl Workspace {
         self.review.as_ref()
     }
 
+    /// This workspace's live merge-conflict probe (docs/backlog.md
+    /// "Merge-conflict indicator..."), for `shell.rs`'s `ReviewChanged`
+    /// subscription to fold into the sidebar's cached `IndexEntry` — the
+    /// same "active workspace patches the index" shape `pr_status` already
+    /// uses (`AppShell::install_active`'s closure). This is how a PR
+    /// review's conflict badge ever reaches the sidebar card at all: the
+    /// headless `hydrate_location` pass can only ever answer `Unsupported`
+    /// for one (see `GitRepo::probe_range_conflict`'s doc comment) — only
+    /// the live workspace, holding the PR's freshly fetched base oid, can.
+    pub(crate) fn conflict(&self) -> Option<&dv_core::ConflictInfo> {
+        self.conflict.as_ref()
+    }
+
     /// This workspace's repo location — normalized to the store's true
     /// toplevel once the initial load completes (see [`Self::new`]'s
     /// `this.location = store_location` reassignment), the raw argument
@@ -2362,6 +2447,19 @@ impl Workspace {
     /// 7 D3's parked-PR diffs) — cross-cutting risk F: leaving either out
     /// would silently undercount the budget a workspace this size actually
     /// costs.
+    /// Whether `path` is one of this workspace's currently conflicted
+    /// files (docs/backlog.md "Merge-conflict indicator in the review
+    /// navigator") — `false` whenever `self.conflict` hasn't determined
+    /// anything yet (`None`, whether that's "not computed yet" or
+    /// `ConflictProbe::Unsupported`) or the review is simply clean. Used by
+    /// [`Self::render_file_row`]'s per-file badge and [`Self::
+    /// automation_state`]'s `"files[].conflicted"`.
+    fn is_file_conflicted(&self, path: &str) -> bool {
+        self.conflict
+            .as_ref()
+            .is_some_and(|c| c.files.iter().any(|f| f == path))
+    }
+
     pub(crate) fn estimated_diff_bytes(&self) -> usize {
         let live: usize = self.diffs.values().map(|d| d.estimated_bytes()).sum();
         let pr_cached: usize = self
@@ -2695,7 +2793,7 @@ impl Workspace {
             .map(|r| (r.id.clone(), r.updated_ms, r.comments.len()));
 
         cx.spawn(async move |this, cx| {
-            let (review, files, worktree_head_oid) = cx
+            let (review, files, worktree_head_oid, conflict) = cx
                 .background_executor()
                 .spawn(async move {
                     let review = pick_review(
@@ -2713,7 +2811,23 @@ impl Workspace {
                     // reactivation is exactly the "git round trips already
                     // happen off-thread" moment to keep it current.
                     let worktree_head_oid = repo.resolve("HEAD").ok();
-                    (review, files, worktree_head_oid)
+                    // Merge-conflict probe (docs/backlog.md "Merge-conflict
+                    // indicator..."), refreshed the same "reactivation is
+                    // the moment to recompute" way as `worktree_head_oid` —
+                    // EXCEPT for `Range`: by the time it lives in
+                    // `self.source`, `resolve_source` has already collapsed
+                    // a merge-base range's `base` to a frozen sha, so
+                    // `conflict_probe` can only ever answer `Unsupported`
+                    // for it here (see that method's doc comment) — and
+                    // recomputing would silently DOWNGRADE a real answer
+                    // `Self::new`/`open_pr` got from the live base ref back
+                    // to "unknown" on every reactivation. `None` (outer)
+                    // means "leave `self.conflict` exactly as it is";
+                    // `Some(None)` is a genuine "couldn't determine, clear
+                    // it" for the other source kinds.
+                    let conflict = (!matches!(source, DiffSource::Range { .. }))
+                        .then(|| repo.conflict_probe(&source).info().cloned());
+                    (review, files, worktree_head_oid, conflict)
                 })
                 .await;
 
@@ -2745,6 +2859,9 @@ impl Workspace {
 
                 if worktree_head_oid.is_some() {
                     this.worktree_head_oid = worktree_head_oid;
+                }
+                if let Some(conflict) = conflict {
+                    this.conflict = conflict;
                 }
 
                 // ---- worktree half: `apply_worktree_reload` is the exact
@@ -3559,6 +3676,12 @@ impl Workspace {
             self.pr_details_open = false;
             self.pr_loading = None;
             self.pr_meta_pending = true;
+            // `CachedPrDiff` predates this feature and carries no conflict
+            // data for the PR being painted — `None` (no indicator) rather
+            // than leaving the OUTGOING pr's conflict flag showing under
+            // `Status::Ready` for the instant before the background
+            // confirm (below) patches in the real answer.
+            self.conflict = None;
             self.status = Status::Ready;
             self.last_pr_open_ms = Some(started.elapsed().as_millis() as u64);
             self.last_pr_open_cache_hit = Some(true);
@@ -3610,6 +3733,7 @@ impl Workspace {
                         files,
                         review,
                         source,
+                        conflict,
                     }) => {
                         let key = pr_source_key(&source);
                         if painted_key.is_some() && key == painted_key {
@@ -3631,6 +3755,11 @@ impl Workspace {
                             cx.emit(ReviewChanged);
                             this.pr = Some(meta.into());
                             this.pr_meta_pending = false;
+                            // The optimistic paint (`CachedPrDiff`) predates
+                            // this feature and carries no conflict data —
+                            // this confirm is the first point with a real
+                            // answer for the PR now on screen.
+                            this.conflict = conflict;
                             cx.notify();
                             return;
                         }
@@ -3678,6 +3807,7 @@ impl Workspace {
                             window.focus(&this.focus_handle, cx);
                         }
                         this.source = source;
+                        this.conflict = conflict;
                         this.source_desc = format!("PR #{number}").into();
                         // A PR's file list is fixed by its endpoints, not
                         // by the working tree — worktree watching (plan
@@ -4411,7 +4541,22 @@ impl Workspace {
                 "path": file.path,
                 "old_path": file.old_path,
                 "status": format!("{:?}", file.status),
+                // docs/backlog.md "Merge-conflict indicator...": per-file,
+                // since both underlying probes (`merge-tree --name-only`,
+                // `ls-files -u`) give exact paths — see `Self::render_
+                // file_row`'s badge, the visual form of this same flag.
+                "conflicted": self.is_file_conflicted(&file.path),
             })).collect::<Vec<_>>(),
+            // Whole-workspace merge-conflict probe (docs/backlog.md
+            // "Merge-conflict indicator..."): `null` when nothing has been
+            // determined yet (not-yet-loaded, or `ConflictProbe::
+            // Unsupported` — an old git, or a transient failure) — distinct
+            // from `{"conflicted": false, "files": []}`, a real "clean"
+            // verdict for this source.
+            "conflict": self.conflict.as_ref().map(|c| json!({
+                "conflicted": c.is_conflicted(),
+                "files": c.files,
+            })),
             "rows": self.selected.and_then(|i| self.diffs.get(&i)).map(|diff| json!({
                 "unified": diff.unified.len(),
                 "split": diff.split.len(),
@@ -5796,6 +5941,16 @@ impl Workspace {
                         }
                         this.source = source;
                         this.source_desc = source_label(&this.source).into();
+                        // Merge-conflict indicator (docs/backlog.md
+                        // "Merge-conflict indicator..."): this jump moves
+                        // to a DIFFERENT review's own stored source, whose
+                        // `base` (for a `Range`) is a resolved merge-base
+                        // sha we have no way to re-probe correctly from
+                        // here (see `GitRepo::probe_range_conflict`'s doc
+                        // comment) — clear rather than let the outgoing
+                        // source's conflict flag linger against the new
+                        // one's files.
+                        this.conflict = None;
                         // Index-keyed into the old file list — stale
                         // caches would render the wrong file under the
                         // right name (same as `open_pr`).
@@ -8927,6 +9082,11 @@ impl Workspace {
                 Some((diff.added, diff.removed))
             }
         });
+        // Merge-conflict badge (docs/backlog.md "Merge-conflict indicator
+        // in the review navigator"): `self.conflict` is per-file already
+        // (both `merge-tree --name-only` and `ls-files -u` give exact
+        // paths), so this is a direct lookup, not a whole-review flag.
+        let conflicted = self.is_file_conflicted(&file.path);
 
         h_flex()
             .id(index)
@@ -8953,6 +9113,21 @@ impl Workspace {
                     )
                     .child(div().min_w(px(0.)).truncate().text_color(color).child(leaf)),
             )
+            .when(conflicted, |el| {
+                let id = SharedString::from(format!("file-conflict-{index}"));
+                el.child(
+                    div()
+                        .id(id)
+                        .flex_none()
+                        .text_xs()
+                        .text_color(theme.warning)
+                        .child("\u{26a0}")
+                        .tooltip(move |window, cx| {
+                            gpui_component::tooltip::Tooltip::new("would conflict on merge")
+                                .build(window, cx)
+                        }),
+                )
+            })
             .children(diffstat.map(|(added, removed)| {
                 h_flex()
                     .flex_none()

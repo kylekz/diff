@@ -7,6 +7,7 @@
 //! library, so the same code path can route through `wsl.exe`.
 
 pub mod command;
+pub mod conflict;
 pub mod diff;
 pub mod git;
 pub mod github;
@@ -18,6 +19,7 @@ pub mod remote;
 pub mod review;
 
 pub use command::CommandBuilder;
+pub use conflict::{ConflictInfo, ConflictProbe};
 pub use diff::{DiffLine, DiffOptions, FileDiff, Hunk, LineKind};
 pub use git::{BlobSpec, ChangeStatus, ChangedFile, DiffSource, DiffTotals, GitRepo, parse_range};
 pub use github::{

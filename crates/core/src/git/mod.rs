@@ -9,6 +9,7 @@ use std::sync::Mutex;
 use anyhow::{Context, Result, anyhow};
 
 use crate::command::CommandBuilder;
+use crate::conflict::{ConflictInfo, ConflictProbe};
 use crate::location::RepoLocation;
 use crate::remote::client::RequestFailure;
 use crate::remote::manager;
@@ -485,6 +486,100 @@ impl GitRepo {
             }
         };
         Ok(parse_numstat_totals(&text))
+    }
+
+    /// Read-only merge-conflict probe for a diff source (docs/backlog.md
+    /// "Merge-conflict indicator in the review navigator") — never touches
+    /// the working tree or index. See `crate::conflict`'s module doc for
+    /// the exact commands and how "clean" is told apart from "couldn't
+    /// tell". `Range` simulates the merge `git merge-tree` would perform
+    /// (direction doesn't matter for conflict detection — merge-tree
+    /// computes its own merge base internally and is symmetric in `base`/
+    /// `head`); `WorkingTree`/`Staged` both read the same index, so they
+    /// share one probe; `Commit` implies no merge, so it's always clean.
+    pub fn conflict_probe(&self, source: &DiffSource) -> ConflictProbe {
+        match source {
+            DiffSource::Range { base, head, .. } => self.probe_range_conflict(base, head),
+            DiffSource::WorkingTree | DiffSource::Staged => self.probe_index_conflict(),
+            DiffSource::Commit(_) => ConflictProbe::Determined(ConflictInfo::default()),
+        }
+    }
+
+    /// **Important caveat, safe by construction**: every persisted
+    /// `DiffSource::Range { merge_base: true, .. }` (a PR-shaped, "GitHub
+    /// Files changed"-style range — see `crates/app/src/workspace.rs`'s
+    /// `resolve_source`, `crates/cli/src/lib.rs`'s `review create`, and
+    /// `load_pr`) resolves `base` to the FROZEN `git merge-base(base,
+    /// head)` sha at creation/load time, once, and keeps it that way
+    /// forever — deliberately, so old-side comment anchors stay pinned to
+    /// what the diff actually showed even after the real base branch
+    /// advances. That means a stored review's `base` is, by construction,
+    /// always an ancestor of `head` — and simulating a merge of an
+    /// ancestor into its own descendant is mathematically ALWAYS clean
+    /// (the "base" side has no changes relative to the pair's own merge
+    /// base), regardless of whether the REAL, current base branch would
+    /// conflict. Silently reporting "clean" here for the single most
+    /// common range shape (every open PR) would be worse than no
+    /// indicator at all. So: if `base` already resolves to `merge_base(base,
+    /// head)`, this bails to `Unsupported` rather than running a probe
+    /// that's guaranteed to lie — determining a REAL answer needs the
+    /// original, live base ref, which isn't recoverable from a resolved
+    /// `DiffSource::Range` alone. Callers holding that live ref (a PR's
+    /// freshly fetched `base_oid`, or a not-yet-resolved `--range a...b`
+    /// launch argument) use [`Self::conflict_probe_live`] directly instead,
+    /// skipping this guard entirely.
+    fn probe_range_conflict(&self, base: &str, head: &str) -> ConflictProbe {
+        match (self.resolve(base), self.merge_base(base, head)) {
+            (Ok(base_oid), Ok(merge_base_oid)) if base_oid == merge_base_oid => {
+                return ConflictProbe::Unsupported;
+            }
+            _ => {}
+        }
+        self.conflict_probe_live(base, head)
+    }
+
+    /// The raw `git merge-tree --write-tree --name-only <base> <head>`
+    /// probe, with NO ancestor guard — only call this with a `base` you
+    /// know reflects real, current state (a live branch/tag name, or a
+    /// freshly fetched PR base oid), never with a `DiffSource::Range`'s
+    /// stored `base` once it's been collapsed to a merge-base sha (see
+    /// [`Self::probe_range_conflict`]'s doc comment for exactly why that
+    /// specific input always comes back clean). `pub` so
+    /// `Workspace::open_pr`/`Workspace::new` (the two call sites that DO
+    /// hold a live base ref) can reach it directly.
+    pub fn conflict_probe_live(&self, base: &str, head: &str) -> ConflictProbe {
+        let root = self.root_arg();
+        let output = self.builder.run_allow_failure(
+            "git",
+            &[
+                "-C",
+                &root,
+                "merge-tree",
+                "--write-tree",
+                "--name-only",
+                base,
+                head,
+            ],
+        );
+        match output {
+            Ok(output) => crate::conflict::parse_merge_tree_probe(
+                output.success,
+                output.exit_code,
+                &output.stdout,
+            ),
+            Err(_) => ConflictProbe::Unsupported,
+        }
+    }
+
+    fn probe_index_conflict(&self) -> ConflictProbe {
+        let root = self.root_arg();
+        let output = self
+            .builder
+            .run_allow_failure("git", &["-C", &root, "ls-files", "-u", "-z"]);
+        match output {
+            Ok(output) => crate::conflict::parse_ls_files_u_probe(output.success, &output.stdout),
+            Err(_) => ConflictProbe::Unsupported,
+        }
     }
 
     /// Appends untracked (never-added) working-tree files — from

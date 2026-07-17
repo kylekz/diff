@@ -64,6 +64,21 @@ pub struct IndexEntry {
     /// omits the cluster.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub diffstat: Option<DiffTotals>,
+    /// Merge-conflict probe for this review's diff source (docs/backlog.md
+    /// "Merge-conflict indicator in the review navigator"), filled by
+    /// [`hydrate_location`] the same way `diffstat` is. **Deliberately
+    /// `#[serde(skip)]`** — unlike `diffstat`/`pr_status`, this is never
+    /// persisted to `review_index.json` at all (it's cheap to recompute
+    /// and, per the feature's scope note, meant to live ephemerally in the
+    /// index/workspace, not on disk): every load starts with `None` here
+    /// regardless of what a previous session computed, and the very next
+    /// hydration pass fills it back in. [`ReviewIndex::upsert`]/
+    /// [`ReviewIndex::apply_hydration`] still carry a live in-memory value
+    /// forward when an incoming entry lacks one, same carry-forward
+    /// reasoning as `diffstat` (a metadata-only refresh via `from_review`
+    /// must not blank out what the last hydration pass found).
+    #[serde(skip)]
+    pub conflict: Option<crate::conflict::ConflictInfo>,
     /// == [`Review::updated_ms`].
     pub updated_ms: u64,
     #[serde(default)]
@@ -204,6 +219,11 @@ impl ReviewIndex {
                 if entry.diffstat.is_none() {
                     entry.diffstat = self.entries[index].diffstat;
                 }
+                // Same carry-forward as `diffstat`, for the same reason —
+                // `from_review` never computes a conflict probe either.
+                if entry.conflict.is_none() {
+                    entry.conflict = self.entries[index].conflict.clone();
+                }
                 // App-managed flag — no upsert caller builds entries with a
                 // meaningful `archived`, so the existing value always wins
                 // (see the field's doc comment; `set_archived` is the only
@@ -306,6 +326,9 @@ impl ReviewIndex {
                             if entry.diffstat.is_none() {
                                 entry.diffstat = existing.diffstat;
                             }
+                            if entry.conflict.is_none() {
+                                entry.conflict = existing.conflict;
+                            }
                             entry.archived = existing.archived;
                             entry.health = EntryHealth::Ok;
                             kept.push(entry);
@@ -407,6 +430,7 @@ impl IndexEntry {
             remote: review.remote.clone(),
             pr_status: None,
             diffstat: None,
+            conflict: None,
             updated_ms: review.updated_ms,
             last_opened_ms: 0,
             health: EntryHealth::Ok,
@@ -441,6 +465,28 @@ pub fn hydrate_location(location: &RepoLocation) -> HydrateOutcome {
                         let mut entry = IndexEntry::from_review(location, r);
                         entry.diffstat =
                             repo.as_ref().and_then(|repo| repo.diffstat(&r.source).ok());
+                        // Cheap (one `merge-tree`/`ls-files` subprocess) —
+                        // computed unconditionally alongside the numstat
+                        // rather than gated behind its own opt-in. `None`
+                        // (`ConflictProbe::Unsupported` — no repo handle,
+                        // an old git, a transient WSL hiccup, OR (the
+                        // common case for a PR-linked review) `r.source`'s
+                        // `base` already collapsed to a frozen merge-base
+                        // sha — see `GitRepo::probe_range_conflict`'s doc
+                        // comment) leaves the card with no indicator.
+                        // KNOWN LIMITATION: this means the sidebar can
+                        // only ever show the conflict badge for a
+                        // PR-linked review while its workspace is actually
+                        // open — `Workspace::open_pr` probes against the
+                        // PR's live `base_oid` instead of `r.source`, which
+                        // this cheap headless pass has no way to fetch
+                        // without a `gh` network call. `apply_hydration`'s
+                        // carry-forward (mirroring `diffstat`'s) keeps
+                        // whatever a previous pass found instead of
+                        // blanking it.
+                        entry.conflict = repo
+                            .as_ref()
+                            .and_then(|repo| repo.conflict_probe(&r.source).info().cloned());
                         entry
                     })
                     .collect(),
@@ -567,6 +613,13 @@ mod tests {
                 additions: 12,
                 deletions: 3,
             }),
+            // Deliberately `None` here, not a sample value: `conflict` is
+            // `#[serde(skip)]` (see its field doc), so a `Some(...)` here
+            // would make `round_trips_through_json` fail for a reason
+            // that's the field's whole point, not a bug — see the
+            // dedicated `conflict_field_is_never_persisted` test below
+            // instead.
+            conflict: None,
             archived: false,
             updated_ms: 1_700_000_000_000,
             last_opened_ms: 1_700_000_000_500,
@@ -591,6 +644,25 @@ mod tests {
         let round_tripped: Persisted = serde_json::from_str(&json).unwrap();
         assert_eq!(round_tripped.v, INDEX_SCHEMA_VERSION);
         assert_eq!(round_tripped.entries, vec![entry]);
+    }
+
+    #[test]
+    fn conflict_field_is_never_persisted() {
+        // The whole point of `#[serde(skip)]` on `conflict` (docs/
+        // backlog.md "Merge-conflict indicator..."): a computed `Some(...)`
+        // must not survive a JSON round trip, unlike every other cache
+        // field (`diffstat`, `pr_status`) this struct carries.
+        let mut entry = sample_entry("r-1");
+        entry.conflict = Some(crate::conflict::ConflictInfo {
+            files: vec!["f.txt".to_string()],
+        });
+        let json = serde_json::to_string(&entry).unwrap();
+        assert!(
+            !json.contains("\"conflict\""),
+            "conflict must not appear as a JSON key at all, got: {json}"
+        );
+        let round_tripped: IndexEntry = serde_json::from_str(&json).unwrap();
+        assert!(round_tripped.conflict.is_none());
     }
 
     #[test]
@@ -912,6 +984,30 @@ mod tests {
     }
 
     #[test]
+    fn upsert_carries_conflict_forward_when_incoming_lacks_it() {
+        // Same reasoning as `upsert_carries_diffstat_forward_when_incoming_
+        // lacks_it`: `from_review` never sets `conflict` either, so a live
+        // metadata-only refresh must not blank a hydration pass's finding.
+        let mut index = ReviewIndex {
+            path: None,
+            entries: Vec::new(),
+        };
+        let mut hydrated = sample_entry("r-1");
+        hydrated.conflict = Some(crate::conflict::ConflictInfo {
+            files: vec!["f.txt".to_string()],
+        });
+        let cached = hydrated.conflict.clone();
+        index.upsert(hydrated, false);
+
+        let mut refresh = sample_entry("r-1");
+        refresh.conflict = None; // as `from_review` would produce
+        refresh.open_comments = 9;
+        index.upsert(refresh, false);
+        assert_eq!(index.entries()[0].conflict, cached);
+        assert_eq!(index.entries()[0].open_comments, 9);
+    }
+
+    #[test]
     fn apply_hydration_carries_diffstat_forward_when_fresh_lacks_it() {
         // A hydration pass where the numstat failed (repo open error, a
         // pruned PR head oid) produces `diffstat: None`; the previously
@@ -932,6 +1028,32 @@ mod tests {
         fresh.last_opened_ms = 0;
         index.apply_hydration(&loc, HydrateOutcome::Reviews(vec![fresh]));
         assert_eq!(index.get("r-1").unwrap().diffstat, cached);
+    }
+
+    #[test]
+    fn apply_hydration_carries_conflict_forward_when_fresh_lacks_it() {
+        // Same reasoning as the diffstat/pr_status carry-forward tests: a
+        // hydration pass that couldn't determine conflict state this time
+        // around (`ConflictProbe::Unsupported` — e.g. a transient WSL
+        // hiccup) must not erase a previously cached finding.
+        let loc = local("difftest");
+        let mut existing = sample_entry("r-1");
+        existing.location = loc.clone();
+        existing.conflict = Some(crate::conflict::ConflictInfo {
+            files: vec!["f.txt".to_string()],
+        });
+        let cached = existing.conflict.clone();
+        let mut index = ReviewIndex {
+            path: None,
+            entries: vec![existing],
+        };
+
+        let mut fresh = sample_entry("r-1");
+        fresh.location = loc.clone();
+        fresh.conflict = None;
+        fresh.last_opened_ms = 0;
+        index.apply_hydration(&loc, HydrateOutcome::Reviews(vec![fresh]));
+        assert_eq!(index.get("r-1").unwrap().conflict, cached);
     }
 
     #[test]

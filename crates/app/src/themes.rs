@@ -144,6 +144,16 @@ pub struct DvTheme {
     /// alpha-composite that is visible over any surface by construction.
     /// Dark themes keep their exact pre-existing `muted.background` pixels.
     pub surface_active: Hsla,
+    /// 1px seam border for modal panels sitting on `sidebar.background`
+    /// (pickers, settings, onboarding — R2 item 6's shared modal chrome).
+    /// Normally `muted.background` — the "soft lightened seam" the modal
+    /// recipe calls for, never `border` by default (Aura Dark defines
+    /// `border` as #000000) — but under the same Claude Light collision
+    /// `surface_active` documents above, a `muted` border on a `sidebar`
+    /// panel paints the panel's own color and the seam vanishes (R2 visual
+    /// review, P3). Claude Light's `border` (#e3e1d7) is a perfectly good
+    /// seam, so the collision case falls back to it.
+    pub modal_border: Hsla,
     /// Absent side of a one-sided split-view row — `recess_bg` @ 0.60.
     pub void_bg: Hsla,
     /// Modal/palette dimming scrim — `recess_bg` @ 0.67 on dark themes,
@@ -218,11 +228,17 @@ impl DvTheme {
         } else {
             theme.muted
         };
+        let modal_border = if theme.muted == theme.sidebar {
+            theme.border
+        } else {
+            theme.muted
+        };
 
         DvTheme {
             recess_bg,
             text_secondary,
             surface_active,
+            modal_border,
             word_created_bg: theme.success.opacity(0.28),
             word_deleted_bg: theme.danger.opacity(0.28),
             void_bg: recess_bg.opacity(0.60),
@@ -427,6 +443,25 @@ mod tests {
                 theme.foreground.opacity(0.30)
             };
             assert_eq!(dv.backdrop, expected_backdrop, "{}: backdrop", entry.name);
+
+            // modal_border: `muted` normally; Claude Light's muted ==
+            // sidebar collision falls back to `border` so the panel seam
+            // never paints the panel's own color (R2 visual review, P3).
+            let expected_seam = if theme.muted == theme.sidebar {
+                theme.border
+            } else {
+                theme.muted
+            };
+            assert_eq!(
+                dv.modal_border, expected_seam,
+                "{}: modal_border",
+                entry.name
+            );
+            assert_ne!(
+                dv.modal_border, theme.sidebar,
+                "{}: a modal panel's seam must never equal its own background",
+                entry.name
+            );
         }
     }
 

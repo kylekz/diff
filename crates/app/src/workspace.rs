@@ -2918,6 +2918,19 @@ impl Workspace {
     /// draft review it links to (docs/phase-3-github.md deliverable 2).
     /// Reused by the GUI PR picker, `dv pr <number|url>`'s launch path, and
     /// the `open_pr` automation command.
+    /// Whether [`Self::open_pr`] would currently refuse — its in-flight
+    /// save/submit/already-loading guards, which `open_pr` applies
+    /// SILENTLY (correct for the PR picker, which stays open and
+    /// retriable). For callers that consume user input on dispatch (the
+    /// shell's quick-open clears its field), so they can surface "busy"
+    /// instead of eating the input (R2 review, P3).
+    pub(crate) fn pr_open_busy(&self) -> bool {
+        self.editor.as_ref().is_some_and(|e| e.saving)
+            || self.thread_input.as_ref().is_some_and(|t| t.saving)
+            || self.submit_in_flight()
+            || self.pr_loading.is_some()
+    }
+
     pub(crate) fn open_pr(&mut self, number: u64, window: &mut Window, cx: &mut Context<Self>) {
         // Same contract as `select_file`: a save in flight must never be
         // dropped. Refuse the whole open rather than orphan it (review
@@ -7137,6 +7150,7 @@ impl Workspace {
         let theme = cx.theme();
         let dv = crate::themes::dv_theme(cx);
         let surface_active = dv.surface_active;
+        let seam = dv.modal_border;
 
         // Keep the selection visible within the capped row window.
         let first = palette.selected.saturating_sub(VISIBLE - 1);
@@ -7148,9 +7162,11 @@ impl Workspace {
             .take(VISIBLE)
             .map(|(match_ix, &file_ix)| {
                 let selected = match_ix == palette.selected;
+                // No w_full alongside mx_1 — see the theme-picker row's
+                // comment (R2 review, P2: the pair overflows the right
+                // inset by the margin width).
                 div()
                     .id(("palette-row", match_ix))
-                    .w_full()
                     .h(px(30.))
                     .mx_1()
                     .px_2()
@@ -7214,9 +7230,21 @@ impl Workspace {
                                 .text_color(theme.foreground)
                                 .text_size(px(13.))
                                 .border_1()
-                                .border_color(theme.muted)
+                                .border_color(seam)
                                 .rounded_lg()
                                 .shadow_lg()
+                                // 11px caption like the other two pickers —
+                                // the shared recipe's caption row (R2
+                                // review, P3: this panel was the only one
+                                // missing it).
+                                .child(
+                                    div()
+                                        .px_2()
+                                        .pt_1()
+                                        .text_size(px(11.))
+                                        .text_color(theme.muted_foreground)
+                                        .child("Jump to file \u{b7} enter to open, esc to close"),
+                                )
                                 .child(gpui_component::input::Input::new(&palette.input).small())
                                 .child(v_flex().w_full().children(rows).when(
                                     palette.matches.is_empty(),
@@ -7666,13 +7694,13 @@ impl Workspace {
         let picker = self.pr_picker.as_ref()?;
 
         let theme = cx.theme();
-        let seam = theme.muted;
         let panel_bg = theme.sidebar;
         let fg = theme.foreground;
         let muted = theme.muted_foreground;
         let danger = theme.danger;
         let mono = theme.mono_font_family.clone();
         let dv = crate::themes::dv_theme(cx);
+        let seam = dv.modal_border;
         let backdrop = dv.backdrop;
         let surface_active = dv.surface_active;
 
@@ -7751,9 +7779,10 @@ impl Workspace {
                             |(i, pr)| {
                                 let selected = i == picker.selected;
                                 let number = pr.number;
+                                // No w_full alongside mx_1 — see the
+                                // theme-picker row's comment (R2 review, P2).
                                 h_flex()
                                     .id(("pr-picker-row", i))
-                                    .w_full()
                                     .h(px(30.))
                                     .mx_1()
                                     .gap_2()
@@ -7786,10 +7815,12 @@ impl Workspace {
                                     .when(pr.is_draft, |el| {
                                         el.child(state_pill(muted, "draft").flex_none())
                                     })
+                                    // Base panel size (13px), muted — row
+                                    // metadata stays at base size (R2
+                                    // visual review nit; was text_xs).
                                     .child(
                                         div()
                                             .flex_none()
-                                            .text_xs()
                                             .text_color(muted)
                                             .child(format!("by {}", pr.author)),
                                     )

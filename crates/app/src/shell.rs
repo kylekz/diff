@@ -2563,6 +2563,18 @@ impl AppShell {
                     );
                     return;
                 };
+                // `open_pr` refuses SILENTLY when a save/submit/PR-load is
+                // in flight — fine for the picker (it stays open,
+                // retriable), fatal here where the input was about to be
+                // cleared: the typed target would vanish with no action
+                // and no error (R2 review, P3). Check first.
+                if ws.read(cx).pr_open_busy() {
+                    self.set_quick_open_error(
+                        "busy — a comment save or PR load is in flight; try again in a moment",
+                        cx,
+                    );
+                    return;
+                }
                 self.clear_quick_open(window, cx);
                 // The active workspace's own PR-open path (same one the
                 // ctrl-g picker's Enter uses) — validates in-flight
@@ -2576,11 +2588,19 @@ impl AppShell {
                 number,
             } => {
                 let slug = format!("{host}/{owner}/{repo}");
+                // Case-insensitive: origin-URL casing drifts for the same
+                // GitHub repo — the same precedent as `load_pr`'s adoption
+                // scan and `sync_index_pr_status` (both eq_ignore_ascii_case
+                // their slugs; R2 review, P3).
                 let location = self
                     .index
                     .entries()
                     .iter()
-                    .find(|e| e.remote.as_ref().is_some_and(|r| r.slug == slug))
+                    .find(|e| {
+                        e.remote
+                            .as_ref()
+                            .is_some_and(|r| r.slug.eq_ignore_ascii_case(&slug))
+                    })
                     .map(|e| e.location.clone());
                 let Some(location) = location else {
                     self.set_quick_open_error(
@@ -2591,16 +2611,46 @@ impl AppShell {
                     );
                     return;
                 };
-                self.clear_quick_open(window, cx);
-                if self
-                    .active
-                    .as_ref()
-                    .is_some_and(|ws| ws.read(cx).location() == &location)
-                {
-                    if let Some(ws) = self.active.clone() {
-                        ws.update(cx, |ws, cx| ws.open_pr(number, window, cx));
+                // "Same repo" by slug identity, NOT `RepoLocation` equality:
+                // the workspace's location is rev-parse-normalized while
+                // the index entry keeps whatever spelling hydration saw —
+                // the exact textual-divergence trap `refresh_badge`'s
+                // lookup documents. A false miss here wouldn't just be
+                // slow: it would stash the active workspace and cold-build
+                // a DUPLICATE workspace for the repo that's already open
+                // (R2 review, P3). A slug-less active review (plain local,
+                // no PR linkage) falls back to location equality — its
+                // repo can still be the target's host clone.
+                let same_repo = self.active.is_some() && {
+                    let active_slug = self
+                        .selected_review_id
+                        .as_deref()
+                        .and_then(|id| self.index.get(id))
+                        .and_then(|e| e.remote.as_ref().map(|r| r.slug.clone()));
+                    match active_slug {
+                        Some(active) => active.eq_ignore_ascii_case(&slug),
+                        None => self
+                            .active
+                            .as_ref()
+                            .is_some_and(|ws| ws.read(cx).location() == &location),
                     }
+                };
+                if same_repo {
+                    let Some(ws) = self.active.clone() else {
+                        return;
+                    };
+                    // Same silent-refusal guard as the PrNumber arm above.
+                    if ws.read(cx).pr_open_busy() {
+                        self.set_quick_open_error(
+                            "busy — a comment save or PR load is in flight; try again in a moment",
+                            cx,
+                        );
+                        return;
+                    }
+                    self.clear_quick_open(window, cx);
+                    ws.update(cx, |ws, cx| ws.open_pr(number, window, cx));
                 } else {
+                    self.clear_quick_open(window, cx);
                     // A different (or no) active repo: the `dv pr <n>`
                     // launch shape — fresh workspace for that location with
                     // the PR fetch pending (`open_review`'s cache-miss
@@ -3061,7 +3111,7 @@ impl AppShell {
                 let visible = value
                     .as_bool()
                     .ok_or_else(|| anyhow::anyhow!("sidebar_visible must be a bool"))?;
-                self.set_sidebar_visible(visible, cx);
+                self.set_sidebar_visible(visible, window, cx);
             }
             "sidebar_grouping" => {
                 let requested = value
@@ -3767,9 +3817,14 @@ impl AppShell {
         cx.notify();
     }
 
-    fn on_toggle_sidebar(&mut self, _: &ToggleSidebar, _: &mut Window, cx: &mut Context<Self>) {
+    fn on_toggle_sidebar(
+        &mut self,
+        _: &ToggleSidebar,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let visible = !self.settings.sidebar_visible;
-        self.set_sidebar_visible(visible, cx);
+        self.set_sidebar_visible(visible, window, cx);
     }
 
     /// Sidebar hide/show (ctrl-b, R2). Hidden means
@@ -3777,7 +3832,7 @@ impl AppShell {
     /// asked to lay out into a zero box and the drag handle can't resurrect
     /// a "hidden" sidebar by widening it. Also closes the filter popover:
     /// it's an overlay anchored to a sidebar button that no longer exists.
-    fn set_sidebar_visible(&mut self, visible: bool, cx: &mut Context<Self>) {
+    fn set_sidebar_visible(&mut self, visible: bool, window: &mut Window, cx: &mut Context<Self>) {
         if self.settings.sidebar_visible == visible {
             return;
         }
@@ -3785,6 +3840,22 @@ impl AppShell {
         self.settings.save();
         if !visible {
             self.close_filter_popover(cx);
+            // The quick-open input is the sidebar's only focus sink, and
+            // gpui does NOT blur a focus whose element unmounts — key
+            // dispatch falls back to the window ROOT node, above every
+            // context-scoped binding in this app, so hiding the sidebar
+            // while the input held focus left the ENTIRE keyboard dead
+            // (ctrl-b itself included) until a mouse click (R2 review,
+            // P2). Land focus where closing any shell overlay does.
+            if self.quick_open.focus_handle(cx).is_focused(window) {
+                match &self.active {
+                    Some(ws) => {
+                        let handle = ws.focus_handle(cx);
+                        window.focus(&handle, cx);
+                    }
+                    None => window.focus(&self.focus_handle, cx),
+                }
+            }
         }
         cx.notify();
     }
@@ -4482,12 +4553,12 @@ impl AppShell {
         let picker = self.theme_picker.as_ref()?;
 
         let theme = cx.theme();
-        let seam = theme.muted;
         let panel_bg = theme.sidebar;
         let fg = theme.foreground;
         let muted = theme.muted_foreground;
         let success = theme.success;
         let dv = themes::dv_theme(cx);
+        let seam = dv.modal_border;
         let backdrop = dv.backdrop;
         let surface_active = dv.surface_active;
         let active_theme = self.settings.theme.clone();
@@ -4542,9 +4613,14 @@ impl AppShell {
                                     themes::names().enumerate().map(|(i, name)| {
                                         let selected = i == picker.selected;
                                         let is_active = name == active_theme;
+                                        // No w_full alongside mx_1: 100%
+                                        // width PLUS margins overflows the
+                                        // content box 4px past the right
+                                        // inset (R2 review, P2) — flex
+                                        // stretch alone sizes the row to
+                                        // content-box minus margins.
                                         h_flex()
                                             .id(("theme-picker-row", i))
-                                            .w_full()
                                             .h(px(30.))
                                             .mx_1()
                                             .gap_2()
@@ -4594,9 +4670,9 @@ impl AppShell {
 
         let theme = cx.theme();
         // R2 item 6: the modal chrome tokens the pickers standardized on
-        // (dv `backdrop` scrim, `sidebar` panel, `muted` seam border) —
+        // (dv `backdrop` scrim, `sidebar` panel, `modal_border` seam) —
         // one modal recipe app-wide.
-        let border = theme.muted;
+        let border = themes::dv_theme(cx).modal_border;
         let popover = theme.sidebar;
         let popover_fg = theme.foreground;
         let muted = theme.muted_foreground;
@@ -4949,7 +5025,7 @@ impl AppShell {
         let theme = cx.theme();
         // Same app-wide modal chrome as the pickers/settings panel (R2
         // item 6) — see `render_settings_panel`.
-        let border = theme.muted;
+        let border = themes::dv_theme(cx).modal_border;
         let popover = theme.sidebar;
         let popover_fg = theme.foreground;
         let muted = theme.muted_foreground;

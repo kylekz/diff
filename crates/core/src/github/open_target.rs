@@ -56,8 +56,13 @@ pub fn parse_open_target(input: &str) -> Result<OpenTarget, String> {
             // by taking leading digits only.
             let digits: String = parts[4].chars().take_while(char::is_ascii_digit).collect();
             if let Ok(number) = digits.parse::<u64>() {
+                // Strip a `:port` — `RepoSlug::parse_remote_url` does the
+                // same, so a stored `RemoteRef::slug` never carries one; a
+                // ported enterprise URL could otherwise never match any
+                // known clone (R2 review, P3).
+                let host = parts[0].split(':').next().unwrap_or(parts[0]);
                 return Ok(OpenTarget::Pr {
-                    host: parts[0].to_string(),
+                    host: host.to_string(),
                     owner: parts[1].to_string(),
                     repo: parts[2].to_string(),
                     number,
@@ -146,6 +151,16 @@ mod tests {
     fn parses_enterprise_host_url() {
         assert_eq!(
             parse_open_target("https://ghe.corp.com/team/svc/pull/42"),
+            Ok(pr("ghe.corp.com", "team", "svc", 42))
+        );
+    }
+
+    #[test]
+    fn enterprise_url_port_is_stripped_to_match_stored_slugs() {
+        // `RepoSlug::parse_remote_url` strips ports, so stored slugs never
+        // carry one — the parsed host must match that convention.
+        assert_eq!(
+            parse_open_target("https://ghe.corp.com:8443/team/svc/pull/42"),
             Ok(pr("ghe.corp.com", "team", "svc", 42))
         );
     }

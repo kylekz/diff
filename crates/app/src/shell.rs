@@ -13,6 +13,7 @@ use gpui::prelude::FluentBuilder;
 use gpui::*;
 use gpui_component::button::{Button, ButtonVariants};
 use gpui_component::input::{Input, InputEvent, InputState};
+use gpui_component::kbd::Kbd;
 use gpui_component::tag::Tag;
 use gpui_component::{
     ActiveTheme, Selectable as _, Sizable as _, StyledExt, TitleBar, h_flex, v_flex,
@@ -76,7 +77,7 @@ const ONBOARDING_CONTEXT: &str = "OnboardingOpen";
 /// natural height would desync scrolling for the rest of the list. Fixing
 /// both to the same explicit height sidesteps that outright rather than
 /// trying to keep two different elements' natural sizes in lockstep.
-const SIDEBAR_ROW_HEIGHT: f32 = 52.;
+const SIDEBAR_ROW_HEIGHT: f32 = 46.;
 
 // Font-size/context-lines clamp bounds (`MONO_FONT_SIZE_MIN`/`_MAX`,
 // `CONTEXT_LINES_MIN`/`_MAX`) live in `settings.rs` now — shared with
@@ -566,6 +567,15 @@ pub(crate) fn state_pill(color: Hsla, label: impl Into<SharedString>) -> Tag {
         .child(label.into())
 }
 
+/// [`state_pill`] carrying an icon instead of text — for marks whose obvious
+/// glyph the UI font doesn't reliably cover (U+2713 rendered as tofu inside
+/// the small Tag; R1e visual review, P3). Same recipe, an `Icon` child.
+pub(crate) fn state_pill_icon(color: Hsla, icon: gpui_component::IconName) -> Tag {
+    Tag::custom(color.opacity(0.15), color, color.opacity(0.4))
+        .small()
+        .child(gpui_component::Icon::new(icon).xsmall())
+}
+
 /// PR state pill label + color (draft/open/merged/closed), shared by the
 /// sidebar's PR-status cluster ([`render_pr_glyphs`]) and the workspace's
 /// title-bar-anatomy header (`Workspace::render_header`, R1c) — both used to
@@ -618,9 +628,12 @@ fn render_pr_glyphs(
 ) -> impl IntoElement {
     let (state_label, state_color) =
         pr_state_pill(is_draft, state, muted, success, danger, accent_alt);
+    // Approved renders an `Icon` check, not U+2713 text — the UI font
+    // tofu'd the glyph at Tag size (R1e visual review, P3). "±" stays text:
+    // Latin-1, universally covered.
     let decision_pill = match decision {
-        Some(ReviewDecision::Approved) => Some(("\u{2713}", success)),
-        Some(ReviewDecision::ChangesRequested) => Some(("\u{b1}", danger)),
+        Some(ReviewDecision::Approved) => Some((None, success)),
+        Some(ReviewDecision::ChangesRequested) => Some((Some("\u{b1}"), danger)),
         Some(ReviewDecision::ReviewRequired) | None => None,
     };
     let ci_color = match checks {
@@ -635,7 +648,10 @@ fn render_pr_glyphs(
         .gap_1()
         .items_center()
         .child(state_pill(state_color, state_label))
-        .children(decision_pill.map(|(glyph, color)| state_pill(color, glyph)))
+        .children(decision_pill.map(|(glyph, color)| match glyph {
+            Some(glyph) => state_pill(color, glyph),
+            None => state_pill_icon(color, gpui_component::IconName::Check),
+        }))
         // Small square (▪), not a dot — kept from the old glyph cluster so
         // the CI marker never reads as a second, indistinguishable copy of
         // the state pill's own color (review finding P3-2, from the retired
@@ -3739,13 +3755,24 @@ impl AppShell {
     }
 
     /// One two-line review card (docs/phase-6-review-navigator.md
-    /// deliverable 2's user sketch): line 1 is `repo_label`(muted) left +
-    /// `relative_age`(muted) right; line 2 is the review's derived title
-    /// (semibold, truncating) left + a status cluster right (health warning,
-    /// PR glyphs, open-comment pill/submitted check). Colors are snapshotted
-    /// as owned locals up front — holding `&Theme` across the card's own
-    /// `cx.listener` setup below is a borrow-check error (CLAUDE.md's gpui
-    /// gotcha; same pattern as `render_summary`/`render_split_row`).
+    /// deliverable 2's user sketch, densified by R1e):
+    /// an 8px status dot (review/PR state
+    /// color — [`pr_state_pill`]'s color for a PR-linked review, `warning`
+    /// when the repo went unavailable, `primary` for a plain local review,
+    /// matching R1c's "local" title-bar Tag) + `repo_label` + `relative_age`
+    /// on line 1, both in `text_secondary` (dv's new second dim-text tier,
+    /// R1a); line 2 is the review's derived title, demoted to a
+    /// "nested/secondary line" treatment — 11px, `text_secondary`, no longer
+    /// bold — left, + a status cluster right (health warning, PR glyphs,
+    /// open-comment pill/submitted check) unaffected by that demotion since
+    /// those are [`state_pill`] Tags with their own tinted colors regardless
+    /// of the row's text color. Row chrome is the shared rounded/hover recipe
+    /// (`mx_1 px_2 py_1 rounded_md`, active/hover on `muted.background`
+    /// rather than dv's old `accent` selection color). Colors are
+    /// snapshotted as owned locals up front — holding `&Theme` across the
+    /// card's own `cx.listener` setup below is a borrow-check error
+    /// (CLAUDE.md's gpui gotcha; same pattern as `render_summary`/
+    /// `render_split_row`).
     fn render_review_card(
         &self,
         entry: &dv_core::IndexEntry,
@@ -3753,13 +3780,19 @@ impl AppShell {
         cx: &mut Context<Self>,
     ) -> impl IntoElement + use<> {
         let theme = cx.theme();
-        let accent = theme.accent;
-        let muted = theme.muted_foreground;
+        // Row hover/active fills use DvTheme's surface_active (NOT
+        // muted.background directly — Claude Light defines that identical to
+        // sidebar.background, which made selection invisible; R1e review).
+        let muted_fg = theme.muted_foreground;
         let primary = theme.primary;
         let success = theme.success;
         let warning = theme.warning;
         let danger = theme.danger;
-        let accent_alt = themes::dv_theme(cx).accent_alt;
+        let dv = themes::dv_theme(cx);
+        let accent_alt = dv.accent_alt;
+        let text_secondary = dv.text_secondary;
+        let surface_active = dv.surface_active;
+        let foreground = theme.foreground;
 
         let review_id = entry.review_id.clone();
         let repo = dv_core::repo_label(&entry.location, entry.remote.as_ref());
@@ -3770,18 +3803,34 @@ impl AppShell {
         let unavailable = entry.health == dv_core::EntryHealth::RepoUnavailable;
         let pr = entry.pr_status.clone();
 
+        // Same state → color mapping the PR-status pill cluster below uses
+        // for a PR-linked review ([`pr_state_pill`]); `warning` for a
+        // repo-unavailable entry mirrors the existing health-warning glyph
+        // on line 2, and `primary` for a plain local review matches R1c's
+        // "local" Tag color — every review gets a dot, not just PR ones.
+        let dot_color = if unavailable {
+            warning
+        } else if let Some(pr) = pr.as_ref() {
+            pr_state_pill(pr.is_draft, pr.state, muted_fg, success, danger, accent_alt).1
+        } else {
+            primary
+        };
+
         v_flex()
             .id(SharedString::from(format!("review-card-{review_id}")))
             .w_full()
             .h(px(SIDEBAR_ROW_HEIGHT))
             .justify_center()
+            // No mx here: uniform_list items are laid out as taffy ROOT
+            // nodes, whose margins are computed but never applied (R1e code
+            // review, P3) — the side inset comes from the list's own
+            // px_2 instead.
             .px_2()
-            .py_1p5()
-            .gap_0p5()
+            .py_1()
             .rounded_md()
             .cursor_pointer()
-            .when(selected, |el| el.bg(accent))
-            .hover(|el| el.bg(accent.opacity(0.5)))
+            .when(selected, |el| el.bg(surface_active))
+            .hover(|el| el.bg(surface_active.opacity(0.5)))
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(move |this, _, window, cx| {
@@ -3792,22 +3841,39 @@ impl AppShell {
                 h_flex()
                     .w_full()
                     .gap_2()
+                    .items_center()
                     .text_xs()
-                    .text_color(muted)
+                    // Line 1 carries the row's identity — near-full
+                    // foreground, the bright-label tier; only the
+                    // trailing age stays dim (R1e visual review, P2: an
+                    // all-text_secondary card flattened the hierarchy).
+                    .text_color(foreground)
+                    .child(
+                        div()
+                            .flex_none()
+                            .w(px(8.))
+                            .h(px(8.))
+                            .rounded_full()
+                            .bg(dot_color),
+                    )
                     .child(div().flex_1().min_w(px(0.)).truncate().child(repo))
-                    .child(div().flex_none().child(age)),
+                    .child(div().flex_none().text_color(text_secondary).child(age)),
             )
             .child(
                 h_flex()
                     .w_full()
+                    // 8px dot + gap_2 = line-1 text starts at 16px; indent
+                    // the nested line to align under it (the pl(16px)
+                    // nested-line treatment — R1e visual review, P2).
+                    .pl(px(16.))
                     .gap_2()
                     .items_center()
                     .child(
                         div()
                             .flex_1()
                             .min_w(px(0.))
-                            .text_sm()
-                            .font_semibold()
+                            .text_size(px(11.))
+                            .text_color(text_secondary)
                             .truncate()
                             .child(title),
                     )
@@ -3825,7 +3891,7 @@ impl AppShell {
                                     pr.state,
                                     pr.decision,
                                     pr.checks,
-                                    muted,
+                                    muted_fg,
                                     success,
                                     danger,
                                     warning,
@@ -3835,7 +3901,8 @@ impl AppShell {
                             .child(if open_comments > 0 {
                                 state_pill(primary, format!("{open_comments}")).into_any_element()
                             } else if submitted {
-                                state_pill(success, "\u{2713}").into_any_element()
+                                state_pill_icon(success, gpui_component::IconName::Check)
+                                    .into_any_element()
                             } else {
                                 div().into_any_element()
                             }),
@@ -3847,7 +3914,11 @@ impl AppShell {
     /// `sidebar_grouping` is non-`None` (docs/phase-6-review-navigator.md
     /// deliverable 3) — fixed to [`SIDEBAR_ROW_HEIGHT`], the same height as
     /// [`Self::render_review_card`] (see that constant's doc comment for
-    /// why `uniform_list`'s scroll math requires it).
+    /// why `uniform_list`'s scroll math requires it). Restyled by R1e to
+    /// a dim directory-header treatment
+    /// ("nested line pl(16px) 11px text_secondary") — 11px,
+    /// `text_secondary` rather than the old bold `muted.foreground`, since
+    /// dv's group headers play a "quiet section label" role.
     ///
     /// The gpui element id is built from `key`, never `label`: two distinct
     /// groups can share an identical display label (`Pr` grouping's label
@@ -3862,7 +3933,7 @@ impl AppShell {
         label: SharedString,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
-        let muted = cx.theme().muted_foreground;
+        let text_secondary = themes::dv_theme(cx).text_secondary;
         let id = SharedString::from(format!("sidebar-header-{key}"));
         div()
             .id(id)
@@ -3871,9 +3942,8 @@ impl AppShell {
             .flex()
             .items_center()
             .px_2()
-            .text_xs()
-            .font_semibold()
-            .text_color(muted)
+            .text_size(px(11.))
+            .text_color(text_secondary)
             .truncate()
             .child(label)
     }
@@ -4756,6 +4826,67 @@ impl AppShell {
             )
             .children(detail.map(|d| div().text_xs().text_color(detail_color).child(d)))
     }
+
+    /// Bottom status-bar keycap legend
+    /// (R1f): a fixed 28px strip
+    /// of outlined keycap chips + dim labels listing dv's real shortcuts. A
+    /// static, hand-maintained list — deliberately
+    /// NOT a bindings-registry reflection (the plan's key_signatures forbid
+    /// over-engineering this). Keep in sync with `init`'s `bind_keys` and
+    /// workspace.rs's own bindings when those change — the R1f code review
+    /// caught a "c → comment" chip here for a binding that doesn't exist
+    /// (comments are mouse-drag only); every entry below is a real binding.
+    ///
+    /// Chips are hand-styled (not `Kbd`'s default appearance) in an
+    /// outlined-transparent recipe — 1px border, footer-bg interior — using
+    /// `Kbd::format` for the platform keystroke text. Border/labels use
+    /// `muted.foreground` alphas rather than `muted.background`, which
+    /// Claude Light defines identical to `sidebar.background` (the R1f
+    /// visual review's invisible-chip P2).
+    fn render_footer(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = cx.theme();
+        let muted_fg = theme.muted_foreground;
+        let chip_border = muted_fg.opacity(0.35);
+        let hint = move |keys: &[&str], label: &'static str| {
+            let mut hint = h_flex().items_center().gap_1();
+            for key in keys {
+                if let Ok(stroke) = gpui::Keystroke::parse(key) {
+                    hint = hint.child(
+                        div()
+                            .flex_none()
+                            .px_1()
+                            .rounded_sm()
+                            .border_1()
+                            .border_color(chip_border)
+                            .text_size(px(11.))
+                            .text_color(muted_fg)
+                            .child(Kbd::format(&stroke)),
+                    );
+                }
+            }
+            hint.child(div().text_color(muted_fg).child(SharedString::from(label)))
+        };
+        h_flex()
+            .h(px(28.))
+            .flex_none()
+            .items_center()
+            .gap_4()
+            .px_3()
+            .overflow_hidden()
+            .bg(theme.sidebar)
+            .border_t_1()
+            .border_color(muted_fg.opacity(0.25))
+            .text_size(px(12.))
+            .child(hint(&["j", "k"], "files"))
+            .child(hint(&["n", "p"], "hunks"))
+            .child(hint(&["s"], "split"))
+            .child(hint(&["r"], "review"))
+            .child(hint(&["f"], "jump"))
+            .child(hint(&["ctrl-g"], "PRs"))
+            .child(hint(&["ctrl-,"], "settings"))
+            .child(hint(&["ctrl-shift-t"], "theme"))
+            .child(hint(&["escape"], "close"))
+    }
 }
 
 impl Render for AppShell {
@@ -4870,12 +5001,25 @@ impl Render for AppShell {
                             .flex_none()
                             .relative()
                             .border_r_1()
-                            .border_color(theme.border)
+                            // muted, not `border`: Aura Dark defines
+                            // `border` as #000000 (a called-out
+                            // trap) — the divider should read as a soft
+                            // lightened seam.
+                            .border_color(theme.muted)
                             .bg(theme.sidebar)
                             .child(
                                 div().p_2().w_full().child(
+                                    // Quiet chrome (per the
+                                    // Sidebar's density pass, R1e): an
+                                    // outlined `primary` rather than a
+                                    // solid-filled one — still the row's
+                                    // most prominent control, but no longer
+                                    // a heavy block sitting above the dense,
+                                    // low-contrast card list below it.
                                     Button::new("new-review")
                                         .primary()
+                                        .outline()
+                                        .small()
                                         .w_full()
                                         .label("New Review")
                                         .on_click(cx.listener(|this, _, window, cx| {
@@ -4967,7 +5111,11 @@ impl Render for AppShell {
                                     ),
                                 )
                                 .flex_1()
-                                .px_1(),
+                                // px_2, not px_1: carries the side inset the
+                                // card itself cannot (root-node margins are
+                                // inert in uniform_list — see
+                                // render_review_card).
+                                .px_2(),
                             )
                             .child(self.render_sidebar_resize_handle(cx)),
                     )
@@ -4982,6 +5130,7 @@ impl Render for AppShell {
                             .child(main),
                     ),
             )
+            .child(self.render_footer(cx))
             .children(self.render_theme_picker(cx))
             .children(self.render_settings_panel(cx))
             .children(self.render_onboarding(cx))

@@ -135,6 +135,15 @@ pub struct DvTheme {
     pub word_created_bg: Hsla,
     /// Word-level intraline tint for removed text — `danger` @ 0.28.
     pub word_deleted_bg: Hsla,
+    /// Selected/hover fill for rows sitting ON `sidebar.background` (review
+    /// cards, file-tree rows, footer keycap chips). Normally just
+    /// `muted.background` — but Claude Light defines `muted.background` ==
+    /// `sidebar.background` (#f0eee6), which made every muted-filled state
+    /// on a sidebar surface literally invisible (R1e/R1f visual review, P2).
+    /// When the two collide, falls back to `foreground` @ 0.10 — an
+    /// alpha-composite that is visible over any surface by construction.
+    /// Dark themes keep their exact pre-existing `muted.background` pixels.
+    pub surface_active: Hsla,
     /// Absent side of a one-sided split-view row — `recess_bg` @ 0.60.
     pub void_bg: Hsla,
     /// Modal/palette dimming scrim — `recess_bg` @ 0.67 on dark themes,
@@ -204,9 +213,16 @@ impl DvTheme {
         // an override here.
         let accent_alt = parse(&overrides.accent_alt).unwrap_or(theme.magenta);
 
+        let surface_active = if theme.muted == theme.sidebar {
+            theme.foreground.opacity(0.10)
+        } else {
+            theme.muted
+        };
+
         DvTheme {
             recess_bg,
             text_secondary,
+            surface_active,
             word_created_bg: theme.success.opacity(0.28),
             word_deleted_bg: theme.danger.opacity(0.28),
             void_bg: recess_bg.opacity(0.60),

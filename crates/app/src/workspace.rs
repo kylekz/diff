@@ -103,6 +103,14 @@ fn gutter_width(font_size: f32) -> f32 {
 fn marker_width(font_size: f32) -> f32 {
     font_size * 2.0
 }
+/// Sidebar file-tree row height (24px, per the reference design's file
+/// tree). Unlike [`row_height`] above, this is a plain UI-chrome
+/// constant — like `shell::SIDEBAR_ROW_HEIGHT` — rather than one
+/// scaled off the `mono_font_size` setting: the file tree renders at the
+/// regular UI text size, not the diff pane's mono font, so it isn't the
+/// settings knob the row-height-scaling guarantee (CLAUDE.md
+/// cross-cutting risks) is protecting.
+const FILE_TREE_ROW_HEIGHT: f32 = 24.0;
 /// Blank leading spacer that aligns a comment thread/editor card's left
 /// edge with where a diff row's CODE TEXT begins, rather than with its
 /// line numbers (the reference design's "72px blank gutter spacer" at
@@ -7819,9 +7827,19 @@ impl Workspace {
         )
     }
 
+    /// One file-tree row, restyled by R1e to the reference design's
+    /// file-tree anatomy:
+    /// [`FILE_TREE_ROW_HEIGHT`] (24px, independent of the
+    /// diff pane's font-size-scaled [`row_height`]), the filename itself
+    /// carrying the status color rather than a separate badge — the tree
+    /// row never pairs a letter pill with the filename, so matching that
+    /// look means dropping the pill this row used pre-R1e (the underlying
+    /// `file.status` is unaffected — only this row's render changes; see
+    /// [`Self::render_file_diff_header`]'s doc comment, updated alongside
+    /// this one, for the surface that DOES keep a pill) — plus this file's
+    /// own `+N`/`−N` at 70% opacity, right-aligned, when its diff happens to
+    /// already be loaded.
     fn render_file_row(&self, index: usize, cx: &mut Context<Self>) -> impl IntoElement + use<> {
-        use crate::shell::state_pill;
-
         let file = &self.files[index];
         let theme = cx.theme();
         let selected = self.selected == Some(index);
@@ -7829,43 +7847,93 @@ impl Workspace {
         // `&Theme`/`&DvTheme` reads, so they coexist fine) — the `cx.listener`
         // below needs `cx` mutably, so nothing borrowed from it can still be
         // live by then (this file's usual gpui gotcha).
-        let accent_alt = crate::themes::dv_theme(cx).accent_alt;
-        // Badge-mapping rule: renamed shares the
-        // merged-PR pill's `accent_alt` "purple link" hue (`shell::
+        let dv = crate::themes::dv_theme(cx);
+        let accent_alt = dv.accent_alt;
+        let text_secondary = dv.text_secondary;
+        let surface_active = dv.surface_active;
+        // File-tree status-color mapping: renamed
+        // shares the merged-PR pill's `accent_alt` "purple link" hue (`shell::
         // render_pr_glyphs`); copied is grouped with it (also a path-linkage
         // status, no separate slot in the spec's table). Type-change/unmerged/
         // unknown aren't in that table either — kept at their pre-restyle
         // colors (the same warning/danger/muted buckets they already used).
-        let (glyph, color) = match file.status {
-            ChangeStatus::Added => ("A", theme.success),
-            ChangeStatus::Deleted => ("D", theme.danger),
-            ChangeStatus::Renamed => ("R", accent_alt),
-            ChangeStatus::Copied => ("C", accent_alt),
-            ChangeStatus::Modified => ("M", theme.primary),
-            ChangeStatus::TypeChanged => ("T", theme.warning),
-            ChangeStatus::Unmerged => ("U", theme.danger),
-            ChangeStatus::Unknown(_) => ("?", theme.muted_foreground),
+        let color = match file.status {
+            ChangeStatus::Added => theme.success,
+            ChangeStatus::Deleted => theme.danger,
+            ChangeStatus::Renamed | ChangeStatus::Copied => accent_alt,
+            ChangeStatus::Modified => theme.primary,
+            ChangeStatus::TypeChanged => theme.warning,
+            ChangeStatus::Unmerged => theme.danger,
+            ChangeStatus::Unknown(_) => theme.muted_foreground,
         };
-        let label: SharedString = match &file.old_path {
-            Some(old) => format!("{old} → {}", file.path).into(),
-            None => file.path.clone().into(),
+        // Dim directory prefix, status-colored basename (R1e visual review,
+        // P2): only the leaf filename gets the color — a fully-tinted path made
+        // the tree read as a wall of primary. Rename rows keep whole-label
+        // coloring (the "old → new" pair reads as one linked unit).
+        let (dir_prefix, leaf): (Option<SharedString>, SharedString) = match &file.old_path {
+            Some(old) => (None, format!("{old} → {}", file.path).into()),
+            None => match file.path.rfind('/') {
+                Some(i) => (
+                    Some(file.path[..=i].to_string().into()),
+                    file.path[i + 1..].to_string().into(),
+                ),
+                None => (None, file.path.clone().into()),
+            },
         };
+        // Per-file diffstat: only available once this file's diff has
+        // actually been loaded this session (Phase 7's lazy per-file load is
+        // untouchable — this must never trigger an eager diff just to fill
+        // in a number). Reuses the pre-tallied `RenderedDiff::added`/
+        // `removed` fields (see `Self::render_file_diff_header`'s own doc
+        // comment on why: no re-walking `diff.unified` on the hot render
+        // path). Blank — not "+0 −0" — for a binary/errored/not-yet-loaded
+        // diff, same suppression [`Self::render_file_diff_header`] uses.
+        let diffstat: Option<(u32, u32)> = self.diffs.get(&index).and_then(|diff| {
+            if diff.is_binary || diff.error {
+                None
+            } else {
+                Some((diff.added, diff.removed))
+            }
+        });
 
         h_flex()
             .id(index)
             .gap_2()
+            .items_center()
             .px_2()
-            .py_0p5()
+            .h(px(FILE_TREE_ROW_HEIGHT))
             .w_full()
             .overflow_hidden()
-            .when(selected, |el| el.bg(theme.accent))
-            .hover(|el| el.bg(theme.accent.opacity(0.6)))
+            .when(selected, |el| el.bg(surface_active))
+            .hover(|el| el.bg(surface_active.opacity(0.5)))
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(move |this, _, window, cx| this.select_file(index, window, cx)),
             )
-            .child(state_pill(color, glyph).flex_none())
-            .child(div().text_sm().truncate().child(label))
+            .child(
+                h_flex()
+                    .flex_1()
+                    .min_w(px(0.))
+                    .text_sm()
+                    .overflow_hidden()
+                    .children(
+                        dir_prefix.map(|prefix| div().text_color(text_secondary).child(prefix)),
+                    )
+                    .child(div().min_w(px(0.)).truncate().text_color(color).child(leaf)),
+            )
+            .children(diffstat.map(|(added, removed)| {
+                h_flex()
+                    .flex_none()
+                    .gap_1()
+                    .text_xs()
+                    .opacity(0.7)
+                    .child(div().text_color(theme.success).child(format!("+{added}")))
+                    .child(
+                        div()
+                            .text_color(theme.danger)
+                            .child(format!("\u{2212}{removed}")),
+                    )
+            }))
     }
 
     /// A hunk header row (shared by both views). When context is hidden
@@ -8936,15 +9004,17 @@ impl Workspace {
         let primary = theme.primary;
         let accent_alt = crate::themes::dv_theme(cx).accent_alt;
 
-        // Same status → color mapping as `Self::render_file_row`'s glyph
-        // pill (kept in sync there rather than factored out — see that fn's
-        // own doc comment on why renamed/copied share `accent_alt`), but
-        // spelled out as the full status word rather than the single-letter
-        // glyph: this is the one row the reference design renders as a word
-        // ("modified", not "M") rather than a letter, so the file-tree's
-        // dense letter pills stay letters while this one surface matches
-        // the reference screenshots exactly (review finding,
-        // the "status pill" row spec).
+        // Same status → color mapping as `Self::render_file_row`'s
+        // status-colored filename (kept in sync there rather than factored
+        // out — see that fn's own doc comment on why renamed/copied share
+        // `accent_alt`), but this row still keeps a `state_pill` badge
+        // (below) spelling out the full status word rather than R1e's
+        // colored-text treatment: this is the one row the reference design
+        // renders as a labeled pill ("modified", not just a color),
+        // matched exactly, while the dense file tree row now carries
+        // the same signal purely through the filename's own color (review
+        // finding: diff-pane "status pill"
+        // vs file-tree "status-colored filenames").
         let (label, color) = match file.status {
             ChangeStatus::Added => ("added", success),
             ChangeStatus::Deleted => ("deleted", danger),

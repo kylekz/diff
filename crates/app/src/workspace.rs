@@ -411,6 +411,23 @@ struct CachedPrDiff {
     files: Vec<ChangedFile>,
     diffs: HashMap<usize, Arc<RenderedDiff>>,
     expanded: HashMap<usize, HashMap<usize, u32>>,
+    /// The PR number this snapshot belongs to (paint-then-patch reopen
+    /// follow-up to Phase 7 D3, docs/backlog.md "PR reopen still pays the
+    /// network round-trip") — carried alongside the diff so
+    /// `Workspace::evict_pr_diff_cache` can also prune the matching entry
+    /// out of `Workspace::pr_diff_cache_by_number` (the reverse index is
+    /// keyed by number, not by this entry's `(merge_base, head_oid)` key).
+    number: u64,
+    /// The review this PR was linked to at stash time, so a later
+    /// optimistic reopen can restore `Workspace::review` instantly (no
+    /// store lookup) instead of only the diff — patched with a fresh copy
+    /// once `load_pr`'s background confirm lands, same as `header` below.
+    review: dv_core::Review,
+    /// The header band shown while this PR was last open, so an optimistic
+    /// reopen has *something* correct-looking to paint before the
+    /// confirming `gh pr view` lands (see `Workspace::open_pr`'s guessed-key
+    /// paint branch).
+    header: PrHeader,
 }
 
 /// Which side of the diff a line (and so a comment anchor) lives on.
@@ -525,7 +542,10 @@ struct Palette {
 
 /// Everything the PR header panel needs, cached from the [`PrMeta`]
 /// [`Workspace::open_pr`] last fetched — the workspace never re-hits `gh`
-/// just to render the band.
+/// just to render the band. `Clone` so a stashed [`CachedPrDiff`] can carry
+/// its own snapshot for an optimistic reopen paint without taking `self.pr`
+/// away from whatever is currently on screen.
+#[derive(Clone)]
 struct PrHeader {
     number: u64,
     title: SharedString,
@@ -1117,30 +1137,66 @@ pub struct Workspace {
     /// `compute_diff` pass) happens later, inside `select_file`/
     /// `request_diff`, and is timed separately into `last_diff_ms` on a
     /// miss (never invoked at all on a hit). Use `last_pr_open_cache_hit`
-    /// to assert warm vs. cold, not a `<<` comparison on this field.
+    /// to assert warm vs. cold, not a `<<` comparison on this field. Paint-
+    /// then-patch follow-up (docs/backlog.md "PR reopen still pays the
+    /// network round-trip"): on a `pr_diff_cache_by_number` guessed-key hit,
+    /// `open_pr` paints synchronously and stamps this (and
+    /// `last_pr_open_cache_hit`) right then — genuinely honest time-to-
+    /// interactive — and the background confirm/patch that follows never
+    /// re-stamps either field, matched or not. Only a guess MISS still times
+    /// the full `load_pr` round trip the way this field's name always has.
     last_pr_open_ms: Option<u64>,
     /// Content-addressed cache of a PR's resolved file-list + rendered
     /// diffs, keyed by [`pr_source_key`] — Phase 7 D3. Reopening the same
     /// `(merge_base, head_oid)` pair reuses this instead of re-running
     /// `changed_files` + a tree-sitter `compute_diff` pass per file (the
-    /// real per-recon cost). `pr_meta` (state/decision/CI/title) is NEVER
-    /// stored here — `open_pr`'s `load_pr` call fetches it fresh on every
-    /// open regardless of a diff-cache hit, so a force-push or a status
-    /// change is always caught even when the diff itself is reused. Cleared
-    /// wholesale by `invalidate_diff_cache` (a theme/context-lines change
-    /// re-bakes diff colors/hunk structure, so cached rows would otherwise
-    /// go stale under the new theme) — that single choke point is why no
-    /// per-entry theme fingerprint is needed here. Its bytes are folded
-    /// into `estimated_diff_bytes`, the S7-3 workspace LRU's memory budget
-    /// (cross-cutting risk F).
+    /// real per-recon cost). Also carries a `review`/`header` snapshot per
+    /// entry (paint-then-patch follow-up) so a guessed-key reopen (see
+    /// `pr_diff_cache_by_number`) can paint the whole workspace — not just
+    /// the diff rows — before any network call. `pr_meta` is still always
+    /// re-fetched by `load_pr`'s background confirm on every open regardless
+    /// of a diff-cache hit, so a force-push or a status change is always
+    /// caught eventually even when the diff itself is reused optimistically.
+    /// Cleared wholesale by `invalidate_diff_cache` (a theme/context-lines
+    /// change re-bakes diff colors/hunk structure, so cached rows would
+    /// otherwise go stale under the new theme) — that single choke point is
+    /// why no per-entry theme fingerprint is needed here. Its bytes are
+    /// folded into `estimated_diff_bytes`, the S7-3 workspace LRU's memory
+    /// budget (cross-cutting risk F).
     pr_diff_cache: HashMap<(String, String), CachedPrDiff>,
     /// Front = most-recently used, back = evict next — bounds
     /// `pr_diff_cache` at [`MAX_PR_DIFF_ENTRIES`] entries.
     pr_diff_lru: VecDeque<(String, String)>,
+    /// Reverse index over `pr_diff_cache`: PR number -> the `(merge_base,
+    /// head_oid)` key its most recently stashed snapshot lives under.
+    /// Paint-then-patch reopen follow-up (docs/backlog.md "PR reopen still
+    /// pays the network round-trip") — lets `open_pr` answer "do I plausibly
+    /// already have this PR's diff" synchronously, in memory, with no git/gh
+    /// call at all, which is what makes painting before `load_pr` even
+    /// starts possible. The guess can be wrong (a force-push/rebase since
+    /// last stashed); `load_pr`'s background confirm always still runs and
+    /// corrects it if so — see `open_pr`. Kept in lockstep with
+    /// `pr_diff_cache`/`pr_diff_lru`: every insert/evict/consume updates all
+    /// three together, and `invalidate_diff_cache`'s wholesale clear takes
+    /// this one with it too.
+    pr_diff_cache_by_number: HashMap<u64, (String, String)>,
     /// Whether the most recent `open_pr` reused a cached diff
     /// (`pr_diff_cache` hit, `true`) or recomputed from scratch (`false`) —
     /// Phase 7 D3 automation assertion. `None` before the first `open_pr`.
+    /// On a guessed-key paint this is stamped `Some(true)` at paint time (see
+    /// `last_pr_open_ms`'s doc) and never revisited by the background
+    /// confirm, matched or not.
     last_pr_open_cache_hit: Option<bool>,
+    /// A guessed-key optimistic paint (see `pr_diff_cache_by_number`) is
+    /// showing and `load_pr`'s background confirm hasn't landed yet — the
+    /// header may still be stale (or, on a force-push, the diff too, until
+    /// the confirm corrects it). Cleared the moment that confirm applies,
+    /// whichever way (matched patch, corrected reload, or a marked-degraded
+    /// failure). `--automation`'s `pr_meta_pending` field so a script can
+    /// `wait_ready` for interactivity and then separately poll this down to
+    /// `false` before asserting on header freshness (Phase 7 D3 follow-up,
+    /// docs/backlog.md "PR reopen still pays the network round-trip").
+    pr_meta_pending: bool,
     /// Comment/reply author, resolved once in the background at load
     /// (`dv_cli::author::resolve_author`). `None` until that resolves —
     /// callers fall back to a placeholder rather than block on it.
@@ -1880,7 +1936,9 @@ impl Workspace {
             last_pr_open_ms: None,
             pr_diff_cache: HashMap::new(),
             pr_diff_lru: VecDeque::new(),
+            pr_diff_cache_by_number: HashMap::new(),
             last_pr_open_cache_hit: None,
+            pr_meta_pending: false,
             author: None,
             submit: None,
             submit_epoch: 0,
@@ -2325,7 +2383,17 @@ impl Workspace {
             let Some(key) = self.pr_diff_lru.pop_back() else {
                 break;
             };
-            self.pr_diff_cache.remove(&key);
+            if let Some(entry) = self.pr_diff_cache.remove(&key) {
+                // Only clear the reverse-index entry if it still points at
+                // THIS key — a later re-stash of the same PR number (e.g.
+                // evicted, then reopened and switched away from again under
+                // a since-force-pushed key) could already have overwritten
+                // it with a fresher mapping that this eviction must not
+                // clobber.
+                if self.pr_diff_cache_by_number.get(&entry.number) == Some(&key) {
+                    self.pr_diff_cache_by_number.remove(&entry.number);
+                }
+            }
         }
     }
 
@@ -2920,6 +2988,7 @@ impl Workspace {
         // since-changed theme (see `pr_diff_cache`'s doc comment).
         self.pr_diff_cache.clear();
         self.pr_diff_lru.clear();
+        self.pr_diff_cache_by_number.clear();
         let host_reachable = eager
             || match &self.location {
                 RepoLocation::Wsl { distro, .. } => {
@@ -3174,16 +3243,56 @@ impl Workspace {
         let captured_highlight_epoch = self.highlight_epoch;
         let outgoing_pr_stash = pr_source_key(&self.source)
             .filter(|_| !self.diffs.is_empty())
-            .map(|key| {
-                (
+            .and_then(|key| {
+                // `header`/`review` are only captured alongside the diff
+                // (paint-then-patch follow-up, docs/backlog.md "PR reopen
+                // still pays the network round-trip") if both are actually
+                // present — they always should be whenever `source` is a
+                // `Range` with non-empty `diffs` (both are set together by
+                // this same success arm below), but bailing to "don't stash
+                // at all" rather than panicking is the safer failure mode
+                // for an invariant this method itself is responsible for
+                // upholding.
+                let header = self.pr.clone()?;
+                let review = self.review.clone()?;
+                Some((
                     key,
                     CachedPrDiff {
                         files: self.files.clone(),
                         diffs: self.diffs.clone(),
                         expanded: self.expanded.clone(),
+                        number: header.number,
+                        review,
+                        header,
                     },
-                )
+                ))
             });
+
+        // Paint-then-patch reopen (docs/backlog.md "PR reopen still pays
+        // the network round-trip"): before any git/gh call, check whether
+        // `pr_diff_cache_by_number` already has a plausible cached snapshot
+        // for THIS pr number — an in-memory, synchronous lookup with zero
+        // network cost. `.remove` (not `.get`) so a hit is consumed exactly
+        // like the confirmed-key hit further down does; a miss (no guess,
+        // or the guessed key was since evicted) leaves everything
+        // untouched and this call falls through to today's behavior
+        // unchanged.
+        let guess_key = self.pr_diff_cache_by_number.get(&number).cloned();
+        let pre_hit = guess_key
+            .as_ref()
+            .and_then(|key| self.pr_diff_cache.remove(key));
+        if pre_hit.is_some() {
+            self.pr_diff_cache_by_number.remove(&number);
+            if let Some(key) = &guess_key {
+                self.pr_diff_lru.retain(|k| k != key);
+            }
+        }
+        // Only `Some` when `pre_hit` is — captured before `pre_hit` is
+        // moved into the paint branch below, and carried into the
+        // background confirm so its completion can tell "I already painted
+        // an optimistic guess for this exact key" apart from an ordinary
+        // cold/miss open.
+        let painted_key = pre_hit.as_ref().and(guess_key);
 
         // Closing the picker here (rather than deferred to the completion
         // below, like the rest of the teardown) is still fine: it holds no
@@ -3199,22 +3308,80 @@ impl Workspace {
         // successful source switch (P3 finding: it was cleared only at the
         // top of switch_source_and_jump itself, never by open_pr).
         self.source_switch_error = None;
-        self.pr_loading = Some(number);
-        self.status = Status::Loading;
         // Bumped before the fetch even starts, so any request_diff already
         // in flight (and this open_pr's own completion, below) can tell a
         // superseding open_pr apart from itself (see the field's doc
         // comment).
         self.source_epoch += 1;
         let epoch = self.source_epoch;
+
+        // Phase 7 D4 instrumentation, extended by the paint-then-patch
+        // follow-up: on a guessed-key hit this now measures genuine
+        // dispatch-to-interactive time (single-digit ms, stamped right
+        // below); on a miss it still measures `load_pr`'s full network
+        // round trip the way it always has (stamped in the background
+        // completion) — see the field's doc comment.
+        let started = std::time::Instant::now();
+
+        if let Some(hit) = pre_hit {
+            // The optimistic paint: everything here comes from the
+            // in-memory snapshot captured the last time this PR was
+            // navigated away from in this session — no git/gh call yet.
+            // `load_pr`'s background confirm, dispatched below regardless,
+            // is what verifies (or corrects) this guess.
+            self.selection = None;
+            let dropped_editor = self.editor.take().is_some();
+            let dropped_input = self.thread_input.take().is_some();
+            if dropped_editor || dropped_input {
+                window.focus(&self.focus_handle, cx);
+            }
+            let (base, head) = painted_key.clone().expect("pre_hit implies painted_key");
+            self.source = DiffSource::Range {
+                base,
+                head,
+                merge_base: false,
+            };
+            self.source_desc = format!("PR #{number}").into();
+            self._worktree_watcher = None;
+            self.files = hit.files;
+            self.diffs = hit.diffs;
+            self.diffstat_cache.set(None);
+            self.expanded = hit.expanded;
+            self.diff_pending.clear();
+            self.stale.clear();
+            self.stale_checked = None;
+            self.selected = None;
+            self.pending_jump = None;
+            self.pr_remote = hit.review.remote.clone();
+            // Belongs to the PR being left behind (if any) — keeping it
+            // around would flash the old PR's read-only threads under the
+            // new PR's files until `refresh_remote_threads`'s fetch lands.
+            self.remote_threads.clear();
+            self.review = Some(hit.review);
+            cx.emit(ReviewChanged);
+            // `hit.header` is a snapshot from whenever this PR was last
+            // open, not necessarily fresh — good enough to paint instantly;
+            // the background confirm below patches it the moment the real
+            // `gh pr view` lands.
+            self.pr = Some(hit.header);
+            self.pr_details_open = false;
+            self.pr_loading = None;
+            self.pr_meta_pending = true;
+            self.status = Status::Ready;
+            self.last_pr_open_ms = Some(started.elapsed().as_millis() as u64);
+            self.last_pr_open_cache_hit = Some(true);
+            self.refresh_remote_threads(cx);
+            if self.files.is_empty() {
+                self.reset_diff_list(cx);
+            } else {
+                self.select_file(0, window, cx);
+            }
+        } else {
+            self.pr_loading = Some(number);
+            self.status = Status::Loading;
+        }
         cx.notify();
 
-        // Phase 7 D4: dispatch-to-`Status::Ready` timing (mirrors
-        // `last_diff_ms`/`last_pr_list_ms`) — this is `load_pr`'s latency
-        // only, identical on a `pr_diff_cache` hit or miss (see
-        // `last_pr_open_ms`'s field doc); it is NOT the S7-5 warm/cold
-        // signal, that's `last_pr_open_cache_hit`.
-        let started = std::time::Instant::now();
         let location = self.location.clone();
         cx.spawn_in(window, async move |this, cx| {
             let outcome = cx
@@ -3230,17 +3397,21 @@ impl Workspace {
                     // whatever the newer call is showing. At most clear
                     // our own cosmetic loading caption, and only if it's
                     // still showing this call's number (the newer call
-                    // already overwrote it with its own otherwise).
+                    // already overwrote it with its own otherwise). This is
+                    // also the stale-completion guard for the optimistic
+                    // paint above (docs/backlog.md "PR reopen still pays
+                    // the network round-trip", care point 1): if the user
+                    // switched to a different PR (or away entirely) before
+                    // this confirm landed, `source_epoch` already moved and
+                    // this whole completion — header patch included — is
+                    // discarded here, mirroring the exact review-id race
+                    // guard the S7-3/S7-4 workspace-cache revalidation uses.
                     if this.pr_loading == Some(number) {
                         this.pr_loading = None;
                     }
                     return;
                 }
                 this.pr_loading = None;
-                // Current-epoch completion, success or error either way —
-                // both set `Status::Ready` below, and a superseded call
-                // already returned above without reaching here.
-                this.last_pr_open_ms = Some(started.elapsed().as_millis() as u64);
                 match outcome {
                     Ok(PrOpenOutcome {
                         meta,
@@ -3248,12 +3419,66 @@ impl Workspace {
                         review,
                         source,
                     }) => {
-                        // Only now — a real, current-epoch success — is it
-                        // safe to tear down the live selection/editor/
-                        // thread-input: `Status::Loading` has had the body
-                        // pane replaced this whole time, so nothing could
-                        // have created a new one in the meantime (review
-                        // finding P2-a).
+                        let key = pr_source_key(&source);
+                        if painted_key.is_some() && key == painted_key {
+                            // CONFIRMED: the optimistic guess painted above
+                            // was correct. `files`/`diffs`/`source`/
+                            // `selected` are already exactly right — only
+                            // the header (and `review`, for freshness: e.g.
+                            // a concurrent CLI comment) need patching, the
+                            // same paint-then-patch shape `refresh_badge`
+                            // uses for sidebar badges. Deliberately does
+                            // NOT touch `last_pr_open_ms`/
+                            // `last_pr_open_cache_hit` — those already
+                            // recorded genuine time-to-interactive at paint
+                            // time, and re-stamping the full round trip
+                            // here would misreport it as having blocked the
+                            // whole time it didn't.
+                            this.pr_remote = review.remote.clone();
+                            this.review = Some(review);
+                            cx.emit(ReviewChanged);
+                            this.pr = Some(meta.into());
+                            this.pr_meta_pending = false;
+                            cx.notify();
+                            return;
+                        }
+                        // A miss (no guess was painted), OR the rare
+                        // MISMATCH case: the guess was wrong (a force-push
+                        // or rebase landed in the split second between the
+                        // optimistic paint and this confirm). Either way
+                        // this arm needs the full teardown-and-replace path
+                        // below — but a mismatch means the user has been
+                        // looking at (and possibly interacting with) the
+                        // now-known-stale content this whole time. Mirror
+                        // the exact save-in-flight guard `open_pr`'s own
+                        // dispatch refuses on, rather than yanking a save
+                        // out from under them: leave the stale paint up,
+                        // marked degraded, and let the next explicit action
+                        // pick up the correction.
+                        if painted_key.is_some()
+                            && (this.editor.as_ref().is_some_and(|e| e.saving)
+                                || this.thread_input.as_ref().is_some_and(|t| t.saving)
+                                || this.submit_in_flight())
+                        {
+                            this.pr_meta_pending = false;
+                            this.pr_error = Some(
+                                "this PR changed since it was reopened — finish or discard \
+                                 your edit, then reopen to refresh."
+                                    .to_string(),
+                            );
+                            cx.notify();
+                            return;
+                        }
+                        if painted_key.is_none() {
+                            this.last_pr_open_ms = Some(started.elapsed().as_millis() as u64);
+                        }
+                        // Only now — a real, current-epoch success with no
+                        // (or no longer valid) optimistic paint standing in
+                        // the way — is it safe to tear down the live
+                        // selection/editor/thread-input: on a miss,
+                        // `Status::Loading` has had the body pane replaced
+                        // this whole time, so nothing could have created a
+                        // new one in the meantime (review finding P2-a).
                         this.selection = None;
                         let dropped_editor = this.editor.take().is_some();
                         let dropped_input = this.thread_input.take().is_some();
@@ -3288,11 +3513,11 @@ impl Workspace {
                         // always this call's freshly-fetched value, so a
                         // diff-cache hit still shows fresh state/decision/
                         // CI.
-                        let key = pr_source_key(&this.source);
                         let cache_hit = key.as_ref().and_then(|k| this.pr_diff_cache.remove(k));
                         if let Some(hit) = cache_hit {
                             if let Some(k) = &key {
                                 this.pr_diff_lru.retain(|lk| lk != k);
+                                this.pr_diff_cache_by_number.remove(&number);
                             }
                             this.files = hit.files;
                             this.diffs = hit.diffs;
@@ -3305,7 +3530,9 @@ impl Workspace {
                             // collapse this gap the next time a different
                             // one is expanded (P3 finding).
                             this.expanded = hit.expanded;
-                            this.last_pr_open_cache_hit = Some(true);
+                            if painted_key.is_none() {
+                                this.last_pr_open_cache_hit = Some(true);
+                            }
                         } else {
                             this.files = files;
                             // The old file list's diffs are keyed by index
@@ -3315,7 +3542,9 @@ impl Workspace {
                             this.diffs.clear();
                             this.diffstat_cache.set(None);
                             this.expanded.clear();
-                            this.last_pr_open_cache_hit = Some(false);
+                            if painted_key.is_none() {
+                                this.last_pr_open_cache_hit = Some(false);
+                            }
                         }
                         // Now that the fetch actually succeeded, commit the
                         // OUTGOING PR's diff (captured at entry, above) into
@@ -3338,6 +3567,8 @@ impl Workspace {
                             && Some(&out_key) != key.as_ref()
                             && this.highlight_epoch == captured_highlight_epoch
                         {
+                            this.pr_diff_cache_by_number
+                                .insert(out_entry.number, out_key.clone());
                             this.pr_diff_cache.insert(out_key.clone(), out_entry);
                             this.pr_diff_lru.retain(|k| k != &out_key);
                             this.pr_diff_lru.push_front(out_key);
@@ -3359,6 +3590,7 @@ impl Workspace {
                         cx.emit(ReviewChanged);
                         this.pr = Some(meta.into());
                         this.pr_details_open = false;
+                        this.pr_meta_pending = false;
                         this.status = Status::Ready;
                         this.refresh_remote_threads(cx);
                         if this.files.is_empty() {
@@ -3368,6 +3600,24 @@ impl Workspace {
                         }
                     }
                     Err(err) => {
+                        if painted_key.is_some() {
+                            // The optimistic paint is showing real, locally-
+                            // cached content — a failed background confirm
+                            // (network down, `gh` unauthenticated, the PR
+                            // fetch itself failing, ...) is exactly the
+                            // "background fetch FAILS" case the paint-then-
+                            // patch design has to stay usable through: the
+                            // workspace keeps exactly what it already
+                            // painted (still perfectly good), and only the
+                            // header's freshness is in question, surfaced
+                            // via `pr_error` rather than discarded via
+                            // `last_pr_open_cache_hit = None` the way a
+                            // genuine miss's failure does below.
+                            this.pr_meta_pending = false;
+                            this.pr_error = Some(format!("{err:#}"));
+                            cx.notify();
+                            return;
+                        }
                         // Leave source/files/pr exactly as they were — the
                         // workspace stays on whatever it was showing before
                         // this attempt, selection/editor/thread-input
@@ -3377,6 +3627,7 @@ impl Workspace {
                         // whatever the previous successful open recorded
                         // would misreport a failed, non-cached open as a
                         // stale hit/miss from an unrelated PR.
+                        this.last_pr_open_ms = Some(started.elapsed().as_millis() as u64);
                         this.status = Status::Ready;
                         this.pr_error = Some(format!("{err:#}"));
                         this.last_pr_open_cache_hit = None;
@@ -3406,6 +3657,18 @@ impl Workspace {
             // but `self.pr` still shows the OLD header, so a refresh spawned
             // now would fetch the old PR yet pass the epoch check and stamp
             // its header over the new PR's. Refresh after the open lands.
+            return;
+        }
+        if self.pr_meta_pending {
+            // A guessed-key optimistic paint (paint-then-patch reopen,
+            // docs/backlog.md "PR reopen still pays the network round-
+            // trip") already has its OWN `load_pr` confirm in flight for
+            // this exact PR number — `pr_loading` is cleared by that point
+            // (the paint made the workspace interactive already), so the
+            // check above doesn't catch this window. An explicit refresh
+            // here would just race a second, redundant `gh pr view` against
+            // the confirm that's already going to patch the header the
+            // moment it lands.
             return;
         }
         let Some(current) = &self.pr else {
@@ -3869,6 +4132,14 @@ impl Workspace {
             // `(merge_base, head_oid)` diff (`pr_diff_cache` hit) instead of
             // recomputing — the S7-5 warm-reopen assertion.
             "last_pr_open_cache_hit": self.last_pr_open_cache_hit,
+            // Paint-then-patch reopen follow-up (docs/backlog.md "PR reopen
+            // still pays the network round-trip"): `true` while a guessed-
+            // key optimistic paint is showing and `load_pr`'s background
+            // confirm hasn't landed yet. A script can `wait_ready` (which
+            // never blocks on this — see `automation_settled`'s doc) and
+            // then poll this down to `false` before asserting on header
+            // freshness.
+            "pr_meta_pending": self.pr_meta_pending,
             "selection": self.selection.as_ref().map(|sel| {
                 let (start, end) = sel.range();
                 json!({
@@ -4106,6 +4377,16 @@ impl Workspace {
     /// (up to 30s) or the definition/target-read round trip actually
     /// landed, making `state.lsp.target_viewer` a race against the script
     /// rather than a deterministic read. `wait_ready` polls this.
+    ///
+    /// Deliberately does NOT wait on `pr_meta_pending` (paint-then-patch
+    /// reopen, docs/backlog.md "PR reopen still pays the network round-
+    /// trip"): a guessed-key optimistic paint is, by design, already fully
+    /// interactive — real files, real diffs, a real (if possibly
+    /// momentarily stale) header — before its background confirm lands, so
+    /// counting it as unsettled would defeat the entire point of painting
+    /// early. A script that specifically wants to wait for the confirmed/
+    /// patched header polls `state.pr_meta_pending` down to `false`
+    /// separately, after `wait_ready` already returned.
     #[cfg(feature = "automation")]
     pub(crate) fn automation_settled(&self) -> bool {
         if self

@@ -51,14 +51,29 @@ pub struct CommandBuilder {
 }
 
 impl CommandBuilder {
-    /// Wsl locations consult [`manager::client_for`] for a live host
-    /// connection; anything it doesn't hand back (disabled, no
-    /// `DV_HOST_PATH`, cooling down after a failure, ...) falls back to
-    /// `Route::Spawn` — the existing, always-correct behavior. Local
-    /// locations never consult the manager at all.
+    /// Wsl locations consult [`manager::client_if_running`] for an already-
+    /// connected host; anything it doesn't hand back (disabled, no host
+    /// alive yet, mid-spawn, ...) falls back to `Route::Spawn` — the
+    /// existing, always-correct Stage-A behavior. Local locations never
+    /// consult the manager at all.
+    ///
+    /// Deliberately non-blocking (docs/backlog.md "the WSL host is spawned
+    /// on the cold-start critical path"): this used to call the BLOCKING
+    /// [`manager::client_for`] here, so the very first command against a
+    /// freshly-opened WSL repo paid for a possibly multi-second install+
+    /// spawn+handshake before it could even run. `client_if_running` never
+    /// spawns anything — a cold distro (no host up yet) always resolves to
+    /// `Route::Spawn` immediately, with the actual spawn instead kicked off
+    /// in the background by [`crate::git::GitRepo::open`] (the one call
+    /// site with genuine "user opened this repo" intent) via
+    /// [`manager::warm_up_in_background`]. A later `CommandBuilder::new`
+    /// for the same distro — a different repo, or this same repo reopened —
+    /// picks up the warmed host for free once it's up; THIS builder's own
+    /// `Route` stays whatever it was decided as here for its whole
+    /// lifetime, same caching contract as always.
     pub fn new(location: RepoLocation) -> Self {
         let route = match &location {
-            RepoLocation::Wsl { distro, .. } => manager::client_for(distro)
+            RepoLocation::Wsl { distro, .. } => manager::client_if_running(distro)
                 .map(Route::Host)
                 .unwrap_or(Route::Spawn),
             RepoLocation::Local(_) => Route::Spawn,

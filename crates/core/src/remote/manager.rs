@@ -191,6 +191,64 @@ pub fn has_running_host(distro: &str) -> bool {
     client_if_running(distro).is_some()
 }
 
+/// Distros with a background warm-up already kicked off and not yet
+/// resolved (spawned OR failed) — de-dupes [`warm_up_in_background`] so a
+/// burst of `GitRepo::open` calls for the same distro in quick succession
+/// (several files/reviews opened before the first spawn attempt finishes)
+/// doesn't pile up one `std::thread::spawn` per call. An entry is removed
+/// the moment its underlying [`client_for`] attempt resolves, so a later
+/// genuine retry (e.g. after a cool-down, or a second distro's repo opened
+/// afterward) still fires.
+fn warming_registry() -> &'static Mutex<std::collections::HashSet<String>> {
+    static WARMING: OnceLock<Mutex<std::collections::HashSet<String>>> = OnceLock::new();
+    WARMING.get_or_init(|| Mutex::new(std::collections::HashSet::new()))
+}
+
+/// Kick off [`client_for`]'s (possibly multi-second, cold-distro-boot-
+/// including) install+spawn+handshake on a background thread instead of the
+/// caller's — the mechanism behind "opening a WSL repo should not block on
+/// host spawn" (docs/backlog.md "Cold startup is tree-sitter-bound... (b)
+/// the WSL host is spawned on the cold-start critical path"). Meant to be
+/// called exactly once per explicit repo-open (`GitRepo::open`, for a `Wsl`
+/// location) — genuine user intent, same distinction
+/// [`client_if_running`]'s own doc draws against the badge walk, which must
+/// never boot a distro on its own and stays on `client_if_running`/
+/// [`has_running_host`] alone (this function is never called from there).
+///
+/// A no-op when hosts are disabled, a client is already alive (nothing to
+/// warm), or a warm-up for this distro is already in flight. Otherwise
+/// spawns a thread that calls the ordinary blocking [`client_for`] purely
+/// for its side effect of populating the registry — its return value is
+/// discarded; `client_for`'s own `Alive`/`Dead`/`Failed` bookkeeping already
+/// logs failures. Every OTHER path that eventually wants this distro's host
+/// (a fresh [`crate::command::CommandBuilder::new`] for a later-opened
+/// repo, or the watch supervisor's own retry loop — see
+/// `crate::remote::supervisor`'s module doc) picks up whatever this
+/// produces the ordinary way, with no direct coupling to this function.
+pub(crate) fn warm_up_in_background(distro: &str) {
+    if !hosts_enabled() || client_if_running(distro).is_some() {
+        return;
+    }
+    {
+        let mut warming = warming_registry().lock().unwrap_or_else(|e| e.into_inner());
+        if !warming.insert(distro.to_string()) {
+            // Already warming — the in-flight attempt's own `client_for`
+            // call serializes on the per-distro slot lock (see that
+            // function's doc), so a second thread here would just block
+            // behind the first for no benefit.
+            return;
+        }
+    }
+    let distro = distro.to_string();
+    std::thread::spawn(move || {
+        client_for(&distro);
+        warming_registry()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&distro);
+    });
+}
+
 /// A connected host client for `distro`, or `None` if hosts are disabled, no
 /// `dv-host` binary is configured/installable (no `DV_HOST_PATH`, no
 /// sidecar — see [`install::ensure_installed`]'s [`install::InstallError::NoSidecar`]),

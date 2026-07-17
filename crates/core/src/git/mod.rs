@@ -142,7 +142,20 @@ impl GitRepo {
     /// `git rev-parse --show-toplevel` and stores the *root* as the
     /// location (the input may point anywhere inside the work tree).
     /// A non-repo path is a descriptive `Err`, not a panic.
+    ///
+    /// For a `Wsl` location, this is genuine "the user opened this repo"
+    /// intent — the one call site (unlike the badge walk or index
+    /// hydration, which must never boot a distro on their own — see
+    /// [`manager::warm_up_in_background`]'s doc) that kicks off the host's
+    /// spawn in the background right away (docs/backlog.md "the WSL host is
+    /// spawned on the cold-start critical path"), so it runs concurrently
+    /// with the tree-sitter/UI work this open leads into instead of sitting
+    /// on `CommandBuilder::new`'s critical path below (which, as of the same
+    /// backlog fix, no longer blocks on it — see that function's doc).
     pub fn open(location: RepoLocation) -> Result<Self> {
+        if let RepoLocation::Wsl { distro, .. } = &location {
+            manager::warm_up_in_background(distro);
+        }
         let probe_builder = CommandBuilder::new(location.clone());
         let probe_root = dash_c_arg(&location);
         let toplevel = probe_builder

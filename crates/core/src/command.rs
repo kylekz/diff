@@ -206,6 +206,39 @@ impl CommandBuilder {
         Ok(decode_output(&bytes).trim_end().to_string())
     }
 
+    /// Like [`Self::run`], but forces the C locale on WSL children by
+    /// prefixing `env LC_ALL=C` at the argv level — which works identically
+    /// for the `wsl.exe --exec` spawn route and the dv-host `proc/exec`
+    /// route, since environment variables can't otherwise cross either
+    /// boundary. Local children run unmodified (git for Windows and the
+    /// bundled coreutils are English unless the user opted into a locale;
+    /// WSL distros routinely aren't).
+    ///
+    /// For callers that classify failures by matching English error text —
+    /// `"No such file or directory"`, `"Is a directory"` — a non-English
+    /// distro locale would otherwise localize the message and turn a benign
+    /// missing-file result into a surfaced error (docs/backlog.md blob_sha
+    /// locale item).
+    pub fn run_c_locale(&self, program: &str, args: &[&str]) -> Result<Vec<u8>> {
+        match &self.location {
+            RepoLocation::Local(_) => self.run(program, args),
+            RepoLocation::Wsl { .. } => {
+                let mut full: Vec<&str> = Vec::with_capacity(args.len() + 2);
+                full.push("LC_ALL=C");
+                full.push(program);
+                full.extend_from_slice(args);
+                self.run("env", &full)
+            }
+        }
+    }
+
+    /// [`Self::run_c_locale`] + [`decode_output`] + trim — the text sibling,
+    /// mirroring [`Self::run_text`].
+    pub fn run_text_c_locale(&self, program: &str, args: &[&str]) -> Result<String> {
+        let bytes = self.run_c_locale(program, args)?;
+        Ok(decode_output(&bytes).trim_end().to_string())
+    }
+
     /// Like [`Self::run`], but writes `stdin_bytes` to the child's stdin
     /// before collecting output. Used by the review store's WSL write path
     /// (`sh -c 'mkdir -p … && cat > tmp && mv tmp final'`), which has no

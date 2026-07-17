@@ -602,9 +602,14 @@ impl GitRepo {
     /// distinguished by the command layer's own success/error split.
     fn blob_sha_rev(&self, rev: &str, path: &str) -> Result<Option<String>> {
         let root = self.root_arg();
+        // `:(literal)`: the trailing argument is a PATHSPEC, so a filename
+        // containing glob magic (`*?[`) or starting with `:` would
+        // otherwise be pattern-matched (or magic-parsed) instead of looked
+        // up verbatim (docs/backlog.md blob_sha exotic-pathspecs item).
+        let pathspec = format!(":(literal){path}");
         let output = self
             .builder
-            .run_text("git", &["-C", &root, "ls-tree", rev, "--", path])
+            .run_text("git", &["-C", &root, "ls-tree", rev, "--", &pathspec])
             .with_context(|| format!("git ls-tree {rev} -- {path}"))?;
         Ok(parse_ls_tree_sha(&output))
     }
@@ -615,9 +620,11 @@ impl GitRepo {
     /// also reports `None` — there is no single "the" blob to anchor to.
     fn blob_sha_index(&self, path: &str) -> Result<Option<String>> {
         let root = self.root_arg();
+        // `:(literal)` for the same reason as `blob_sha_rev`.
+        let pathspec = format!(":(literal){path}");
         let output = self
             .builder
-            .run_text("git", &["-C", &root, "ls-files", "-s", "--", path])
+            .run_text("git", &["-C", &root, "ls-files", "-s", "--", &pathspec])
             .with_context(|| format!("git ls-files -s -- {path}"))?;
         Ok(parse_ls_files_stage0_sha(&output))
     }
@@ -630,9 +637,13 @@ impl GitRepo {
     /// ...).
     fn blob_sha_working(&self, path: &str) -> Result<Option<String>> {
         let root = self.root_arg();
+        // C locale so the missing-file match below can't be defeated by a
+        // localized git message on a non-English WSL distro. (No
+        // `:(literal)` here — `hash-object` takes a real file path, not a
+        // pathspec, so glob characters are never expanded.)
         match self
             .builder
-            .run_text("git", &["-C", &root, "hash-object", "--", path])
+            .run_text_c_locale("git", &["-C", &root, "hash-object", "--", path])
         {
             Ok(sha) => Ok(Some(sha)),
             Err(err) if err.to_string().contains("No such file or directory") => Ok(None),
@@ -649,7 +660,9 @@ impl GitRepo {
             },
             RepoLocation::Wsl { path: root, .. } => {
                 let full_path = join_posix(root, path);
-                match self.builder.run("cat", &["--", &full_path]) {
+                // C locale for the same reason as `blob_sha_working`: the
+                // missing-file classification matches English cat output.
+                match self.builder.run_c_locale("cat", &["--", &full_path]) {
                     Ok(bytes) => Ok(Some(bytes)),
                     Err(err) if err.to_string().contains("No such file or directory") => Ok(None),
                     Err(err) => Err(err),

@@ -310,7 +310,12 @@ impl Settings {
         }
         if let Ok(bytes) = serde_json::to_vec_pretty(self) {
             // Atomic-ish: write a temp sibling then rename over the target.
-            let tmp = path.with_extension("json.tmp");
+            // Pid-suffixed so two dv processes saving concurrently can't
+            // interleave writes into ONE shared temp file (the loser's
+            // rename then publishing a torn mix) — each process races with
+            // whole files only, and last-rename-wins is a complete file
+            // either way.
+            let tmp = path.with_extension(format!("json.tmp.{}", std::process::id()));
             if std::fs::write(&tmp, &bytes).is_ok() {
                 let _ = std::fs::rename(&tmp, &path);
             }

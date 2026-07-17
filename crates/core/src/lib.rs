@@ -37,7 +37,7 @@ pub use provision::{
 pub use remote::{HostClient, RequestFailure};
 pub use review::{
     Comment, CommentStatus, RemoteRef, Reply, Review, ReviewState, ReviewStore, ReviewWatcher,
-    Side, Verdict, format_review_as_prompt,
+    Side, Verdict, anchor_spec, format_review_as_prompt,
 };
 
 pub const APP_NAME: &str = "dv";

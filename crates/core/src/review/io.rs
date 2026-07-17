@@ -53,7 +53,7 @@ impl StoreIo {
                     return result;
                 }
                 let full = self.wsl_path(rel)?;
-                match self.builder.run("cat", &["--", &full]) {
+                match self.builder.run_c_locale("cat", &["--", &full]) {
                     Ok(bytes) => Ok(Some(bytes)),
                     Err(err) if is_missing_path_error(&err) => Ok(None),
                     Err(err) => Err(err),
@@ -102,7 +102,7 @@ impl StoreIo {
                 let dir = self.wsl_path(rel_dir)?;
                 match self
                     .builder
-                    .run_text("ls", &["-la", "--time-style=full-iso", "--", &dir])
+                    .run_text_c_locale("ls", &["-la", "--time-style=full-iso", "--", &dir])
                 {
                     Ok(listing) => Ok(listing),
                     Err(err) if is_missing_path_error(&err) => Ok(String::new()),
@@ -161,7 +161,7 @@ impl StoreIo {
                     return result;
                 }
                 let full = self.wsl_path(rel_dir)?;
-                match self.builder.run_text("ls", &["-1", "--", &full]) {
+                match self.builder.run_text_c_locale("ls", &["-1", "--", &full]) {
                     Ok(text) if text.is_empty() => Ok(Vec::new()),
                     Ok(text) => Ok(text.lines().map(str::to_string).collect()),
                     Err(err) if is_missing_path_error(&err) => Ok(Vec::new()),
@@ -376,7 +376,7 @@ pub fn resolve_local_git_dir(root: &Path) -> Result<PathBuf> {
 /// see the module doc), only needs to compile there.
 fn resolve_wsl_git_dir(builder: &CommandBuilder, repo_root: &str) -> Result<String> {
     let dot_git = format!("{}/.git", repo_root.trim_end_matches('/'));
-    match builder.run_text("cat", &["--", &dot_git]) {
+    match builder.run_text_c_locale("cat", &["--", &dot_git]) {
         Ok(contents) => {
             let gitdir_line = contents
                 .lines()
@@ -398,6 +398,10 @@ fn resolve_wsl_git_dir(builder: &CommandBuilder, repo_root: &str) -> Result<Stri
 /// Whether a command failure's stderr indicates a missing file/directory
 /// (vs. a real failure) — the same heuristic
 /// [`crate::git::GitRepo::working_blob`]'s WSL branch uses for `cat`.
+/// English-only by design: every command whose failure feeds this runs via
+/// `CommandBuilder::run_c_locale`/`run_text_c_locale`, which force
+/// `LC_ALL=C` on WSL children so a non-English distro locale can't
+/// localize the message out from under the match.
 fn is_missing_path_error(err: &anyhow::Error) -> bool {
     err.to_string().contains("No such file or directory")
 }

@@ -355,7 +355,10 @@ impl ReviewIndex {
             entries: self.entries.clone(),
         };
         if let Ok(bytes) = serde_json::to_vec_pretty(&persisted) {
-            let tmp = path.with_extension("json.tmp");
+            // Pid-suffixed temp so two dv processes saving concurrently
+            // never interleave into one shared temp file (each renames a
+            // complete file; last rename wins).
+            let tmp = path.with_extension(format!("json.tmp.{}", std::process::id()));
             if std::fs::write(&tmp, &bytes).is_ok() {
                 let _ = std::fs::rename(&tmp, path);
             }

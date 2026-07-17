@@ -113,9 +113,10 @@ impl SetupState {
             let _ = std::fs::create_dir_all(parent);
         }
         if let Ok(bytes) = serde_json::to_vec_pretty(self) {
-            // Atomic-ish: write a temp sibling then rename over the target
-            // (same pattern as `Settings::save`/`RecentStore::save`).
-            let tmp = path.with_extension("json.tmp");
+            // Atomic-ish: write a pid-suffixed temp sibling then rename over
+            // the target (same pattern + two-process rationale as
+            // `Settings::save`).
+            let tmp = path.with_extension(format!("json.tmp.{}", std::process::id()));
             if std::fs::write(&tmp, &bytes).is_ok() {
                 let _ = std::fs::rename(&tmp, &path);
             }

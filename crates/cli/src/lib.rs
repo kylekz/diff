@@ -39,8 +39,8 @@ mod wait;
 use std::path::PathBuf;
 
 use dv_core::{
-    BlobSpec, Comment, CommentStatus, DiffSource, GitRepo, RepoLocation, Review, ReviewState,
-    ReviewStore, Side, Verdict,
+    Comment, CommentStatus, DiffSource, GitRepo, RepoLocation, Review, ReviewState, ReviewStore,
+    Side, Verdict,
 };
 use serde_json::{Value, json};
 
@@ -508,7 +508,7 @@ fn cmd_comment_add(
     let store = ReviewStore::open(repo.location().clone());
     let (mut review, created) = target_review_for_add(&store, parsed.review.as_deref())?;
 
-    let anchor = anchor_spec(&review.source, parsed.side, &parsed.file);
+    let anchor = dv_core::anchor_spec(&review.source, parsed.side, &parsed.file);
     let blob_sha = repo.blob_sha(&anchor).map_err(op_err)?;
     let unverifiable = blob_sha.is_none();
 
@@ -776,44 +776,6 @@ fn parse_lines(raw: &str) -> Result<(u32, u32), String> {
         return Err(format!("--lines end ({end}) must be >= start ({start})"));
     }
     Ok((start, end))
-}
-
-/// Map `(review.source, side, path)` to the [`BlobSpec`] whose sha anchors
-/// the comment (docs/phase-2-review-layer.md § Agent CLI). A plain,
-/// deliberately UI-agnostic function — `crates/app/src/workspace.rs`'s
-/// `compute_diff` has the equivalent mapping today (plus file-status
-/// short-circuits this doesn't need, since [`GitRepo::blob_sha`] already
-/// returns `None` for a path absent on that side); the UI is expected to
-/// eventually share this copy instead of its own.
-fn anchor_spec(source: &DiffSource, side: Side, path: &str) -> BlobSpec {
-    match (side, source) {
-        (Side::Old, DiffSource::WorkingTree | DiffSource::Staged) => BlobSpec::Rev {
-            rev: "HEAD".to_string(),
-            path: path.to_string(),
-        },
-        (Side::Old, DiffSource::Range { base, .. }) => BlobSpec::Rev {
-            rev: base.clone(),
-            path: path.to_string(),
-        },
-        (Side::Old, DiffSource::Commit(sha)) => BlobSpec::Rev {
-            rev: format!("{sha}^"),
-            path: path.to_string(),
-        },
-        (Side::New, DiffSource::WorkingTree) => BlobSpec::Working {
-            path: path.to_string(),
-        },
-        (Side::New, DiffSource::Staged) => BlobSpec::Index {
-            path: path.to_string(),
-        },
-        (Side::New, DiffSource::Range { head, .. }) => BlobSpec::Rev {
-            rev: head.clone(),
-            path: path.to_string(),
-        },
-        (Side::New, DiffSource::Commit(sha)) => BlobSpec::Rev {
-            rev: sha.clone(),
-            path: path.to_string(),
-        },
-    }
 }
 
 // ---------------------------------------------------------------------
@@ -1097,84 +1059,6 @@ mod tests {
     fn parse_lines_rejects_garbage() {
         assert!(parse_lines("abc").is_err());
         assert!(parse_lines("10:abc").is_err());
-    }
-
-    // --- anchor_spec: all source x side combos -------------------------
-
-    #[test]
-    fn anchor_spec_working_tree() {
-        assert_eq!(
-            anchor_spec(&DiffSource::WorkingTree, Side::Old, "a.rs"),
-            BlobSpec::Rev {
-                rev: "HEAD".to_string(),
-                path: "a.rs".to_string()
-            }
-        );
-        assert_eq!(
-            anchor_spec(&DiffSource::WorkingTree, Side::New, "a.rs"),
-            BlobSpec::Working {
-                path: "a.rs".to_string()
-            }
-        );
-    }
-
-    #[test]
-    fn anchor_spec_staged() {
-        assert_eq!(
-            anchor_spec(&DiffSource::Staged, Side::Old, "a.rs"),
-            BlobSpec::Rev {
-                rev: "HEAD".to_string(),
-                path: "a.rs".to_string()
-            }
-        );
-        assert_eq!(
-            anchor_spec(&DiffSource::Staged, Side::New, "a.rs"),
-            BlobSpec::Index {
-                path: "a.rs".to_string()
-            }
-        );
-    }
-
-    #[test]
-    fn anchor_spec_range() {
-        let source = DiffSource::Range {
-            base: "base-sha".to_string(),
-            head: "head-sha".to_string(),
-            merge_base: false,
-        };
-        assert_eq!(
-            anchor_spec(&source, Side::Old, "a.rs"),
-            BlobSpec::Rev {
-                rev: "base-sha".to_string(),
-                path: "a.rs".to_string()
-            }
-        );
-        assert_eq!(
-            anchor_spec(&source, Side::New, "a.rs"),
-            BlobSpec::Rev {
-                rev: "head-sha".to_string(),
-                path: "a.rs".to_string()
-            }
-        );
-    }
-
-    #[test]
-    fn anchor_spec_commit() {
-        let source = DiffSource::Commit("deadbeef".to_string());
-        assert_eq!(
-            anchor_spec(&source, Side::Old, "a.rs"),
-            BlobSpec::Rev {
-                rev: "deadbeef^".to_string(),
-                path: "a.rs".to_string()
-            }
-        );
-        assert_eq!(
-            anchor_spec(&source, Side::New, "a.rs"),
-            BlobSpec::Rev {
-                rev: "deadbeef".to_string(),
-                path: "a.rs".to_string()
-            }
-        );
     }
 
     // --- arg parsing ----------------------------------------------------

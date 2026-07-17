@@ -1281,36 +1281,6 @@ pub struct Workspace {
     root_bounds: Rc<Cell<Option<Bounds<Pixels>>>>,
 }
 
-/// Which blob a comment on `side` of `path` anchors to, given the review's
-/// (resolved) diff source. The CLI carries the same mapping; keep in sync
-/// until it moves into dv-core (backlog).
-fn anchor_spec(source: &DiffSource, side: dv_core::Side, path: &str) -> BlobSpec {
-    match (side, source) {
-        (dv_core::Side::Old, DiffSource::WorkingTree | DiffSource::Staged) => BlobSpec::Rev {
-            rev: "HEAD".into(),
-            path: path.into(),
-        },
-        (dv_core::Side::Old, DiffSource::Range { base, .. }) => BlobSpec::Rev {
-            rev: base.clone(),
-            path: path.into(),
-        },
-        (dv_core::Side::Old, DiffSource::Commit(sha)) => BlobSpec::Rev {
-            rev: format!("{sha}^"),
-            path: path.into(),
-        },
-        (dv_core::Side::New, DiffSource::WorkingTree) => BlobSpec::Working { path: path.into() },
-        (dv_core::Side::New, DiffSource::Staged) => BlobSpec::Index { path: path.into() },
-        (dv_core::Side::New, DiffSource::Range { head, .. }) => BlobSpec::Rev {
-            rev: head.clone(),
-            path: path.into(),
-        },
-        (dv_core::Side::New, DiffSource::Commit(sha)) => BlobSpec::Rev {
-            rev: sha.clone(),
-            path: path.into(),
-        },
-    }
-}
-
 /// Which review the workspace should display, from a store listing
 /// (newest-first).
 ///
@@ -2268,14 +2238,14 @@ impl Workspace {
     /// read off-thread, so by completion time a *faster* concurrent writer
     /// — a GUI comment save, or another one of these three reload paths —
     /// may have already landed a newer version of the SAME review into
-    /// `this.review`. Comparing only the `(id, updated_ms, comments.len())`
-    /// fingerprint can't tell "genuinely different" apart from "an older
-    /// snapshot of what's already current", so a same-id pick whose
-    /// `updated_ms` is strictly older than what's already showing is
-    /// discarded rather than applied — this pass must never move a review
-    /// backwards in time. A different id (the pick genuinely landed on a
-    /// different review, e.g. the pin fell through to another draft) always
-    /// applies regardless of its `updated_ms`.
+    /// `this.review`. Content comparison alone can't tell "genuinely
+    /// different" apart from "an older snapshot of what's already current"
+    /// (both just compare unequal), so a same-id pick whose `updated_ms` is
+    /// strictly older than what's already showing is discarded rather than
+    /// applied — this pass must never move a review backwards in time. A
+    /// different id (the pick genuinely landed on a different review, e.g.
+    /// the pin fell through to another draft) always applies regardless of
+    /// its `updated_ms`.
     ///
     /// Returns whether `this.review` actually changed — callers use this to
     /// decide whether to call `reset_diff_list`/`cx.notify()`, since
@@ -2294,11 +2264,13 @@ impl Workspace {
         if stale_snapshot {
             return false;
         }
-        let fingerprint = |r: &Option<dv_core::Review>| {
-            r.as_ref()
-                .map(|r| (r.id.clone(), r.updated_ms, r.comments.len()))
-        };
-        if fingerprint(&self.review) == fingerprint(&review) {
+        // Full content equality (`Review: PartialEq`), not the old
+        // `(id, updated_ms, comments.len())` fingerprint — that trio was
+        // blind to same-millisecond external writes with equal comment
+        // counts (a reply landing in the same ms as the save it raced, a
+        // status flip plus an add, ...). (docs/backlog.md fingerprint-
+        // hardening item.)
+        if self.review == review {
             return false;
         }
         // `remote_threads` was fetched for whichever PR `pr_remote` pointed
@@ -4365,7 +4337,8 @@ impl Workspace {
                         let Some(sha) = sha else { continue }; // unverifiable
                         let is_new = matches!(side, dv_core::Side::New);
                         let entry = current.entry(is_new).or_insert_with(|| {
-                            repo.blob_sha(&anchor_spec(&source, side, &path)).ok()
+                            repo.blob_sha(&dv_core::anchor_spec(&source, side, &path))
+                                .ok()
                         });
                         let Some(current_sha) = entry else {
                             continue; // git failed — skip, keep prior verdict
@@ -4643,7 +4616,13 @@ impl Workspace {
                 .background_executor()
                 .spawn(async move {
                     let store = dv_core::ReviewStore::open(location);
-                    let mut review = store.load(&review.id).ok().flatten().unwrap_or(review);
+                    // `?`, not `.ok().flatten()`: a load ERROR is not "file
+                    // missing" (that's `Ok(None)`, where our clone is the
+                    // right fallback) — it's an unreadable or future-schema
+                    // file, and saving our stale clone over it would destroy
+                    // data this build can't even parse. Abort and surface
+                    // instead (docs/backlog.md schema-guard finding).
+                    let mut review = store.load(&review.id)?.unwrap_or(review);
                     review.set_state(dv_core::ReviewState::Submitted {
                         verdict,
                         at_ms: dv_core::review::now_ms(),
@@ -5263,7 +5242,7 @@ impl Workspace {
                     // Anchor against the review's own source — it may have
                     // been created by the CLI over a different one.
                     let sha = repo
-                        .blob_sha(&anchor_spec(&review.source, side, &path))
+                        .blob_sha(&dv_core::anchor_spec(&review.source, side, &path))
                         .ok()
                         .flatten();
                     review.add_comment(path, side, start, end, sha, body, author)?;
@@ -5326,7 +5305,13 @@ impl Workspace {
                 .spawn(async move {
                     let store = dv_core::ReviewStore::open(location);
                     // Fresh-load before mutating (see submit_comment).
-                    let mut review = store.load(&review.id).ok().flatten().unwrap_or(review);
+                    // `?`, not `.ok().flatten()`: a load ERROR is not "file
+                    // missing" (that's `Ok(None)`, where our clone is the
+                    // right fallback) — it's an unreadable or future-schema
+                    // file, and saving our stale clone over it would destroy
+                    // data this build can't even parse. Abort and surface
+                    // instead (docs/backlog.md schema-guard finding).
+                    let mut review = store.load(&review.id)?.unwrap_or(review);
                     // Re-check against the freshly-loaded state, not the
                     // stale clone the synchronous check above saw.
                     if matches!(review.state, dv_core::ReviewState::Submitted { .. }) {
@@ -5378,7 +5363,13 @@ impl Workspace {
                 .spawn(async move {
                     let store = dv_core::ReviewStore::open(location);
                     // Fresh-load before mutating (see submit_comment).
-                    let mut review = store.load(&review.id).ok().flatten().unwrap_or(review);
+                    // `?`, not `.ok().flatten()`: a load ERROR is not "file
+                    // missing" (that's `Ok(None)`, where our clone is the
+                    // right fallback) — it's an unreadable or future-schema
+                    // file, and saving our stale clone over it would destroy
+                    // data this build can't even parse. Abort and surface
+                    // instead (docs/backlog.md schema-guard finding).
+                    let mut review = store.load(&review.id)?.unwrap_or(review);
                     if matches!(review.state, dv_core::ReviewState::Submitted { .. }) {
                         return anyhow::Ok((review, false));
                     }
@@ -5611,7 +5602,13 @@ impl Workspace {
                 .background_executor()
                 .spawn(async move {
                     let store = dv_core::ReviewStore::open(location);
-                    let mut review = store.load(&review.id).ok().flatten().unwrap_or(review);
+                    // `?`, not `.ok().flatten()`: a load ERROR is not "file
+                    // missing" (that's `Ok(None)`, where our clone is the
+                    // right fallback) — it's an unreadable or future-schema
+                    // file, and saving our stale clone over it would destroy
+                    // data this build can't even parse. Abort and surface
+                    // instead (docs/backlog.md schema-guard finding).
+                    let mut review = store.load(&review.id)?.unwrap_or(review);
                     // Re-check against the freshly-loaded state — the
                     // `review_is_readonly` check `open_thread_input` did
                     // when this input was opened can be stale by now.

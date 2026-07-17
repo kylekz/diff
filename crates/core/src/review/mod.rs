@@ -21,7 +21,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use anyhow::{Result, anyhow, bail};
 use serde::{Deserialize, Serialize};
 
-use crate::git::DiffSource;
+use crate::git::{BlobSpec, DiffSource};
 
 pub use io::{
     list_dir_names, read_file_at, remove_file_at, resolve_local_git_dir, write_file_atomic_at,
@@ -42,7 +42,7 @@ pub const SCHEMA_VERSION: u32 = 1;
 /// this model — a newer dv writing extra fields must stay readable by an
 /// older build (forward compat), matching phase-2's schema-versioning
 /// plan of only failing on a `v` bump, not on unrecognized fields.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Review {
     /// Schema version; always [`SCHEMA_VERSION`] on anything this build
     /// writes.
@@ -106,7 +106,7 @@ pub enum Side {
 }
 
 /// A single-line or range comment thread.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Comment {
     /// `c-<created_ms>-<4 hex>`.
     pub id: String,
@@ -140,7 +140,7 @@ pub enum CommentStatus {
     Resolved,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Reply {
     /// `p-<created_ms>-<4 hex>` (`p` for "reply", `r` and `c` already being
     /// taken by [`Review`] and [`Comment`]).
@@ -326,6 +326,44 @@ fn gen_id(prefix: char, now_ms: u64) -> String {
 
     let value = (counter as u16) ^ (salt as u16);
     format!("{prefix}-{now_ms}-{value:04x}")
+}
+
+/// Which blob a comment on `side` of `path` anchors to, given the review's
+/// (resolved) diff source — the single shared CLI/GUI mapping (formerly
+/// duplicated, verified identical, in `crates/cli` and
+/// `crates/app/src/workspace.rs`; docs/backlog.md unification item). A
+/// plain, UI-agnostic function: no per-file-status short-circuits are
+/// needed because [`crate::GitRepo::blob_sha`] already returns `None` for
+/// a path absent on the requested side.
+pub fn anchor_spec(source: &DiffSource, side: Side, path: &str) -> BlobSpec {
+    match (side, source) {
+        (Side::Old, DiffSource::WorkingTree | DiffSource::Staged) => BlobSpec::Rev {
+            rev: "HEAD".to_string(),
+            path: path.to_string(),
+        },
+        (Side::Old, DiffSource::Range { base, .. }) => BlobSpec::Rev {
+            rev: base.clone(),
+            path: path.to_string(),
+        },
+        (Side::Old, DiffSource::Commit(sha)) => BlobSpec::Rev {
+            rev: format!("{sha}^"),
+            path: path.to_string(),
+        },
+        (Side::New, DiffSource::WorkingTree) => BlobSpec::Working {
+            path: path.to_string(),
+        },
+        (Side::New, DiffSource::Staged) => BlobSpec::Index {
+            path: path.to_string(),
+        },
+        (Side::New, DiffSource::Range { head, .. }) => BlobSpec::Rev {
+            rev: head.clone(),
+            path: path.to_string(),
+        },
+        (Side::New, DiffSource::Commit(sha)) => BlobSpec::Rev {
+            rev: sha.clone(),
+            path: path.to_string(),
+        },
+    }
 }
 
 /// A loaded review's `v` must not exceed what this build understands —
@@ -584,5 +622,84 @@ mod tests {
             let candidate = review.fresh_id('c', review.comments[0].created_ms);
             assert_ne!(candidate, existing_id);
         }
+    }
+
+    // --- anchor_spec: all source x side combos (moved from crates/cli
+    // when the duplicated mapping was unified here) ----------------------
+
+    #[test]
+    fn anchor_spec_working_tree() {
+        assert_eq!(
+            anchor_spec(&DiffSource::WorkingTree, Side::Old, "a.rs"),
+            BlobSpec::Rev {
+                rev: "HEAD".to_string(),
+                path: "a.rs".to_string()
+            }
+        );
+        assert_eq!(
+            anchor_spec(&DiffSource::WorkingTree, Side::New, "a.rs"),
+            BlobSpec::Working {
+                path: "a.rs".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn anchor_spec_staged() {
+        assert_eq!(
+            anchor_spec(&DiffSource::Staged, Side::Old, "a.rs"),
+            BlobSpec::Rev {
+                rev: "HEAD".to_string(),
+                path: "a.rs".to_string()
+            }
+        );
+        assert_eq!(
+            anchor_spec(&DiffSource::Staged, Side::New, "a.rs"),
+            BlobSpec::Index {
+                path: "a.rs".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn anchor_spec_range() {
+        let source = DiffSource::Range {
+            base: "base-sha".to_string(),
+            head: "head-sha".to_string(),
+            merge_base: false,
+        };
+        assert_eq!(
+            anchor_spec(&source, Side::Old, "a.rs"),
+            BlobSpec::Rev {
+                rev: "base-sha".to_string(),
+                path: "a.rs".to_string()
+            }
+        );
+        assert_eq!(
+            anchor_spec(&source, Side::New, "a.rs"),
+            BlobSpec::Rev {
+                rev: "head-sha".to_string(),
+                path: "a.rs".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn anchor_spec_commit() {
+        let source = DiffSource::Commit("deadbeef".to_string());
+        assert_eq!(
+            anchor_spec(&source, Side::Old, "a.rs"),
+            BlobSpec::Rev {
+                rev: "deadbeef^".to_string(),
+                path: "a.rs".to_string()
+            }
+        );
+        assert_eq!(
+            anchor_spec(&source, Side::New, "a.rs"),
+            BlobSpec::Rev {
+                rev: "deadbeef".to_string(),
+                path: "a.rs".to_string()
+            }
+        );
     }
 }

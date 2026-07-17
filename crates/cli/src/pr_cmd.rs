@@ -940,7 +940,7 @@ mod tests {
                     "no draft exists to create-then-submit here, so this advice is wrong: {msg}"
                 );
             }
-            CliError::Usage { .. } => panic!("expected an operation error, got a usage error"),
+            other => panic!("expected an operation error, got: {other:?}"),
         }
     }
 
@@ -975,7 +975,7 @@ mod tests {
                 assert!(msg.contains("linked to PR 5"), "message: {msg}");
                 assert!(msg.contains("--pr 9"), "message: {msg}");
             }
-            CliError::Usage { .. } => panic!("expected an operation error, got a usage error"),
+            other => panic!("expected an operation error, got: {other:?}"),
         }
     }
 
@@ -992,10 +992,9 @@ mod tests {
             .expect_err("missing --pr with no linkage must error");
         match err {
             CliError::Usage { .. } => {}
-            CliError::Op(msg) => panic!(
-                "expected a usage error (exit 2) like missing --verdict, got an operation \
-                 error: {msg}"
-            ),
+            other => {
+                panic!("expected a usage error (exit 2) like missing --verdict, got: {other:?}")
+            }
         }
     }
 
@@ -1014,7 +1013,7 @@ mod tests {
                 msg.contains("no commits yet"),
                 "message should name the real problem, not surface raw git text: {msg}"
             ),
-            CliError::Usage { .. } => panic!("expected an operation error, got a usage error"),
+            other => panic!("expected an operation error, got: {other:?}"),
         }
     }
 }

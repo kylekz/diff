@@ -32,7 +32,9 @@
 pub mod author;
 pub mod pr;
 mod pr_cmd;
+mod skill;
 pub mod submit;
+mod wait;
 
 use std::path::PathBuf;
 
@@ -43,12 +45,13 @@ use dv_core::{
 use serde_json::{Value, json};
 
 const TOP_USAGE: &str = "\
-usage: dv <review|comment|pr> [options]
+usage: dv <review|comment|pr|skill> [options]
        dv --version
 
   review    manage local reviews (see `dv review --help`)
   comment   manage review comments (see `dv comment --help`)
   pr        GitHub PR operations (see `dv pr --help`)
+  skill     install/show the dv-review agent skill (see `dv skill --help`)
   --version print the dv-cli version";
 
 /// Entry point for both `crates/app/src/main.rs`'s headless dispatch (which
@@ -79,6 +82,21 @@ pub fn run(args: &[String]) -> i32 {
         Some("review") => dispatch(&args[1..], REVIEW_USAGE, review_router),
         Some("comment") => dispatch(&args[1..], COMMENT_USAGE, comment_router),
         Some("pr") => dispatch(&args[1..], pr_cmd::PR_USAGE, pr_cmd::pr_router),
+        // `skill` takes no repo location — a small bespoke arm instead of
+        // `dispatch` (whose location-global extraction would silently
+        // accept a meaningless `--repo`).
+        Some("skill") => {
+            let rest = &args[1..];
+            let json = rest.iter().any(|a| a == "--json");
+            let leftover: Vec<String> = rest.iter().filter(|a| *a != "--json").cloned().collect();
+            let Some((sub, sub_rest)) = leftover.split_first() else {
+                return report_error(usage_err("missing subcommand", skill::SKILL_USAGE), json);
+            };
+            match skill::skill_router(sub, sub_rest, json) {
+                Ok(()) => 0,
+                Err(err) => report_error(err, json),
+            }
+        }
         // Version-sync is by content hash, not this string (see
         // `crates/core/src/remote/install.rs`'s module doc) — `--version`
         // is purely a diagnostic nicety. It's reachable from BOTH callers:
@@ -121,9 +139,16 @@ pub fn run(args: &[String]) -> i32 {
 /// alongside the specific complaint; an operation error (exit 1) is just a
 /// message (unknown id, no repo, store failure — see the module doc's exit
 /// code contract).
+#[derive(Debug)]
 enum CliError {
-    Usage { reason: String, usage: &'static str },
+    Usage {
+        reason: String,
+        usage: &'static str,
+    },
     Op(String),
+    /// Exit with this code, printing nothing — the command already produced
+    /// its own output (e.g. `review wait`'s timeout report, exit 3).
+    Exit(i32),
 }
 
 fn usage_err(reason: impl Into<String>, usage: &'static str) -> CliError {
@@ -150,6 +175,7 @@ fn report_error(err: CliError, json: bool) -> i32 {
             eprintln!("{reason}");
             (reason, 1)
         }
+        CliError::Exit(code) => return code,
     };
     if json {
         println!("{}", json!({ "error": reason }));
@@ -229,7 +255,7 @@ fn resolve_repo(location: Option<RepoLocation>) -> Result<GitRepo, CliError> {
 // ---------------------------------------------------------------------
 
 const REVIEW_USAGE: &str = "\
-usage: dv review <list|show|create|delete|submit> [options]
+usage: dv review <list|show|create|delete|submit|wait> [options]
 
   list                        all reviews in the repo
   show <id>                   one review, including its comments
@@ -239,6 +265,9 @@ usage: dv review <list|show|create|delete|submit> [options]
   submit [<id>] --pr <number> [--verdict comment|approve|request-changes]
                [--body <text>] [--include-resolved]
                submit a draft review to GitHub via `gh` (docs/phase-3-github.md)
+  wait [<id>] [--timeout <seconds>]
+               block until review activity changes, then report it
+               (exit 0 = changed, 3 = timeout)
 
 global options (may appear anywhere after `review`):
   --repo <path>                local path or \\\\wsl.localhost\\<distro>\\<path> (default: .)
@@ -313,6 +342,7 @@ fn review_router(
             Ok(())
         }
         "submit" => pr_cmd::cmd_review_submit(args, json, location),
+        "wait" => wait::cmd_review_wait(args, json, location),
         other => Err(usage_err(
             format!("unknown review subcommand: {other}"),
             REVIEW_USAGE,

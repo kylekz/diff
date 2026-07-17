@@ -374,8 +374,8 @@ fn register_fonts(cx: &mut App) {
 }
 
 fn main() {
-    // Pure headless path: `dv review ...` / `dv comment ...` / `dv pr
-    // <list|view|create|fetch> ...` are the agent-facing CLI
+    // Pure headless path: `dv review ...` / `dv comment ...` / `dv skill
+    // ...` / `dv pr <list|view|create|fetch> ...` are the agent-facing CLI
     // (docs/phase-2-review-layer.md § Agent CLI, docs/phase-3-github.md)
     // and must never touch gpui — no window, no platform app, no theme
     // init. Handled before anything else in `main` so a CI/agent
@@ -387,7 +387,12 @@ fn main() {
     // by `pr_first_positional` before anything commits to either path.
     let raw_args: Vec<String> = std::env::args().collect();
     if let Some(sub) = raw_args.get(1) {
-        if sub == "review" || sub == "comment" || sub == "--version" || sub == "-V" {
+        if sub == "review"
+            || sub == "comment"
+            || sub == "skill"
+            || sub == "--version"
+            || sub == "-V"
+        {
             let code = dv_cli::run(&raw_args[1..]);
             std::process::exit(code);
         }

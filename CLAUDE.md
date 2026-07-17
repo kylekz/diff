@@ -121,7 +121,18 @@ Always pass `--json` for machine parsing — it's a stable schema (`review`/
 `reviews`/`comment`/`comments`/`review_id`/`comment_id` keys). Errors print
 to stderr always, plus `{"error":"..."}` on stdout in `--json` mode. Exit
 codes: `0` success, `1` operation error (unknown id, no repo, store
-failure), `2` usage error (bad flags).
+failure), `2` usage error (bad flags), `3` timeout (`review wait` only).
+
+`dv review wait [<id>] [--timeout <secs>]` blocks (no polling — it rides
+the store watcher) until review activity changes, then emits
+`{"wait":{"outcome":"changed","changes":[...]}}` (kinds: `created`/
+`deleted`/`updated` with `comments_added`/`status_changed`/
+`comments_updated`/`state_changed`) and exits 0; timeout emits
+`{"wait":{"outcome":"timeout"}}` and exits 3. `dv skill
+<install|show|path>` distributes the dv-review agent skill
+(`crates/cli/skill/SKILL.md`, embedded in the binary) to
+`~/.claude/skills/dv-review/` — that skill, not this file, is how agents
+in *reviewed* repos learn the workflow.
 
 `dv pr <list|view|create|fetch>` (`crates/app/src/cli/pr_cmd.rs`) wrap `gh`
 for GitHub PRs: `list`/`view <n>` emit `{"prs":[...]}`/`{"pr":{...}}`;

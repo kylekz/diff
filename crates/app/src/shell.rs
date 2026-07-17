@@ -57,7 +57,16 @@ actions!(
         ToggleArchiveReview,
         DeleteReviewPrompt,
         DeleteReviewConfirm,
-        DeleteReviewCancel
+        DeleteReviewCancel,
+        // ctrl-k / cmd-k command palette (docs/backlog.md "one fuzzy
+        // surface over commands AND destinations") — a fourth shell-level
+        // overlay, same family as the theme picker/settings panel/
+        // onboarding page above.
+        OpenCommandPalette,
+        CommandPaletteNext,
+        CommandPalettePrev,
+        CommandPaletteClose,
+        CommandPaletteChoose
     ]
 );
 
@@ -76,6 +85,8 @@ const ONBOARDING_CONTEXT: &str = "OnboardingOpen";
 /// review card's context menu — no keybinding opens it, but escape/enter
 /// need a context to bind against while it's up).
 const DELETE_CONFIRM_CONTEXT: &str = "DeleteConfirmOpen";
+/// Same mechanism, for the ctrl-k/cmd-k command palette.
+const COMMAND_PALETTE_CONTEXT: &str = "CommandPaletteOpen";
 
 /// Fixed height, in px, of every sidebar row — both a review card
 /// ([`AppShell::render_review_card`]) and a group header
@@ -721,6 +732,10 @@ pub fn init(cx: &mut App) {
         // ctrl-b convention; cmd- twin per the S8i macOS pairing above.
         KeyBinding::new("cmd-b", ToggleSidebar, shell),
         KeyBinding::new("ctrl-b", ToggleSidebar, shell),
+        // ctrl-k / cmd-k command palette — same cmd-/ctrl- pairing every
+        // other shell-level binding above already uses.
+        KeyBinding::new("cmd-k", OpenCommandPalette, shell),
+        KeyBinding::new("ctrl-k", OpenCommandPalette, shell),
     ]);
     cx.bind_keys([
         KeyBinding::new("down", ThemePickerNext, theme_picker),
@@ -734,6 +749,13 @@ pub fn init(cx: &mut App) {
     cx.bind_keys([
         KeyBinding::new("escape", DeleteReviewCancel, delete_confirm),
         KeyBinding::new("enter", DeleteReviewConfirm, delete_confirm),
+    ]);
+    let command_palette = Some("AppShell && CommandPaletteOpen");
+    cx.bind_keys([
+        KeyBinding::new("down", CommandPaletteNext, command_palette),
+        KeyBinding::new("up", CommandPalettePrev, command_palette),
+        KeyBinding::new("escape", CommandPaletteClose, command_palette),
+        KeyBinding::new("enter", CommandPaletteChoose, command_palette),
     ]);
 }
 
@@ -1024,6 +1046,11 @@ pub struct AppShell {
     /// PR picker there's nothing to load — the registry is a static list —
     /// so this is just a cursor into `themes::names()`.
     theme_picker: Option<ThemePicker>,
+    /// The ctrl-k/cmd-k command palette, when open (docs/backlog.md "one
+    /// fuzzy surface over commands AND destinations"). A fifth shell-level
+    /// overlay in the same mutual-exclusion family as `theme_picker`/
+    /// `settings_panel`/`onboarding`/`delete_confirm` above.
+    command_palette: Option<CommandPalette>,
     /// The settings panel (`ctrl-,`), when open.
     settings_panel: Option<SettingsPanel>,
     /// Keeps the window's OS-appearance observer alive — re-resolves the
@@ -1143,6 +1170,103 @@ struct ThemePicker {
     selected: usize,
 }
 
+/// The ctrl-k/cmd-k command palette overlay, while open. Unlike the theme
+/// picker/jump-to-file palette (a static list / one workspace's files),
+/// this one's candidate set spans commands + reviews + files + PRs and can
+/// change out from under the query (a background PR-list revalidation, a
+/// live `ReviewChanged`) — so `items` is the already-ranked snapshot for
+/// the CURRENT `input` text, rebuilt on every `InputEvent::Change`
+/// (`AppShell::recompute_command_palette`) rather than re-derived on every
+/// render.
+struct CommandPalette {
+    input: Entity<InputState>,
+    _subscription: Subscription,
+    /// Ranked, mixed results for `input`'s current text — see
+    /// [`crate::command_palette::rank_and_mix`]. Rebuilt wholesale on every
+    /// change rather than diffed; the candidate lists involved (a few dozen
+    /// commands, a handful of reviews/files/PRs) are far too small for that
+    /// to matter.
+    items: Vec<PaletteRow>,
+    /// Cursor into `items`.
+    selected: usize,
+}
+
+/// One already-ranked palette row, owned (not borrowed) so it can outlive
+/// the `Vec<PaletteCandidate>` scratch list `recompute_command_palette`
+/// builds and ranks each keystroke — see that function's doc comment for
+/// why lifetime-borrowing `crate::command_palette::rank_and_mix`'s output
+/// straight into `CommandPalette::items` doesn't work here (it would tie
+/// `CommandPalette` to a borrow of a temporary).
+struct PaletteRow {
+    kind: crate::command_palette::PaletteKind,
+    id: String,
+    label: SharedString,
+    subtitle: SharedString,
+}
+
+impl From<&crate::command_palette::PaletteCandidate> for PaletteRow {
+    fn from(c: &crate::command_palette::PaletteCandidate) -> Self {
+        Self {
+            kind: c.kind,
+            id: c.id.clone(),
+            label: c.label.clone().into(),
+            subtitle: c.subtitle.clone().into(),
+        }
+    }
+}
+
+/// Real, live keybinding text for `action_name` (e.g. `"workspace::
+/// ToggleSplit"`), for the command palette's Commands-group subtitle — task
+/// requirement: "surface real bindings, not hardcoded strings". Builds the
+/// action (same `cx.build_action` automation's own `Cmd::Action` dispatch
+/// uses) and looks it up in the app-wide keymap directly
+/// ([`gpui::App::key_bindings`]/[`gpui::Keymap::bindings_for_action`]) —
+/// deliberately NOT `Window::bindings_for_action` (used by gpui-component's
+/// own `Kbd::binding_for_action`), which filters by the CURRENTLY FOCUSED
+/// node's context stack: while the palette itself has focus, that stack is
+/// "AppShell && CommandPaletteOpen", which would report every workspace-
+/// scoped binding (bound to `"Workspace && ..."` predicates, see
+/// `workspace::init`) as unbound. The bare keymap has no such blind spot —
+/// it matches on the action's TYPE only, regardless of what's focused right
+/// now, which is exactly "what key would invoke this, in general".
+/// `bindings_for_action`'s own doc comment says the LAST-registered binding
+/// should win for display purposes when a namespace multi-binds
+/// cmd-and-ctrl twins (S8i's convention throughout `workspace::init`/
+/// `Self::init`: cmd- registered first, ctrl- second) — `.last()` here
+/// prefers the ctrl- form, the right one to show on this non-mac dev
+/// machine. `None` when the action has no binding at all (not every
+/// command needs one).
+fn keybinding_hint(action_name: &str, cx: &App) -> Option<String> {
+    let action = cx.build_action(action_name, None).ok()?;
+    let keymap = cx.key_bindings();
+    let keymap = keymap.borrow();
+    let binding = keymap.bindings_for_action(action.as_ref()).last()?;
+    let strokes = binding.keystrokes();
+    if strokes.is_empty() {
+        return None;
+    }
+    Some(
+        strokes
+            .iter()
+            .map(|k| Kbd::format(k.as_keystroke()))
+            .collect::<Vec<_>>()
+            .join(" "),
+    )
+}
+
+/// Display label for a palette group header — see
+/// [`crate::command_palette::PaletteKind`]'s own doc comment for the group
+/// order this mirrors.
+fn palette_group_label(kind: crate::command_palette::PaletteKind) -> &'static str {
+    use crate::command_palette::PaletteKind;
+    match kind {
+        PaletteKind::Command => "Commands",
+        PaletteKind::Review => "Reviews",
+        PaletteKind::File => "Files",
+        PaletteKind::Pr => "Pull Requests",
+    }
+}
+
 /// The settings panel overlay, while open. Mouse-first (no arrow-key
 /// cursor like the theme/PR pickers — every control is a button/stepper/
 /// text-input the user clicks directly), so all this holds is the one text
@@ -1255,6 +1379,7 @@ impl AppShell {
             _ws_summary_subscription: None,
             settings,
             theme_picker: None,
+            command_palette: None,
             settings_panel: None,
             _appearance_subscription: None,
             last_switch_ms: None,
@@ -2347,7 +2472,10 @@ impl AppShell {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if self.theme_picker.is_some() || self.settings_panel.is_some() || self.onboarding.is_some()
+        if self.theme_picker.is_some()
+            || self.settings_panel.is_some()
+            || self.onboarding.is_some()
+            || self.command_palette.is_some()
         {
             return;
         }
@@ -2450,7 +2578,10 @@ impl AppShell {
         // is NOT redundant though (post-hoc review P3): it's a workspace-
         // pane overlay, so the sidebar stays right-clickable while it's
         // open and this modal would stack on top of it.
-        if self.theme_picker.is_some() || self.settings_panel.is_some() || self.onboarding.is_some()
+        if self.theme_picker.is_some()
+            || self.settings_panel.is_some()
+            || self.onboarding.is_some()
+            || self.command_palette.is_some()
         {
             return;
         }
@@ -2681,6 +2812,520 @@ impl AppShell {
         for ws in self.workspace_cache.cached_entities() {
             ws.update(cx, |ws, cx| ws.on_theme_changed(false, cx));
         }
+    }
+
+    // ---- ctrl-k / cmd-k command palette ---------------------------------
+    //
+    // docs/backlog.md: "one fuzzy surface over commands AND destinations:
+    // the action registry, reviews via the Phase-6 global index, files in
+    // the current diff, PRs." Same shell-level-overlay shape as the theme
+    // picker just above (open/close/next/prev/choose, a key-context toggle,
+    // mutual exclusion with the other overlays) but with a live text input
+    // like `workspace::Palette` (jump-to-file) — the ranking/mixing itself
+    // is pure logic in `crate::command_palette`, unit-tested there headless;
+    // everything here is just wiring live app state into it.
+
+    fn on_open_command_palette(
+        &mut self,
+        _: &OpenCommandPalette,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        // Same mutual-exclusion posture as `on_open_theme_picker` — plus
+        // `self.command_palette.is_some()` itself, since (unlike the theme
+        // picker) there's no reason to special-case "already open" with a
+        // refocus: the input already has focus, so ctrl-k firing again a
+        // second time can only mean the keymap somehow dispatched it twice.
+        if self.command_palette.is_some()
+            || self.theme_picker.is_some()
+            || self.settings_panel.is_some()
+            || self.onboarding.is_some()
+            || self.delete_confirm.is_some()
+        {
+            return;
+        }
+        if self
+            .active
+            .as_ref()
+            .is_some_and(|ws| ws.read(cx).pr_picker_open())
+        {
+            return;
+        }
+        self.close_filter_popover(cx);
+
+        let input = cx.new(|cx| {
+            InputState::new(window, cx)
+                .placeholder("Type a command, or search reviews/files/PRs\u{2026}")
+        });
+        let items = self.compute_command_palette_items("", cx);
+        let subscription = cx.subscribe_in(
+            &input,
+            window,
+            |this, input, event: &InputEvent, window, cx| match event {
+                InputEvent::Change => {
+                    let query = input.read(cx).value().to_string();
+                    this.recompute_command_palette(&query, cx);
+                }
+                InputEvent::PressEnter { .. } => this.command_palette_choose(window, cx),
+                InputEvent::Blur => this.close_command_palette(window, cx),
+                InputEvent::Focus => {}
+            },
+        );
+        // Focus the INPUT itself (not `self.focus_handle`) — same reasoning
+        // as `workspace::Workspace::on_jump_to_file`: up/down/escape/enter
+        // are bound to "AppShell && CommandPaletteOpen", a context stamped
+        // on this shell's ROOT node (see `render`'s `key_context` builder),
+        // which is an ancestor of the input regardless of which specific
+        // node has literal focus — so those bindings still resolve fine
+        // while the input holds focus and receives the actual typing.
+        input.update(cx, |input, cx| input.focus(window, cx));
+        self.command_palette = Some(CommandPalette {
+            input,
+            _subscription: subscription,
+            items,
+            selected: 0,
+        });
+        cx.notify();
+    }
+
+    /// Closes the palette, restoring focus the same way
+    /// [`Self::close_theme_picker`] does (Phase 7 D0 fixed a real regression
+    /// in exactly this spot for the PR picker: focusing the wrong target
+    /// left a binding's context off the dispatch path) — the active
+    /// workspace's own handle if one exists, else the shell's.
+    fn close_command_palette(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.command_palette.take().is_some() {
+            match &self.active {
+                Some(ws) => window.focus(&ws.focus_handle(cx), cx),
+                None => window.focus(&self.focus_handle, cx),
+            }
+            cx.notify();
+        }
+    }
+
+    fn on_command_palette_close(
+        &mut self,
+        _: &CommandPaletteClose,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.close_command_palette(window, cx);
+    }
+
+    fn on_command_palette_next(
+        &mut self,
+        _: &CommandPaletteNext,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(palette) = &mut self.command_palette
+            && !palette.items.is_empty()
+        {
+            palette.selected = (palette.selected + 1).min(palette.items.len() - 1);
+            cx.notify();
+        }
+    }
+
+    fn on_command_palette_prev(
+        &mut self,
+        _: &CommandPalettePrev,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(palette) = &mut self.command_palette {
+            palette.selected = palette.selected.saturating_sub(1);
+            cx.notify();
+        }
+    }
+
+    fn on_command_palette_choose(
+        &mut self,
+        _: &CommandPaletteChoose,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.command_palette_choose(window, cx);
+    }
+
+    /// Shared by the keyboard path ([`Self::on_command_palette_choose`]) and
+    /// a row's own mouse click ([`Self::render_command_palette`]).
+    fn command_palette_choose(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(palette) = &self.command_palette else {
+            return;
+        };
+        let Some(row) = palette.items.get(palette.selected) else {
+            return;
+        };
+        let kind = row.kind;
+        let id = row.id.clone();
+        self.activate_palette_row(kind, id, window, cx);
+    }
+
+    /// Runs whatever a palette row's `kind`/`id` mean. Closes the palette
+    /// FIRST in every case (task requirement: "palette closes, then the
+    /// action runs") — load-bearing, not just cosmetic, for the Command
+    /// case: this palette is now one of `on_open_theme_picker`'s (etc.)
+    /// mutual-exclusion checks, so dispatching e.g. `OpenThemePicker` while
+    /// `self.command_palette` were still `Some` would silently no-op
+    /// against its own guard.
+    fn activate_palette_row(
+        &mut self,
+        kind: crate::command_palette::PaletteKind,
+        id: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        use crate::command_palette::PaletteKind;
+        self.close_command_palette(window, cx);
+        match kind {
+            PaletteKind::Command => {
+                // Same dispatch primitives `--automation`'s `Cmd::Action`
+                // handler uses (`automation/mod.rs`) — build the action from
+                // its registered name, then dispatch it exactly like a
+                // keystroke or a menu click would (`window.dispatch_action`
+                // bubbles through the same action-handler chain regardless
+                // of trigger). A build failure here (stale id from a query
+                // typed before some app-state change removed the action) is
+                // a silent no-op, matching this codebase's general posture
+                // for a stale-click race (see e.g. `open_review_row`'s own
+                // doc comment).
+                if let Ok(action) = cx.build_action(&id, None) {
+                    window.dispatch_action(action, cx);
+                }
+            }
+            PaletteKind::Review => {
+                // Same path a sidebar card click takes.
+                self.open_review_row(&id, window, cx);
+            }
+            PaletteKind::File => {
+                // Same path a file-list row click takes
+                // (`Workspace::select_file`).
+                if let (Some(ws), Ok(index)) = (&self.active, id.parse::<usize>()) {
+                    ws.update(cx, |ws, cx| ws.select_file(index, window, cx));
+                }
+            }
+            PaletteKind::Pr => {
+                // Same path the PR picker's own row click takes
+                // (`Workspace::open_pr`).
+                if let (Some(ws), Ok(number)) = (&self.active, id.parse::<u64>()) {
+                    ws.update(cx, |ws, cx| ws.open_pr(number, window, cx));
+                }
+            }
+        }
+    }
+
+    /// Rebuilds `self.command_palette.items` for `query` — the input's
+    /// `InputEvent::Change` handler installed in
+    /// [`Self::on_open_command_palette`]. Resets the cursor to the top:
+    /// keeping a numeric selection index stable across a result-set reshape
+    /// would as often land on an unrelated row as the intended one.
+    fn recompute_command_palette(&mut self, query: &str, cx: &mut Context<Self>) {
+        let items = self.compute_command_palette_items(query, cx);
+        if let Some(palette) = &mut self.command_palette {
+            palette.items = items;
+            palette.selected = 0;
+        }
+        cx.notify();
+    }
+
+    /// Gathers fresh candidates from every live source and ranks/mixes them
+    /// for `query` via [`crate::command_palette::rank_and_mix`]. Cheap
+    /// enough to call on every keystroke: a few dozen commands, the review
+    /// index (already in memory), the active workspace's file list
+    /// (likewise), and the PR-picker's own in-memory cache (never a fresh
+    /// `gh` fetch — task's own scope note: opening/typing in the palette
+    /// must never trigger one).
+    fn compute_command_palette_items(
+        &self,
+        query: &str,
+        cx: &mut Context<Self>,
+    ) -> Vec<PaletteRow> {
+        let candidates = self.command_palette_candidates(cx);
+        crate::command_palette::rank_and_mix(query, &candidates)
+            .into_iter()
+            .map(PaletteRow::from)
+            .collect()
+    }
+
+    /// Builds the full, unranked candidate list — every group's entire
+    /// membership, in whatever order makes for a sensible empty-query
+    /// default (see [`crate::command_palette::rank_and_mix`]'s doc comment
+    /// on why that only matters for the empty-query cap).
+    fn command_palette_candidates(
+        &self,
+        cx: &mut Context<Self>,
+    ) -> Vec<crate::command_palette::PaletteCandidate> {
+        use crate::command_palette::{
+            PaletteCandidate, PaletteKind, command_priority, humanize_action_name,
+            is_palette_command,
+        };
+
+        // Commands: `cx.all_action_names()` is THE SAME registry
+        // `--automation`'s `actions` command enumerates — see
+        // `is_palette_command`'s doc comment for the narrow allow/deny
+        // filter on top of it. Collected to an owned `Vec` first (rather
+        // than `.iter().filter().map()` straight off the borrowed slice) to
+        // sidestep the borrowed-slice's double-reference item type
+        // entirely — clearer than fighting deref coercion for a list this
+        // small.
+        let action_names: Vec<&'static str> = cx.all_action_names().to_vec();
+        let mut commands: Vec<PaletteCandidate> = Vec::new();
+        for name in action_names {
+            if !is_palette_command(name) {
+                continue;
+            }
+            let short = name.rsplit_once("::").map_or(name, |(_, s)| s);
+            let label = humanize_action_name(short);
+            let subtitle = keybinding_hint(name, cx).unwrap_or_default();
+            commands.push(PaletteCandidate {
+                kind: PaletteKind::Command,
+                id: name.to_string(),
+                search_text: label.clone(),
+                label,
+                subtitle,
+            });
+        }
+        // Curated priority first (see `command_priority`'s doc comment),
+        // alphabetical among the rest — only affects the empty-query
+        // default cap; a real query re-ranks by fuzzy score regardless.
+        commands.sort_by(|a, b| {
+            let sa = a.id.rsplit_once("::").map_or(a.id.as_str(), |(_, s)| s);
+            let sb = b.id.rsplit_once("::").map_or(b.id.as_str(), |(_, s)| s);
+            command_priority(sa)
+                .cmp(&command_priority(sb))
+                .then_with(|| a.label.cmp(&b.label))
+        });
+
+        // Reviews: the Phase-6 global index, same source the sidebar
+        // renders from. `self.index.entries()` is already recency-sorted
+        // (`ReviewIndex::load`'s own doc comment), which is exactly the
+        // order a "recent reviews" empty-query default wants. Condensed to
+        // one line per the task's own spec ("repo/PR + age") via
+        // `repo_label`/`relative_age` — the same two helpers
+        // `render_review_card` uses for its own line 1 — with the title
+        // folded into `search_text` only, so typing a review's title still
+        // finds it even though the condensed label omits it.
+        let reviews: Vec<PaletteCandidate> = self
+            .index
+            .entries()
+            .iter()
+            .map(|entry| {
+                let repo = dv_core::repo_label(&entry.location, entry.remote.as_ref());
+                let age = relative_age(entry.updated_ms);
+                PaletteCandidate {
+                    kind: PaletteKind::Review,
+                    id: entry.review_id.clone(),
+                    label: format!("{repo} \u{b7} {age}"),
+                    subtitle: entry.title.clone(),
+                    search_text: format!("{repo} {}", entry.title),
+                }
+            })
+            .collect();
+
+        // Files/PRs: only the ACTIVE workspace has either — no active
+        // review means both groups are simply empty (`rank_and_mix`
+        // already omits an empty group's header).
+        let mut files: Vec<PaletteCandidate> = Vec::new();
+        let mut prs: Vec<PaletteCandidate> = Vec::new();
+        if let Some(ws) = &self.active {
+            let ws = ws.read(cx);
+            files = ws
+                .files()
+                .iter()
+                .enumerate()
+                .map(|(index, file)| PaletteCandidate {
+                    kind: PaletteKind::File,
+                    id: index.to_string(),
+                    label: file.path.clone(),
+                    subtitle: format!("{:?}", file.status),
+                    search_text: file.path.clone(),
+                })
+                .collect();
+            // Task's own scope note: reuse the ctrl-g picker's cache ONLY —
+            // never trigger a `gh pr list` fetch just because the palette
+            // opened. `pr_list_cache()` is a plain read, never a fetch.
+            prs = ws
+                .pr_list_cache()
+                .into_iter()
+                .flatten()
+                .map(|pr| PaletteCandidate {
+                    kind: PaletteKind::Pr,
+                    id: pr.number.to_string(),
+                    label: format!("#{} {}", pr.number, pr.title),
+                    subtitle: format!("by {}", pr.author),
+                    search_text: format!("{} {} {}", pr.number, pr.title, pr.author),
+                })
+                .collect();
+        }
+
+        commands
+            .into_iter()
+            .chain(reviews)
+            .chain(files)
+            .chain(prs)
+            .collect()
+    }
+
+    /// The command palette overlay, when open — same shared modal recipe as
+    /// `render_theme_picker`/`workspace::render_palette`
+    /// (R2 item 6), with grouped
+    /// rows: a quiet 11px header (`render_sidebar_header`'s own treatment)
+    /// whenever the ranked list's `kind` changes from the previous row —
+    /// cheap because `rank_and_mix` already emits items pre-grouped
+    /// contiguously in Commands/Reviews/Files/PRs order, so this only ever
+    /// needs to compare adjacent entries, never re-sort.
+    fn render_command_palette(&self, cx: &mut Context<Self>) -> Option<Div> {
+        const VISIBLE: usize = 16;
+        let palette = self.command_palette.as_ref()?;
+        let theme = cx.theme();
+        let dv = themes::dv_theme(cx);
+        let surface_active = dv.surface_active;
+        let seam = dv.modal_border;
+        let backdrop = dv.backdrop;
+        let panel_bg = theme.sidebar;
+        let fg = theme.foreground;
+        let muted = theme.muted_foreground;
+        let chip_bg = theme.tokens.muted;
+        let text_secondary = dv.text_secondary;
+
+        let first = palette.selected.saturating_sub(VISIBLE - 1);
+        let mut rows: Vec<AnyElement> = Vec::new();
+        let mut prev_kind: Option<crate::command_palette::PaletteKind> = None;
+        for (i, row) in palette.items.iter().enumerate().skip(first).take(VISIBLE) {
+            if prev_kind != Some(row.kind) {
+                rows.push(
+                    div()
+                        .px_2()
+                        .pt_1()
+                        .text_size(px(11.))
+                        .text_color(text_secondary)
+                        .child(palette_group_label(row.kind))
+                        .into_any_element(),
+                );
+                prev_kind = Some(row.kind);
+            }
+            let selected = i == palette.selected;
+            let label = row.label.clone();
+            let subtitle = row.subtitle.clone();
+            // Commands' subtitle is a real keybinding hint (`keybinding_hint`)
+            // — chip-styled like the footer's own `Kbd` legend
+            // rather than plain text, so it reads
+            // as "this is a shortcut" and not as a review's title/a file's
+            // status. Other kinds' subtitles (age/status/author) stay plain
+            // muted text — they're prose, not a keycap.
+            let is_command_hint = row.kind == crate::command_palette::PaletteKind::Command;
+            rows.push(
+                h_flex()
+                    .id(("command-palette-row", i))
+                    .h(px(30.))
+                    .mx_1()
+                    .gap_2()
+                    .px_2()
+                    .items_center()
+                    .rounded_md()
+                    .cursor_pointer()
+                    .when(selected, |el| el.bg(surface_active))
+                    .hover(|el| el.bg(surface_active.opacity(0.5)))
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |this, _, window, cx| {
+                            if let Some(palette) = &mut this.command_palette {
+                                palette.selected = i;
+                            }
+                            this.command_palette_choose(window, cx);
+                        }),
+                    )
+                    .child(div().flex_1().min_w(px(0.)).truncate().child(label))
+                    .when(!subtitle.is_empty() && is_command_hint, |el| {
+                        el.child(
+                            div()
+                                .flex_none()
+                                .text_color(muted)
+                                .bg(chip_bg)
+                                .py_0p5()
+                                .px_1()
+                                .rounded(theme.radius.half())
+                                .text_size(px(11.))
+                                .child(subtitle.clone()),
+                        )
+                    })
+                    .when(!subtitle.is_empty() && !is_command_hint, |el| {
+                        el.child(
+                            div()
+                                .flex_none()
+                                .text_color(muted)
+                                .truncate()
+                                .child(subtitle),
+                        )
+                    })
+                    .into_any_element(),
+            );
+        }
+
+        Some(
+            div()
+                .absolute()
+                .inset_0()
+                .occlude()
+                .bg(backdrop)
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(|this, _, window, cx| {
+                        this.close_command_palette(window, cx);
+                        cx.stop_propagation();
+                    }),
+                )
+                .child(
+                    div()
+                        .absolute()
+                        .top(px(48.))
+                        .left_0()
+                        .right_0()
+                        .flex()
+                        .justify_center()
+                        .child(
+                            v_flex()
+                                .w(px(560.))
+                                .max_w_full()
+                                .max_h(px(480.))
+                                .overflow_hidden()
+                                .p_2()
+                                .gap_2()
+                                .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                                .bg(panel_bg)
+                                .text_color(fg)
+                                .text_size(px(13.))
+                                .border_1()
+                                .border_color(seam)
+                                .rounded_lg()
+                                .shadow_lg()
+                                .child(
+                                    div()
+                                        .px_2()
+                                        .pt_1()
+                                        .text_size(px(11.))
+                                        .text_color(muted)
+                                        .child(
+                                            "Go to anything \u{b7} > commands, # PRs \u{b7} \
+                                             enter to open, esc to close",
+                                        ),
+                                )
+                                .child(gpui_component::input::Input::new(&palette.input).small())
+                                .child(v_flex().w_full().children(rows).when(
+                                    palette.items.is_empty(),
+                                    |el| {
+                                        el.child(
+                                            div()
+                                                .px_2()
+                                                .py_1()
+                                                .text_color(muted)
+                                                .child("no matches"),
+                                        )
+                                    },
+                                )),
+                        ),
+                ),
+        )
     }
 
     /// Re-resolve the active theme from `follow_os_appearance`'s light/dark
@@ -2988,7 +3633,10 @@ impl AppShell {
     /// in the first place, but it's included anyway for symmetry with
     /// `on_open_theme_picker`'s own decline guard.
     pub(crate) fn overlay_open(&self) -> bool {
-        self.theme_picker.is_some() || self.settings_panel.is_some() || self.onboarding.is_some()
+        self.theme_picker.is_some()
+            || self.settings_panel.is_some()
+            || self.onboarding.is_some()
+            || self.command_palette.is_some()
     }
 
     /// Closes the sidebar filter popover if open, notifying on change. The
@@ -3136,6 +3784,24 @@ impl AppShell {
             // eyeballing a screenshot.
             "theme": theme.theme_name().to_string(),
             "theme_picker_open": self.theme_picker.is_some(),
+            // ctrl-k command palette: open flag, live query, item count/
+            // cursor, and a few top rows (kind/id/label) so a script can
+            // assert filtered results without a screenshot.
+            "command_palette": self.command_palette.as_ref().map(|p| json!({
+                "query": p.input.read(cx).value().to_string(),
+                "items": p.items.len(),
+                "selected": p.selected,
+                "top": p.items.iter().take(5).map(|row| json!({
+                    "kind": match row.kind {
+                        crate::command_palette::PaletteKind::Command => "command",
+                        crate::command_palette::PaletteKind::Review => "review",
+                        crate::command_palette::PaletteKind::File => "file",
+                        crate::command_palette::PaletteKind::Pr => "pr",
+                    },
+                    "id": row.id,
+                    "label": row.label.to_string(),
+                })).collect::<Vec<_>>(),
+            })),
             "mono_font": theme.mono_font_family.to_string(),
             // Settings deliverable (docs/phase-4-settings-and-theming.md
             // deliverable 7): the whole persisted struct, plus whether the
@@ -3409,7 +4075,10 @@ impl AppShell {
     // ---- Settings panel ---------------------------------------------------
 
     fn on_open_settings(&mut self, _: &OpenSettings, window: &mut Window, cx: &mut Context<Self>) {
-        if self.settings_panel.is_some() || self.theme_picker.is_some() || self.onboarding.is_some()
+        if self.settings_panel.is_some()
+            || self.theme_picker.is_some()
+            || self.onboarding.is_some()
+            || self.command_palette.is_some()
         {
             return;
         }
@@ -3628,7 +4297,10 @@ impl AppShell {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if self.onboarding.is_some() || self.settings_panel.is_some() || self.theme_picker.is_some()
+        if self.onboarding.is_some()
+            || self.settings_panel.is_some()
+            || self.theme_picker.is_some()
+            || self.command_palette.is_some()
         {
             return;
         }
@@ -3814,6 +4486,7 @@ impl AppShell {
             None => {
                 let overlay_blocking = self.settings_panel.is_some()
                     || self.theme_picker.is_some()
+                    || self.command_palette.is_some()
                     || self
                         .active
                         .as_ref()
@@ -4680,6 +5353,7 @@ impl AppShell {
                 // on top of the picker and swallow its first click.
                 if this.settings_panel.is_some()
                     || this.theme_picker.is_some()
+                    || this.command_palette.is_some()
                     || this
                         .active
                         .as_ref()
@@ -5820,6 +6494,10 @@ impl Render for AppShell {
             key_context.push(' ');
             key_context.push_str(DELETE_CONFIRM_CONTEXT);
         }
+        if self.command_palette.is_some() {
+            key_context.push(' ');
+            key_context.push_str(COMMAND_PALETTE_CONTEXT);
+        }
 
         v_flex()
             .size_full()
@@ -5842,6 +6520,11 @@ impl Render for AppShell {
             .on_action(cx.listener(Self::on_delete_review_prompt))
             .on_action(cx.listener(Self::on_delete_review_confirm))
             .on_action(cx.listener(Self::on_delete_review_cancel))
+            .on_action(cx.listener(Self::on_open_command_palette))
+            .on_action(cx.listener(Self::on_command_palette_next))
+            .on_action(cx.listener(Self::on_command_palette_prev))
+            .on_action(cx.listener(Self::on_command_palette_close))
+            .on_action(cx.listener(Self::on_command_palette_choose))
             .child(
                 TitleBar::new().child(
                     h_flex()
@@ -6048,6 +6731,7 @@ impl Render for AppShell {
             .children(self.render_onboarding(cx))
             .children(self.render_sidebar_filter_popover(cx))
             .children(self.render_delete_confirm(cx))
+            .children(self.render_command_palette(cx))
     }
 }
 

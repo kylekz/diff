@@ -9,6 +9,7 @@
 
 #[cfg(feature = "automation")]
 mod automation;
+mod command_palette;
 mod fuzzy;
 mod highlight;
 mod lsp;

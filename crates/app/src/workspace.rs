@@ -2906,6 +2906,24 @@ impl Workspace {
         self.pr_picker.is_some()
     }
 
+    /// The active diff's changed-file list, for the ctrl-k command
+    /// palette's Files group (`AppShell::command_palette_candidates`) — the
+    /// exact same list [`Self::render_file_row`]/[`Self::select_file`] index
+    /// into, so a palette-picked index lands on the identical file a
+    /// sidebar file-list click would.
+    pub(crate) fn files(&self) -> &[dv_core::ChangedFile] {
+        &self.files
+    }
+
+    /// The PR-picker's own stale-while-revalidate cache
+    /// ([`Self::pr_list_cache`]'s doc comment), read-only, for the command
+    /// palette's PRs group. Deliberately just a read: the palette must
+    /// never trigger the `gh pr list` fetch itself (task's own scope note)
+    /// — only `ctrl-g`'s `on_open_pr_picker` does that.
+    pub(crate) fn pr_list_cache(&self) -> Option<&[PrSummary]> {
+        self.pr_list_cache.as_ref().map(|(prs, _)| prs.as_slice())
+    }
+
     /// Whether the active review is submitted — suppresses mutation of its
     /// EXISTING threads (docs/phase-6-review-navigator.md S6c doc-deviation
     /// #4: the thread card's reply/edit/resolve/delete) plus shows a banner

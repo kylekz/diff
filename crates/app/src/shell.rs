@@ -52,7 +52,11 @@ actions!(
         OpenSettings,
         SettingsClose,
         OpenOnboarding,
-        OnboardingClose
+        OnboardingClose,
+        ToggleArchiveReview,
+        DeleteReviewPrompt,
+        DeleteReviewConfirm,
+        DeleteReviewCancel
     ]
 );
 
@@ -67,6 +71,10 @@ const SETTINGS_PANEL_CONTEXT: &str = "SettingsPanelOpen";
 /// `--automation`'s `OpenOnboarding` action), but `escape` still needs a
 /// context to bind against while it's up.
 const ONBOARDING_CONTEXT: &str = "OnboardingOpen";
+/// Same mechanism, for the delete-review confirmation modal (opened from a
+/// review card's context menu — no keybinding opens it, but escape/enter
+/// need a context to bind against while it's up).
+const DELETE_CONFIRM_CONTEXT: &str = "DeleteConfirmOpen";
 
 /// Fixed height, in px, of every sidebar row — both a review card
 /// ([`AppShell::render_review_card`]) and a group header
@@ -313,6 +321,12 @@ enum SidebarItem {
 ///   unavailable-repo glyph, the only on-screen signal of the problem, out
 ///   of view with it (P3 finding).
 fn entry_passes_filters(entry: &dv_core::IndexEntry, filters: &SidebarFilters) -> bool {
+    // Archived wins over everything, including the unavailable-repo
+    // bypass below — the user explicitly tucked this review away, and an
+    // unplugged drive shouldn't drag it back into view.
+    if entry.archived && !filters.archived {
+        return false;
+    }
     if entry.health != dv_core::EntryHealth::Ok {
         return true;
     }
@@ -528,6 +542,12 @@ const REVIEW_FILTER_ROWS: &[FilterAccessor] = &[
         |f| f.review_changes,
         |f, v| f.review_changes = v,
     ),
+    (
+        "sidebar-filter-archived",
+        "Archived",
+        |f| f.archived,
+        |f, v| f.archived = v,
+    ),
 ];
 
 /// Compact relative time for a review card's line-1 age (docs/phase-6-
@@ -689,6 +709,11 @@ pub fn init(cx: &mut App) {
     ]);
     cx.bind_keys([KeyBinding::new("escape", SettingsClose, settings_panel)]);
     cx.bind_keys([KeyBinding::new("escape", OnboardingClose, onboarding)]);
+    let delete_confirm = Some("AppShell && DeleteConfirmOpen");
+    cx.bind_keys([
+        KeyBinding::new("escape", DeleteReviewCancel, delete_confirm),
+        KeyBinding::new("enter", DeleteReviewConfirm, delete_confirm),
+    ]);
 }
 
 /// Maximum number of recently-active workspaces the [`WorkspaceCache`] LRU
@@ -866,6 +891,16 @@ impl WorkspaceCache {
     }
 }
 
+/// State of the delete-review confirmation modal (see
+/// [`AppShell::delete_confirm`]).
+struct DeleteConfirm {
+    review_id: String,
+    /// The store delete is running on the background executor; the
+    /// modal's Delete button is disabled meanwhile.
+    in_flight: bool,
+    error: Option<String>,
+}
+
 pub struct AppShell {
     focus_handle: FocusHandle,
     recent: RecentStore,
@@ -882,6 +917,18 @@ pub struct AppShell {
     /// own `ReviewChanged` reports which review actually landed (see
     /// `_ws_subscription`, below).
     selected_review_id: Option<String>,
+    /// The review a card context menu was last opened over: stashed by the
+    /// card's right-mouse-down (which fires alongside the `ContextMenuExt`
+    /// machinery), read by the menu items' unit actions
+    /// (`ToggleArchiveReview`/`DeleteReviewPrompt`). Identity by id, same
+    /// rationale as [`Self::selected_review_id`].
+    menu_review: Option<String>,
+    /// The delete-review confirmation modal, when open (context menu →
+    /// "Delete review…"). The modal owns the whole delete flow: it stays
+    /// up while the store delete runs (`in_flight`) and shows a failure
+    /// (e.g. a WSL distro that stopped) instead of pretending the review
+    /// is gone.
+    delete_confirm: Option<DeleteConfirm>,
     /// True under `--automation`: blocks the native folder picker, which
     /// would wedge the foreground executor (and thus the whole automation
     /// channel) until a human dismissed it.
@@ -1172,6 +1219,8 @@ impl AppShell {
             recent: RecentStore::load(),
             active: None,
             selected_review_id: None,
+            menu_review: None,
+            delete_confirm: None,
             automation,
             badges: HashMap::new(),
             index: dv_core::ReviewIndex::load(),
@@ -1649,8 +1698,10 @@ impl AppShell {
                     // first recency stamp (review finding: doing so bumped
                     // the unrelated draft's `last_opened_ms` and left the
                     // just-launched PR review's recency untouched, sorting
-                    // the wrong review to the top of the sidebar on the
-                    // next resort). Wait for the event whose review is
+                    // the wrong review to the top of the sidebar at the
+                    // next launch — `ReviewIndex::load` is the only place
+                    // recency ordering applies since `apply_hydration`
+                    // went order-preserving). Wait for the event whose review is
                     // actually linked to `pending_pr` before stamping; a
                     // plain open (no `pending_pr`) or an already-pinned open
                     // has no such transient step, so its first event is
@@ -2328,6 +2379,177 @@ impl AppShell {
         self.close_theme_picker(window, cx);
     }
 
+    // ---- Review-card context menu (archive / delete) -------------------
+
+    /// Context-menu "Archive"/"Unarchive": flips the index's app-managed
+    /// flag for the review the menu was opened over ([`Self::menu_review`]).
+    /// Nothing in the repo's store changes — with the Archived filter off
+    /// (the default) the row just disappears from the sidebar.
+    fn on_toggle_archive_review(
+        &mut self,
+        _: &ToggleArchiveReview,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(id) = self.menu_review.take() else {
+            return;
+        };
+        let Some(archived) = self.index.get(&id).map(|e| e.archived) else {
+            return;
+        };
+        self.index.set_archived(&id, !archived);
+        cx.notify();
+    }
+
+    /// Context-menu "Delete review…": open the confirmation modal. The
+    /// actual store delete only runs on [`Self::on_delete_review_confirm`].
+    fn on_delete_review_prompt(
+        &mut self,
+        _: &DeleteReviewPrompt,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(id) = self.menu_review.take() else {
+            return;
+        };
+        // Same mutual-exclusion posture as the other shell overlays (see
+        // `on_open_theme_picker`) — mostly unreachable while one is up
+        // (they occlude the sidebar), kept for safety. The PR-picker check
+        // is NOT redundant though (post-hoc review P3): it's a workspace-
+        // pane overlay, so the sidebar stays right-clickable while it's
+        // open and this modal would stack on top of it.
+        if self.theme_picker.is_some() || self.settings_panel.is_some() || self.onboarding.is_some()
+        {
+            return;
+        }
+        if self
+            .active
+            .as_ref()
+            .is_some_and(|ws| ws.read(cx).pr_picker_open())
+        {
+            return;
+        }
+        self.delete_confirm = Some(DeleteConfirm {
+            review_id: id,
+            in_flight: false,
+            error: None,
+        });
+        // Focus the shell so the modal's escape/enter bindings (context
+        // "AppShell && DeleteConfirmOpen") sit on the dispatch path — same
+        // reasoning as `on_open_theme_picker`.
+        window.focus(&self.focus_handle, cx);
+        cx.notify();
+    }
+
+    /// Close the confirmation modal, restoring focus the same way
+    /// [`Self::close_theme_picker`] does. Safe to call mid-flight: the
+    /// delete keeps running and its completion still folds the removal
+    /// into the index (the deletion has happened on disk either way).
+    fn close_delete_confirm(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.delete_confirm.take().is_some() {
+            match &self.active {
+                Some(ws) => window.focus(&ws.focus_handle(cx), cx),
+                None => window.focus(&self.focus_handle, cx),
+            }
+            cx.notify();
+        }
+    }
+
+    fn on_delete_review_cancel(
+        &mut self,
+        _: &DeleteReviewCancel,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.close_delete_confirm(window, cx);
+    }
+
+    /// Run the delete: `ReviewStore::delete` on the background executor
+    /// (it shells out — WSL locations route through the host), then fold
+    /// the removal into the index. The modal stays up while in flight and
+    /// shows the error on failure (a stopped distro, a vanished path)
+    /// rather than pretending the review is gone.
+    fn on_delete_review_confirm(
+        &mut self,
+        _: &DeleteReviewConfirm,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(confirm) = &mut self.delete_confirm else {
+            return;
+        };
+        if confirm.in_flight {
+            return;
+        }
+        let id = confirm.review_id.clone();
+        let Some(location) = self.index.get(&id).map(|e| e.location.clone()) else {
+            // Vanished from the index meanwhile (deleted externally) —
+            // nothing left to delete; close with the standard focus rescue.
+            self.close_delete_confirm(window, cx);
+            return;
+        };
+        confirm.in_flight = true;
+        confirm.error = None;
+        cx.notify();
+
+        let store_location = location.clone();
+        let store_id = id.clone();
+        cx.spawn_in(window, async move |this, cx| {
+            let result = cx
+                .background_executor()
+                .spawn(async move { dv_core::ReviewStore::open(store_location).delete(&store_id) })
+                .await;
+            this.update_in(cx, |this, window, cx| {
+                // Only the modal instance that launched this delete may be
+                // touched (post-hoc review P2): the user can escape a
+                // slow in-flight delete and open the modal for a DIFFERENT
+                // review meanwhile — closing that one here (or writing this
+                // delete's error/in_flight into it, re-arming its Delete
+                // button mid-flight) would corrupt the newer flow.
+                let own_modal = this
+                    .delete_confirm
+                    .as_ref()
+                    .is_some_and(|confirm| confirm.review_id == id);
+                match result {
+                    Ok(()) => {
+                        this.index.remove(&id);
+                        // Drop any parked workspace for the deleted review
+                        // (its watchers included). If the review is the
+                        // ACTIVE workspace's, its own store watcher fires
+                        // next and falls back to another review or the
+                        // empty state (the existing external-CLI-delete
+                        // path in `_ws_subscription`); clear the stale pin
+                        // rather than waiting on that event.
+                        this.workspace_cache.drop_stale(&id);
+                        if this.selected_review_id.as_deref() == Some(id.as_str()) {
+                            this.selected_review_id = None;
+                        }
+                        // Proper focus rescue on close (the R2 lesson:
+                        // never leave focus parked on a node that's about
+                        // to stop mattering).
+                        if own_modal {
+                            this.close_delete_confirm(window, cx);
+                        }
+                        this.hydrate_index_location(location, cx);
+                    }
+                    Err(err) => {
+                        // If not `own_modal` (dismissed mid-flight, or a
+                        // different review's modal is up now) there's
+                        // nothing to report into — the review simply stays
+                        // in the sidebar.
+                        if own_modal && let Some(confirm) = &mut this.delete_confirm {
+                            confirm.in_flight = false;
+                            confirm.error = Some(format!("{err:#}"));
+                        }
+                    }
+                }
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
     fn on_theme_picker_next(
         &mut self,
         _: &ThemePickerNext,
@@ -2857,7 +3079,13 @@ impl AppShell {
                     "deletions": ds.deletions,
                 })),
                 "last_opened_ms": e.last_opened_ms,
+                "archived": e.archived,
             })).collect::<Vec<_>>(),
+            "delete_confirm_open": self.delete_confirm.is_some(),
+            // Which review a card context menu was last opened over — lets
+            // a script confirm its right-click landed on the intended card
+            // before dispatching ToggleArchiveReview/DeleteReviewPrompt.
+            "menu_review": self.menu_review,
             // Theme deliverable: the currently-applied theme's own name
             // (read off the live global `Theme`, not `self.settings`, so
             // this can never lie about what's actually painted), whether
@@ -3943,8 +4171,10 @@ impl AppShell {
     /// `SidebarGrouping::None` — partitioned into named runs with a
     /// [`SidebarItem::Header`] above each (deliverables 3/4). Groups appear
     /// in first-encounter order; entries within a group, and ungrouped
-    /// entries, keep `self.index.entries()`'s own relative order (already
-    /// `last_opened_ms` descending). Both [`Render::render`]'s
+    /// entries, keep `self.index.entries()`'s own relative order —
+    /// recency-sorted at load, then stable for the whole session
+    /// (`apply_hydration` is order-preserving; only genuinely-new reviews
+    /// insert at the front). Both [`Render::render`]'s
     /// `uniform_list` and [`Self::automation_state`]'s `"sidebar"` field are
     /// built from this one function, so what a script asserts is exactly
     /// what's on screen.
@@ -4078,6 +4308,8 @@ impl AppShell {
         let foreground = theme.foreground;
 
         let review_id = entry.review_id.clone();
+        let menu_review_id = entry.review_id.clone();
+        let archived = entry.archived;
         let repo = dv_core::repo_label(&entry.location, entry.remote.as_ref());
         let age = relative_age(entry.updated_ms);
         let diffstat = entry.diffstat;
@@ -4100,7 +4332,7 @@ impl AppShell {
             primary
         };
 
-        v_flex()
+        let card = v_flex()
             .id(SharedString::from(format!("review-card-{review_id}")))
             .w_full()
             .h(px(SIDEBAR_ROW_HEIGHT))
@@ -4114,11 +4346,26 @@ impl AppShell {
             .rounded_md()
             .cursor_pointer()
             .when(selected, |el| el.bg(surface_active))
+            // Archived rows (visible only with the Archived filter on)
+            // read as parked, not live work.
+            .when(archived, |el| el.opacity(0.55))
             .hover(|el| el.bg(surface_active.opacity(0.5)))
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(move |this, _, window, cx| {
                     this.open_review_row(&review_id, window, cx);
+                }),
+            )
+            // Stash which review the context menu is being opened over —
+            // this fires alongside `ContextMenuExt`'s own right-click
+            // handling (both observe the same mouse-down), so by the time
+            // a menu item dispatches its unit action, `menu_review` names
+            // this card. See `AppShell::menu_review`.
+            .on_mouse_down(
+                MouseButton::Right,
+                cx.listener(move |this, _, _, cx| {
+                    this.menu_review = Some(menu_review_id.clone());
+                    cx.notify();
                 }),
             )
             .child(
@@ -4211,7 +4458,37 @@ impl AppShell {
                                 div().into_any_element()
                             }),
                     ),
-            )
+            );
+
+        // Right-click menu (gpui-component `ContextMenuExt`): the items
+        // dispatch unit actions handled on the shell root; the right-
+        // mouse-down stash above tells those handlers which review this
+        // is. `archived` is a render-time snapshot — fine, the card
+        // re-renders on every index change. `action_context` is REQUIRED:
+        // the menu steals focus when it opens, and without a context to
+        // focus back to, dismissing it (escape, click-away) strands focus
+        // on the unmounted menu node — the whole keyboard dies until a
+        // rescue click (the same R2 ctrl-b P2 class). Same workspace-else-
+        // shell target `close_theme_picker` restores to. Known narrow gap
+        // (post-hoc review P3, accepted): the handle is a render-time
+        // snapshot latched into the open menu, so a watcher-driven active-
+        // workspace swap while a menu is up can leave dismiss focusing the
+        // parked entity's handle; user-driven switches dismiss the menu
+        // first, so only that async race hits it.
+        use gpui_component::menu::ContextMenuExt as _;
+        let menu_focus_target = match &self.active {
+            Some(ws) => ws.focus_handle(cx),
+            None => self.focus_handle.clone(),
+        };
+        card.context_menu(move |menu, _window, _cx| {
+            menu.action_context(menu_focus_target.clone())
+                .menu(
+                    if archived { "Unarchive" } else { "Archive" },
+                    Box::new(ToggleArchiveReview),
+                )
+                .separator()
+                .menu("Delete review…", Box::new(DeleteReviewPrompt))
+        })
     }
 
     /// A group header row, sitting above a run of cards when
@@ -4536,6 +4813,132 @@ impl AppShell {
                     .w(px(2.))
                     .group_hover("sidebar-resize-handle", move |el| el.bg(accent)),
             )
+    }
+
+    /// The delete-review confirmation modal (context menu → "Delete
+    /// review…"), on the shared modal recipe (`render_theme_picker`'s doc
+    /// comment). Destructive-action posture: names exactly what will be
+    /// deleted (title, repo, comment count), the store delete only runs
+    /// from its Delete button / enter, and a failure surfaces here rather
+    /// than closing optimistically.
+    fn render_delete_confirm(&self, cx: &mut Context<Self>) -> Option<Div> {
+        use gpui_component::Disableable as _;
+        use gpui_component::button::{Button, ButtonVariants as _};
+
+        let confirm = self.delete_confirm.as_ref()?;
+        let theme = cx.theme();
+        let panel_bg = theme.sidebar;
+        let fg = theme.foreground;
+        let muted = theme.muted_foreground;
+        let danger = theme.danger;
+        let dv = themes::dv_theme(cx);
+        let seam = dv.modal_border;
+        let backdrop = dv.backdrop;
+        let text_secondary = dv.text_secondary;
+
+        let entry = self.index.get(&confirm.review_id);
+        let title = entry.map(|e| e.title.clone()).unwrap_or_default();
+        let repo = entry
+            .map(|e| dv_core::repo_label(&e.location, e.remote.as_ref()))
+            .unwrap_or_default();
+        let comments = entry.map(|e| e.open_comments).unwrap_or(0);
+        let detail = if comments == 1 {
+            format!("{repo} · {title} · 1 open comment")
+        } else if comments > 1 {
+            format!("{repo} · {title} · {comments} open comments")
+        } else {
+            format!("{repo} · {title}")
+        };
+        let in_flight = confirm.in_flight;
+        let error = confirm.error.clone();
+
+        Some(
+            div()
+                .absolute()
+                .inset_0()
+                .occlude()
+                .bg(backdrop)
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(|this, _, window, cx| {
+                        this.close_delete_confirm(window, cx);
+                        cx.stop_propagation();
+                    }),
+                )
+                .child(
+                    div()
+                        .absolute()
+                        .top(px(48.))
+                        .left_0()
+                        .right_0()
+                        .flex()
+                        .justify_center()
+                        .child(
+                            v_flex()
+                                .w(px(560.))
+                                .max_w_full()
+                                .overflow_hidden()
+                                .p_3()
+                                .gap_2()
+                                .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                                .bg(panel_bg)
+                                .text_color(fg)
+                                .text_size(px(13.))
+                                .border_1()
+                                .border_color(seam)
+                                .rounded_lg()
+                                .shadow_lg()
+                                .child(div().font_semibold().child("Delete review?"))
+                                .child(
+                                    div()
+                                        .text_size(px(11.))
+                                        .text_color(text_secondary)
+                                        .truncate()
+                                        .child(detail),
+                                )
+                                .child(div().text_color(muted).child(
+                                    "This permanently deletes the review and its comments \
+                                     from the repo's .git/dv store. Archiving (right-click) \
+                                     hides it instead, without deleting anything.",
+                                ))
+                                .when_some(error, |el, err| {
+                                    el.child(div().text_color(danger).child(err))
+                                })
+                                .child(
+                                    h_flex()
+                                        .gap_2()
+                                        .justify_end()
+                                        .child(
+                                            Button::new("delete-confirm-cancel")
+                                                .ghost()
+                                                .small()
+                                                .label("Cancel")
+                                                .on_click(cx.listener(|this, _, window, cx| {
+                                                    this.close_delete_confirm(window, cx);
+                                                })),
+                                        )
+                                        .child(
+                                            Button::new("delete-confirm-delete")
+                                                .danger()
+                                                .small()
+                                                .label(if in_flight {
+                                                    "Deleting…"
+                                                } else {
+                                                    "Delete"
+                                                })
+                                                .disabled(in_flight)
+                                                .on_click(cx.listener(|this, _, window, cx| {
+                                                    this.on_delete_review_confirm(
+                                                        &DeleteReviewConfirm,
+                                                        window,
+                                                        cx,
+                                                    );
+                                                })),
+                                        ),
+                                ),
+                        ),
+                ),
+        )
     }
 
     /// The theme picker overlay (`ctrl-shift-t`), when open: same
@@ -5316,6 +5719,10 @@ impl Render for AppShell {
             key_context.push(' ');
             key_context.push_str(ONBOARDING_CONTEXT);
         }
+        if self.delete_confirm.is_some() {
+            key_context.push(' ');
+            key_context.push_str(DELETE_CONFIRM_CONTEXT);
+        }
 
         v_flex()
             .size_full()
@@ -5334,6 +5741,10 @@ impl Render for AppShell {
             .on_action(cx.listener(Self::on_settings_close))
             .on_action(cx.listener(Self::on_open_onboarding))
             .on_action(cx.listener(Self::on_onboarding_close))
+            .on_action(cx.listener(Self::on_toggle_archive_review))
+            .on_action(cx.listener(Self::on_delete_review_prompt))
+            .on_action(cx.listener(Self::on_delete_review_confirm))
+            .on_action(cx.listener(Self::on_delete_review_cancel))
             .child(
                 TitleBar::new().child(
                     h_flex()
@@ -5539,6 +5950,7 @@ impl Render for AppShell {
             .children(self.render_settings_panel(cx))
             .children(self.render_onboarding(cx))
             .children(self.render_sidebar_filter_popover(cx))
+            .children(self.render_delete_confirm(cx))
     }
 }
 
@@ -5666,6 +6078,7 @@ mod tests {
             updated_ms: 1,
             last_opened_ms: 1,
             health: dv_core::EntryHealth::Ok,
+            archived: false,
         }
     }
 
@@ -5829,6 +6242,31 @@ mod tests {
         assert!(
             entry_passes_filters(&entry, &filters),
             "Missing health must bypass filters the same way RepoUnavailable does"
+        );
+    }
+
+    #[test]
+    fn entry_passes_filters_archived_hidden_by_default_and_wins_over_health_bypass() {
+        let mut entry = sample_index_entry("r-1");
+        entry.archived = true;
+        let mut filters = SidebarFilters::default();
+        assert!(
+            !entry_passes_filters(&entry, &filters),
+            "archived must be hidden with the default filter set"
+        );
+        filters.archived = true;
+        assert!(
+            entry_passes_filters(&entry, &filters),
+            "the Archived filter opts archived rows back in"
+        );
+
+        // Archived beats the unavailable-repo bypass: tucking a review
+        // away must hold even when its repo goes unreachable.
+        entry.health = dv_core::EntryHealth::RepoUnavailable;
+        filters.archived = false;
+        assert!(
+            !entry_passes_filters(&entry, &filters),
+            "an archived review must stay hidden even when its repo is unavailable"
         );
     }
 

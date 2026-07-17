@@ -70,6 +70,16 @@ pub struct IndexEntry {
     pub last_opened_ms: u64,
     #[serde(default)]
     pub health: EntryHealth,
+    /// App-managed "tucked away" flag: an archived review stays fully
+    /// intact in its repo's `.git/dv` store (nothing on disk changes) but
+    /// the sidebar hides it unless the Archived filter is enabled. Only
+    /// [`ReviewIndex::set_archived`] writes it — [`IndexEntry::from_review`]
+    /// always produces `false`, so both [`ReviewIndex::upsert`] and
+    /// [`ReviewIndex::apply_hydration`] carry the existing value forward
+    /// unconditionally (an incoming `false` means "caller doesn't manage
+    /// this field", not "unarchive").
+    #[serde(default)]
+    pub archived: bool,
 }
 
 /// Whether an entry's backing repo is currently reachable. Never causes an
@@ -194,6 +204,11 @@ impl ReviewIndex {
                 if entry.diffstat.is_none() {
                     entry.diffstat = self.entries[index].diffstat;
                 }
+                // App-managed flag — no upsert caller builds entries with a
+                // meaningful `archived`, so the existing value always wins
+                // (see the field's doc comment; `set_archived` is the only
+                // writer).
+                entry.archived = self.entries[index].archived;
                 self.entries[index] = entry;
                 index
             }
@@ -217,6 +232,18 @@ impl ReviewIndex {
         self.save();
     }
 
+    /// Set the app-managed archived flag (see [`IndexEntry::archived`]) and
+    /// persist. Returns `false` if no entry has that id. In place — never
+    /// reorders.
+    pub fn set_archived(&mut self, review_id: &str, archived: bool) -> bool {
+        let Some(entry) = self.entries.iter_mut().find(|e| e.review_id == review_id) else {
+            return false;
+        };
+        entry.archived = archived;
+        self.save();
+        true
+    }
+
     /// Fold a [`hydrate_location`] result into the index. `Reviews`
     /// replaces the *entire* current entry set for `location` with the
     /// fresh one — additions and deletions on disk both take effect —
@@ -224,10 +251,19 @@ impl ReviewIndex {
     /// app-filled `pr_status` forward by `review_id` (`from_review` always
     /// produces `pr_status: None`, so without this the network-filled PR
     /// badge would be wiped on every re-hydration pass) so re-hydrating
-    /// doesn't reset recency or drop the cached PR badge. The whole list
-    /// is re-sorted `last_opened_ms` descending afterward — `retain` +
-    /// append would otherwise leave the surviving entries at the tail,
-    /// scrambling the recency order [`Self::load`] establishes.
+    /// doesn't reset recency or drop the cached PR badge.
+    ///
+    /// **Order-preserving**: each surviving entry is replaced *in place*,
+    /// never moved — the no-jumping-under-clicks rule ([`Self::upsert`]'s
+    /// doc comment; recency ordering applies once, at [`Self::load`]).
+    /// This used to re-sort the whole list `last_opened_ms` descending
+    /// here, which defeated that rule live: selecting a review stamps its
+    /// recency (upsert, in place — no visible move) and then triggers a
+    /// location hydration, whose re-sort bubbled the freshly-clicked
+    /// review — and, under repo grouping, its whole first-encounter group —
+    /// to the top of the sidebar on every click. Only genuinely-new
+    /// reviews move: they're inserted at the front (matching `upsert`'s
+    /// new-entry rule), in their store order.
     /// `Unavailable` never drops anything; it only flags existing entries
     /// for the location [`EntryHealth::RepoUnavailable`] (see
     /// cross-cutting risk A in docs/phase-6-review-navigator.md's slice
@@ -248,42 +284,54 @@ impl ReviewIndex {
                 // just this location's, means such a leftover gets folded
                 // in rather than surviving as a second, duplicate row for
                 // the same review.
-                let fresh_ids: std::collections::HashSet<&str> =
-                    fresh.iter().map(|e| e.review_id.as_str()).collect();
-                let mut carried: HashMap<
-                    String,
-                    (u64, Option<CachedPrStatus>, Option<DiffTotals>),
-                > = self
-                    .entries
-                    .iter()
-                    .filter(|e| fresh_ids.contains(e.review_id.as_str()))
-                    .map(|e| {
-                        (
-                            e.review_id.clone(),
-                            (e.last_opened_ms, e.pr_status.clone(), e.diffstat),
-                        )
-                    })
+                let fresh_order: Vec<String> = fresh.iter().map(|e| e.review_id.clone()).collect();
+                let mut fresh_by_id: HashMap<String, IndexEntry> = fresh
+                    .into_iter()
+                    .map(|e| (e.review_id.clone(), e))
                     .collect();
-                self.entries.retain(|e| {
-                    &e.location != location && !fresh_ids.contains(e.review_id.as_str())
-                });
-                for mut entry in fresh {
-                    if let Some((last_opened_ms, pr_status, diffstat)) =
-                        carried.remove(&entry.review_id)
-                    {
-                        entry.last_opened_ms = last_opened_ms;
-                        if entry.pr_status.is_none() {
-                            entry.pr_status = pr_status;
+                // Walk the current list in order: replace each surviving
+                // entry in place (carrying its app-filled fields), drop
+                // this location's vanished ones, drop any *later* duplicate
+                // of an id already folded in (the P2-1 leftover — its fresh
+                // entry was consumed by the first occurrence), and leave
+                // every other location's entries untouched where they sit.
+                let mut kept: Vec<IndexEntry> = Vec::with_capacity(self.entries.len());
+                for existing in self.entries.drain(..) {
+                    match fresh_by_id.remove(existing.review_id.as_str()) {
+                        Some(mut entry) => {
+                            entry.last_opened_ms = existing.last_opened_ms;
+                            if entry.pr_status.is_none() {
+                                entry.pr_status = existing.pr_status;
+                            }
+                            if entry.diffstat.is_none() {
+                                entry.diffstat = existing.diffstat;
+                            }
+                            entry.archived = existing.archived;
+                            entry.health = EntryHealth::Ok;
+                            kept.push(entry);
                         }
-                        if entry.diffstat.is_none() {
-                            entry.diffstat = diffstat;
+                        None => {
+                            let was_fresh_duplicate =
+                                fresh_order.iter().any(|id| id == &existing.review_id);
+                            if &existing.location != location && !was_fresh_duplicate {
+                                kept.push(existing);
+                            }
                         }
                     }
-                    entry.health = EntryHealth::Ok;
-                    self.entries.push(entry);
                 }
-                self.entries
-                    .sort_by_key(|e| std::cmp::Reverse(e.last_opened_ms));
+                self.entries = kept;
+                // Genuinely-new reviews (not in the index anywhere) land at
+                // the front in their store order — `upsert`'s new-entry
+                // rule.
+                let new_entries: Vec<IndexEntry> = fresh_order
+                    .iter()
+                    .filter_map(|id| {
+                        let mut entry = fresh_by_id.remove(id)?;
+                        entry.health = EntryHealth::Ok;
+                        Some(entry)
+                    })
+                    .collect();
+                self.entries.splice(0..0, new_entries);
             }
             HydrateOutcome::Unavailable => {
                 for entry in self.entries.iter_mut().filter(|e| &e.location == location) {
@@ -359,6 +407,7 @@ impl IndexEntry {
             updated_ms: review.updated_ms,
             last_opened_ms: 0,
             health: EntryHealth::Ok,
+            archived: false,
         }
     }
 }
@@ -515,6 +564,7 @@ mod tests {
                 additions: 12,
                 deletions: 3,
             }),
+            archived: false,
             updated_ms: 1_700_000_000_000,
             last_opened_ms: 1_700_000_000_500,
             health: EntryHealth::Ok,
@@ -706,12 +756,13 @@ mod tests {
     }
 
     #[test]
-    fn apply_hydration_preserves_last_opened_ms_desc_order() {
-        // Regression for a re-hydration pass scrambling the sidebar's
-        // recency order: entries start correctly sorted (as `load()`
-        // would leave them); hydrating one of two locations must not
-        // leave the survivor(s) out of order relative to entries from
-        // other, untouched locations.
+    fn apply_hydration_preserves_current_order_even_against_recency() {
+        // The no-jumping-under-clicks rule (Kyle's long-standing sidebar
+        // bug): selecting a review stamps its recency in place and then
+        // triggers a location hydration — that hydration must NOT re-sort
+        // the list, or the freshly-clicked review (largest
+        // `last_opened_ms`) visibly jumps to the top on every click.
+        // Recency ordering applies once, at `load()`.
         let loc1 = local("difftest");
         let loc2 = local("other");
         let mut a = sample_entry("r-a");
@@ -728,9 +779,14 @@ mod tests {
             entries: vec![a.clone(), b.clone(), c.clone()],
         };
 
-        // Fresh-off-disk entries for loc1 arrive in an order unrelated to
-        // recency (as `ReviewStore::list` would produce), carrying no
-        // `last_opened_ms` of their own.
+        // The user clicks r-c: upsert stamps its recency in place (now the
+        // largest in the list, but still in third position)...
+        index.upsert(c.clone(), true);
+        assert_eq!(index.entries()[2].review_id, "r-c");
+        assert!(index.entries()[2].last_opened_ms > 300);
+
+        // ...and the follow-up hydration of its location must leave every
+        // survivor exactly where it was.
         let mut fresh_a = a.clone();
         fresh_a.last_opened_ms = 0;
         let mut fresh_c = c.clone();
@@ -745,8 +801,79 @@ mod tests {
         assert_eq!(
             ids,
             vec!["r-a", "r-b", "r-c"],
-            "must stay last_opened_ms-desc (300, 200, 100) after re-hydration"
+            "hydration must never reorder surviving entries, whatever their recency"
         );
+        assert!(
+            index.get("r-c").unwrap().last_opened_ms > 300,
+            "the click's recency stamp still survives the hydration (for the next load)"
+        );
+    }
+
+    #[test]
+    fn apply_hydration_inserts_genuinely_new_reviews_at_the_front() {
+        // Matches `upsert`'s new-entry rule: a review that appeared on
+        // disk since the last pass (created via CLI, another window…)
+        // lands at the top of the sidebar, in store order, without
+        // disturbing anything below.
+        let loc = local("difftest");
+        let mut old = sample_entry("r-old");
+        old.location = loc.clone();
+        let mut other = sample_entry("r-other-repo");
+        other.location = local("unrelated");
+        let mut index = ReviewIndex {
+            path: None,
+            entries: vec![old.clone(), other.clone()],
+        };
+
+        let mut new1 = sample_entry("r-new1");
+        new1.location = loc.clone();
+        let mut new2 = sample_entry("r-new2");
+        new2.location = loc.clone();
+        index.apply_hydration(&loc, HydrateOutcome::Reviews(vec![new1, old.clone(), new2]));
+
+        let ids: Vec<&str> = index
+            .entries()
+            .iter()
+            .map(|e| e.review_id.as_str())
+            .collect();
+        assert_eq!(ids, vec!["r-new1", "r-new2", "r-old", "r-other-repo"]);
+    }
+
+    #[test]
+    fn archived_flag_survives_upsert_and_hydration_and_only_set_archived_writes_it() {
+        let loc = local("difftest");
+        let mut entry = sample_entry("r-1");
+        entry.location = loc.clone();
+        let mut index = ReviewIndex {
+            path: None,
+            entries: vec![entry.clone()],
+        };
+
+        assert!(index.set_archived("r-1", true));
+        assert!(index.entries()[0].archived);
+        assert!(!index.set_archived("r-missing", true));
+
+        // A metadata refresh (`from_review` never sets archived)...
+        let mut refresh = entry.clone();
+        refresh.archived = false;
+        refresh.open_comments = 7;
+        index.upsert(refresh, false);
+        assert!(
+            index.entries()[0].archived,
+            "upsert must carry the app-managed flag forward"
+        );
+
+        // ...and a full location re-hydration both leave it intact.
+        let mut fresh = entry.clone();
+        fresh.archived = false;
+        index.apply_hydration(&loc, HydrateOutcome::Reviews(vec![fresh]));
+        assert!(
+            index.entries()[0].archived,
+            "hydration must carry the app-managed flag forward"
+        );
+
+        assert!(index.set_archived("r-1", false));
+        assert!(!index.entries()[0].archived);
     }
 
     #[test]

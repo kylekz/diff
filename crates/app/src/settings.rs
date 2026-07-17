@@ -158,6 +158,12 @@ pub struct SidebarFilters {
     pub review_approved: bool,
     #[serde(default = "default_true")]
     pub review_changes: bool,
+    /// Show archived reviews (`IndexEntry::archived`, set from the review
+    /// card's context menu). The one filter that defaults OFF — archiving
+    /// means "hide this from the sidebar", so showing archived rows is the
+    /// opt-in, not the other way around.
+    #[serde(default)]
+    pub archived: bool,
 }
 
 impl Default for SidebarFilters {
@@ -172,6 +178,7 @@ impl Default for SidebarFilters {
             review_comment: true,
             review_approved: true,
             review_changes: true,
+            archived: false,
         }
     }
 }

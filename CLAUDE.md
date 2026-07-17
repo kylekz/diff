@@ -11,6 +11,9 @@ cargo build                                        # debug build
 cargo run -p dv                                    # launch the app
 cargo test --workspace
 cargo clippy --workspace --all-targets -- -D warnings
+cargo clippy -p dv --no-default-features --all-targets -- -D warnings
+#   ^ the SHIPPED build shape (automation feature off) — CI checks it and
+#     it drifts silently if only the default shape is linted locally
 cargo fmt --all                                    # also auto-runs via PostToolUse hook
 ```
 

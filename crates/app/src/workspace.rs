@@ -1346,7 +1346,15 @@ fn pick_review(
                 remote.pr == pr.pr && remote.slug.eq_ignore_ascii_case(&pr.slug)
             })
         };
-        if let Some(matched) = reviews.iter().find(matches_pr) {
+        // Draft preference within the PR's matches, exactly as the doc
+        // comment above promises (P3: the code used to take the first
+        // match of ANY state, so a newer submitted review shadowed the
+        // older draft where comments should accumulate).
+        if let Some(matched) = reviews
+            .iter()
+            .find(|r| matches_pr(r) && matches!(r.state, dv_core::ReviewState::Draft))
+            .or_else(|| reviews.iter().find(matches_pr))
+        {
             return Some(matched.clone());
         }
         return current_id
@@ -5259,24 +5267,41 @@ impl Workspace {
                                 // comment where the verdict bar hides it
                                 // and the CLI refuses to touch it
                                 // (review finding P1, mutation-guard
-                                // half). Start a fresh draft instead,
-                                // carrying over the PR linkage (minus
-                                // the submission ids) when there was
-                                // one — this is exactly what
+                                // half). Prefer an EXISTING draft for
+                                // the same PR before creating one (P3:
+                                // with an older matching draft + a newer
+                                // matching submitted review on disk, the
+                                // unconditional create spawned a THIRD
+                                // review here); else start a fresh
+                                // draft, carrying over the PR linkage
+                                // (minus the submission ids) — what
                                 // `submit_review`'s doc comment already
                                 // promises ("the next comment
-                                // auto-creates a fresh draft"), made to
-                                // actually hold.
-                                let mut draft = store.create(source.clone())?;
-                                if let Some(remote) = &fresh.remote {
-                                    draft.remote = Some(dv_core::RemoteRef {
-                                        submitted_review_id: None,
-                                        submitted_url: None,
-                                        ..remote.clone()
-                                    });
-                                    store.save(&draft)?;
+                                // auto-creates a fresh draft").
+                                let existing = fresh.remote.as_ref().and_then(|remote| {
+                                    store.list().unwrap_or_default().into_iter().find(|r| {
+                                        matches!(r.state, dv_core::ReviewState::Draft)
+                                            && r.remote.as_ref().is_some_and(|rr| {
+                                                rr.pr == remote.pr
+                                                    && rr.slug.eq_ignore_ascii_case(&remote.slug)
+                                            })
+                                    })
+                                });
+                                match existing {
+                                    Some(draft) => draft,
+                                    None => {
+                                        let mut draft = store.create(source.clone())?;
+                                        if let Some(remote) = &fresh.remote {
+                                            draft.remote = Some(dv_core::RemoteRef {
+                                                submitted_review_id: None,
+                                                submitted_url: None,
+                                                ..remote.clone()
+                                            });
+                                            store.save(&draft)?;
+                                        }
+                                        draft
+                                    }
                                 }
-                                draft
                             } else {
                                 fresh
                             }
@@ -8832,7 +8857,20 @@ impl Workspace {
                     "Submitted \u{b7} {} \u{2713}",
                     verdict_label(*verdict)
                 )))
-                .child(div().text_xs().text_color(muted).child(url.clone()))
+                .child({
+                    // Clickable (backlog: was plain text) — same
+                    // `cx.open_url` affordance as the title bar's
+                    // external-link button.
+                    let href = url.clone();
+                    div()
+                        .id("submit-done-url")
+                        .text_xs()
+                        .text_color(cx.theme().primary)
+                        .cursor_pointer()
+                        .hover(|s| s.opacity(0.8))
+                        .on_click(move |_, _, cx| cx.open_url(&href))
+                        .child(url.clone())
+                })
                 .into_any_element(),
 
             SubmitFlow::Failed { message, .. } => v_flex()
@@ -10746,6 +10784,28 @@ mod tests {
         ];
         let picked = pick_review(reviews, Some("r-a-current"), Some(&pr_a), None);
         assert_eq!(picked.map(|r| r.id), Some("r-a-current".to_string()));
+    }
+
+    /// A newer SUBMITTED review and an older DRAFT both match the open PR:
+    /// the draft (where comments accumulate) must win, per the doc
+    /// comment's "(1) the draft (or, failing that, any review)" promise —
+    /// the pre-fix first-match-of-any-state rule shadowed the draft.
+    #[test]
+    fn pick_review_with_pr_open_prefers_draft_over_newer_submitted_match() {
+        let pr = fake_remote(5, "github.com/acme/widgets");
+        let reviews = vec![
+            fake_review(
+                "r-submitted-newest",
+                ReviewState::Submitted {
+                    verdict: dv_core::Verdict::Comment,
+                    at_ms: 2,
+                },
+                Some(pr.clone()),
+            ),
+            fake_review("r-draft-older", ReviewState::Draft, Some(pr.clone())),
+        ];
+        let picked = pick_review(reviews, None, Some(&pr), None);
+        assert_eq!(picked.map(|r| r.id), Some("r-draft-older".to_string()));
     }
 
     #[test]

@@ -42,6 +42,15 @@ windows-sys = { version = "0.59", features = [
     "Win32_UI_WindowsAndMessaging",
 ] }
 
+[dev-dependencies]
+# Headless parser-structure + no-panic tests for `markdown.rs` (backlog:
+# render markdown in PR/comment bodies) — the exact crate `gpui-component`'s
+# `TextView` already parses Markdown with, so this pulls in zero new code:
+# it's already resolved in Cargo.lock as one of gpui-component's own
+# dependencies (same "already in the build" precedent as the `chrono` note
+# above). Test-only: never ships in the release binary.
+markdown = { version = "1.0.0", features = ["serde"] }
+
 [features]
 default = ["automation"]
 # `dv --automation`: the JSON-over-stdio control channel (crates/app/src/

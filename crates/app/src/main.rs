@@ -12,6 +12,7 @@ mod automation;
 mod fuzzy;
 mod highlight;
 mod lsp;
+mod markdown;
 mod mentions;
 mod menu;
 mod onboarding;

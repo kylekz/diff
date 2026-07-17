@@ -1412,6 +1412,7 @@ dependencies = [
  "gpui-component-assets",
  "gpui_platform",
  "lsp-types",
+ "markdown",
  "png 0.17.16",
  "ropey",
  "serde",

@@ -8614,17 +8614,20 @@ impl Workspace {
                         .gap_1()
                         .border_t_1()
                         .border_color(border)
-                        .child(
+                        .child(if body_text.trim().is_empty() {
                             div()
                                 .text_sm()
-                                .whitespace_normal()
                                 .text_color(foreground)
-                                .child(if body_text.trim().is_empty() {
-                                    SharedString::from("(no description)")
-                                } else {
-                                    body_text
-                                }),
-                        )
+                                .child("(no description)")
+                                .into_any_element()
+                        } else {
+                            // Rendered as markdown (backlog: PR descriptions
+                            // showed literal `## headers`/etc as raw text).
+                            crate::markdown::view("pr-body-text", body_text)
+                                .text_sm()
+                                .text_color(foreground)
+                                .into_any_element()
+                        })
                         .children(url_text.map(|url| div().text_xs().text_color(muted).child(url))),
                 )
             })
@@ -9837,16 +9840,21 @@ impl Workspace {
                             }),
                     )
                     .map(|el| {
-                        // Editing swaps the body text for the input; otherwise
-                        // the body renders normally.
+                        // Editing swaps the body text for the input (raw
+                        // markdown, unrendered — only the resting display
+                        // renders); otherwise the body renders as markdown
+                        // (backlog: headers/bold/code/links/etc, not raw
+                        // ## text).
                         if editing.is_some_and(|(mode, _)| mode == ThreadInputMode::EditBody) {
                             el
                         } else {
                             el.child(
-                                div()
-                                    .text_sm()
-                                    .text_color(text_secondary)
-                                    .child(comment.body.clone()),
+                                crate::markdown::view(
+                                    SharedString::from(format!("comment-body-{}", comment.id)),
+                                    comment.body.clone(),
+                                )
+                                .text_sm()
+                                .text_color(text_secondary),
                             )
                         }
                     })
@@ -9881,10 +9889,15 @@ impl Workspace {
                                                 ),
                                         )
                                         .child(
-                                            div()
-                                                .text_sm()
-                                                .text_color(text_secondary)
-                                                .child(reply.body.clone()),
+                                            crate::markdown::view(
+                                                SharedString::from(format!(
+                                                    "reply-body-{}",
+                                                    reply.id
+                                                )),
+                                                reply.body.clone(),
+                                            )
+                                            .text_sm()
+                                            .text_color(text_secondary),
                                         )
                                 })),
                         )
@@ -10102,40 +10115,52 @@ impl Workspace {
                             }),
                     )
                     .child(
-                        div()
-                            .text_sm()
-                            .text_color(text_secondary)
-                            .child(opening.body.clone()),
+                        crate::markdown::view(
+                            SharedString::from(format!("remote-body-{}-0", thread.id)),
+                            opening.body.clone(),
+                        )
+                        .text_sm()
+                        .text_color(text_secondary),
                     )
                     .when(!replies.is_empty(), |el| {
                         // Same reply shape as `render_thread`: "↳" +
                         // author/age header, body beneath — no nested rail.
-                        el.child(v_flex().gap_2().children(replies.iter().map(|reply| {
-                            v_flex()
-                                .gap_1()
-                                .child(
-                                    h_flex()
-                                        .items_center()
-                                        .gap_2()
+                        el.child(v_flex().gap_2().children(replies.iter().enumerate().map(
+                            |(reply_ix, reply)| {
+                                v_flex()
+                                    .gap_1()
+                                    .child(
+                                        h_flex()
+                                            .items_center()
+                                            .gap_2()
+                                            .text_sm()
+                                            .child(div().text_color(muted).child("↳"))
+                                            .child(
+                                                div().font_semibold().child(reply.author.clone()),
+                                            )
+                                            .child(
+                                                div()
+                                                    .text_size(px(11.))
+                                                    .text_color(text_secondary)
+                                                    .child(crate::shell::relative_age(
+                                                        reply.created_ms,
+                                                    )),
+                                            ),
+                                    )
+                                    .child(
+                                        crate::markdown::view(
+                                            SharedString::from(format!(
+                                                "remote-body-{}-{}",
+                                                thread.id,
+                                                reply_ix + 1
+                                            )),
+                                            reply.body.clone(),
+                                        )
                                         .text_sm()
-                                        .child(div().text_color(muted).child("↳"))
-                                        .child(div().font_semibold().child(reply.author.clone()))
-                                        .child(
-                                            div()
-                                                .text_size(px(11.))
-                                                .text_color(text_secondary)
-                                                .child(crate::shell::relative_age(
-                                                    reply.created_ms,
-                                                )),
-                                        ),
-                                )
-                                .child(
-                                    div()
-                                        .text_sm()
-                                        .text_color(text_secondary)
-                                        .child(reply.body.clone()),
-                                )
-                        })))
+                                        .text_color(text_secondary),
+                                    )
+                            },
+                        )))
                     }),
             )
     }

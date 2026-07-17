@@ -6334,6 +6334,21 @@ impl Workspace {
                             }
                         }
                     }
+                    // Tautological-hover suppression (R3):
+                    // hovering a symbol's own
+                    // declaration NAME would only echo the line already
+                    // under the cursor — one extra definition round trip
+                    // decides. A definition error keeps the hover
+                    // (never-fail-hard); see
+                    // `dv_core::lsp::definition_covers_position` for why
+                    // this checks the name token, not the whole
+                    // declaration span.
+                    if hover.is_some()
+                        && let Ok(targets) = handle.definition(&uri, position)
+                        && dv_core::lsp::definition_covers_position(&targets, &uri, position)
+                    {
+                        hover = None;
+                    }
                     Ok(hover)
                 })
                 .await;

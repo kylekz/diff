@@ -628,6 +628,36 @@ fn hash_text(text: &str) -> u64 {
 /// popover at all rather than an empty box (the same "hover empty space ->
 /// no popover" case a `null` `Hover` response covers at the [`LspHandle::hover`]
 /// layer).
+/// True when any definition target's NAME token covers (`uri`, `pos`)
+/// itself — the hover sits ON the symbol's own declaration, so a popover
+/// would only echo the line already under the cursor (the "tautological
+/// hover" suppression rule, R3). Compared against `target_selection_range`
+/// (the name span), deliberately NOT the whole-declaration
+/// `target_range`: a whole-body span would also swallow the hover on a
+/// recursive call inside its own function, which is a genuine usage site.
+/// The app chains hover → definition and drops the popover when this is
+/// true; a definition error keeps the hover (never-fail-hard).
+pub fn definition_covers_position(
+    targets: &[lsp_types::LocationLink],
+    uri: &str,
+    pos: lsp_types::Position,
+) -> bool {
+    targets.iter().any(|target| {
+        target.target_uri.as_str() == uri
+            && range_contains_position(&target.target_selection_range, pos)
+    })
+}
+
+/// Half-open on lines/inclusive-start exclusive-end on characters, matching
+/// LSP `Range` semantics (end is exclusive).
+fn range_contains_position(range: &lsp_types::Range, pos: lsp_types::Position) -> bool {
+    let after_start = pos.line > range.start.line
+        || (pos.line == range.start.line && pos.character >= range.start.character);
+    let before_end = pos.line < range.end.line
+        || (pos.line == range.end.line && pos.character < range.end.character);
+    after_start && before_end
+}
+
 pub fn hover_contents_to_text(contents: &lsp_types::HoverContents) -> Option<String> {
     let text = match contents {
         lsp_types::HoverContents::Scalar(marked) => marked_string_to_text(marked),
@@ -1045,5 +1075,137 @@ mod tests {
             .filter(|(name, _)| name.eq_ignore_ascii_case("content-length"))
             .map(|(_, value)| value.trim());
         assert_eq!(parsed, Some("12"));
+    }
+
+    // --- definition_covers_position (tautological-hover suppression, R3) --
+
+    fn decl_link(
+        uri: &str,
+        sel: ((u32, u32), (u32, u32)),
+        target: ((u32, u32), (u32, u32)),
+    ) -> lsp_types::LocationLink {
+        let range = |((sl, sc), (el, ec)): ((u32, u32), (u32, u32))| {
+            json!({
+                "start": { "line": sl, "character": sc },
+                "end": { "line": el, "character": ec },
+            })
+        };
+        // Built through the wire shape — this lsp_types' `Uri` offers no
+        // direct constructor, same reason the normalize tests above go
+        // through JSON.
+        serde_json::from_value(json!({
+            "targetUri": uri,
+            "targetRange": range(target),
+            "targetSelectionRange": range(sel),
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn hover_on_own_declaration_name_is_covered() {
+        // `fn mono_family` declared at line 10, name token cols 3..14;
+        // hovering inside the name is tautological.
+        let targets = vec![decl_link(
+            "file:///w/src/a.ts",
+            ((10, 3), (10, 14)),
+            ((10, 0), (20, 1)),
+        )];
+        let pos = lsp_types::Position {
+            line: 10,
+            character: 5,
+        };
+        assert!(definition_covers_position(
+            &targets,
+            "file:///w/src/a.ts",
+            pos
+        ));
+    }
+
+    #[test]
+    fn hover_on_a_usage_site_is_not_covered() {
+        // Same declaration; hovering a CALL at line 42 resolves to it but
+        // the position isn't inside the name token — a real hover.
+        let targets = vec![decl_link(
+            "file:///w/src/a.ts",
+            ((10, 3), (10, 14)),
+            ((10, 0), (20, 1)),
+        )];
+        let pos = lsp_types::Position {
+            line: 42,
+            character: 8,
+        };
+        assert!(!definition_covers_position(
+            &targets,
+            "file:///w/src/a.ts",
+            pos
+        ));
+    }
+
+    #[test]
+    fn recursive_call_inside_own_body_is_not_covered() {
+        // The reason this checks target_SELECTION_range, not the whole
+        // target_range: a recursive call at line 15 sits inside the
+        // declaration's body span (10..20) but not inside the name token.
+        let targets = vec![decl_link(
+            "file:///w/src/a.ts",
+            ((10, 3), (10, 14)),
+            ((10, 0), (20, 1)),
+        )];
+        let pos = lsp_types::Position {
+            line: 15,
+            character: 5,
+        };
+        assert!(!definition_covers_position(
+            &targets,
+            "file:///w/src/a.ts",
+            pos
+        ));
+    }
+
+    #[test]
+    fn cross_file_definition_is_not_covered() {
+        // Hovering a usage whose declaration lives in another file — the
+        // uri differs even if line/col happen to coincide.
+        let targets = vec![decl_link(
+            "file:///w/src/other.ts",
+            ((10, 3), (10, 14)),
+            ((10, 0), (20, 1)),
+        )];
+        let pos = lsp_types::Position {
+            line: 10,
+            character: 5,
+        };
+        assert!(!definition_covers_position(
+            &targets,
+            "file:///w/src/a.ts",
+            pos
+        ));
+    }
+
+    #[test]
+    fn range_end_is_exclusive_and_start_inclusive() {
+        let targets = vec![decl_link(
+            "file:///w/src/a.ts",
+            ((10, 3), (10, 14)),
+            ((10, 0), (20, 1)),
+        )];
+        let at_start = lsp_types::Position {
+            line: 10,
+            character: 3,
+        };
+        let at_end = lsp_types::Position {
+            line: 10,
+            character: 14,
+        };
+        assert!(definition_covers_position(
+            &targets,
+            "file:///w/src/a.ts",
+            at_start
+        ));
+        assert!(!definition_covers_position(
+            &targets,
+            "file:///w/src/a.ts",
+            at_end
+        ));
     }
 }

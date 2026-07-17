@@ -43,7 +43,10 @@
 
 pub mod client;
 
-pub use client::{LspClient, LspError, LspHandle, hover_contents_to_text, node_modules_present};
+pub use client::{
+    LspClient, LspError, LspHandle, definition_covers_position, hover_contents_to_text,
+    node_modules_present,
+};
 
 /// Map a repo path to the `languageId` vtsls expects in
 /// `textDocument/didOpen` — restricted to the TypeScript family (this

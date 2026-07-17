@@ -123,6 +123,19 @@ fn thread_gutter_width(font_size: f32) -> f32 {
     gutter_width(font_size) + marker_width(font_size)
 }
 
+/// The comment composers' footer hint. Platform-conditional because the
+/// actual submit trigger is `PressEnter { secondary: true }` — gpui's
+/// platform modifier, cmd on macOS (S8i conventions), ctrl everywhere else
+/// — so a hardcoded "ctrl-enter" would document a key that doesn't submit
+/// on a Mac.
+fn submit_hint() -> &'static str {
+    if cfg!(target_os = "macos") {
+        "cmd-enter to submit · esc to cancel"
+    } else {
+        "ctrl-enter to submit · esc to cancel"
+    }
+}
+
 /// Byte offset → UTF-16 code-unit count, up to (and excluding) `byte_offset`
 /// — LSP's `Position.character` is defined in UTF-16 code units regardless
 /// of source encoding (the client never advertised `positionEncoding:
@@ -437,6 +450,15 @@ enum DisplayRow {
 struct CommentEditor {
     input: Entity<gpui_component::input::InputState>,
     saving: bool,
+    /// The composer's "path:lines (side)" caption, captured at open time —
+    /// NOT derived from `selection.file` at render time: that's a raw index
+    /// into `files`, and a worktree reload can remap indices under an open
+    /// editor (`apply_worktree_reload` reconciles `selected` by path but
+    /// never `selection.file`), which would repaint the caption naming
+    /// whichever file now occupies the stale index. The anchor the user
+    /// clicked is fixed the moment the editor opens; `submit_comment`'s
+    /// own `sel.file == selected` guard still protects the write path.
+    target: Option<SharedString>,
     _subscription: Subscription,
 }
 
@@ -4528,7 +4550,10 @@ impl Workspace {
             let mut state = InputState::new(window, cx)
                 .multi_line(true)
                 .auto_grow(3, 12)
-                .placeholder("Leave a comment… (ctrl-enter to submit, esc to cancel)");
+                // The submit/cancel keys live in the card's footer hint now
+                // (`render_editor`'s composer shape) — the placeholder
+                // stays a plain prompt.
+                .placeholder("Leave a comment…");
             state.lsp.completion_provider = Some(Rc::new(crate::mentions::MentionProvider {
                 users: mentions,
             }));
@@ -4544,9 +4569,26 @@ impl Workspace {
                 }
             });
         input.update(cx, |input, cx| input.focus(window, cx));
+        // Caption captured now, while `selection.file` is known-fresh (this
+        // fn is only reachable from `gutter_up` on a live selection) — see
+        // `CommentEditor::target`'s doc comment for why not at render time.
+        let target = self.selection.and_then(|sel| {
+            let file = self.files.get(sel.file)?;
+            let (lo, hi) = sel.range();
+            let side = match sel.side {
+                DiffSide::Old => "old",
+                DiffSide::New => "new",
+            };
+            Some(SharedString::from(if lo == hi {
+                format!("{}:{lo} ({side})", file.path)
+            } else {
+                format!("{}:{lo}–{hi} ({side})", file.path)
+            }))
+        });
         self.editor = Some(CommentEditor {
             input,
             saving: false,
+            target,
             _subscription: subscription,
         });
         self.reset_diff_list(cx);
@@ -5491,9 +5533,8 @@ impl Workspace {
         let input = cx.new(|cx| {
             let mut state = InputState::new(window, cx).multi_line(true).auto_grow(2, 8);
             state = match mode {
-                ThreadInputMode::Reply => {
-                    state.placeholder("Reply… (ctrl-enter to send, esc to cancel)")
-                }
+                // Keys live in the thread card's footer hint (`render_thread`).
+                ThreadInputMode::Reply => state.placeholder("Reply…"),
                 ThreadInputMode::EditBody => state,
             };
             state.lsp.completion_provider = Some(Rc::new(crate::mentions::MentionProvider {
@@ -8802,7 +8843,7 @@ impl Workspace {
         else {
             return div();
         };
-        // `local_resolved` drives the Resolve/Unresolve button — dv can
+        // `local_resolved` drives the resolve/unresolve link — dv can
         // only ever mutate the local status (two-way GitHub sync is a
         // non-goal, docs/phase-6-review-navigator.md § Non-goals).
         // `resolved` (badge/border) ORs in `github_resolved`, which covers
@@ -8815,11 +8856,11 @@ impl Workspace {
         // Backlog item (Phase-6 S6c, P3): on a SUBMITTED review the four
         // action handlers below are unconditionally refused
         // (`open_thread_input`/`set_comment_status`/`delete_comment`'s
-        // readonly gates), but the buttons used to render fully live and
-        // silently no-op. Disable them instead — the standard dimmed
-        // affordance — matching the suppress-the-entry-point posture while
-        // no longer inviting dead clicks; the summary panel's read-only
-        // banner explains the state.
+        // readonly gates), but the actions used to render fully live and
+        // silently no-op. Render them dimmed and inert instead (see the
+        // `link` helper below) — matching the suppress-the-entry-point
+        // posture while no longer inviting dead clicks; the summary panel's
+        // read-only banner explains the state.
         let readonly = self.review_is_readonly();
         let id = comment.id.clone();
         let id_for_delete = comment.id.clone();
@@ -8842,10 +8883,31 @@ impl Workspace {
         };
         let text_secondary = crate::themes::dv_theme(cx).text_secondary;
         let created_age = crate::shell::relative_age(comment.created_ms);
+        let muted_fg = theme.muted_foreground;
+
+        // The action affordance is a quiet colored text link ("↳ reply",
+        // hover fade), not a button row.
+        // dv has four actions where the reference design has one, so they form one link row
+        // at the card's foot; `readonly` renders the same labels dimmed and
+        // inert (the link-shaped equivalent of a disabled button, keeping
+        // the Phase-6 backlog fix's visible-but-disabled posture).
+        let link = move |id: (&'static str, usize), label: &'static str, color: Hsla| {
+            div()
+                .id(id)
+                .text_sm()
+                .text_color(if readonly { color.opacity(0.45) } else { color })
+                .when(!readonly, |el| {
+                    el.cursor_pointer().hover(|s| s.opacity(0.8))
+                })
+                .child(label)
+        };
 
         h_flex()
             .w_full()
-            .py_3()
+            // `py_1`, not the old wrapper's py_3 — comment rows sit
+            // contiguous with the code rows; a whisper of separation is all
+            // dv's taller block cards need (visual review, rhythm nit).
+            .py_1()
             .child(
                 // The "72px blank gutter
                 // spacer" — aligns the card's left edge with where the diff
@@ -8855,133 +8917,71 @@ impl Workspace {
             )
             .child(
                 v_flex()
+                    // Full-width square band, flush to the pane's right edge —
+                    // the reference design's comment-row shape (no rounding,
+                    // no max-width, no right margin), not a floating widget.
+                    // `min_w_0` as in
+                    // that shape: without it flexbox's min-width:auto
+                    // lets a long body line push the card past the pane edge
+                    // instead of soft-wrapping.
                     .flex_1()
-                    // `mr_4`, not `pr_4` — `p_3` below assigns all four
-                    // padding sides (last-write-wins), which silently killed
-                    // a `pr_4` set before it. An outer margin survives that
-                    // and restores the right-edge gap the old `px_4` wrapper
-                    // gave the card.
-                    .mr_4()
-                    .max_w(px(720.))
+                    .min_w_0()
                     .p_3()
-                    .gap_3()
+                    .gap_2()
                     // `sidebar.background` bg + a left-only accent bar
                     // ("card bg sidebar.background +
                     // border_l_2 primary accent bar") replaces the old
-                    // popover-bg/full-border card. Resolved threads get the
-                    // softer `muted.background` bar instead of full `primary` —
-                    // NOT `border` (the Aura-dark trap: that theme's `border`
-                    // is pure black, invisible here — see CLAUDE.md's cross-
-                    // cutting risk).
+                    // popover-bg/full-border card. Resolved threads get a
+                    // softer bar than full `primary` — from `muted_foreground`
+                    // (a text-tier token, so it contrasts on ANY theme's card
+                    // bg) rather than `muted`, which IS the card bg in Claude
+                    // Light (muted == sidebar collision, the `modal_border`/
+                    // `surface_active` family) and near-invisible on Aura.
                     .bg(theme.sidebar)
                     .border_l_2()
-                    .border_color(if resolved { theme.muted } else { theme.primary })
-                    .rounded_lg()
+                    .border_color(if resolved {
+                        theme.muted_foreground.opacity(0.45)
+                    } else {
+                        theme.primary
+                    })
                     .child(
+                        // Comment header: bold author + 11px dim age;
+                        // dv adds its anchor label and state badges at the
+                        // same 11px metadata tier.
                         h_flex()
                             .items_center()
                             .gap_2()
-                            // Safety net for a narrow summary/thread column (same
-                            // reasoning as `render_verdict_area`'s own
-                            // `.flex_wrap()`: "Unresolve" is long enough that the
-                            // action-button group can outgrow what's left of the
-                            // row next to the author/status text) — the group
-                            // spills onto its own line instead of clipping off
-                            // the right edge.
                             .flex_wrap()
                             .text_sm()
                             .child(div().font_semibold().child(comment.author.clone()))
                             .child(
                                 div()
-                                    .text_xs()
+                                    .text_size(px(11.))
                                     .text_color(text_secondary)
                                     .child(created_age),
                             )
                             .child(
                                 div()
-                                    .text_color(theme.muted_foreground)
+                                    .text_size(px(11.))
+                                    .text_color(text_secondary)
                                     .child(format!("{side} · {lines}")),
                             )
                             .when(resolved, |el| {
-                                el.child(div().text_color(theme.success).child("✓ resolved"))
+                                el.child(
+                                    div()
+                                        .text_size(px(11.))
+                                        .text_color(theme.success)
+                                        .child("✓ resolved"),
+                                )
                             })
                             .when(self.stale.contains(&comment.id), |el| {
                                 el.child(
                                     div()
+                                        .text_size(px(11.))
                                         .text_color(theme.warning)
                                         .child("⚠ stale — the anchored content changed"),
                                 )
-                            })
-                            .child(div().flex_1())
-                            // Action-button group: tighter internal spacing than
-                            // the metadata cluster to its left, so the four
-                            // actions read as one cohesive group (GitHub's
-                            // thread-card action-row feel) rather than just more
-                            // items on the same row.
-                            .child(
-                                h_flex()
-                                    .flex_none()
-                                    .gap_1()
-                                    .child(
-                                        Button::new(("resolve", comment_ix))
-                                            .ghost()
-                                            .small()
-                                            .disabled(readonly)
-                                            .label(if local_resolved {
-                                                "Unresolve"
-                                            } else {
-                                                "Resolve"
-                                            })
-                                            .on_click(cx.listener(move |this, _, _, cx| {
-                                                let status = if local_resolved {
-                                                    dv_core::CommentStatus::Open
-                                                } else {
-                                                    dv_core::CommentStatus::Resolved
-                                                };
-                                                this.set_comment_status(id.clone(), status, cx);
-                                            })),
-                                    )
-                                    .child(
-                                        Button::new(("reply", comment_ix))
-                                            .ghost()
-                                            .small()
-                                            .disabled(readonly)
-                                            .label("Reply")
-                                            .on_click(cx.listener(move |this, _, window, cx| {
-                                                this.open_thread_input(
-                                                    id_for_reply.clone(),
-                                                    ThreadInputMode::Reply,
-                                                    window,
-                                                    cx,
-                                                );
-                                            })),
-                                    )
-                                    .child(
-                                        Button::new(("edit", comment_ix))
-                                            .ghost()
-                                            .small()
-                                            .disabled(readonly)
-                                            .label("Edit")
-                                            .on_click(cx.listener(move |this, _, window, cx| {
-                                                this.open_thread_input(
-                                                    id_for_edit.clone(),
-                                                    ThreadInputMode::EditBody,
-                                                    window,
-                                                    cx,
-                                                );
-                                            })),
-                                    )
-                                    .child(
-                                        Button::new(("delete", comment_ix))
-                                            .danger()
-                                            .small()
-                                            .disabled(readonly)
-                                            .label("Delete")
-                                            .on_click(cx.listener(move |this, _, _, cx| {
-                                                this.delete_comment(id_for_delete.clone(), cx);
-                                            })),
-                                    ),
-                            ),
+                            }),
                     )
                     .map(|el| {
                         // Editing swaps the body text for the input; otherwise
@@ -8998,44 +8998,142 @@ impl Workspace {
                         }
                     })
                     .when(!comment.replies.is_empty(), |el| {
-                        // One indentation rail + tighter internal spacing for
-                        // the whole reply run, distinct from the looser
-                        // header/body/replies/editor rhythm above (`gap_3`) —
-                        // consecutive replies are more tightly related to each
-                        // other than to the sections around them.
+                        // Reply shape: a "↳" marker opening the reply's
+                        // own author/age header, body beneath — replies are
+                        // more rows of the same card, not a nested rail.
                         el.child(
                             v_flex()
                                 .gap_2()
-                                .pl_3()
-                                .border_l_2()
-                                // `muted`, not `theme.border` — the Aura-dark
-                                // trap (that theme's `border` is pure black,
-                                // invisible on this card's background; see
-                                // CLAUDE.md's cross-cutting risk and the
-                                // resolved-accent choice above).
-                                .border_color(theme.muted)
                                 .children(comment.replies.iter().map(|reply| {
-                                    h_flex()
-                                        .gap_2()
-                                        .text_sm()
-                                        .child(div().font_semibold().child(reply.author.clone()))
+                                    v_flex()
+                                        .gap_1()
+                                        .child(
+                                            h_flex()
+                                                .items_center()
+                                                .gap_2()
+                                                .text_sm()
+                                                .child(div().text_color(muted_fg).child("↳"))
+                                                .child(
+                                                    div()
+                                                        .font_semibold()
+                                                        .child(reply.author.clone()),
+                                                )
+                                                .child(
+                                                    div()
+                                                        .text_size(px(11.))
+                                                        .text_color(text_secondary)
+                                                        .child(crate::shell::relative_age(
+                                                            reply.created_ms,
+                                                        )),
+                                                ),
+                                        )
                                         .child(
                                             div()
+                                                .text_sm()
                                                 .text_color(text_secondary)
                                                 .child(reply.body.clone()),
                                         )
                                 })),
                         )
                     })
-                    .when_some(editing, |el, (_, saving)| {
+                    .map(|el| {
+                        // The card's foot: the quiet action-link row normally,
+                        // swapped for the inline input + submit row while a
+                        // reply/edit is being written (the two never coexist —
+                        // "↳ reply" under an open reply composer would be
+                        // noise).
+                        let Some((_, saving)) = editing else {
+                            return el.child(
+                                h_flex()
+                                    .items_center()
+                                    .gap_3()
+                                    .child(
+                                        link(("reply", comment_ix), "↳ reply", theme.primary).when(
+                                            !readonly,
+                                            |el| {
+                                                el.on_click(cx.listener(
+                                                    move |this, _, window, cx| {
+                                                        this.open_thread_input(
+                                                            id_for_reply.clone(),
+                                                            ThreadInputMode::Reply,
+                                                            window,
+                                                            cx,
+                                                        );
+                                                    },
+                                                ))
+                                            },
+                                        ),
+                                    )
+                                    .child(
+                                        link(
+                                            ("resolve", comment_ix),
+                                            if local_resolved {
+                                                "unresolve"
+                                            } else {
+                                                "resolve"
+                                            },
+                                            // `muted_foreground`, not
+                                            // `text_secondary` — the body is
+                                            // text_secondary, so same-tier
+                                            // links read as more body text
+                                            // (Claude Light especially).
+                                            muted_fg,
+                                        )
+                                        .when(
+                                            !readonly,
+                                            |el| {
+                                                el.on_click(cx.listener(move |this, _, _, cx| {
+                                                    let status = if local_resolved {
+                                                        dv_core::CommentStatus::Open
+                                                    } else {
+                                                        dv_core::CommentStatus::Resolved
+                                                    };
+                                                    this.set_comment_status(id.clone(), status, cx);
+                                                }))
+                                            },
+                                        ),
+                                    )
+                                    .child(link(("edit", comment_ix), "edit", muted_fg).when(
+                                        !readonly,
+                                        |el| {
+                                            el.on_click(cx.listener(move |this, _, window, cx| {
+                                                this.open_thread_input(
+                                                    id_for_edit.clone(),
+                                                    ThreadInputMode::EditBody,
+                                                    window,
+                                                    cx,
+                                                );
+                                            }))
+                                        },
+                                    ))
+                                    .child(
+                                        link(("delete", comment_ix), "delete", theme.danger).when(
+                                            !readonly,
+                                            |el| {
+                                                el.on_click(cx.listener(move |this, _, _, cx| {
+                                                    this.delete_comment(id_for_delete.clone(), cx);
+                                                }))
+                                            },
+                                        ),
+                                    ),
+                            );
+                        };
                         let input = self
                             .thread_input
                             .as_ref()
                             .map(|ti| gpui_component::input::Input::new(&ti.input));
                         el.children(input).child(
                             h_flex()
+                                .items_center()
                                 .gap_2()
-                                .justify_end()
+                                .child(
+                                    // Composer footer hint, dv's binding.
+                                    div()
+                                        .flex_1()
+                                        .text_size(px(11.))
+                                        .text_color(text_secondary)
+                                        .child(submit_hint()),
+                                )
                                 .child(
                                     Button::new(("ti-cancel", comment_ix))
                                         .ghost()
@@ -9074,15 +9172,12 @@ impl Workspace {
         // — even though this card has no listeners today, for consistency
         // with every other card in this file).
         let theme = cx.theme();
-        // `muted`, not `theme.border` — the Aura-dark trap (that theme's
-        // `border` is pure black, invisible on this card's background; see
-        // CLAUDE.md's cross-cutting risk and `render_thread`'s resolved-
-        // accent choice, which this card's read-only outline should match).
-        let border = theme.muted;
-        let popover = theme.popover;
+        let sidebar_bg = theme.sidebar;
         let success = theme.success;
         let muted = theme.muted_foreground;
-        let text_secondary = crate::themes::dv_theme(cx).text_secondary;
+        let dv = crate::themes::dv_theme(cx);
+        let text_secondary = dv.text_secondary;
+        let accent_alt = dv.accent_alt;
 
         let Some(thread) = self.remote_threads.get(thread_ix) else {
             return div();
@@ -9098,7 +9193,10 @@ impl Workspace {
 
         h_flex()
             .w_full()
-            .py_3()
+            // `py_1`, not the old wrapper's py_3 — comment rows sit
+            // contiguous with the code rows; a whisper of separation is all
+            // dv's taller block cards need (visual review, rhythm nit).
+            .py_1()
             .child(
                 // Same 72px-equivalent gutter spacer as `render_thread` —
                 // keeps every card in the interleaved display list flush
@@ -9107,21 +9205,27 @@ impl Workspace {
             )
             .child(
                 v_flex()
+                    // The same full-width square band as `render_thread`,
+                    // distinguished by its accent: `accent_alt` (the
+                    // deliberate purple-family link for GitHub-side state,
+                    // per the badge table) instead of
+                    // `primary` — a read-only remote thread never needs
+                    // dv-side attention, only visibility. Resolved falls
+                    // back to the same `muted` bar as local threads.
+                    // `min_w_0` — see `render_thread`'s wrap note.
                     .flex_1()
-                    // `mr_4`, not `pr_4` (dead under `p_3`'s last-write-wins
-                    // padding assignment below) — see `render_thread`'s note.
-                    .mr_4()
-                    .max_w(px(720.))
+                    .min_w_0()
                     .p_3()
-                    .gap_3()
-                    // A muted background (rather than `render_thread`'s
-                    // unresolved-primary tint, which means "needs your
-                    // attention in dv") — a read-only remote thread never
-                    // needs dv-side attention, only visibility.
-                    .bg(popover.opacity(0.6))
-                    .border_1()
-                    .border_color(border)
-                    .rounded_lg()
+                    .gap_2()
+                    .bg(sidebar_bg)
+                    .border_l_2()
+                    // Resolved bar from `muted_foreground`, not `muted` — the
+                    // same any-theme-contrast reasoning as `render_thread`.
+                    .border_color(if thread.is_resolved {
+                        muted.opacity(0.45)
+                    } else {
+                        accent_alt
+                    })
                     .child(
                         h_flex()
                             .items_center()
@@ -9129,12 +9233,19 @@ impl Workspace {
                             .flex_wrap()
                             .text_sm()
                             .child(div().font_semibold().child(opening.author.clone()))
-                            .child(div().text_color(muted).child(format!(
-                                "GitHub \u{b7} {line_label} \u{b7} {}",
-                                crate::shell::relative_age(opening.created_ms)
-                            )))
+                            .child(div().text_size(px(11.)).text_color(text_secondary).child(
+                                format!(
+                                    "GitHub \u{b7} {line_label} \u{b7} {}",
+                                    crate::shell::relative_age(opening.created_ms)
+                                ),
+                            ))
                             .when(thread.is_resolved, |el| {
-                                el.child(div().text_color(success).child("\u{2713} resolved"))
+                                el.child(
+                                    div()
+                                        .text_size(px(11.))
+                                        .text_color(success)
+                                        .child("\u{2713} resolved"),
+                                )
                             }),
                     )
                     .child(
@@ -9144,30 +9255,34 @@ impl Workspace {
                             .child(opening.body.clone()),
                     )
                     .when(!replies.is_empty(), |el| {
-                        el.child(
+                        // Same reply shape as `render_thread`: "↳" +
+                        // author/age header, body beneath — no nested rail.
+                        el.child(v_flex().gap_2().children(replies.iter().map(|reply| {
                             v_flex()
-                                .gap_2()
-                                .pl_3()
-                                .border_l_2()
-                                .border_color(border)
-                                .children(replies.iter().map(|reply| {
+                                .gap_1()
+                                .child(
                                     h_flex()
-                                        .gap_2()
                                         .items_center()
+                                        .gap_2()
                                         .text_sm()
+                                        .child(div().text_color(muted).child("↳"))
                                         .child(div().font_semibold().child(reply.author.clone()))
                                         .child(
-                                            div().text_color(muted).text_xs().child(
-                                                crate::shell::relative_age(reply.created_ms),
-                                            ),
-                                        )
-                                        .child(
                                             div()
+                                                .text_size(px(11.))
                                                 .text_color(text_secondary)
-                                                .child(reply.body.clone()),
-                                        )
-                                })),
-                        )
+                                                .child(crate::shell::relative_age(
+                                                    reply.created_ms,
+                                                )),
+                                        ),
+                                )
+                                .child(
+                                    div()
+                                        .text_sm()
+                                        .text_color(text_secondary)
+                                        .child(reply.body.clone()),
+                                )
+                        })))
                     }),
             )
     }
@@ -9181,10 +9296,21 @@ impl Workspace {
             return div();
         };
         let saving = editor.saving;
+        let dv = crate::themes::dv_theme(cx);
+        let text_secondary = dv.text_secondary;
+        let modal_border = dv.modal_border;
+        // The composer opens with a dim "path:line (SIDE)" target caption
+        // — the one card whose anchor isn't self-evident from its position
+        // alone (nothing is rendered above it yet). Captured at open time
+        // (`CommentEditor::target`), not derived from the live selection.
+        let target = editor.target.clone();
 
         h_flex()
             .w_full()
-            .py_3()
+            // `py_1`, not the old wrapper's py_3 — comment rows sit
+            // contiguous with the code rows; a whisper of separation is all
+            // dv's taller block cards need (visual review, rhythm nit).
+            .py_1()
             .child(
                 // Same gutter spacer as `render_thread`/`render_remote_thread`
                 // — the editor is a comment-card row too, in the same
@@ -9192,23 +9318,45 @@ impl Workspace {
                 div().w(px(thread_gutter_width(self.font_size))).flex_none(),
             )
             .child(
+                // The composer card recipe:
+                // ~520px panel, rounded, 1px border, panel bg, shadow, p_2 —
+                // rendered inline under the anchor rather than floating
+                // (dv's editor lives in the display list), on dv's tokens:
+                // `sidebar` bg + `modal_border` seam, the shared modal
+                // vocabulary from R2's picker restyle.
                 v_flex()
                     .flex_1()
-                    // `mr_4`, not `pr_4` (dead under `p_3`'s last-write-wins
-                    // padding assignment below) — see `render_thread`'s note.
+                    .min_w_0()
                     .mr_4()
-                    .max_w(px(720.))
-                    .p_3()
-                    .gap_3()
-                    .bg(theme.popover)
+                    .max_w(px(560.))
+                    .p_2()
+                    .gap_2()
+                    .bg(theme.sidebar)
                     .border_1()
-                    .border_color(theme.primary.opacity(0.7))
+                    .border_color(modal_border)
                     .rounded_lg()
+                    .shadow_lg()
+                    .when_some(target, |el, target| {
+                        el.child(
+                            div()
+                                .text_xs()
+                                .text_color(theme.muted_foreground)
+                                .truncate()
+                                .child(target),
+                        )
+                    })
                     .child(gpui_component::input::Input::new(&editor.input))
                     .child(
                         h_flex()
+                            .items_center()
                             .gap_2()
-                            .justify_end()
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .text_size(px(11.))
+                                    .text_color(text_secondary)
+                                    .child(submit_hint()),
+                            )
                             .child(
                                 Button::new("cancel-comment")
                                     .ghost()

@@ -44,6 +44,12 @@ const SHUTDOWN_GRACE: Duration = Duration::from_millis(2000);
 
 type NotificationHandler = Arc<dyn Fn(Notification) + Send + Sync>;
 
+/// A one-shot "this connection is dead" listener registered via
+/// [`HostClient::on_death`]. Runs on the reader thread as it exits (see
+/// [`ReaderDeathGuard`]) — must be cheap and non-blocking (hand off to a
+/// channel), same contract as [`HostClient::set_notification_handler`].
+type DeathListener = Box<dyn FnOnce() + Send>;
+
 /// A `watch/event` callback, registered against a `watch_id` by
 /// [`HostClient::register_watch_callback`] — see that method's doc for the
 /// threading contract (never the reader thread; always the dedicated
@@ -65,6 +71,9 @@ pub struct HostClient {
     /// `watch_id -> callback`, consulted only by [`spawn_watch_dispatcher`]'s
     /// dedicated thread (see [`Self::register_watch_callback`]).
     watch_registry: Arc<Mutex<HashMap<u64, WatchCallback>>>,
+    /// Listeners fired exactly once when the reader thread observes the
+    /// connection's death — see [`Self::on_death`].
+    death_listeners: Arc<Mutex<Vec<DeathListener>>>,
     hello: Hello,
 }
 
@@ -262,6 +271,7 @@ impl HostClient {
             as NotificationHandler));
         let watch_registry: Arc<Mutex<HashMap<u64, WatchCallback>>> =
             Arc::new(Mutex::new(HashMap::new()));
+        let death_listeners: Arc<Mutex<Vec<DeathListener>>> = Arc::new(Mutex::new(Vec::new()));
 
         // The reader thread only ever needs to hand a parsed `watch/event`
         // off cheaply (an unbounded `Sender::send` never blocks) — the
@@ -278,6 +288,7 @@ impl HostClient {
             Arc::clone(&alive),
             Arc::clone(&notification_handler),
             watch_tx,
+            Arc::clone(&death_listeners),
         );
 
         Ok(Self {
@@ -289,6 +300,7 @@ impl HostClient {
             stderr_ring,
             notification_handler,
             watch_registry,
+            death_listeners,
             hello,
         })
     }
@@ -610,9 +622,9 @@ impl HostClient {
         Ok(result.watch_id)
     }
 
-    /// `watch/unsubscribe`. Callers (`ReviewWatcher::Remote`'s and
-    /// `WorktreeWatcher`'s `Drop`) treat this as best-effort — a connection
-    /// that's already dead (or dying) has nothing to unsubscribe FROM, and
+    /// `watch/unsubscribe`. The caller (`super::supervisor`'s teardown, on
+    /// its own thread) treats this as best-effort — a connection that's
+    /// already dead (or dying) has nothing to unsubscribe FROM, and
     /// dropping the error is the same "never worse than not having a host"
     /// posture the rest of the remote layer takes.
     pub fn watch_unsubscribe(&self, watch_id: u64) -> Result<()> {
@@ -638,6 +650,39 @@ impl HostClient {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .insert(watch_id, Arc::new(callback));
+    }
+
+    /// Register a one-shot listener that fires when this connection dies —
+    /// i.e. when the reader thread observes EOF/an I/O error on the host's
+    /// stdout and flips [`Self::is_alive`] to `false` (crash, `kill -9`,
+    /// distro stopped, or a clean stdin-EOF shutdown alike). If the
+    /// connection is ALREADY dead when this is called, `listener` fires
+    /// immediately on the calling thread instead of being registered — so a
+    /// caller racing the death can never register a listener that nothing
+    /// will ever fire.
+    ///
+    /// `listener` runs at most once, on the reader thread as it exits (or
+    /// inline, per above) — it must be cheap and non-blocking, and must not
+    /// call back into this client (hand off to a channel). This is the host
+    /// death-signal hook `remote::supervisor` builds resubscribe-on-respawn
+    /// on: an event, not a poll, so a supervisor learns of the outage the
+    /// moment the reader thread does.
+    pub fn on_death(&self, listener: impl FnOnce() + Send + 'static) {
+        let mut guard = self
+            .death_listeners
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        // The alive check happens UNDER the listeners lock, mirrored by
+        // [`ReaderDeathGuard::drop`] flipping `alive` BEFORE taking this
+        // same lock to drain: whichever side wins the lock, a listener is
+        // either drained by the guard (registered while alive) or fired
+        // inline here (alive already false) — never silently dropped.
+        if !self.is_alive() {
+            drop(guard);
+            listener();
+            return;
+        }
+        guard.push(Box::new(listener));
     }
 
     /// Stop routing `watch/event`s for `watch_id` to any callback. A stray
@@ -733,6 +778,7 @@ fn read_hello_line(
 struct ReaderDeathGuard {
     pending: Arc<Mutex<HashMap<u64, SyncSender<RpcResult>>>>,
     alive: Arc<AtomicBool>,
+    death_listeners: Arc<Mutex<Vec<DeathListener>>>,
 }
 
 impl Drop for ReaderDeathGuard {
@@ -750,6 +796,20 @@ impl Drop for ReaderDeathGuard {
                 "host connection lost",
             )));
         }
+        // Death listeners fire AFTER `alive` flipped (so a listener that
+        // immediately probes `is_alive()` sees the truth) and after pending
+        // requests were failed. The `alive`-then-lock ordering here pairs
+        // with `HostClient::on_death`'s lock-then-check — see that method's
+        // comment for why no listener can fall through the gap.
+        let listeners: Vec<DeathListener> = self
+            .death_listeners
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .drain(..)
+            .collect();
+        for listener in listeners {
+            listener();
+        }
     }
 }
 
@@ -765,6 +825,7 @@ fn spawn_reader_thread(
     alive: Arc<AtomicBool>,
     notification_handler: Arc<Mutex<NotificationHandler>>,
     watch_tx: mpsc::Sender<WatchEventParams>,
+    death_listeners: Arc<Mutex<Vec<DeathListener>>>,
 ) {
     std::thread::Builder::new()
         .name("dv-host-reader".into())
@@ -777,6 +838,7 @@ fn spawn_reader_thread(
             let _death_guard = ReaderDeathGuard {
                 pending: Arc::clone(&pending),
                 alive: Arc::clone(&alive),
+                death_listeners,
             };
             let mut line = String::new();
             loop {

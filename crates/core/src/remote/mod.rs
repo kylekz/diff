@@ -13,6 +13,7 @@ pub mod client;
 pub mod install;
 pub mod manager;
 pub mod proto;
+pub mod supervisor;
 pub mod worktree;
 
 pub use client::{ExecOutcome, HostClient, RequestFailure};

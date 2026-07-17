@@ -125,8 +125,7 @@ pub fn subscribe(
 
 /// `watch/unsubscribe`: drop `watch_id`'s OS watcher (idempotent — an
 /// already-unknown id is simply a no-op, not an error, matching how
-/// `dv_core::review::ReviewWatcher::Remote`'s `Drop` treats it as
-/// best-effort).
+/// `dv_core::remote::supervisor`'s teardown treats it as best-effort).
 pub fn unsubscribe(watch_id: u64) {
     registry()
         .lock()

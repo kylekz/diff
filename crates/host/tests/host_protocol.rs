@@ -557,6 +557,153 @@ fn watch_overflow_flag_set_beyond_1000_coalesced_paths() {
     std::fs::remove_dir_all(&dir).ok();
 }
 
+// --- on_death + supervised resubscribe-on-respawn (backlog: "Remote
+// watchers — resubscribe-on-respawn + subscribe off the GUI thread") ------
+//
+// Cross-process, no WSL: the supervisor's `client_source` seam is handed a
+// closure that spawns REAL local `dv-host` processes, so the whole state
+// machine — subscribe, death detection via `on_death`, resubscribe on a
+// fresh connection, synthetic re-arm event, teardown — is proven against
+// the real wire protocol on every CI platform. The `#[ignore]`d WSL tests
+// (crates/core/tests/wsl_watch_supervisor.rs) prove the same flow through
+// the real `remote::manager` cool-down path.
+
+#[test]
+fn on_death_fires_after_kill_and_immediately_when_already_dead() {
+    let client = spawn_host();
+    let (tx, rx) = mpsc::channel::<&'static str>();
+    let tx2 = tx.clone();
+    client.on_death(move || {
+        let _ = tx2.send("registered-before-death");
+    });
+    client.kill();
+    assert_eq!(
+        rx.recv_timeout(Duration::from_secs(5)),
+        Ok("registered-before-death"),
+        "a listener registered on a live client must fire when it dies"
+    );
+    assert!(wait_until(Duration::from_secs(5), || !client.is_alive()));
+    // Registered AFTER death: must fire inline, immediately.
+    client.on_death(move || {
+        let _ = tx.send("registered-after-death");
+    });
+    assert_eq!(
+        rx.recv_timeout(Duration::from_millis(200)),
+        Ok("registered-after-death"),
+        "a listener registered on an already-dead client must fire immediately"
+    );
+}
+
+#[test]
+fn supervisor_resubscribes_to_a_fresh_host_after_kill() {
+    use dv_core::remote::supervisor::{self, SupervisorConfig};
+    use std::sync::Mutex;
+
+    let dir = temp_dir("dv-host-supervisor-respawn");
+    run_git(&["init", "-q"], &dir);
+    let root = dir.to_str().unwrap().to_string();
+    let reviews_dir = dir.join(".git").join("dv").join("reviews");
+
+    // Every client the source ever vended, so the test can kill "the
+    // current host" from outside the supervisor.
+    let clients: Arc<Mutex<Vec<Arc<HostClient>>>> = Arc::new(Mutex::new(Vec::new()));
+    let clients_for_source = Arc::clone(&clients);
+
+    let (event_tx, event_rx) = mpsc::channel::<Instant>();
+    let on_change: Arc<dyn Fn() + Send + Sync> = Arc::new(move || {
+        let _ = event_tx.send(Instant::now());
+    });
+
+    let handle = supervisor::spawn(SupervisorConfig {
+        label: "supervisor-respawn-test".into(),
+        root: root.clone(),
+        kind: "store",
+        on_change: Arc::clone(&on_change),
+        client_source: Box::new(move || {
+            let client = Arc::new(spawn_host());
+            clients_for_source.lock().unwrap().push(Arc::clone(&client));
+            Some(client)
+        }),
+        fallback_tick: None,
+        synthetic_on_first_arm: true,
+        poll_interval: Duration::from_millis(100),
+    });
+
+    // First arm: one synthetic.
+    event_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("expected the first-arm synthetic event");
+
+    // A real store write flows through the first host's subscription.
+    std::fs::write(reviews_dir.join("r-1.json"), b"{}").expect("write review file");
+    event_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("expected a watch event through the first subscription");
+
+    // Kill the current host out from under the supervisor.
+    let first = Arc::clone(clients.lock().unwrap().last().expect("one client vended"));
+    let killed_at = Instant::now();
+    first.kill();
+
+    // The supervisor must notice the death, acquire a FRESH host from the
+    // source, resubscribe, and fire the synthetic re-arm event.
+    let synthetic_at = event_rx
+        .recv_timeout(Duration::from_secs(10))
+        .expect("expected a synthetic re-arm event after the kill");
+    eprintln!(
+        "kill -> resubscribe synthetic: {:?}",
+        synthetic_at.duration_since(killed_at)
+    );
+    assert!(
+        clients.lock().unwrap().len() >= 2,
+        "the supervisor should have acquired a fresh client after the kill"
+    );
+
+    // Drain any stragglers, then prove the NEW subscription is live.
+    while event_rx.recv_timeout(Duration::from_millis(300)).is_ok() {}
+    std::fs::write(reviews_dir.join("r-2.json"), b"{}").expect("write second review file");
+    event_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("expected a watch event through the respawned host's subscription");
+
+    // Second crash cycle: repeated crash/respawn must keep working, not
+    // just the first.
+    let second = Arc::clone(
+        clients
+            .lock()
+            .unwrap()
+            .last()
+            .expect("second client vended"),
+    );
+    second.kill();
+    event_rx
+        .recv_timeout(Duration::from_secs(10))
+        .expect("expected a synthetic re-arm event after the second kill");
+    while event_rx.recv_timeout(Duration::from_millis(300)).is_ok() {}
+    std::fs::write(reviews_dir.join("r-3.json"), b"{}").expect("write third review file");
+    event_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("expected a watch event after the second respawn");
+
+    // Teardown: drop stops delivery and the supervisor thread exits
+    // (releasing its `on_change` clone; callback registrations release
+    // theirs with their client). The channel disconnecting entirely is the
+    // strongest "no callback can ever fire again" signal available.
+    drop(handle);
+    assert!(
+        wait_until(Duration::from_secs(10), || Arc::strong_count(&on_change)
+            == 1),
+        "supervisor thread (and callback registrations) should release on_change after drop"
+    );
+    std::fs::write(reviews_dir.join("r-4.json"), b"{}").expect("write post-drop review file");
+    assert!(
+        event_rx.recv_timeout(Duration::from_millis(800)).is_err(),
+        "no events may be delivered after the watcher handle is dropped"
+    );
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
 fn local_hash_object(bytes: &[u8]) -> String {
     let mut child = Command::new("git")
         .args(["hash-object", "--stdin"])

@@ -83,7 +83,10 @@ fn cooldown() -> Duration {
 /// `DV_NO_HOST=1` is the hard A/B lever (plan §3): force-disables host
 /// routing even after [`enable_hosts`] ran, so a single env var reproduces
 /// Stage-A behavior for comparison runs without a separate build.
-fn hosts_enabled() -> bool {
+/// `pub(crate)` for [`super::worktree::watch_worktree`]'s cheap "can this
+/// process ever have a host at all" gate — no supervisor thread is worth
+/// spawning when the answer is a hard no.
+pub(crate) fn hosts_enabled() -> bool {
     hosts_enabled_given(
         std::env::var("DV_NO_HOST").ok().as_deref(),
         ENABLED.load(Ordering::SeqCst),

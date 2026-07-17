@@ -123,6 +123,16 @@ fn is_blank_style(style: &HighlightStyle) -> bool {
 /// `StyledText::with_highlights`. `syntax` runs are sorted & non-overlapping
 /// (from [`bucket_by_line`]); `intraline` ranges are sorted & non-overlapping
 /// (from dv-core). All ranges are clamped to `len` so slicing never panics.
+///
+/// `intra_bg` is the word-tint
+/// tier — a second, more saturated alpha layered over the row's own
+/// ~12.5% tint. The caller (`workspace.rs`'s `request_diff`) supplies
+/// `DvTheme::word_created_bg`/`word_deleted_bg` (`success`/`danger` @
+/// 0.28), so this fn itself stays theme-agnostic; it just paints whatever
+/// color it's handed onto the ranges dv-core's `intraline` module already
+/// picked out (that module's own `>70% changed` suppression heuristic is
+/// R3, not this fn's concern — an empty `intraline` slice already means
+/// "no highlight" here regardless of why it's empty).
 pub fn merge_line_runs(
     len: usize,
     syntax: &[(Range<usize>, HighlightStyle)],

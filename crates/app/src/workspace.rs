@@ -92,6 +92,28 @@ fn row_height(font_size: f32) -> f32 {
 fn gutter_width(font_size: f32) -> f32 {
     font_size * 3.5
 }
+/// Width of the +/- marker column, split out from the number gutter(s) —
+/// the reference design's unified-row anatomy is three segments
+/// (44+44+28px at its fixed 13px mono/22px row: two number columns then
+/// the marker column). This used to be a bare `w_4()` (16px), fixed
+/// regardless of the font-size setting, the same pre-restyle problem
+/// [`gutter_width`]'s own doc comment describes for the number columns.
+/// `2.0` lands close to the reference 28/44 ≈ 0.64 ratio against
+/// `gutter_width`'s `3.5` (2.0/3.5 ≈ 0.57) on a clean multiplier.
+fn marker_width(font_size: f32) -> f32 {
+    font_size * 2.0
+}
+/// Blank leading spacer that aligns a comment thread/editor card's left
+/// edge with where a diff row's CODE TEXT begins, rather than with its
+/// line numbers (the reference design's "72px blank gutter spacer" at
+/// its fixed 13px/28px numbers — one number-gutter column plus the
+/// marker column). A comment always anchors to a single
+/// side regardless of view mode, so this uses the single-side width even
+/// under the unified view (which shows two number columns) rather than
+/// double-counting a comment card's indent against both.
+fn thread_gutter_width(font_size: f32) -> f32 {
+    gutter_width(font_size) + marker_width(font_size)
+}
 
 /// Byte offset → UTF-16 code-unit count, up to (and excluding) `byte_offset`
 /// — LSP's `Position.character` is defined in UTF-16 code units regardless
@@ -274,6 +296,15 @@ struct RenderedDiff {
     /// This "diff" is a cached failure message; re-selecting the file
     /// retries instead of pinning the error forever.
     error: bool,
+    /// Added/removed line counts and binary-ness, tallied once here (in
+    /// `build_rows`/`error_diff`) rather than re-walking `unified` on every
+    /// `Workspace::render` frame — `Self::render_file_diff_header`'s own
+    /// per-file diffstat used to do exactly that walk unconditionally on
+    /// the hot render path (review finding: new O(rows) work per frame,
+    /// growing with file size, on a path Phase 7 worked to keep clean).
+    added: u32,
+    removed: u32,
+    is_binary: bool,
 }
 
 impl RenderedDiff {
@@ -1371,6 +1402,9 @@ fn error_diff(msg: SharedString) -> RenderedDiff {
         hunk_rows_unified: Vec::new(),
         hunk_rows_split: Vec::new(),
         error: true,
+        added: 0,
+        removed: 0,
+        is_binary: false,
     }
 }
 
@@ -2623,10 +2657,19 @@ impl Workspace {
         let expand = self.expanded.get(&index).cloned().unwrap_or_default();
         let context_lines = self.context_lines;
         let theme = cx.theme();
+        // Word-tint tier (R1a's `DvTheme`):
+        // `word_created_bg`/`word_deleted_bg` are `success`/
+        // `danger` @ 0.28 — a second, more saturated alpha tier over the
+        // existing ~12.5% row tint (`Row::Line`'s own `bg` in
+        // `render_diff_row`/`render_split_cell`, untouched by this slice —
+        // the row-tint tokens needed no new work). This used to be a bare `.opacity(0.32)` computed inline
+        // here; routing it through `DvTheme` means a future per-theme `"dv"`
+        // override to these hues is honored automatically.
+        let dv = crate::themes::dv_theme(cx);
         let hl = HighlightInputs {
             theme: theme.highlight_theme.clone(),
-            intra_added: theme.success.opacity(0.32),
-            intra_removed: theme.danger.opacity(0.32),
+            intra_added: dv.word_created_bg,
+            intra_removed: dv.word_deleted_bg,
         };
         cx.spawn(async move |this, cx| {
             let started = std::time::Instant::now();
@@ -7827,6 +7870,20 @@ impl Workspace {
 
     /// A hunk header row (shared by both views). When context is hidden
     /// above the hunk, the row is clickable and says how much it reveals.
+    /// Two anatomies: a plain
+    /// "hunk header row" (`recess_bg` bg, `muted.foreground` label) when
+    /// nothing is hidden above it, or a "gap row" (`recess_bg` bg, hover
+    /// `muted.background`, centered "⋯ N hidden lines") when there is. The
+    /// reference design
+    /// keeps these as two distinct row kinds; dv's row model folds the
+    /// gap-affordance into the same [`Row::HunkHeader`]/[`SplitRow::
+    /// HunkHeader`] variant (this fn's shared caller, both views) — see
+    /// this file's row-model doc comment — so this single row plays double
+    /// duty when `expandable` is `Some`: it's still the `@@ ...@@` boundary
+    /// label (kept `flex_none` on the left — dropping it would lose the
+    /// hunk's line-range info with nowhere else to show it) AND the
+    /// clickable hidden-lines affordance, given its own `flex_1` centered
+    /// segment to match the centered gap-row treatment.
     fn render_hunk_header(
         &self,
         label: SharedString,
@@ -7835,32 +7892,36 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) -> Stateful<Div> {
         let theme = cx.theme();
+        let mono = theme.mono_font_family.clone();
+        let muted_bg = theme.muted;
+        let muted_fg = theme.muted_foreground;
+        let accent = theme.primary;
+        let recess_bg = crate::themes::dv_theme(cx).recess_bg;
         let base = h_flex()
             .id(("hunk-header", hunk))
             .w_full()
             .h(px(row_height(self.font_size)))
             .px_2()
-            .bg(theme.muted)
-            .font_family(theme.mono_font_family.clone())
+            .bg(recess_bg)
+            .font_family(mono)
             .text_size(px(self.font_size))
-            .text_color(theme.muted_foreground);
+            .text_color(muted_fg);
         match expandable {
             None => base.child(label),
-            Some(hidden) => {
-                let accent = theme.primary;
-                base.cursor_pointer()
-                    .hover(|el| el.bg(theme.accent.opacity(0.4)))
-                    .on_mouse_down(
-                        MouseButton::Left,
-                        cx.listener(move |this, _, _, cx| this.expand_hunk_gap(hunk, cx)),
-                    )
-                    .child(h_flex().gap_2().child(label).child(
-                        div().text_color(accent.opacity(0.9)).child(format!(
-                            "⌃ {hidden} hidden line{} — click to expand",
-                            if hidden == 1 { "" } else { "s" }
-                        )),
-                    ))
-            }
+            Some(hidden) => base
+                .cursor_pointer()
+                .hover(|el| el.bg(muted_bg))
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(move |this, _, _, cx| this.expand_hunk_gap(hunk, cx)),
+                )
+                .child(label)
+                .child(h_flex().flex_1().justify_center().child(
+                    div().text_color(accent.opacity(0.9)).child(format!(
+                        "\u{22ef} {hidden} hidden line{} \u{2014} click to expand",
+                        if hidden == 1 { "" } else { "s" }
+                    )),
+                )),
         }
     }
 
@@ -8456,178 +8517,220 @@ impl Workspace {
             dv_core::Side::Old => "old",
             dv_core::Side::New => "new",
         };
+        let text_secondary = crate::themes::dv_theme(cx).text_secondary;
+        let created_age = crate::shell::relative_age(comment.created_ms);
 
-        div().w_full().px_4().py_3().child(
-            v_flex()
-                .w_full()
-                .max_w(px(720.))
-                .p_3()
-                .gap_3()
-                .bg(theme.popover)
-                .border_1()
-                .border_color(if resolved {
-                    theme.border
-                } else {
-                    theme.primary.opacity(0.5)
-                })
-                .rounded_lg()
-                .child(
-                    h_flex()
-                        .items_center()
-                        .gap_2()
-                        // Safety net for a narrow summary/thread column (same
-                        // reasoning as `render_verdict_area`'s own
-                        // `.flex_wrap()`: "Unresolve" is long enough that the
-                        // action-button group can outgrow what's left of the
-                        // row next to the author/status text) — the group
-                        // spills onto its own line instead of clipping off
-                        // the right edge.
-                        .flex_wrap()
-                        .text_sm()
-                        .child(div().font_semibold().child(comment.author.clone()))
-                        .child(
-                            div()
-                                .text_color(theme.muted_foreground)
-                                .child(format!("{side} · {lines}")),
-                        )
-                        .when(resolved, |el| {
-                            el.child(div().text_color(theme.success).child("✓ resolved"))
-                        })
-                        .when(self.stale.contains(&comment.id), |el| {
-                            el.child(
-                                div()
-                                    .text_color(theme.warning)
-                                    .child("⚠ stale — the anchored content changed"),
-                            )
-                        })
-                        .child(div().flex_1())
-                        // Action-button group: tighter internal spacing than
-                        // the metadata cluster to its left, so the four
-                        // actions read as one cohesive group (GitHub's
-                        // thread-card action-row feel) rather than just more
-                        // items on the same row.
-                        .child(
-                            h_flex()
-                                .flex_none()
-                                .gap_1()
-                                .child(
-                                    Button::new(("resolve", comment_ix))
-                                        .ghost()
-                                        .small()
-                                        .label(if local_resolved {
-                                            "Unresolve"
-                                        } else {
-                                            "Resolve"
-                                        })
-                                        .on_click(cx.listener(move |this, _, _, cx| {
-                                            let status = if local_resolved {
-                                                dv_core::CommentStatus::Open
-                                            } else {
-                                                dv_core::CommentStatus::Resolved
-                                            };
-                                            this.set_comment_status(id.clone(), status, cx);
-                                        })),
-                                )
-                                .child(
-                                    Button::new(("reply", comment_ix))
-                                        .ghost()
-                                        .small()
-                                        .label("Reply")
-                                        .on_click(cx.listener(move |this, _, window, cx| {
-                                            this.open_thread_input(
-                                                id_for_reply.clone(),
-                                                ThreadInputMode::Reply,
-                                                window,
-                                                cx,
-                                            );
-                                        })),
-                                )
-                                .child(
-                                    Button::new(("edit", comment_ix))
-                                        .ghost()
-                                        .small()
-                                        .label("Edit")
-                                        .on_click(cx.listener(move |this, _, window, cx| {
-                                            this.open_thread_input(
-                                                id_for_edit.clone(),
-                                                ThreadInputMode::EditBody,
-                                                window,
-                                                cx,
-                                            );
-                                        })),
-                                )
-                                .child(
-                                    Button::new(("delete", comment_ix))
-                                        .danger()
-                                        .small()
-                                        .label("Delete")
-                                        .on_click(cx.listener(move |this, _, _, cx| {
-                                            this.delete_comment(id_for_delete.clone(), cx);
-                                        })),
-                                ),
-                        ),
-                )
-                .map(|el| {
-                    // Editing swaps the body text for the input; otherwise
-                    // the body renders normally.
-                    if editing.is_some_and(|(mode, _)| mode == ThreadInputMode::EditBody) {
-                        el
-                    } else {
-                        el.child(div().text_sm().child(comment.body.clone()))
-                    }
-                })
-                .when(!comment.replies.is_empty(), |el| {
-                    // One indentation rail + tighter internal spacing for
-                    // the whole reply run, distinct from the looser
-                    // header/body/replies/editor rhythm above (`gap_3`) —
-                    // consecutive replies are more tightly related to each
-                    // other than to the sections around them.
-                    el.child(
-                        v_flex()
-                            .gap_2()
-                            .pl_3()
-                            .border_l_2()
-                            .border_color(theme.border)
-                            .children(comment.replies.iter().map(|reply| {
-                                h_flex()
-                                    .gap_2()
-                                    .text_sm()
-                                    .child(div().font_semibold().child(reply.author.clone()))
-                                    .child(div().child(reply.body.clone()))
-                            })),
-                    )
-                })
-                .when_some(editing, |el, (_, saving)| {
-                    let input = self
-                        .thread_input
-                        .as_ref()
-                        .map(|ti| gpui_component::input::Input::new(&ti.input));
-                    el.children(input).child(
+        h_flex()
+            .w_full()
+            .py_3()
+            .child(
+                // The "72px blank gutter
+                // spacer" — aligns the card's left edge with where the diff
+                // row's CODE TEXT begins (see `thread_gutter_width`'s doc
+                // comment), not `px_4`'s flat padding on both sides.
+                div().w(px(thread_gutter_width(self.font_size))).flex_none(),
+            )
+            .child(
+                v_flex()
+                    .flex_1()
+                    // `mr_4`, not `pr_4` — `p_3` below assigns all four
+                    // padding sides (last-write-wins), which silently killed
+                    // a `pr_4` set before it. An outer margin survives that
+                    // and restores the right-edge gap the old `px_4` wrapper
+                    // gave the card.
+                    .mr_4()
+                    .max_w(px(720.))
+                    .p_3()
+                    .gap_3()
+                    // `sidebar.background` bg + a left-only accent bar
+                    // ("card bg sidebar.background +
+                    // border_l_2 primary accent bar") replaces the old
+                    // popover-bg/full-border card. Resolved threads get the
+                    // softer `muted.background` bar instead of full `primary` —
+                    // NOT `border` (the Aura-dark trap: that theme's `border`
+                    // is pure black, invisible here — see CLAUDE.md's cross-
+                    // cutting risk).
+                    .bg(theme.sidebar)
+                    .border_l_2()
+                    .border_color(if resolved { theme.muted } else { theme.primary })
+                    .rounded_lg()
+                    .child(
                         h_flex()
+                            .items_center()
                             .gap_2()
-                            .justify_end()
+                            // Safety net for a narrow summary/thread column (same
+                            // reasoning as `render_verdict_area`'s own
+                            // `.flex_wrap()`: "Unresolve" is long enough that the
+                            // action-button group can outgrow what's left of the
+                            // row next to the author/status text) — the group
+                            // spills onto its own line instead of clipping off
+                            // the right edge.
+                            .flex_wrap()
+                            .text_sm()
+                            .child(div().font_semibold().child(comment.author.clone()))
                             .child(
-                                Button::new(("ti-cancel", comment_ix))
-                                    .ghost()
-                                    .small()
-                                    .label("Cancel")
-                                    .on_click(cx.listener(|this, _, window, cx| {
-                                        this.close_thread_input(window, cx)
-                                    })),
+                                div()
+                                    .text_xs()
+                                    .text_color(text_secondary)
+                                    .child(created_age),
                             )
                             .child(
-                                Button::new(("ti-submit", comment_ix))
-                                    .primary()
-                                    .small()
-                                    .label(if saving { "Saving…" } else { "Save" })
-                                    .disabled(saving)
-                                    .on_click(cx.listener(|this, _, window, cx| {
-                                        this.submit_thread_input(window, cx)
-                                    })),
+                                div()
+                                    .text_color(theme.muted_foreground)
+                                    .child(format!("{side} · {lines}")),
+                            )
+                            .when(resolved, |el| {
+                                el.child(div().text_color(theme.success).child("✓ resolved"))
+                            })
+                            .when(self.stale.contains(&comment.id), |el| {
+                                el.child(
+                                    div()
+                                        .text_color(theme.warning)
+                                        .child("⚠ stale — the anchored content changed"),
+                                )
+                            })
+                            .child(div().flex_1())
+                            // Action-button group: tighter internal spacing than
+                            // the metadata cluster to its left, so the four
+                            // actions read as one cohesive group (GitHub's
+                            // thread-card action-row feel) rather than just more
+                            // items on the same row.
+                            .child(
+                                h_flex()
+                                    .flex_none()
+                                    .gap_1()
+                                    .child(
+                                        Button::new(("resolve", comment_ix))
+                                            .ghost()
+                                            .small()
+                                            .label(if local_resolved {
+                                                "Unresolve"
+                                            } else {
+                                                "Resolve"
+                                            })
+                                            .on_click(cx.listener(move |this, _, _, cx| {
+                                                let status = if local_resolved {
+                                                    dv_core::CommentStatus::Open
+                                                } else {
+                                                    dv_core::CommentStatus::Resolved
+                                                };
+                                                this.set_comment_status(id.clone(), status, cx);
+                                            })),
+                                    )
+                                    .child(
+                                        Button::new(("reply", comment_ix))
+                                            .ghost()
+                                            .small()
+                                            .label("Reply")
+                                            .on_click(cx.listener(move |this, _, window, cx| {
+                                                this.open_thread_input(
+                                                    id_for_reply.clone(),
+                                                    ThreadInputMode::Reply,
+                                                    window,
+                                                    cx,
+                                                );
+                                            })),
+                                    )
+                                    .child(
+                                        Button::new(("edit", comment_ix))
+                                            .ghost()
+                                            .small()
+                                            .label("Edit")
+                                            .on_click(cx.listener(move |this, _, window, cx| {
+                                                this.open_thread_input(
+                                                    id_for_edit.clone(),
+                                                    ThreadInputMode::EditBody,
+                                                    window,
+                                                    cx,
+                                                );
+                                            })),
+                                    )
+                                    .child(
+                                        Button::new(("delete", comment_ix))
+                                            .danger()
+                                            .small()
+                                            .label("Delete")
+                                            .on_click(cx.listener(move |this, _, _, cx| {
+                                                this.delete_comment(id_for_delete.clone(), cx);
+                                            })),
+                                    ),
                             ),
                     )
-                }),
-        )
+                    .map(|el| {
+                        // Editing swaps the body text for the input; otherwise
+                        // the body renders normally.
+                        if editing.is_some_and(|(mode, _)| mode == ThreadInputMode::EditBody) {
+                            el
+                        } else {
+                            el.child(
+                                div()
+                                    .text_sm()
+                                    .text_color(text_secondary)
+                                    .child(comment.body.clone()),
+                            )
+                        }
+                    })
+                    .when(!comment.replies.is_empty(), |el| {
+                        // One indentation rail + tighter internal spacing for
+                        // the whole reply run, distinct from the looser
+                        // header/body/replies/editor rhythm above (`gap_3`) —
+                        // consecutive replies are more tightly related to each
+                        // other than to the sections around them.
+                        el.child(
+                            v_flex()
+                                .gap_2()
+                                .pl_3()
+                                .border_l_2()
+                                // `muted`, not `theme.border` — the Aura-dark
+                                // trap (that theme's `border` is pure black,
+                                // invisible on this card's background; see
+                                // CLAUDE.md's cross-cutting risk and the
+                                // resolved-accent choice above).
+                                .border_color(theme.muted)
+                                .children(comment.replies.iter().map(|reply| {
+                                    h_flex()
+                                        .gap_2()
+                                        .text_sm()
+                                        .child(div().font_semibold().child(reply.author.clone()))
+                                        .child(
+                                            div()
+                                                .text_color(text_secondary)
+                                                .child(reply.body.clone()),
+                                        )
+                                })),
+                        )
+                    })
+                    .when_some(editing, |el, (_, saving)| {
+                        let input = self
+                            .thread_input
+                            .as_ref()
+                            .map(|ti| gpui_component::input::Input::new(&ti.input));
+                        el.children(input).child(
+                            h_flex()
+                                .gap_2()
+                                .justify_end()
+                                .child(
+                                    Button::new(("ti-cancel", comment_ix))
+                                        .ghost()
+                                        .small()
+                                        .label("Cancel")
+                                        .on_click(cx.listener(|this, _, window, cx| {
+                                            this.close_thread_input(window, cx)
+                                        })),
+                                )
+                                .child(
+                                    Button::new(("ti-submit", comment_ix))
+                                        .primary()
+                                        .small()
+                                        .label(if saving { "Saving…" } else { "Save" })
+                                        .disabled(saving)
+                                        .on_click(cx.listener(|this, _, window, cx| {
+                                            this.submit_thread_input(window, cx)
+                                        })),
+                                ),
+                        )
+                    }),
+            )
     }
 
     /// A read-only GitHub-side review thread card (docs/phase-6-review-
@@ -8644,10 +8747,15 @@ impl Workspace {
         // — even though this card has no listeners today, for consistency
         // with every other card in this file).
         let theme = cx.theme();
-        let border = theme.border;
+        // `muted`, not `theme.border` — the Aura-dark trap (that theme's
+        // `border` is pure black, invisible on this card's background; see
+        // CLAUDE.md's cross-cutting risk and `render_thread`'s resolved-
+        // accent choice, which this card's read-only outline should match).
+        let border = theme.muted;
         let popover = theme.popover;
         let success = theme.success;
         let muted = theme.muted_foreground;
+        let text_secondary = crate::themes::dv_theme(cx).text_secondary;
 
         let Some(thread) = self.remote_threads.get(thread_ix) else {
             return div();
@@ -8661,60 +8769,80 @@ impl Workspace {
             .map(|l| format!("line {l}"))
             .unwrap_or_else(|| "outdated".to_string());
 
-        div().w_full().px_4().py_3().child(
-            v_flex()
-                .w_full()
-                .max_w(px(720.))
-                .p_3()
-                .gap_3()
-                // A muted background (rather than `render_thread`'s
-                // unresolved-primary tint, which means "needs your
-                // attention in dv") — a read-only remote thread never
-                // needs dv-side attention, only visibility.
-                .bg(popover.opacity(0.6))
-                .border_1()
-                .border_color(border)
-                .rounded_lg()
-                .child(
-                    h_flex()
-                        .items_center()
-                        .gap_2()
-                        .flex_wrap()
-                        .text_sm()
-                        .child(div().font_semibold().child(opening.author.clone()))
-                        .child(div().text_color(muted).child(format!(
-                            "GitHub \u{b7} {line_label} \u{b7} {}",
-                            crate::shell::relative_age(opening.created_ms)
-                        )))
-                        .when(thread.is_resolved, |el| {
-                            el.child(div().text_color(success).child("\u{2713} resolved"))
-                        }),
-                )
-                .child(div().text_sm().child(opening.body.clone()))
-                .when(!replies.is_empty(), |el| {
-                    el.child(
-                        v_flex()
+        h_flex()
+            .w_full()
+            .py_3()
+            .child(
+                // Same 72px-equivalent gutter spacer as `render_thread` —
+                // keeps every card in the interleaved display list flush
+                // to the same left edge regardless of which kind it is.
+                div().w(px(thread_gutter_width(self.font_size))).flex_none(),
+            )
+            .child(
+                v_flex()
+                    .flex_1()
+                    // `mr_4`, not `pr_4` (dead under `p_3`'s last-write-wins
+                    // padding assignment below) — see `render_thread`'s note.
+                    .mr_4()
+                    .max_w(px(720.))
+                    .p_3()
+                    .gap_3()
+                    // A muted background (rather than `render_thread`'s
+                    // unresolved-primary tint, which means "needs your
+                    // attention in dv") — a read-only remote thread never
+                    // needs dv-side attention, only visibility.
+                    .bg(popover.opacity(0.6))
+                    .border_1()
+                    .border_color(border)
+                    .rounded_lg()
+                    .child(
+                        h_flex()
+                            .items_center()
                             .gap_2()
-                            .pl_3()
-                            .border_l_2()
-                            .border_color(border)
-                            .children(replies.iter().map(|reply| {
-                                h_flex()
-                                    .gap_2()
-                                    .items_center()
-                                    .text_sm()
-                                    .child(div().font_semibold().child(reply.author.clone()))
-                                    .child(
-                                        div()
-                                            .text_color(muted)
-                                            .text_xs()
-                                            .child(crate::shell::relative_age(reply.created_ms)),
-                                    )
-                                    .child(div().child(reply.body.clone()))
-                            })),
+                            .flex_wrap()
+                            .text_sm()
+                            .child(div().font_semibold().child(opening.author.clone()))
+                            .child(div().text_color(muted).child(format!(
+                                "GitHub \u{b7} {line_label} \u{b7} {}",
+                                crate::shell::relative_age(opening.created_ms)
+                            )))
+                            .when(thread.is_resolved, |el| {
+                                el.child(div().text_color(success).child("\u{2713} resolved"))
+                            }),
                     )
-                }),
-        )
+                    .child(
+                        div()
+                            .text_sm()
+                            .text_color(text_secondary)
+                            .child(opening.body.clone()),
+                    )
+                    .when(!replies.is_empty(), |el| {
+                        el.child(
+                            v_flex()
+                                .gap_2()
+                                .pl_3()
+                                .border_l_2()
+                                .border_color(border)
+                                .children(replies.iter().map(|reply| {
+                                    h_flex()
+                                        .gap_2()
+                                        .items_center()
+                                        .text_sm()
+                                        .child(div().font_semibold().child(reply.author.clone()))
+                                        .child(
+                                            div().text_color(muted).text_xs().child(
+                                                crate::shell::relative_age(reply.created_ms),
+                                            ),
+                                        )
+                                        .child(
+                                            div()
+                                                .text_color(text_secondary)
+                                                .child(reply.body.clone()),
+                                        )
+                                })),
+                        )
+                    }),
+            )
     }
 
     /// The inline comment editor card.
@@ -8727,44 +8855,192 @@ impl Workspace {
         };
         let saving = editor.saving;
 
-        div().w_full().px_4().py_3().child(
-            v_flex()
-                .w_full()
-                .max_w(px(720.))
-                .p_3()
-                .gap_3()
-                .bg(theme.popover)
-                .border_1()
-                .border_color(theme.primary.opacity(0.7))
-                .rounded_lg()
-                .child(gpui_component::input::Input::new(&editor.input))
-                .child(
-                    h_flex()
-                        .gap_2()
-                        .justify_end()
-                        .child(
-                            Button::new("cancel-comment")
-                                .ghost()
-                                .small()
-                                .label("Cancel")
-                                .on_click(
-                                    cx.listener(|this, _, window, cx| {
+        h_flex()
+            .w_full()
+            .py_3()
+            .child(
+                // Same gutter spacer as `render_thread`/`render_remote_thread`
+                // — the editor is a comment-card row too, in the same
+                // interleaved display list.
+                div().w(px(thread_gutter_width(self.font_size))).flex_none(),
+            )
+            .child(
+                v_flex()
+                    .flex_1()
+                    // `mr_4`, not `pr_4` (dead under `p_3`'s last-write-wins
+                    // padding assignment below) — see `render_thread`'s note.
+                    .mr_4()
+                    .max_w(px(720.))
+                    .p_3()
+                    .gap_3()
+                    .bg(theme.popover)
+                    .border_1()
+                    .border_color(theme.primary.opacity(0.7))
+                    .rounded_lg()
+                    .child(gpui_component::input::Input::new(&editor.input))
+                    .child(
+                        h_flex()
+                            .gap_2()
+                            .justify_end()
+                            .child(
+                                Button::new("cancel-comment")
+                                    .ghost()
+                                    .small()
+                                    .label("Cancel")
+                                    .on_click(cx.listener(|this, _, window, cx| {
                                         this.close_editor(window, cx)
-                                    }),
-                                ),
+                                    })),
+                            )
+                            .child(
+                                Button::new("submit-comment")
+                                    .primary()
+                                    .small()
+                                    .label(if saving { "Saving…" } else { "Comment" })
+                                    .disabled(saving)
+                                    .on_click(cx.listener(|this, _, window, cx| {
+                                        this.submit_comment(window, cx)
+                                    })),
+                            ),
+                    ),
+            )
+    }
+
+    /// The "file header row" that sits atop the diff-row list
+    /// itself — distinct from
+    /// [`Self::render_header`]'s whole-REVIEW title bar (R1c): this one
+    /// names the single file currently open. The reference design
+    /// concatenates every
+    /// file's diff into one scroll region, so its file-header row repeats
+    /// per file as you scroll past one; dv shows one file at a time (picked
+    /// from the file tree), so "the file header row" collapses to "the
+    /// selected file's header", rendered once above the row list. `sidebar.
+    /// background` bg, the same status pill/color mapping as [`Self::
+    /// render_file_row`], the bold path (+ `← old_path` for renames), a
+    /// `N comments · M outdated` note, and this ONE file's own `+N`/`−N` —
+    /// counted straight off the already-computed [`RenderedDiff`] (unlike
+    /// [`Self::diffstat`]'s whole-review running total, a single open
+    /// file's diff is always fully loaded by the time this renders, so
+    /// there's no partial-total qualifier to carry here).
+    fn render_file_diff_header(&self, index: usize, cx: &mut Context<Self>) -> Div {
+        use crate::shell::state_pill;
+
+        let Some(file) = self.files.get(index) else {
+            return div();
+        };
+        let theme = cx.theme();
+        let sidebar_bg = theme.sidebar;
+        let muted = theme.muted_foreground;
+        let success = theme.success;
+        let danger = theme.danger;
+        let warning = theme.warning;
+        let primary = theme.primary;
+        let accent_alt = crate::themes::dv_theme(cx).accent_alt;
+
+        // Same status → color mapping as `Self::render_file_row`'s glyph
+        // pill (kept in sync there rather than factored out — see that fn's
+        // own doc comment on why renamed/copied share `accent_alt`), but
+        // spelled out as the full status word rather than the single-letter
+        // glyph: this is the one row the reference design renders as a word
+        // ("modified", not "M") rather than a letter, so the file-tree's
+        // dense letter pills stay letters while this one surface matches
+        // the reference screenshots exactly (review finding,
+        // the "status pill" row spec).
+        let (label, color) = match file.status {
+            ChangeStatus::Added => ("added", success),
+            ChangeStatus::Deleted => ("deleted", danger),
+            ChangeStatus::Renamed => ("renamed", accent_alt),
+            ChangeStatus::Copied => ("copied", accent_alt),
+            ChangeStatus::Modified => ("modified", primary),
+            ChangeStatus::TypeChanged => ("type changed", warning),
+            ChangeStatus::Unmerged => ("unmerged", danger),
+            ChangeStatus::Unknown(_) => ("unknown", muted),
+        };
+
+        // `None` ⇒ the diff hasn't loaded yet, it's binary (no textual diff
+        // to count), or it failed to load (`error_diff` caches added=0/
+        // removed=0, which is not a real count) — in every case "+0 -0"
+        // would misleadingly read as an actual line-change count, so
+        // suppress the diffstat children entirely rather than assert a
+        // fake zero. Counts are read straight off the cached `RenderedDiff`
+        // (tallied once in `build_rows`/`error_diff`) instead of re-walking
+        // `diff.unified` here on every render.
+        let diffstat: Option<(u32, u32)> = self.diffs.get(&index).and_then(|diff| {
+            if diff.is_binary || diff.error {
+                None
+            } else {
+                Some((diff.added, diff.removed))
+            }
+        });
+
+        // Single pass over this file's comments for both the total and the
+        // stale/outdated subset, rather than two separate `.filter().count()`
+        // scans of `review.comments`.
+        let (comment_total, outdated) = self
+            .review
+            .as_ref()
+            .map(|r| {
+                r.comments.iter().filter(|c| c.path == file.path).fold(
+                    (0usize, 0usize),
+                    |(total, outdated), c| {
+                        (
+                            total + 1,
+                            outdated + usize::from(self.stale.contains(&c.id)),
                         )
-                        .child(
-                            Button::new("submit-comment")
-                                .primary()
-                                .small()
-                                .label(if saving { "Saving…" } else { "Comment" })
-                                .disabled(saving)
-                                .on_click(cx.listener(|this, _, window, cx| {
-                                    this.submit_comment(window, cx)
-                                })),
-                        ),
-                ),
-        )
+                    },
+                )
+            })
+            .unwrap_or((0, 0));
+
+        h_flex()
+            .w_full()
+            .flex_none()
+            .items_center()
+            .gap_2()
+            .px_3()
+            .py_1p5()
+            .bg(sidebar_bg)
+            .child(state_pill(color, label).flex_none())
+            .child(
+                div()
+                    .flex_shrink_1()
+                    .min_w(px(0.))
+                    .font_semibold()
+                    .truncate()
+                    .child(file.path.clone()),
+            )
+            .children(file.old_path.as_ref().map(|old| {
+                div()
+                    .flex_none()
+                    .text_color(muted)
+                    .child(format!("\u{2190} {old}"))
+            }))
+            .child(div().flex_1())
+            .when(comment_total > 0, |el| {
+                el.child(
+                    div()
+                        .flex_none()
+                        .text_xs()
+                        .text_color(muted)
+                        .child(if outdated > 0 {
+                            format!(
+                                "{comment_total} comment{} \u{b7} {outdated} outdated",
+                                if comment_total == 1 { "" } else { "s" }
+                            )
+                        } else {
+                            format!(
+                                "{comment_total} comment{}",
+                                if comment_total == 1 { "" } else { "s" }
+                            )
+                        }),
+                )
+            })
+            .children(diffstat.map(|(added, removed)| {
+                h_flex()
+                    .flex_none()
+                    .gap_2()
+                    .child(div().text_color(success).child(format!("+{added}")))
+                    .child(div().text_color(danger).child(format!("\u{2212}{removed}")))
+            }))
     }
 
     fn render_diff_row(&self, row_index: usize, cx: &mut Context<Self>) -> Div {
@@ -8827,13 +9103,16 @@ impl Workspace {
                 };
 
                 let anchor = Self::row_anchor(*old_line, *new_line);
+                // Existing-token role mapping:
+                // selection (blue @30%) computes `primary.background`
+                // @ 0.30 at apply time — was 0.18 pre-restyle.
                 let selected_bg = anchor
                     .filter(|&(side, line)| {
                         self.selection
                             .as_ref()
                             .is_some_and(|sel| sel.contains(side, line))
                     })
-                    .map(|_| theme.primary.opacity(0.18));
+                    .map(|_| theme.primary.opacity(0.30));
 
                 // The number gutter is the comment handle: press to start a
                 // line selection, drag/shift-click to widen it.
@@ -8887,7 +9166,12 @@ impl Workspace {
                         )
                     })
                     .child(gutter)
-                    .child(div().w_4().flex_none().child(marker))
+                    .child(
+                        div()
+                            .w(px(marker_width(self.font_size)))
+                            .flex_none()
+                            .child(marker),
+                    )
                     .child(content)
             }
         }
@@ -8898,7 +9182,13 @@ impl Workspace {
         // `cx` is held across the `&mut cx` calls to render_split_cell.
         let mono = cx.theme().mono_font_family.clone();
         let muted = cx.theme().muted_foreground;
-        let border = cx.theme().border;
+        let muted_bg = cx.theme().muted;
+        // Divider recipe: a 6px
+        // `recess_bg` column bordered `muted.background` both sides — NOT
+        // `border` (the Aura-dark trap: that theme's `border` is pure
+        // black, invisible against its own dark surfaces — see CLAUDE.md's
+        // cross-cutting risk and `DvTheme`'s own doc comment in themes.rs).
+        let recess_bg = crate::themes::dv_theme(cx).recess_bg;
 
         let Some(diff) = self.selected.and_then(|i| self.diffs.get(&i)) else {
             return div();
@@ -8933,7 +9223,16 @@ impl Workspace {
                     .font_family(mono)
                     .text_size(px(self.font_size))
                     .child(left.flex_1().min_w(px(0.)))
-                    .child(div().w(px(1.)).flex_none().bg(border))
+                    .child(
+                        div()
+                            .w(px(6.))
+                            .h_full()
+                            .flex_none()
+                            .bg(recess_bg)
+                            .border_l_1()
+                            .border_r_1()
+                            .border_color(muted_bg),
+                    )
                     .child(right.flex_1().min_w(px(0.)))
             }
         }
@@ -8952,14 +9251,20 @@ impl Workspace {
     ) -> Div {
         let theme = cx.theme();
         let mono = theme.mono_font_family.clone();
+        // The "absent side of a
+        // one-sided split-view row" — `DvTheme::void_bg` (`recess_bg` @
+        // 0.60), not a bare `muted.opacity(0.25)` guess.
+        let void_bg = crate::themes::dv_theme(cx).void_bg;
         let Some(cell) = cell else {
-            return div().h_full().bg(theme.muted.opacity(0.25));
+            return div().h_full().bg(void_bg);
         };
         let (marker, bg) = match cell.kind {
             LineKind::Added => ("+", Some(theme.success.opacity(0.14))),
             LineKind::Removed => ("-", Some(theme.danger.opacity(0.14))),
             LineKind::Context => (" ", None),
         };
+        // See `render_diff_row`'s matching comment: selection composes
+        // `primary.background` @ 0.30 (was 0.18 pre-restyle).
         let selected_bg = cell
             .line
             .filter(|&line| {
@@ -8967,7 +9272,7 @@ impl Workspace {
                     .as_ref()
                     .is_some_and(|sel| sel.contains(side, line))
             })
-            .map(|_| theme.primary.opacity(0.18));
+            .map(|_| theme.primary.opacity(0.30));
         let number: SharedString = cell.line.map(|v| v.to_string()).unwrap_or_default().into();
         // Clip long lines at the cell edge — without this they render on
         // under the other column's text (backlog: proper h-scroll later).
@@ -9031,7 +9336,12 @@ impl Workspace {
                 )
             })
             .child(gutter)
-            .child(div().w_4().flex_none().child(marker))
+            .child(
+                div()
+                    .w(px(marker_width(self.font_size)))
+                    .flex_none()
+                    .child(marker),
+            )
             .child(content)
     }
 }
@@ -9236,6 +9546,8 @@ fn build_rows(
     let mut split = Vec::new();
     let mut hunk_rows_unified = Vec::new();
     let mut hunk_rows_split = Vec::new();
+    let mut added_count = 0u32;
+    let mut removed_count = 0u32;
     if diff.is_binary {
         unified.push(Row::Binary);
         split.push(SplitRow::Binary);
@@ -9245,6 +9557,9 @@ fn build_rows(
             hunk_rows_unified,
             hunk_rows_split,
             error: false,
+            added: 0,
+            removed: 0,
+            is_binary: true,
         };
     }
     if diff.hunks.is_empty() {
@@ -9256,6 +9571,9 @@ fn build_rows(
             hunk_rows_unified,
             hunk_rows_split,
             error: false,
+            added: 0,
+            removed: 0,
+            is_binary: false,
         };
     }
 
@@ -9377,6 +9695,11 @@ fn build_rows(
             .collect();
 
         for p in &prepared {
+            match p.kind {
+                LineKind::Added => added_count += 1,
+                LineKind::Removed => removed_count += 1,
+                LineKind::Context => {}
+            }
             unified.push(Row::Line {
                 kind: p.kind,
                 old_line: p.old_line,
@@ -9393,6 +9716,9 @@ fn build_rows(
         hunk_rows_unified,
         hunk_rows_split,
         error: false,
+        added: added_count,
+        removed: removed_count,
+        is_binary: false,
     }
 }
 
@@ -9463,6 +9789,14 @@ impl Focusable for Workspace {
 impl Render for Workspace {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let summary = self.render_summary(cx);
+        // Computed as its own local (same reasoning as `summary` just
+        // above), not inline inside `.children(...)` down in the `Ready`
+        // arm: `cx` needs a fresh `&mut` reborrow for the call, and this
+        // keeps that reborrow's lifetime scoped to one statement rather
+        // than tangled up in the match arm building the rest of `body`.
+        let file_header = self
+            .selected
+            .map(|index| self.render_file_diff_header(index, cx));
         let theme = cx.theme();
 
         let body: Div = match &self.status {
@@ -9524,51 +9858,59 @@ impl Render for Workspace {
                             ),
                     )
                     .child(
-                        div()
+                        v_flex()
                             .h_full()
                             .flex_1()
                             .min_w(px(0.))
-                            // P2 finding: `Self::wrap_symbol_click_target`'s
-                            // `.on_hover` leave never fires for a wheel
-                            // scroll with the mouse stationary — gpui
-                            // dispatches a distinct `ScrollWheelEvent` for
-                            // that, never a synthetic `MouseMoveEvent` —
-                            // and once the raising row scrolls out of this
-                            // list's viewport its listener isn't even
-                            // registered anymore, so nothing else would ever
-                            // clear a popover left behind by a scroll.
-                            // Dropping it here (rather than repositioning
-                            // it) matches `on_symbol_hover_leave`'s own
-                            // posture: a stale popover is worth clearing,
-                            // not worth chasing across a scroll.
-                            //
-                            // Bump the epoch/release the claimed row
-                            // UNCONDITIONALLY — an in-flight debounced hover
-                            // request (up to ~3.3s inside the LSP warm-up
-                            // retry window) must also be superseded here,
-                            // not just an already-shown popover cleared, or
-                            // its answer can land after the scroll and pop a
-                            // stale, wrongly-anchored popover over whatever
-                            // is now under the stationary pointer (P2
-                            // finding). `cx.notify()` stays conditional on
-                            // an existing popover to actually clear.
-                            .on_scroll_wheel(cx.listener(
-                                |this, _: &ScrollWheelEvent, _window, cx| {
-                                    this.hover_request_epoch += 1;
-                                    this.hover_request_line = None;
-                                    if this.hover_popover.take().is_some() {
-                                        cx.notify();
-                                    }
-                                },
-                            ))
-                            .child({
-                                let this = cx.weak_entity();
-                                list(self.diff_list.clone(), move |ix, _window, cx| {
-                                    this.update(cx, |this, cx| this.render_display_row(ix, cx))
-                                        .unwrap_or_else(|_| div().into_any_element())
-                                })
-                                .size_full()
-                            }),
+                            .children(file_header)
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .min_h(px(0.))
+                                    // P2 finding: `Self::wrap_symbol_click_target`'s
+                                    // `.on_hover` leave never fires for a wheel
+                                    // scroll with the mouse stationary — gpui
+                                    // dispatches a distinct `ScrollWheelEvent` for
+                                    // that, never a synthetic `MouseMoveEvent` —
+                                    // and once the raising row scrolls out of this
+                                    // list's viewport its listener isn't even
+                                    // registered anymore, so nothing else would ever
+                                    // clear a popover left behind by a scroll.
+                                    // Dropping it here (rather than repositioning
+                                    // it) matches `on_symbol_hover_leave`'s own
+                                    // posture: a stale popover is worth clearing,
+                                    // not worth chasing across a scroll.
+                                    //
+                                    // Bump the epoch/release the claimed row
+                                    // UNCONDITIONALLY — an in-flight debounced hover
+                                    // request (up to ~3.3s inside the LSP warm-up
+                                    // retry window) must also be superseded here,
+                                    // not just an already-shown popover cleared, or
+                                    // its answer can land after the scroll and pop a
+                                    // stale, wrongly-anchored popover over whatever
+                                    // is now under the stationary pointer (P2
+                                    // finding). `cx.notify()` stays conditional on
+                                    // an existing popover to actually clear.
+                                    .on_scroll_wheel(cx.listener(
+                                        |this, _: &ScrollWheelEvent, _window, cx| {
+                                            this.hover_request_epoch += 1;
+                                            this.hover_request_line = None;
+                                            if this.hover_popover.take().is_some() {
+                                                cx.notify();
+                                            }
+                                        },
+                                    ))
+                                    .child({
+                                        let this = cx.weak_entity();
+                                        list(self.diff_list.clone(), move |ix, _window, cx| {
+                                            this.update(cx, |this, cx| {
+                                                this.render_display_row(ix, cx)
+                                            })
+                                            .unwrap_or_else(|_| div().into_any_element())
+                                        })
+                                        .size_full()
+                                    }),
+                            ),
                     )
                     .children(summary),
             ),

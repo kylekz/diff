@@ -21,14 +21,18 @@ use crate::themes::DEFAULT_THEME;
 /// shell.rs).
 pub const DEFAULT_MONO_FONT: &str = "JetBrains Mono";
 
-/// Today's effective diff/code text size, in px, kept as the default so a
-/// settings.json that never sets `mono_font_size` renders byte-identical to
-/// before this setting existed: diff rows render with `.text_sm()`
-/// (`rems(0.875)`), and gpui-component's `Theme::font_size` — which drives
-/// `window.rem_size()` (see `gpui_component::Root::render`) — defaults to
-/// 16px and isn't overridden by any of the four bundled theme JSONs. So
-/// `0.875 * 16 = 14`.
-pub const DEFAULT_MONO_FONT_SIZE: f32 = 14.0;
+/// Default diff/code text size, in px. Phase 4 through R1c kept this at
+/// `14.0` — byte-identical to the pre-setting fixed size (diff rows render
+/// with `.text_sm()` = `rems(0.875)`, and gpui-component's `Theme::font_size`
+/// — which drives `window.rem_size()` (see `gpui_component::Root::render`)
+/// — defaults to 16px and isn't overridden by any of the four bundled theme
+/// JSONs, so `0.875 * 16 = 14`). R1d ("adopt 13px/22px defaults only")
+/// moves the *default* to
+/// a denser 13px — `13.0 * (24. / 14.) ≈ 22px` rows via `workspace.rs`'s
+/// `row_height`, a fixed 13px/22px bar within rounding. This
+/// only changes what a fresh install renders: any settings.json that already
+/// pins `mono_font_size` explicitly (e.g. back to 14.0) is unaffected.
+pub const DEFAULT_MONO_FONT_SIZE: f32 = 13.0;
 
 /// Default follow-OS light/dark pairing. `DEFAULT_DARK_THEME` intentionally
 /// matches `themes::DEFAULT_THEME` (today's plain default), so turning on
@@ -333,7 +337,7 @@ mod tests {
         assert_eq!(s.light_theme, "Claude Light");
         assert_eq!(s.dark_theme, "Aura Dark");
         assert_eq!(s.mono_font, "JetBrains Mono");
-        assert_eq!(s.mono_font_size, 14.0);
+        assert_eq!(s.mono_font_size, 13.0);
         assert_eq!(s.context_lines, 3);
         assert_eq!(s.view_mode_default, ViewModeSetting::Unified);
         assert_eq!(s.sidebar_width, 280.0);

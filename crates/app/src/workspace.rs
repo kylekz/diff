@@ -1,4 +1,4 @@
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::ops::Range;
 use std::rc::Rc;
@@ -934,6 +934,17 @@ pub struct Workspace {
     /// The active draft review (latest draft in the store), lazily loaded.
     review: Option<dv_core::Review>,
     editor: Option<CommentEditor>,
+    /// Shared pool of @-mentionable users (R3 item 2) backing every
+    /// composer's [`crate::mentions::MentionProvider`].
+    /// Seeded from the review's own comment/reply authors, then filled by
+    /// one background `mentionable_users` fetch per workspace (see
+    /// [`Self::ensure_mentions_fetch`]) — `Rc<RefCell>` so live-attached
+    /// providers observe the fill mid-typing-session.
+    mentions: Rc<RefCell<Vec<dv_core::Mention>>>,
+    /// True once [`Self::ensure_mentions_fetch`] has dispatched (or decided
+    /// against) the one background fetch — never retried within a
+    /// workspace's lifetime (a deliberate once-per-workspace flag).
+    mentions_fetch_started: bool,
     /// Diff rows + interleaved threads/editor, in display order. The list
     /// element renders these; rebuilt by [`Self::rebuild_display`].
     display: Vec<DisplayRow>,
@@ -1721,6 +1732,8 @@ impl Workspace {
             pinned_review_id: pinned_review_id.clone(),
             review: None,
             editor: None,
+            mentions: Rc::new(RefCell::new(Vec::new())),
+            mentions_fetch_started: false,
             display: Vec::new(),
             diff_to_display: Vec::new(),
             source: source.clone(),
@@ -4506,11 +4519,20 @@ impl Workspace {
         // while `lsp_session` is `Spawning` could complete after this
         // editor opens and commit the target viewer on top of it mid-type.
         self.lsp_request_epoch += 1;
+        // First composer open kicks the one-shot mentionable-users fill
+        // (no-op for a local review); the provider reads the shared pool
+        // live, so it's attached unconditionally.
+        self.ensure_mentions_fetch(cx);
+        let mentions = self.mentions.clone();
         let input = cx.new(|cx| {
-            InputState::new(window, cx)
+            let mut state = InputState::new(window, cx)
                 .multi_line(true)
                 .auto_grow(3, 12)
-                .placeholder("Leave a comment… (ctrl-enter to submit, esc to cancel)")
+                .placeholder("Leave a comment… (ctrl-enter to submit, esc to cancel)");
+            state.lsp.completion_provider = Some(Rc::new(crate::mentions::MentionProvider {
+                users: mentions,
+            }));
+            state
         });
         let subscription =
             cx.subscribe_in(&input, window, |this, _, event: &InputEvent, window, cx| {
@@ -5345,6 +5367,85 @@ impl Workspace {
         .detach();
     }
 
+    /// One-shot background fill of [`Self::mentions`] (R3 item 2),
+    /// called lazily the first time a composer opens — viewers
+    /// who never comment never pay for it. No-op without PR linkage (the
+    /// plan's gate: `mentionableUsers` is a GitHub repo concept; a plain
+    /// local review has no slug to ask about). Seeds the pool synchronously
+    /// with everyone already visible on the review — comment/reply authors
+    /// (GitHub logins since Phase 3) and the PR author — so the popup has
+    /// relevant names before the network fill lands;
+    /// the fetch then merges additively by login. A
+    /// failed fetch is silent: autocomplete is a nicety, and the seeds keep
+    /// working.
+    fn ensure_mentions_fetch(&mut self, cx: &mut Context<Self>) {
+        if self.mentions_fetch_started {
+            return;
+        }
+        let Some(remote) = self.review.as_ref().and_then(|r| r.remote.clone()) else {
+            return;
+        };
+        self.mentions_fetch_started = true;
+
+        {
+            let mut pool = self.mentions.borrow_mut();
+            let mut add = |login: &str| {
+                if !login.is_empty() && !pool.iter().any(|m| m.login.eq_ignore_ascii_case(login)) {
+                    pool.push(dv_core::Mention {
+                        login: login.to_string(),
+                        name: None,
+                    });
+                }
+            };
+            if let Some(review) = &self.review {
+                for comment in &review.comments {
+                    add(&comment.author);
+                    for reply in &comment.replies {
+                        add(&reply.author);
+                    }
+                }
+            }
+            if let Some(pr) = &self.pr {
+                add(&pr.author);
+            }
+        }
+
+        // `remote.slug` is `host/owner/repo` (RepoSlug's Display shape).
+        let mut parts = remote.slug.splitn(3, '/');
+        let (Some(host), Some(owner), Some(repo)) = (parts.next(), parts.next(), parts.next())
+        else {
+            return;
+        };
+        let slug = RepoSlug {
+            host: host.to_string(),
+            owner: owner.to_string(),
+            repo: repo.to_string(),
+        };
+        cx.spawn(async move |this, cx| {
+            let fetched = cx
+                .background_spawn(async move { GithubClient::for_slug(slug)?.mentionable_users() })
+                .await;
+            let Ok(users) = fetched else {
+                return;
+            };
+            this.update(cx, |this, _| {
+                let mut pool = this.mentions.borrow_mut();
+                for user in users {
+                    if !pool
+                        .iter()
+                        .any(|m| m.login.eq_ignore_ascii_case(&user.login))
+                    {
+                        pool.push(user);
+                    }
+                }
+                // No cx.notify(): nothing rendered reads the pool — the
+                // provider pulls it fresh on the next keystroke.
+            })
+            .ok();
+        })
+        .detach();
+    }
+
     /// Open a reply (or body-edit) input inside a thread card. Only one is
     /// open at a time. Gates both `Reply` and `EditBody` behind
     /// `review_is_readonly` (docs/phase-6-review-navigator.md S6c
@@ -5384,6 +5485,9 @@ impl Workspace {
                 .map(|c| c.body.clone())
                 .unwrap_or_default(),
         };
+        // Same mention wiring as `open_editor` — see its comment.
+        self.ensure_mentions_fetch(cx);
+        let mentions = self.mentions.clone();
         let input = cx.new(|cx| {
             let mut state = InputState::new(window, cx).multi_line(true).auto_grow(2, 8);
             state = match mode {
@@ -5392,6 +5496,9 @@ impl Workspace {
                 }
                 ThreadInputMode::EditBody => state,
             };
+            state.lsp.completion_provider = Some(Rc::new(crate::mentions::MentionProvider {
+                users: mentions,
+            }));
             state
         });
         if !prefill.is_empty() {
@@ -8075,6 +8182,19 @@ impl Workspace {
 
     /// The review summary panel: every thread across files, filterable,
     /// click to jump, with the finish-review verdict at the bottom.
+    /// "Copy as prompt" (R3 item 3):
+    /// the review's open threads as one
+    /// agent-ready block (`dv_core::format_review_as_prompt`) onto the
+    /// clipboard. Pure clipboard — no AI integration (R4 stays dropped).
+    fn copy_review_prompt(&self, cx: &mut Context<Self>) {
+        let Some(review) = &self.review else {
+            return;
+        };
+        cx.write_to_clipboard(ClipboardItem::new_string(dv_core::format_review_as_prompt(
+            review, false,
+        )));
+    }
+
     fn render_summary(&self, cx: &mut Context<Self>) -> Option<Div> {
         use gpui_component::Selectable as _;
         use gpui_component::Sizable as _;
@@ -8214,7 +8334,24 @@ impl Workspace {
                         .child(div().text_color(muted).text_sm().child(format!(
                             "{open_count} open \u{b7} {} resolved",
                             total - open_count
-                        ))),
+                        )))
+                        .child(div().flex_1())
+                        // Copy-as-prompt (R3 item 3):
+                        // the open threads as one agent-ready block, on the
+                        // clipboard. Open-only, matching the formatter's
+                        // default and the CLI's canonical
+                        // `dv comment list --status open`.
+                        .when(review.is_some(), |el| {
+                            el.child(
+                                Button::new("copy-review-prompt")
+                                    .ghost()
+                                    .xsmall()
+                                    .label("Copy as prompt")
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.copy_review_prompt(cx);
+                                    })),
+                            )
+                        }),
                 )
                 .when(readonly, |el| {
                     // Suppress-the-entry-point posture (docs/phase-6-

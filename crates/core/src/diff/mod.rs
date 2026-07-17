@@ -453,11 +453,15 @@ mod tests {
 
     // T11: 2 removed lines vs 1 added line — only the first removed line is
     // paired (and gets intraline); the second is left unpaired and empty.
+    // The paired lines share most of their text so the pairing assertion
+    // isn't masked by the >70%-changed suppression (R3 — see
+    // `intraline::MAX_CHANGED_FRACTION`; the old `foo1`/`foo9` fixture was
+    // a 100%-changed token pair, which that rule now correctly blanks).
     #[test]
     fn t11_unequal_block_lengths_pair_positionally() {
         let d = diff_blobs(
-            Some(b"foo1\nfoo2\n"),
-            Some(b"foo9\n"),
+            Some(b"shared words one\nsecond line\n"),
+            Some(b"shared words two\n"),
             &DiffOptions::default(),
         );
         assert_eq!(d.hunks.len(), 1);
@@ -474,9 +478,9 @@ mod tests {
             .collect();
         assert_eq!(removed.len(), 2);
         assert_eq!(added.len(), 1);
-        assert_eq!(removed[0].intraline, vec![0..4]);
+        assert_eq!(removed[0].intraline, vec![13..16]);
         assert!(removed[1].intraline.is_empty());
-        assert_eq!(added[0].intraline, vec![0..4]);
+        assert_eq!(added[0].intraline, vec![13..16]);
     }
 
     // T12: binary detection via NUL byte in the new side.

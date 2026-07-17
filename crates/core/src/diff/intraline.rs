@@ -14,6 +14,12 @@ use super::token_source::Tokens;
 /// pair rather than pay for an O(n*m) diff on e.g. a huge minified line.
 const MAX_TOKEN_PRODUCT: usize = 10_000;
 
+/// If more than this fraction of either line's bytes changed, word-level
+/// highlighting is noise — the line reads as rewritten, and speckling it
+/// with tint fragments obscures that (R3 item 1). The whole-line
+/// row tint still marks it changed; only the word-level tier goes quiet.
+const MAX_CHANGED_FRACTION: f32 = 0.7;
+
 /// Returns (removed byte ranges, added byte ranges), both empty if the pair
 /// is identical, too large to diff cheaply, or otherwise has no word-level
 /// difference.
@@ -44,6 +50,19 @@ pub(super) fn diff_pair(removed: &str, added: &str) -> (Vec<Range<usize>>, Vec<R
             let end = a_tokens[hunk.after.end as usize - 1].end;
             push_merged(&mut a_ranges, start..end);
         }
+    }
+
+    // Mostly-rewritten pair: suppress BOTH sides when either side crossed
+    // the fraction (a one-sided suppression would leave an
+    // asymmetric, more-confusing highlight). `trim_end` mirrors that rule too:
+    // trailing whitespace shouldn't dilute the denominator.
+    let changed = |ranges: &[Range<usize>], len: usize| {
+        len > 0
+            && ranges.iter().map(|r| r.len()).sum::<usize>() as f32 / len as f32
+                > MAX_CHANGED_FRACTION
+    };
+    if changed(&r_ranges, removed.trim_end().len()) || changed(&a_ranges, added.trim_end().len()) {
+        return (Vec::new(), Vec::new());
     }
     (r_ranges, a_ranges)
 }
@@ -139,5 +158,59 @@ mod tests {
         let (r, added) = diff_pair(&a, &b);
         assert!(r.is_empty());
         assert!(added.is_empty());
+    }
+
+    // --- MAX_CHANGED_FRACTION (R3 item 1) ---------------------------------
+
+    #[test]
+    fn small_edit_keeps_intraline() {
+        let (r, a) = diff_pair("let count = 5;", "let count = 6;");
+        assert_eq!(r, vec![12..13], "only the changed digit is tinted");
+        assert_eq!(a, vec![12..13]);
+    }
+
+    #[test]
+    fn mostly_rewritten_line_suppresses_intraline() {
+        // Only the trailing ";" survives between the two — far past 70%
+        // changed on both sides. Word-tinting nearly the whole line is
+        // noise; the row tint alone should carry it.
+        let (r, a) = diff_pair(
+            "let old_name = compute_thing(alpha);",
+            "self.registry.insert(key, value);",
+        );
+        assert!(r.is_empty(), "suppressed, got {r:?}");
+        assert!(a.is_empty(), "suppressed, got {a:?}");
+    }
+
+    #[test]
+    fn one_side_mostly_rewritten_suppresses_both_sides() {
+        // The removed side is one short token, fully replaced (100% > 70%);
+        // the added side is long with plenty of unchanged... nothing — the
+        // sides share nothing here, but the point is the EITHER-side rule:
+        // a single crossing suppresses both, never just one (asymmetric
+        // highlights read worse than none).
+        let (r, a) = diff_pair("x", "a much longer replacement line entirely");
+        assert!(r.is_empty());
+        assert!(a.is_empty());
+    }
+
+    #[test]
+    fn trailing_whitespace_does_not_dilute_the_fraction() {
+        // Without trim_end, 30 trailing spaces would grow the denominator
+        // and sneak a fully-rewritten visible line under the threshold.
+        let removed = format!("abc{}", " ".repeat(30));
+        let added = format!("xyz{}", " ".repeat(30));
+        let (r, a) = diff_pair(&removed, &added);
+        assert!(r.is_empty());
+        assert!(a.is_empty());
+    }
+
+    #[test]
+    fn moderate_edit_below_threshold_keeps_intraline() {
+        // Roughly half the line changes — under 70% on both sides, so the
+        // word tints stay.
+        let (r, a) = diff_pair("prefix common alpha beta", "prefix common gamma delta");
+        assert!(!r.is_empty());
+        assert!(!a.is_empty());
     }
 }

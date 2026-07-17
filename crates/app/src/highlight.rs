@@ -17,6 +17,42 @@ pub type LineRuns = HashMap<u32, Vec<(Range<usize>, HighlightStyle)>>;
 /// generated/minified blob is neither useful nor cheap.
 const MAX_HIGHLIGHT_BYTES: usize = 2_000_000;
 
+/// WCAG relative luminance of an (opaque) color — `to_rgb()` drops alpha, so
+/// callers pre-composite any translucent color onto its backing surface
+/// first (see [`merge_line_runs`], which blends the intraline tint over the
+/// row's base background before calling this).
+fn relative_luminance(color: Hsla) -> f32 {
+    let rgb = color.to_rgb();
+    let channel = |c: f32| {
+        if c <= 0.04045 {
+            c / 12.92
+        } else {
+            ((c + 0.055) / 1.055).powf(2.4)
+        }
+    };
+    0.2126 * channel(rgb.r) + 0.7152 * channel(rgb.g) + 0.0722 * channel(rgb.b)
+}
+
+/// WCAG contrast ratio between two colors, order-independent — 1.0 is no
+/// contrast at all, 21.0 is black-on-white.
+fn contrast_ratio(a: Hsla, b: Hsla) -> f32 {
+    let (la, lb) = (relative_luminance(a), relative_luminance(b));
+    let (hi, lo) = if la > lb { (la, lb) } else { (lb, la) };
+    (hi + 0.05) / (lo + 0.05)
+}
+
+/// Below this ratio, a syntax token's own foreground reads as muddy against
+/// an intraline highlight background — Dracula's and Aura's comment color
+/// measure ~1.5 against the green intraline-add tint (docs/backlog.md's
+/// "Dracula: comment-colored text over the green intraline-add highlight
+/// is muddy" entry) — and [`merge_line_runs`] swaps in a theme-provided
+/// fallback foreground instead. Deliberately short of WCAG AA's 4.5 (normal
+/// text): that bar would repaint most syntax colors on every intraline
+/// span, not just the genuinely muddy ones. 3.0 is AA's own "large text"
+/// floor — high enough to catch clearly-bad pairs, low enough to leave
+/// comfortably-contrasted syntax colors alone.
+const MIN_INTRA_CONTRAST: f32 = 3.0;
+
 /// Lines longer than this skip styling entirely (see [`merge_line_runs`]
 /// callers): one pathological minified line would otherwise carry so many
 /// style runs that layout dominates. Generous for hand-written code.
@@ -133,15 +169,27 @@ fn is_blank_style(style: &HighlightStyle) -> bool {
 /// picked out (that module's own `>70% changed` suppression heuristic is
 /// R3, not this fn's concern — an empty `intraline` slice already means
 /// "no highlight" here regardless of why it's empty).
+///
+/// `base_bg` is the row's surface color `intra_bg` paints over (an
+/// approximation — it skips the row's own ~12.5% tint layered between the
+/// two, so it slightly under-states the true accumulated tint, but that's
+/// the conservative direction for a contrast check). `intra_fg_fallback` is
+/// swapped in for a syntax token's own foreground when that color measures
+/// under [`MIN_INTRA_CONTRAST`] against the blended `base_bg`/`intra_bg` —
+/// the Dracula/Aura comment-on-green-intraline muddiness this fn's own doc
+/// comment on `intra_bg` doesn't otherwise account for (docs/backlog.md).
 pub fn merge_line_runs(
     len: usize,
     syntax: &[(Range<usize>, HighlightStyle)],
     intraline: &[Range<usize>],
     intra_bg: Hsla,
+    base_bg: Hsla,
+    intra_fg_fallback: Hsla,
 ) -> Vec<(Range<usize>, HighlightStyle)> {
     if syntax.is_empty() && intraline.is_empty() {
         return Vec::new();
     }
+    let effective_intra_bg = base_bg.blend(intra_bg);
 
     // Boundary points that any run edge falls on; segments between adjacent
     // boundaries have a single, constant style.
@@ -188,6 +236,11 @@ pub fn merge_line_runs(
         let mut style = syntax_style.unwrap_or_default();
         if in_intra {
             style.background_color = Some(intra_bg);
+            if let Some(fg) = style.color
+                && contrast_ratio(fg, effective_intra_bg) < MIN_INTRA_CONTRAST
+            {
+                style.color = Some(intra_fg_fallback);
+            }
         }
         runs.push((a..b, style));
     }
@@ -209,6 +262,24 @@ mod tests {
             ..Default::default()
         }
     }
+
+    /// Black — the surface backing every plain `merge_line_runs` test call
+    /// below, none of which care about the contrast-override behavior
+    /// (they only assert `background_color`/`color.is_some()`, never a
+    /// specific `color` value) — see the dedicated `contrast_*`/
+    /// `merge_swaps_*` tests further down for that.
+    const OPAQUE_BLACK: Hsla = Hsla {
+        h: 0.0,
+        s: 0.0,
+        l: 0.0,
+        a: 1.0,
+    };
+    const OPAQUE_WHITE: Hsla = Hsla {
+        h: 0.0,
+        s: 0.0,
+        l: 1.0,
+        a: 1.0,
+    };
 
     #[test]
     fn bucket_splits_across_lines_and_rebases() {
@@ -241,7 +312,7 @@ mod tests {
         let syntax = vec![(0..3, colored(100))];
         #[allow(clippy::single_range_in_vec_init)]
         let intra: Vec<Range<usize>> = vec![4..5];
-        let runs = merge_line_runs(5, &syntax, &intra, bg);
+        let runs = merge_line_runs(5, &syntax, &intra, bg, OPAQUE_BLACK, OPAQUE_WHITE);
         // Expect: 0..3 colored (no bg), 4..5 bg-only. 3..4 is bare → skipped.
         assert_eq!(runs.len(), 2);
         assert_eq!(runs[0].0, 0..3);
@@ -263,7 +334,7 @@ mod tests {
         let syntax = vec![(0..5, colored(100))];
         #[allow(clippy::single_range_in_vec_init)]
         let intra: Vec<Range<usize>> = vec![1..3];
-        let runs = merge_line_runs(5, &syntax, &intra, bg);
+        let runs = merge_line_runs(5, &syntax, &intra, bg, OPAQUE_BLACK, OPAQUE_WHITE);
         assert_eq!(runs.len(), 3);
         assert_eq!(runs[0].0, 0..1);
         assert_eq!(runs[1].0, 1..3);
@@ -289,7 +360,7 @@ mod tests {
             (6..10, colored(30)),
         ];
         let intra = vec![1..3, 7..8];
-        let runs = merge_line_runs(10, &syntax, &intra, bg);
+        let runs = merge_line_runs(10, &syntax, &intra, bg, OPAQUE_BLACK, OPAQUE_WHITE);
         // Every run is within bounds, sorted, non-overlapping.
         let mut prev_end = 0;
         for (r, _) in &runs {
@@ -323,7 +394,14 @@ mod tests {
             a: 0.3,
         };
         // syntax range extends past len 3 — must clamp, never panic.
-        let runs = merge_line_runs(3, &[(0..99, colored(100))], &[], bg);
+        let runs = merge_line_runs(
+            3,
+            &[(0..99, colored(100))],
+            &[],
+            bg,
+            OPAQUE_BLACK,
+            OPAQUE_WHITE,
+        );
         assert_eq!(runs.last().unwrap().0.end, 3);
     }
 
@@ -335,6 +413,105 @@ mod tests {
             l: 0.0,
             a: 0.3,
         };
-        assert!(merge_line_runs(10, &[], &[], bg).is_empty());
+        assert!(merge_line_runs(10, &[], &[], bg, OPAQUE_BLACK, OPAQUE_WHITE).is_empty());
+    }
+
+    #[test]
+    fn contrast_ratio_black_on_white_is_maximal() {
+        let ratio = contrast_ratio(OPAQUE_BLACK, OPAQUE_WHITE);
+        assert!((ratio - 21.0).abs() < 0.05, "expected ~21.0, got {ratio}");
+    }
+
+    #[test]
+    fn contrast_ratio_is_order_independent() {
+        assert_eq!(
+            contrast_ratio(OPAQUE_BLACK, OPAQUE_WHITE),
+            contrast_ratio(OPAQUE_WHITE, OPAQUE_BLACK)
+        );
+    }
+
+    #[test]
+    fn contrast_ratio_same_color_is_one() {
+        let ratio = contrast_ratio(OPAQUE_WHITE, OPAQUE_WHITE);
+        assert!((ratio - 1.0).abs() < 1e-4);
+    }
+
+    #[test]
+    fn contrast_ratio_matches_dracula_comment_on_green_intraline() {
+        // Real numbers from the reported bug (docs/backlog.md): Dracula's
+        // #6272a4 comment color measures ~1.45 against its background
+        // (#282a36) blended with the green intraline tint (success @
+        // 0.28) — well under MIN_INTRA_CONTRAST, confirming this is the
+        // exact pair that needs the override.
+        use gpui_component::Colorize as _;
+        let comment = Hsla::parse_hex("#6272a4").unwrap();
+        let base_bg = Hsla::parse_hex("#282a36").unwrap();
+        let green = Hsla::parse_hex("#50fa7b").unwrap().opacity(0.28);
+        let effective_bg = base_bg.blend(green);
+        let ratio = contrast_ratio(comment, effective_bg);
+        assert!(ratio < MIN_INTRA_CONTRAST, "expected muddy, got {ratio}");
+    }
+
+    #[test]
+    fn merge_swaps_low_contrast_syntax_color_for_fallback_over_intra_bg() {
+        // A mid-gray syntax color (l=0.5) sits low-contrast against a
+        // mid-gray-ish translucent intra background over a mid-gray base —
+        // the override must kick in and use the fallback instead.
+        let mid_gray = HighlightStyle {
+            color: Some(Hsla {
+                h: 0.0,
+                s: 0.0,
+                l: 0.5,
+                a: 1.0,
+            }),
+            ..Default::default()
+        };
+        let base_bg = Hsla {
+            h: 0.0,
+            s: 0.0,
+            l: 0.5,
+            a: 1.0,
+        };
+        let intra_bg = Hsla {
+            h: 0.0,
+            s: 0.0,
+            l: 0.5,
+            a: 0.9,
+        };
+        let fallback = OPAQUE_WHITE;
+        let syntax = vec![(0..3, mid_gray)];
+        #[allow(clippy::single_range_in_vec_init)]
+        let intra: Vec<Range<usize>> = vec![0..3];
+        let runs = merge_line_runs(3, &syntax, &intra, intra_bg, base_bg, fallback);
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0].1.color, Some(fallback));
+        assert_eq!(runs[0].1.background_color, Some(intra_bg));
+    }
+
+    #[test]
+    fn merge_keeps_high_contrast_syntax_color_over_intra_bg() {
+        // White text over a dark base + intra tint stays comfortably above
+        // MIN_INTRA_CONTRAST — the override must NOT fire, so the original
+        // syntax color survives untouched.
+        let white_text = colored(255);
+        let base_bg = OPAQUE_BLACK;
+        let intra_bg = Hsla {
+            h: 0.3,
+            s: 0.6,
+            l: 0.4,
+            a: 0.28,
+        };
+        let fallback = Hsla {
+            h: 0.9,
+            s: 1.0,
+            l: 0.5,
+            a: 1.0,
+        };
+        let syntax = vec![(0..3, white_text)];
+        #[allow(clippy::single_range_in_vec_init)]
+        let intra: Vec<Range<usize>> = vec![0..3];
+        let runs = merge_line_runs(3, &syntax, &intra, intra_bg, base_bg, fallback);
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0].1.color, white_text.color);
     }
 }

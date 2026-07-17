@@ -15,6 +15,7 @@ use gpui_component::button::{Button, ButtonVariants};
 use gpui_component::input::{Input, InputEvent, InputState};
 use gpui_component::kbd::Kbd;
 use gpui_component::tag::Tag;
+use gpui_component::tooltip::Tooltip;
 use gpui_component::{
     ActiveTheme, Selectable as _, Sizable as _, StyledExt, TitleBar, h_flex, v_flex,
 };
@@ -572,6 +573,26 @@ pub(crate) fn relative_age(updated_ms: u64) -> String {
         format!("{}mo", secs / (86_400 * 30))
     } else {
         format!("{}y", secs / (86_400 * 365))
+    }
+}
+
+/// Absolute local timestamp for a review card's hover tooltip — the exact
+/// moment `relative_age`'s "2h"/"3d" names (docs/backlog.md's Phase-6 S6c
+/// deferral). That entry assumed gpui-component's `.tooltip()` was the only
+/// option and gated `pub(crate)`; checked against the real pinned gpui
+/// source (`~/.cargo/git/checkouts/zed-*/*/crates/gpui/src/elements/div.rs`)
+/// instead of guessing, `.tooltip()` turns out to be a plain public
+/// `StatefulInteractiveElement` method (needs `.id(...)`, nothing else) —
+/// gpui-component's OWN `gpui_component::tooltip::Tooltip::new(text).build
+/// (window, cx)` builds the `AnyView` it wants, also plain `pub`. No new
+/// tooltip idiom needed. A malformed/out-of-range `ms` (shouldn't happen —
+/// every caller sources it from a review's own `updated_ms`) falls back to
+/// a label rather than panicking.
+pub(crate) fn absolute_timestamp(ms: u64) -> String {
+    use chrono::{Local, TimeZone};
+    match Local.timestamp_millis_opt(i64::try_from(ms).unwrap_or(i64::MAX)) {
+        chrono::LocalResult::Single(dt) => dt.format("%b %-d, %Y, %-I:%M %p").to_string(),
+        _ => "unknown time".to_string(),
     }
 }
 
@@ -4308,6 +4329,12 @@ impl AppShell {
         let foreground = theme.foreground;
 
         let review_id = entry.review_id.clone();
+        // A separate clone from `review_id`/`menu_review_id` above — those
+        // two are each `move`d whole into their own mouse-down closure, so
+        // the age tooltip's `.id(...)` (built well after both closures are
+        // constructed) needs its own copy rather than reusing an
+        // already-moved binding.
+        let review_id_for_age = entry.review_id.clone();
         let menu_review_id = entry.review_id.clone();
         let archived = entry.archived;
         let repo = dv_core::repo_label(&entry.location, entry.remote.as_ref());
@@ -4408,7 +4435,19 @@ impl AppShell {
                                     .child(format!("\u{2212}{}", ds.deletions)),
                             )
                     }))
-                    .child(div().flex_none().text_color(text_secondary).child(age)),
+                    .child({
+                        let updated_ms = entry.updated_ms;
+                        div()
+                            .id(SharedString::from(format!(
+                                "review-card-age-{review_id_for_age}"
+                            )))
+                            .flex_none()
+                            .text_color(text_secondary)
+                            .tooltip(move |window, cx| {
+                                Tooltip::new(absolute_timestamp(updated_ms)).build(window, cx)
+                            })
+                            .child(age)
+                    }),
             )
             .child(
                 h_flex()

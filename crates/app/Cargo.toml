@@ -18,6 +18,15 @@ futures = "0.3"
 serde_json = "1.0.150"
 serde = { version = "1.0.228", features = ["derive"] }
 dirs = "6.0.0"
+# Review-card hover tooltip's absolute local timestamp (shell.rs
+# `absolute_timestamp`) — already resolved in Cargo.lock at this exact
+# version as one of gpui's own transitive deps (with the `iana-time-zone`/
+# `windows-link` local-offset machinery this needs), so pulling it in
+# directly adds no new download, just a direct edge to a crate already in
+# the build.
+chrono = { version = "0.4.45", default-features = false, features = [
+    "clock",
+] }
 # Only used by automation/capture.rs's PNG screenshot encoder — optional so
 # it drops out of the `--no-default-features` release build along with the
 # rest of the automation surface (see the `automation` feature below).

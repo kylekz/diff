@@ -252,12 +252,19 @@ enum Status {
 enum Row {
     HunkHeader {
         label: SharedString,
-        /// Index into the file's hunk list — identifies which gap a click
-        /// expands.
+        /// Gap key — a real hunk index for the gap ABOVE it, or
+        /// `hunks.len()` for the trailing gap after the last hunk. See
+        /// `Workspace::expanded`'s doc comment.
         hunk: usize,
-        /// `Some(n)` ⇒ n hidden context lines sit between the previous hunk
-        /// (or file start) and this one, and clicking reveals them.
+        /// `Some(n)` ⇒ n hidden context lines remain in this gap, and
+        /// clicking reveals up to `GAP_EXPAND_STEP` more of them (or all of
+        /// them, once that's all that's left) from the near edge.
         expandable: Option<u32>,
+        /// Whether `hunk` names the trailing (post-last-hunk) gap rather
+        /// than a real hunk — routes the click to `expand_hunk_gap`'s
+        /// no-reanchor path (see that fn's doc comment) instead of
+        /// `n`/`p` hunk-jump bookkeeping, which only ever tracks real hunks.
+        is_trailing: bool,
     },
     Line {
         kind: LineKind,
@@ -289,6 +296,7 @@ enum SplitRow {
         label: SharedString,
         hunk: usize,
         expandable: Option<u32>,
+        is_trailing: bool,
     },
     Pair {
         left: Option<SplitCell>,
@@ -305,6 +313,16 @@ struct HighlightInputs {
     theme: Arc<HighlightTheme>,
     intra_added: Hsla,
     intra_removed: Hsla,
+    /// The diff pane's base surface — `highlight::merge_line_runs` blends
+    /// `intra_added`/`intra_removed` over this to judge whether a syntax
+    /// token's own foreground is still readable, swapping in
+    /// `intra_fg_fallback` when it isn't (Dracula/Aura comment-on-green
+    /// muddiness, docs/backlog.md).
+    base_bg: Hsla,
+    /// Theme foreground — always contrasts well against `base_bg` by
+    /// construction, so it's a safe fallback wherever a syntax color's own
+    /// contrast against an intraline background comes up short.
+    intra_fg_fallback: Hsla,
 }
 
 struct RenderedDiff {
@@ -392,7 +410,7 @@ const MAX_PR_DIFF_ENTRIES: usize = 3;
 struct CachedPrDiff {
     files: Vec<ChangedFile>,
     diffs: HashMap<usize, Arc<RenderedDiff>>,
-    expanded: HashMap<usize, HashSet<usize>>,
+    expanded: HashMap<usize, HashMap<usize, u32>>,
 }
 
 /// Which side of the diff a line (and so a comment anchor) lives on.
@@ -909,9 +927,15 @@ pub struct Workspace {
     source_desc: SharedString,
     /// Which hunk n/p last jumped to in the selected file.
     current_hunk: usize,
-    /// Per file: hunk indices whose preceding context gap has been expanded
-    /// (click on the hunk header). Feeds row rebuilding.
-    expanded: HashMap<usize, HashSet<usize>>,
+    /// Per file: gap key → number of stepped expand-clicks so far. A gap
+    /// key is a hunk index (its PRECEDING context gap) for `0..hunks.len()`,
+    /// or `hunks.len()` itself for the trailing gap after the last hunk to
+    /// EOF (see `gap_above`/`gap_below`/`gap_revealed_lines`). Each click
+    /// reveals `GAP_EXPAND_STEP` more lines from the gap's near edge —
+    /// `build_rows` turns the click count into a revealed-line count fresh
+    /// every rebuild, so this map only ever needs to grow by one per click,
+    /// never store the derived line count itself. Feeds row rebuilding.
+    expanded: HashMap<usize, HashMap<usize, u32>>,
     file_scroll: UniformListScrollHandle,
     /// The diff pane is a gpui `list` (not uniform_list): comment threads
     /// render inline under their anchor rows at whatever height their
@@ -1428,11 +1452,13 @@ fn error_diff(msg: SharedString) -> RenderedDiff {
             label: msg.clone(),
             hunk: 0,
             expandable: None,
+            is_trailing: false,
         }],
         split: vec![SplitRow::HunkHeader {
             label: msg,
             hunk: 0,
             expandable: None,
+            is_trailing: false,
         }],
         hunk_rows_unified: Vec::new(),
         hunk_rows_split: Vec::new(),
@@ -2367,7 +2393,7 @@ impl Workspace {
                     // (`reset_diff_list`, called by the caller, keeps the
                     // current offset).
                     self.selected = Some(index);
-                    self.request_diff(index, cx);
+                    self.request_diff(index, true, cx);
                 }
                 None if !self.files.is_empty() => {
                     // The previously selected file is gone (or nothing was
@@ -2375,7 +2401,7 @@ impl Workspace {
                     // reset hunk navigation same as a normal `select_file`.
                     self.selected = Some(0);
                     self.current_hunk = 0;
-                    self.request_diff(0, cx);
+                    self.request_diff(0, true, cx);
                 }
                 None => {
                     // Nothing left to show — clear cleanly rather than leave
@@ -2443,7 +2469,7 @@ impl Workspace {
             self.diffstat_cache.set(None);
             self.diff_pending.clear();
             if let Some(index) = self.selected {
-                self.request_diff(index, cx);
+                self.request_diff(index, true, cx);
             }
             cx.notify();
         }
@@ -2673,12 +2699,21 @@ impl Workspace {
         if cached_ok || self.diff_pending.contains(&index) {
             return;
         }
-        self.request_diff(index, cx);
+        self.request_diff(index, true, cx);
     }
 
     /// Kick off (or re-run) the off-thread row computation for one file,
-    /// honoring its current gap-expansion state.
-    fn request_diff(&mut self, index: usize, cx: &mut Context<Self>) {
+    /// honoring its current gap-expansion state. `reanchor` controls
+    /// whether the completion re-anchors the viewport on `self.current_hunk`
+    /// once the (possibly row-shifted) rows land — every caller except
+    /// [`Self::expand_hunk_gap`]'s trailing-gap branch wants the existing
+    /// behavior (`true`); see that branch's own doc comment for why it
+    /// passes `false`. Captured into the async completion itself (not read
+    /// from a shared field at completion time) so two overlapping
+    /// `request_diff` calls for the same file — e.g. a double-click before
+    /// the first recompute lands — can never have one call's completion
+    /// consume the other's reanchor decision.
+    fn request_diff(&mut self, index: usize, reanchor: bool, cx: &mut Context<Self>) {
         let Some(repo) = self.repo.clone() else {
             return;
         };
@@ -2710,6 +2745,8 @@ impl Workspace {
             theme: theme.highlight_theme.clone(),
             intra_added: dv.word_created_bg,
             intra_removed: dv.word_deleted_bg,
+            base_bg: theme.background,
+            intra_fg_fallback: theme.foreground,
         };
         cx.spawn(async move |this, cx| {
             let started = std::time::Instant::now();
@@ -2749,7 +2786,7 @@ impl Workspace {
                 // the current hunk so the content doesn't visually jump.
                 if this.selected == Some(index) {
                     let jumped = this.reset_diff_list(cx);
-                    if !jumped {
+                    if !jumped && reanchor {
                         this.scroll_to_current_hunk(cx);
                     }
                 }
@@ -2842,7 +2879,7 @@ impl Workspace {
             self.diff_pending.clear();
             self.diffs_theme_stale = false;
             if let Some(index) = self.selected {
-                self.request_diff(index, cx);
+                self.request_diff(index, true, cx);
             }
         } else {
             // Parked WSL entry with no live host: recomputing here would boot
@@ -2927,20 +2964,58 @@ impl Workspace {
         cx.notify();
     }
 
-    /// Reveal the hidden context above `hunk` in the selected file, then
-    /// recompute that file's rows.
-    fn expand_hunk_gap(&mut self, hunk: usize, cx: &mut Context<Self>) {
+    /// Step the gap keyed by `key` (a real hunk index, or `hunks.len()` for
+    /// the trailing gap — see `Workspace::expanded`'s doc comment) one more
+    /// `GAP_EXPAND_STEP`-line reveal closer to fully open, or all the way
+    /// open at once when `reveal_all` (the header's secondary "expand all"
+    /// affordance). Recomputes the selected file's rows.
+    fn expand_hunk_gap(
+        &mut self,
+        key: usize,
+        is_trailing: bool,
+        reveal_all: bool,
+        cx: &mut Context<Self>,
+    ) {
         let Some(index) = self.selected else {
             return;
         };
-        self.expanded.entry(index).or_default().insert(hunk);
-        // Anchor the viewport on the expanded hunk once the rebuilt rows
-        // land (see request_diff) — its own row index is about to move.
-        self.current_hunk = hunk;
+        let clicks = self
+            .expanded
+            .entry(index)
+            .or_default()
+            .entry(key)
+            .or_insert(0);
+        // `gap_revealed_lines` caps at the gap's real length regardless of
+        // `clicks`, so `u32::MAX` is a plain "reveal everything" sentinel —
+        // no need to know the gap's actual length here (this fn only sees
+        // the click-count map, `build_rows` is what turns it into a
+        // revealed-line count against the real hunk data).
+        *clicks = if reveal_all {
+            u32::MAX
+        } else {
+            clicks.saturating_add(1)
+        };
+        // A real hunk's gap sits directly above it, so the click-triggering
+        // header row (and everything the click reveals) is ABOVE whatever
+        // the user was last looking at — re-anchor on it, same as before
+        // this fn supported stepping. The trailing gap is the opposite: its
+        // header sits BELOW the last hunk, at (or near) the bottom of the
+        // list the user is already looking at, and revealing more of it
+        // only appends rows further down — nothing above the click shifts,
+        // so the existing scroll offset already shows the same content and
+        // reanchoring would just yank the view back up to whatever
+        // `current_hunk` happens to be (possibly hunk 0, never touched by a
+        // trailing click). `request_diff`'s `reanchor` param, captured at
+        // call time rather than read from a shared field, is what makes
+        // this safe even if a second click lands before the first's
+        // recompute completes (see that param's own doc comment).
+        if !is_trailing {
+            self.current_hunk = key;
+        }
         // Keep the stale rows on screen while the recompute runs; the
         // completion overwrites them. Removing them first blanks the pane
         // for the whole recompute (visible on large files).
-        self.request_diff(index, cx);
+        self.request_diff(index, !is_trailing, cx);
     }
 
     // ---- GitHub PR open flow ------------------------------------------
@@ -5164,7 +5239,7 @@ impl Workspace {
                                 if !this.files.is_empty() {
                                     this.selected = Some(0);
                                     this.current_hunk = 0;
-                                    this.request_diff(0, cx);
+                                    this.request_diff(0, true, cx);
                                 }
                                 this.reset_diff_list(cx);
                             }
@@ -8269,11 +8344,22 @@ impl Workspace {
     /// hunk's line-range info with nowhere else to show it) AND the
     /// clickable hidden-lines affordance, given its own `flex_1` centered
     /// segment to match the centered gap-row treatment.
+    ///
+    /// Clicking the row itself steps the reveal by `GAP_EXPAND_STEP` lines
+    /// from the gap's near edge (GitHub-style; docs/backlog.md "Context
+    /// expansion: no trailing gap, no partial expansion"); a second, smaller
+    /// "expand all" affordance appears alongside it whenever more than one
+    /// step remains, preserving the old one-click-reveals-everything
+    /// behavior for anyone who wants it. `cx.stop_propagation()` on the
+    /// inner affordance keeps its click from ALSO triggering the row's own
+    /// stepped-expand handler (same nested-clickable idiom as the target
+    /// viewer's backdrop/content pair).
     fn render_hunk_header(
         &self,
         label: SharedString,
         hunk: usize,
         expandable: Option<u32>,
+        is_trailing: bool,
         cx: &mut Context<Self>,
     ) -> Stateful<Div> {
         let theme = cx.theme();
@@ -8293,20 +8379,63 @@ impl Workspace {
             .text_color(muted_fg);
         match expandable {
             None => base.child(label),
-            Some(hidden) => base
-                .cursor_pointer()
-                .hover(|el| el.bg(muted_bg))
-                .on_mouse_down(
-                    MouseButton::Left,
-                    cx.listener(move |this, _, _, cx| this.expand_hunk_gap(hunk, cx)),
-                )
-                .child(label)
-                .child(h_flex().flex_1().justify_center().child(
-                    div().text_color(accent.opacity(0.9)).child(format!(
-                        "\u{22ef} {hidden} hidden line{} \u{2014} click to expand",
-                        if hidden == 1 { "" } else { "s" }
-                    )),
-                )),
+            Some(hidden) => {
+                let expand_all = (hidden > GAP_EXPAND_STEP).then(|| {
+                    div()
+                        .id(("hunk-header-expand-all", hunk))
+                        .flex_none()
+                        .cursor_pointer()
+                        .text_color(accent.opacity(0.7))
+                        .hover(|el| el.text_color(accent))
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(move |this, _, _, cx| {
+                                this.expand_hunk_gap(hunk, is_trailing, true, cx);
+                                cx.stop_propagation();
+                            }),
+                        )
+                        .child("expand all")
+                });
+                base.cursor_pointer()
+                    .hover(|el| el.bg(muted_bg))
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |this, _, _, cx| {
+                            this.expand_hunk_gap(hunk, is_trailing, false, cx);
+                        }),
+                    )
+                    .child(label)
+                    .child(
+                        h_flex()
+                            .flex_1()
+                            .min_w(px(0.))
+                            .justify_center()
+                            .gap_2()
+                            .child(
+                                // `min_w(0)` + `truncate()` (same idiom as
+                                // `render_file_row`'s path label): a narrow
+                                // diff column (e.g. the summary panel open at
+                                // its max drag width) otherwise hard-cuts this
+                                // text mid-word right at the column's own
+                                // edge — contained, not bleeding into the
+                                // summary panel, but an abrupt cut with no
+                                // ellipsis. Related to docs/backlog.md's
+                                // "Summary panel occludes..." entry: this is
+                                // the one remaining rough edge once the panel
+                                // itself was confirmed to already reserve
+                                // real flex width rather than overlay.
+                                div()
+                                    .min_w(px(0.))
+                                    .truncate()
+                                    .text_color(accent.opacity(0.9))
+                                    .child(format!(
+                                        "\u{22ef} {hidden} hidden line{} \u{2014} click to expand",
+                                        if hidden == 1 { "" } else { "s" }
+                                    )),
+                            )
+                            .children(expand_all),
+                    )
+            }
         }
     }
 
@@ -9619,9 +9748,11 @@ impl Workspace {
                 label,
                 hunk,
                 expandable,
+                is_trailing,
             } => {
-                let (label, hunk, expandable) = (label.clone(), *hunk, *expandable);
-                div().child(self.render_hunk_header(label, hunk, expandable, cx))
+                let (label, hunk, expandable, is_trailing) =
+                    (label.clone(), *hunk, *expandable, *is_trailing);
+                div().child(self.render_hunk_header(label, hunk, expandable, is_trailing, cx))
             }
             Row::Binary => div()
                 .w_full()
@@ -9763,9 +9894,11 @@ impl Workspace {
                 label,
                 hunk,
                 expandable,
+                is_trailing,
             } => {
-                let (label, hunk, expandable) = (label.clone(), *hunk, *expandable);
-                div().child(self.render_hunk_header(label, hunk, expandable, cx))
+                let (label, hunk, expandable, is_trailing) =
+                    (label.clone(), *hunk, *expandable, *is_trailing);
+                div().child(self.render_hunk_header(label, hunk, expandable, is_trailing, cx))
             }
             SplitRow::Binary => div()
                 .w_full()
@@ -9959,7 +10092,7 @@ fn compute_diff(
     source: &DiffSource,
     file: &ChangedFile,
     hl: &HighlightInputs,
-    expand: &HashSet<usize>,
+    expand: &HashMap<usize, u32>,
     context_lines: u32,
 ) -> anyhow::Result<RenderedDiff> {
     let old_path = file.old_path.as_deref().unwrap_or(&file.path);
@@ -10098,13 +10231,44 @@ fn gap_above(hunks: &[dv_core::Hunk], i: usize) -> (u32, u32, u32) {
     (prev_old_end, prev_new_end, len)
 }
 
+/// The context gap hidden after the LAST hunk, to end-of-file: `(first_old,
+/// first_new, len)` in 1-based line numbers — the trailing-gap mirror of
+/// [`gap_above`] (see its doc comment for the unified-anchor convention).
+/// `hunks` must be non-empty (`build_rows` only calls this once it's
+/// already handled the no-hunks case).
+fn gap_below(hunks: &[dv_core::Hunk], old_line_count: u32, new_line_count: u32) -> (u32, u32, u32) {
+    let first = |start: u32, count: u32| if count == 0 { start + 1 } else { start };
+    let last = hunks.last().expect("gap_below requires at least one hunk");
+    let old_end = first(last.old_start, last.old_count) + last.old_count;
+    let new_end = first(last.new_start, last.new_count) + last.new_count;
+    // Same "pure context, must match on both sides" guard as `gap_above`.
+    let old_len = (old_line_count + 1).saturating_sub(old_end);
+    let new_len = (new_line_count + 1).saturating_sub(new_end);
+    let len = if old_len == new_len { new_len } else { 0 };
+    (old_end, new_end, len)
+}
+
+/// Lines revealed per expand-click, GitHub's own convention (docs/backlog.md
+/// "Context expansion: no trailing gap, no partial expansion").
+const GAP_EXPAND_STEP: u32 = 20;
+
+/// How many of a `gap_len`-line gap are revealed after `clicks` expand
+/// clicks of [`GAP_EXPAND_STEP`] lines each. Saturates at `gap_len` — the
+/// click that would otherwise leave a short remainder instead reveals
+/// everything, so a gap never gets stuck showing a lone "1 hidden line"
+/// stub, and `Workspace::expand_hunk_gap`'s `u32::MAX` "reveal all"
+/// sentinel collapses to exactly `gap_len` here regardless of overflow.
+fn gap_revealed_lines(clicks: u32, gap_len: u32) -> u32 {
+    (u64::from(clicks) * u64::from(GAP_EXPAND_STEP)).min(u64::from(gap_len)) as u32
+}
+
 fn build_rows(
     diff: &FileDiff,
     old_runs: &LineRuns,
     new_runs: &LineRuns,
     hl: &HighlightInputs,
     new_text: &str,
-    expand: &HashSet<usize>,
+    expand: &HashMap<usize, u32>,
 ) -> RenderedDiff {
     let mut unified = Vec::new();
     let mut split = Vec::new();
@@ -10152,37 +10316,58 @@ fn build_rows(
             // All gap lines must exist in the new blob (they won't for a
             // deleted file, where the new side is empty).
             && (gap_new_first + gap_len - 1) as usize <= new_lines.len();
+        let clicks = if gap_available {
+            expand.get(&i).copied().unwrap_or(0)
+        } else {
+            0
+        };
+        let revealed = gap_revealed_lines(clicks, gap_len);
+        let hidden = gap_len - revealed;
+        let fully_revealed = gap_available && gap_len > 0 && hidden == 0;
 
-        if gap_available && expand.contains(&i) {
-            // Reveal the gap: context rows instead of this hunk's header.
-            let gap: Vec<PreparedLine> = (0..gap_len)
-                .map(|k| {
-                    let new_line = gap_new_first + k;
-                    let old_line = gap_old_first + k;
-                    // Strip at most ONE trailing CR — the same convention as
-                    // dv-core's strip_ending and highlight's bucket_by_line.
-                    // A rogue "\r\r\n" line must keep its inner CR, or the
-                    // syntax runs (computed against the bucketed content)
-                    // overrun the display text and StyledText asserts.
-                    let raw = new_lines[(new_line - 1) as usize];
-                    let text = raw.strip_suffix('\r').unwrap_or(raw);
-                    let runs = if text.len() > highlight::MAX_HIGHLIGHT_LINE {
-                        Vec::new()
-                    } else {
-                        // Route through merge_line_runs (empty intraline) for
-                        // the same end-clamping regular diff rows get.
-                        let syntax = new_runs.get(&new_line).map(Vec::as_slice).unwrap_or(&[]);
-                        highlight::merge_line_runs(text.len(), syntax, &[], hl.intra_added)
-                    };
-                    PreparedLine {
-                        kind: LineKind::Context,
-                        old_line: Some(old_line),
-                        new_line: Some(new_line),
-                        text: text.to_owned().into(),
-                        runs,
-                    }
-                })
-                .collect();
+        // n/p target the hunk's own block, not the top of its gap — same
+        // anchor regardless of collapsed/partial/fully-revealed, since it's
+        // always the first row about to be pushed for hunk `i`.
+        hunk_rows_unified.push(unified.len());
+        hunk_rows_split.push(split.len());
+
+        let label: SharedString = format!(
+            "@@ -{},{} +{},{} @@",
+            hunk.old_start, hunk.old_count, hunk.new_start, hunk.new_count
+        )
+        .into();
+
+        if !fully_revealed {
+            // Collapsed (nothing revealed yet) or partially revealed (some
+            // of the gap showing below, this header still covering the
+            // rest) — either way there's a header row to click.
+            let expandable = (gap_available && hidden > 0).then_some(hidden);
+            unified.push(Row::HunkHeader {
+                label: label.clone(),
+                hunk: i,
+                expandable,
+                is_trailing: false,
+            });
+            split.push(SplitRow::HunkHeader {
+                label,
+                hunk: i,
+                expandable,
+                is_trailing: false,
+            });
+        }
+        if gap_available && revealed > 0 {
+            // The revealed slice sits nearest hunk `i` — the near edge for
+            // a gap ABOVE a hunk — so it's the LAST `revealed` lines of the
+            // gap; the still-`hidden` lines (covered by the header above,
+            // if any) are the ones further from `i`.
+            let gap = gap_context_lines(
+                gap_old_first + hidden,
+                gap_new_first + hidden,
+                revealed,
+                &new_lines,
+                new_runs,
+                hl,
+            );
             for p in &gap {
                 unified.push(Row::Line {
                     kind: p.kind,
@@ -10193,28 +10378,6 @@ fn build_rows(
                 });
             }
             build_split_rows(gap, &mut split);
-            // n/p target the hunk's own lines, not the top of the gap.
-            hunk_rows_unified.push(unified.len());
-            hunk_rows_split.push(split.len());
-        } else {
-            hunk_rows_unified.push(unified.len());
-            hunk_rows_split.push(split.len());
-            let label: SharedString = format!(
-                "@@ -{},{} +{},{} @@",
-                hunk.old_start, hunk.old_count, hunk.new_start, hunk.new_count
-            )
-            .into();
-            let expandable = gap_available.then_some(gap_len);
-            unified.push(Row::HunkHeader {
-                label: label.clone(),
-                hunk: i,
-                expandable,
-            });
-            split.push(SplitRow::HunkHeader {
-                label,
-                hunk: i,
-                expandable,
-            });
         }
 
         let prepared: Vec<PreparedLine> = hunk
@@ -10246,7 +10409,14 @@ fn build_rows(
                 let runs = if line.text.len() > highlight::MAX_HIGHLIGHT_LINE {
                     Vec::new()
                 } else {
-                    highlight::merge_line_runs(line.text.len(), syntax, &line.intraline, intra_bg)
+                    highlight::merge_line_runs(
+                        line.text.len(),
+                        syntax,
+                        &line.intraline,
+                        intra_bg,
+                        hl.base_bg,
+                        hl.intra_fg_fallback,
+                    )
                 };
                 PreparedLine {
                     kind: line.kind,
@@ -10274,6 +10444,74 @@ fn build_rows(
         }
         build_split_rows(prepared, &mut split);
     }
+
+    // Trailing gap: hidden context between the last hunk and EOF, keyed as
+    // gap `diff.hunks.len()` (one past the last real hunk index — see
+    // `Workspace::expanded`'s doc comment). Deliberately never pushed to
+    // `hunk_rows_unified`/`hunk_rows_split` (only the loop above does that),
+    // so it can never become an `n`/`p` hunk-jump target — there's no hunk
+    // to jump to, just more of the same file's tail.
+    {
+        let trailing_key = diff.hunks.len();
+        let (tail_old_first, tail_new_first, tail_len) =
+            gap_below(&diff.hunks, diff.old_line_count, diff.new_line_count);
+        let tail_available =
+            tail_len > 0 && (tail_new_first + tail_len - 1) as usize <= new_lines.len();
+        let clicks = if tail_available {
+            expand.get(&trailing_key).copied().unwrap_or(0)
+        } else {
+            0
+        };
+        let revealed = gap_revealed_lines(clicks, tail_len);
+        let hidden = tail_len - revealed;
+
+        if tail_available && revealed > 0 {
+            // The revealed slice sits nearest the last hunk — the trailing
+            // gap's near edge — so it's the FIRST `revealed` lines of the
+            // tail; the still-hidden remainder trails further toward EOF.
+            let gap = gap_context_lines(
+                tail_old_first,
+                tail_new_first,
+                revealed,
+                &new_lines,
+                new_runs,
+                hl,
+            );
+            for p in &gap {
+                unified.push(Row::Line {
+                    kind: p.kind,
+                    old_line: p.old_line,
+                    new_line: p.new_line,
+                    text: p.text.clone(),
+                    runs: p.runs.clone(),
+                });
+            }
+            build_split_rows(gap, &mut split);
+        }
+        if tail_available && hidden > 0 {
+            let label: SharedString = format!(
+                "@@ -{},{} +{},{} @@",
+                tail_old_first + revealed,
+                hidden,
+                tail_new_first + revealed,
+                hidden
+            )
+            .into();
+            unified.push(Row::HunkHeader {
+                label: label.clone(),
+                hunk: trailing_key,
+                expandable: Some(hidden),
+                is_trailing: true,
+            });
+            split.push(SplitRow::HunkHeader {
+                label,
+                hunk: trailing_key,
+                expandable: Some(hidden),
+                is_trailing: true,
+            });
+        }
+    }
+
     RenderedDiff {
         unified,
         split,
@@ -10284,6 +10522,56 @@ fn build_rows(
         removed: removed_count,
         is_binary: false,
     }
+}
+
+/// Build [`PreparedLine`]s for `count` consecutive context lines starting at
+/// 1-based `(old_first, new_first)`, pulled from the new blob's text (gap
+/// content is identical on both sides by definition — see `gap_above`/
+/// `gap_below`). Shared by between-hunk gap reveals and the trailing
+/// end-of-file gap.
+fn gap_context_lines(
+    old_first: u32,
+    new_first: u32,
+    count: u32,
+    new_lines: &[&str],
+    new_runs: &LineRuns,
+    hl: &HighlightInputs,
+) -> Vec<PreparedLine> {
+    (0..count)
+        .map(|k| {
+            let new_line = new_first + k;
+            let old_line = old_first + k;
+            // Strip at most ONE trailing CR — the same convention as
+            // dv-core's strip_ending and highlight's bucket_by_line. A
+            // rogue "\r\r\n" line must keep its inner CR, or the syntax
+            // runs (computed against the bucketed content) overrun the
+            // display text and StyledText asserts.
+            let raw = new_lines[(new_line - 1) as usize];
+            let text = raw.strip_suffix('\r').unwrap_or(raw);
+            let runs = if text.len() > highlight::MAX_HIGHLIGHT_LINE {
+                Vec::new()
+            } else {
+                // Route through merge_line_runs (empty intraline) for the
+                // same end-clamping regular diff rows get.
+                let syntax = new_runs.get(&new_line).map(Vec::as_slice).unwrap_or(&[]);
+                highlight::merge_line_runs(
+                    text.len(),
+                    syntax,
+                    &[],
+                    hl.intra_added,
+                    hl.base_bg,
+                    hl.intra_fg_fallback,
+                )
+            };
+            PreparedLine {
+                kind: LineKind::Context,
+                old_line: Some(old_line),
+                new_line: Some(new_line),
+                text: text.to_owned().into(),
+                runs,
+            }
+        })
+        .collect()
 }
 
 /// Turn a hunk's interleaved [context, removed…, added…] lines into aligned
@@ -10426,6 +10714,25 @@ impl Render for Workspace {
                             .h_full()
                             .flex_1()
                             .min_w(px(0.))
+                            // `flex_1().min_w(0)` already makes the flex
+                            // layout correctly SHRINK this column while the
+                            // summary panel is open (the panel is a later,
+                            // `flex_none` sibling with its own persisted
+                            // width) — but layout allocation alone doesn't
+                            // clip content that overflows it. A gap-header's
+                            // centered "click to expand" label (or a thread
+                            // card's action row) has no bound on its own
+                            // intrinsic width, so on a narrow column it can
+                            // paint past this column's right edge — right
+                            // under the summary panel, which paints after it
+                            // (a later sibling) and so visually occludes the
+                            // overflow, cutting it off mid-glyph exactly at
+                            // the panel's left edge (docs/backlog.md
+                            // "Summary panel occludes inline thread cards").
+                            // `overflow_hidden()` makes this column actually
+                            // clip at its own allocated bounds instead of
+                            // bleeding into the next sibling.
+                            .overflow_hidden()
                             .children(file_header)
                             .child(
                                 div()
@@ -10555,11 +10862,12 @@ impl Render for Workspace {
 #[cfg(test)]
 mod tests {
     use super::{
-        ChecksSummary, PrHeader, PrMeta, PrState, PreparedLine, SplitRow, SubmissionOutcome,
-        SubmitFlow, SubmitPrep, Violation, ViolationKind, build_split_rows,
-        cancel_submit_flow_outcome, gap_above, pick_review, pr_source_key,
-        reconcile_file_selection, resolved_pin, review_adopts_pr, submit_flow_from_submission,
-        submit_flow_from_validation, trim_trailing_newlines, verdict_label,
+        ChecksSummary, GAP_EXPAND_STEP, PrHeader, PrMeta, PrState, PreparedLine, SplitRow,
+        SubmissionOutcome, SubmitFlow, SubmitPrep, Violation, ViolationKind, build_split_rows,
+        cancel_submit_flow_outcome, gap_above, gap_below, gap_revealed_lines, pick_review,
+        pr_source_key, reconcile_file_selection, resolved_pin, review_adopts_pr,
+        submit_flow_from_submission, submit_flow_from_validation, trim_trailing_newlines,
+        verdict_label,
     };
     // Automation-only word functions (see their `#[cfg(feature =
     // "automation")]` gates above) — only the tests exercising them
@@ -10624,6 +10932,67 @@ mod tests {
         let hunks = [hunk(10, 5, 10, 8), hunk(20, 2, 20, 2)];
         let (_, _, len) = gap_above(&hunks, 1);
         assert_eq!(len, 0);
+    }
+
+    #[test]
+    fn gap_below_counts_to_end_of_file() {
+        // Single hunk old 1..6 (5 lines) / new 1..8 (7 lines); file totals
+        // old=20, new=22 → tail is old 6..20 (15 lines) = new 8..22 (15).
+        let hunks = [hunk(1, 5, 1, 7)];
+        assert_eq!(gap_below(&hunks, 20, 22), (6, 8, 15));
+    }
+
+    #[test]
+    fn gap_below_is_empty_when_last_hunk_reaches_eof() {
+        // Hunk covers every line on both sides — nothing trails it.
+        let hunks = [hunk(1, 20, 1, 20)];
+        let (_, _, len) = gap_below(&hunks, 20, 20);
+        assert_eq!(len, 0);
+    }
+
+    #[test]
+    fn gap_below_mismatched_lengths_disable_expansion() {
+        // Deliberately inconsistent totals → tail reported as absent,
+        // mirroring `mismatched_gap_lengths_disable_expansion` above.
+        let hunks = [hunk(1, 5, 1, 8)];
+        let (_, _, len) = gap_below(&hunks, 20, 20);
+        assert_eq!(len, 0);
+    }
+
+    #[test]
+    fn gap_revealed_lines_steps_by_gap_expand_step() {
+        assert_eq!(gap_revealed_lines(0, 100), 0);
+        assert_eq!(gap_revealed_lines(1, 100), GAP_EXPAND_STEP);
+        assert_eq!(gap_revealed_lines(2, 100), GAP_EXPAND_STEP * 2);
+    }
+
+    #[test]
+    fn gap_revealed_lines_saturates_at_gap_len() {
+        // A gap of 25 lines: one click can't leave a 5-line stub forever —
+        // the SECOND click must reveal the rest in one go (25, not 40).
+        assert_eq!(gap_revealed_lines(1, 25), 20);
+        assert_eq!(gap_revealed_lines(2, 25), 25);
+        assert_eq!(gap_revealed_lines(3, 25), 25);
+    }
+
+    #[test]
+    fn gap_revealed_lines_small_gap_reveals_fully_on_first_click() {
+        // A gap ≤ GAP_EXPAND_STEP reveals entirely on the very first click —
+        // no dangling residual header for a handful of lines.
+        assert_eq!(gap_revealed_lines(1, 5), 5);
+    }
+
+    #[test]
+    fn gap_revealed_lines_reveal_all_sentinel_never_overflows() {
+        // `Workspace::expand_hunk_gap`'s `u32::MAX` "reveal all" sentinel
+        // must collapse to exactly `gap_len`, not wrap/panic on overflow.
+        assert_eq!(gap_revealed_lines(u32::MAX, 137), 137);
+    }
+
+    #[test]
+    fn gap_revealed_lines_empty_gap_is_always_fully_revealed() {
+        assert_eq!(gap_revealed_lines(0, 0), 0);
+        assert_eq!(gap_revealed_lines(5, 0), 0);
     }
 
     fn line(kind: LineKind, old: Option<u32>, new: Option<u32>) -> PreparedLine {

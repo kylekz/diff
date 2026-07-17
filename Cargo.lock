@@ -1402,6 +1402,7 @@ name = "dv"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "chrono",
  "dirs",
  "dv-cli",
  "dv-core",

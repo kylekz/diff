@@ -81,6 +81,16 @@ fn language_for_path(path: &str) -> Option<&'static str> {
     Some(name)
 }
 
+/// Whether [`highlight_file`] would produce any runs at all for this
+/// text/path — the cheap pre-check `workspace.rs`'s two-stage diff pipeline
+/// uses to decide if a background tree-sitter pass is worth scheduling.
+/// Mirrors `highlight_file`'s own early-outs exactly (unknown language,
+/// empty, over the size cap), so "false for both sides" means the
+/// unhighlighted stage-1 rows are already the final render.
+pub fn wants_highlight(text: &str, path: &str) -> bool {
+    language_for_path(path).is_some() && !text.is_empty() && text.len() <= MAX_HIGHLIGHT_BYTES
+}
+
 /// Parse `text` as `path`'s language and return per-line style runs. Empty
 /// when the language is unknown. The whole file is parsed (tree-sitter needs
 /// full context); runs are then bucketed to lines and made line-relative.

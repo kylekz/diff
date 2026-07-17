@@ -344,6 +344,17 @@ struct RenderedDiff {
     added: u32,
     removed: u32,
     is_binary: bool,
+    /// Rows were built WITHOUT whole-file syntax runs (the fast first paint
+    /// of [`Workspace::request_diff`]'s two-stage pipeline) and a background
+    /// tree-sitter pass is expected to replace this entry with a recolored
+    /// copy — identical text/row structure, colors only. Always `false` for
+    /// content no highlight pass would touch (unknown language, over the
+    /// size cap, binary, no hunks, [`error_diff`] placeholders): those rows
+    /// are already final. `select_file_inner` treats a cached
+    /// `syntax_pending` entry as incomplete (re-requests it), so a snapshot
+    /// stashed mid-highlight — e.g. into [`CachedPrDiff`] — self-heals on
+    /// the next selection instead of pinning plain text forever.
+    syntax_pending: bool,
 }
 
 impl RenderedDiff {
@@ -910,6 +921,34 @@ pub struct Workspace {
     /// `&mut self` just to memoize.
     diffstat_cache: Cell<Option<(u32, u32)>>,
     diff_pending: HashSet<usize>,
+    /// Monotonic id stamped onto every [`Self::request_diff`] dispatch —
+    /// see `diff_req_latest`.
+    diff_req_seq: u64,
+    /// file index → the seq of the LATEST `request_diff` dispatched for it.
+    /// Both completions of the two-stage pipeline (fast unhighlighted rows,
+    /// then the background tree-sitter recolor) re-check their captured seq
+    /// against this and discard themselves when superseded — the guard that
+    /// keeps a stale stage-2 recolor (computed against pre-expansion or
+    /// pre-worktree-edit content, and now potentially SECONDS stale where
+    /// the old single-stage pipeline's window was one compute) from
+    /// clobbering a newer request's rows. Same discard-if-superseded shape
+    /// as `source_epoch`/`highlight_epoch`, which stay on as the
+    /// cross-source/cross-theme guards; this one covers same-source
+    /// same-theme races (gap expansion, watcher reloads). Cleared wherever
+    /// `diff_pending` is cleared — those sites are about to re-key or
+    /// discard every in-flight request anyway.
+    diff_req_latest: HashMap<usize, u64>,
+    /// Whole-file syntax runs (old side, new side) from the last completed
+    /// highlight pass, per file index — lets a same-content recompute
+    /// (most commonly a gap-expansion click) rebuild rows in ONE fast pass
+    /// with real colors instead of re-running tree-sitter and briefly
+    /// flashing plain text. Strictly a cache over (file content, theme):
+    /// cleared at every site that clears/replaces `self.diffs` (source
+    /// switches, worktree reloads, theme/context invalidation, PR cache
+    /// restores), so an entry present here is always valid for the index's
+    /// current content under the current theme. Counted in
+    /// [`Self::estimated_diff_bytes`].
+    highlight_runs: HashMap<usize, Arc<(LineRuns, LineRuns)>>,
     /// Bumped by [`Self::invalidate_diff_cache`] (theme swaps via
     /// [`Self::on_theme_changed`], and context-lines changes via
     /// [`Self::set_context_lines`] — anything that requires a full
@@ -1032,9 +1071,16 @@ pub struct Workspace {
     display: Vec<DisplayRow>,
     /// diff row index → display row index, for hunk scrolling.
     diff_to_display: Vec<usize>,
-    /// Wall-clock of the most recent per-file diff computation (blob fetch
-    /// + diff + highlight), for `--automation` perf validation.
+    /// Wall-clock of the most recent per-file diff computation's FIRST
+    /// stage (blob fetch + diff + row build — the part time-to-interactive
+    /// actually waits on; whole-file syntax highlighting runs after, see
+    /// `last_highlight_ms`), for `--automation` perf validation.
     last_diff_ms: Option<u64>,
+    /// Wall-clock of the most recent background highlight pass (whole-file
+    /// tree-sitter on both sides + the row rebuild) — the work the
+    /// two-stage `request_diff` pipeline moved OFF the time-to-interactive
+    /// path (docs/backlog.md "Cold startup is tree-sitter-bound", lead (a)).
+    last_highlight_ms: Option<u64>,
     /// Keeps the review-store watcher alive; external edits (agent CLI,
     /// another window) stream in through it. Dropped with the workspace.
     _watcher: Option<dv_core::ReviewWatcher>,
@@ -1501,6 +1547,15 @@ fn lsp_chip(text: SharedString, color: Hsla) -> impl IntoElement {
         .child(text)
 }
 
+/// Rough heap footprint of one side's whole-file [`LineRuns`] — feeds
+/// [`Workspace::estimated_diff_bytes`], same estimate-not-exact spirit as
+/// [`RenderedDiff::estimated_bytes`].
+fn estimated_line_runs_bytes(runs: &LineRuns) -> usize {
+    runs.values()
+        .map(|line| line.len() * std::mem::size_of::<(Range<usize>, HighlightStyle)>() + 48)
+        .sum()
+}
+
 /// A one-row "diff" carrying an error message where the hunks would be.
 fn error_diff(msg: SharedString) -> RenderedDiff {
     RenderedDiff {
@@ -1522,6 +1577,7 @@ fn error_diff(msg: SharedString) -> RenderedDiff {
         added: 0,
         removed: 0,
         is_binary: false,
+        syntax_pending: false,
     }
 }
 
@@ -1900,6 +1956,9 @@ impl Workspace {
             diffs: HashMap::new(),
             diffstat_cache: Cell::new(None),
             diff_pending: HashSet::new(),
+            diff_req_seq: 0,
+            diff_req_latest: HashMap::new(),
+            highlight_runs: HashMap::new(),
             view_mode: view_mode_default.into(),
             context_lines,
             font_size,
@@ -1919,6 +1978,7 @@ impl Workspace {
             stale_checked: None,
             stale_gen: 0,
             last_diff_ms: None,
+            last_highlight_ms: None,
             _watcher: None,
             _worktree_watcher: None,
             pr: None,
@@ -2310,7 +2370,16 @@ impl Workspace {
             .flat_map(|entry| entry.diffs.values())
             .map(|d| d.estimated_bytes())
             .sum();
-        live + pr_cached
+        // The per-file whole-file syntax-runs cache (two-stage highlight
+        // pipeline) is the same order of magnitude as a file's merged row
+        // runs — leaving it out would undercount the budget the same way
+        // risk F warns about for `split`.
+        let runs_cached: usize = self
+            .highlight_runs
+            .values()
+            .map(|r| estimated_line_runs_bytes(&r.0) + estimated_line_runs_bytes(&r.1))
+            .sum();
+        live + pr_cached + runs_cached
     }
 
     /// Count of `self.diffs` entries that are a genuine rendered diff, NOT
@@ -2506,6 +2575,11 @@ impl Workspace {
             self.diffs.clear();
             self.diffstat_cache.set(None);
             self.diff_pending.clear();
+            // Both index-keyed against the old list, and the runs were
+            // computed against possibly-changed content — same staleness as
+            // `diffs` itself (see each field's doc comment).
+            self.diff_req_latest.clear();
+            self.highlight_runs.clear();
             self.expanded.clear();
             self.pending_jump = None;
             match new_selected {
@@ -2590,6 +2664,9 @@ impl Workspace {
             self.diffs.clear();
             self.diffstat_cache.set(None);
             self.diff_pending.clear();
+            self.diff_req_latest.clear();
+            // Theme-baked colors — stale for the same reason `diffs` is.
+            self.highlight_runs.clear();
             if let Some(index) = self.selected {
                 self.request_diff(index, true, cx);
             }
@@ -2816,8 +2893,16 @@ impl Workspace {
         }
         cx.notify();
 
-        // A cached failure retries on reselect; a good diff is final.
-        let cached_ok = self.diffs.get(&index).is_some_and(|d| !d.error);
+        // A cached failure retries on reselect; a good diff is final. A
+        // `syntax_pending` entry (stage-1 rows whose recolor never landed —
+        // e.g. restored from a PR-cache snapshot stashed mid-highlight, or
+        // its stage 2 was superseded) counts as incomplete: re-requesting
+        // repaints identical rows (no flash) and re-runs the highlight
+        // pass, so plain text can never pin itself permanently.
+        let cached_ok = self
+            .diffs
+            .get(&index)
+            .is_some_and(|d| !d.error && !d.syntax_pending);
         if cached_ok || self.diff_pending.contains(&index) {
             return;
         }
@@ -2835,11 +2920,32 @@ impl Workspace {
     /// `request_diff` calls for the same file — e.g. a double-click before
     /// the first recompute lands — can never have one call's completion
     /// consume the other's reanchor decision.
+    ///
+    /// Two-stage pipeline (docs/backlog.md "Cold startup is
+    /// tree-sitter-bound", lead (a)): stage 1 fetches blobs + diffs +
+    /// builds rows WITHOUT whole-file syntax runs and lands them
+    /// immediately — that's what `wait_ready`/first paint see, so
+    /// time-to-interactive no longer waits on tree-sitter. Stage 2 then
+    /// runs both sides' whole-file highlight on the background executor
+    /// over the SAME payload (no second git round trip) and swaps in a
+    /// rebuilt, recolored copy — identical text and row structure, so the
+    /// swap is a pure recolor with no layout shift (intraline word tints
+    /// don't wait either: `merge_line_runs` paints them from dv-core's
+    /// ranges in stage 1, with no syntax foreground to contrast-check
+    /// yet). When `self.highlight_runs` already holds this index's runs (a
+    /// gap-expansion recompute over unchanged content), stage 1 uses them
+    /// directly and stage 2 is skipped entirely — single-pass, flash-free,
+    /// and faster than the old always-re-tree-sitter recompute. Both
+    /// completions re-check `source_epoch`/`highlight_epoch` (as before)
+    /// plus `diff_req_latest` (see that field's doc) before touching state.
     fn request_diff(&mut self, index: usize, reanchor: bool, cx: &mut Context<Self>) {
         let Some(repo) = self.repo.clone() else {
             return;
         };
         self.diff_pending.insert(index);
+        self.diff_req_seq += 1;
+        let seq = self.diff_req_seq;
+        self.diff_req_latest.insert(index, seq);
 
         let file = self.files[index].clone();
         let source = self.source.clone();
@@ -2870,47 +2976,119 @@ impl Workspace {
             base_bg: theme.background,
             intra_fg_fallback: theme.foreground,
         };
+        // Whole-file syntax runs already computed for this exact index's
+        // content under the current theme (see `highlight_runs`'s doc) —
+        // reuse them synchronously in stage 1 and skip stage 2.
+        let cached_runs = self.highlight_runs.get(&index).cloned();
+
         cx.spawn(async move |this, cx| {
             let started = std::time::Instant::now();
-            let rendered = cx
-                .background_executor()
-                .spawn(
-                    async move { compute_diff(&repo, &source, &file, &hl, &expand, context_lines) },
-                )
-                .await;
+            let stage1 = {
+                let hl = hl.clone();
+                let expand = expand.clone();
+                cx.background_executor().spawn(async move {
+                    let payload = fetch_and_diff(&repo, &source, &file, context_lines)?;
+                    let rendered = match &cached_runs {
+                        Some(runs) => {
+                            render_payload(&payload, &runs.0, &runs.1, &hl, &expand, false)
+                        }
+                        None => {
+                            let empty = LineRuns::new();
+                            let pending = payload_wants_highlight(&payload);
+                            render_payload(&payload, &empty, &empty, &hl, &expand, pending)
+                        }
+                    };
+                    anyhow::Ok((payload, rendered))
+                })
+            }
+            .await;
             let elapsed_ms = started.elapsed().as_millis() as u64;
+
+            let follow_up = this
+                .update(cx, |this, cx| {
+                    if this.source_epoch != epoch || this.highlight_epoch != highlight_epoch {
+                        // Stale: computed against a source that's since been
+                        // replaced, or a theme that's since been swapped again.
+                        // Discard outright rather than write rows for the wrong
+                        // file/palette into the cache under a reused index
+                        // (review finding P1-a; same reasoning for the theme
+                        // case, see `highlight_epoch`).
+                        return None;
+                    }
+                    if this.diff_req_latest.get(&index) != Some(&seq) {
+                        // A newer request for this same index superseded this
+                        // one (gap expansion click-storm, worktree reload) —
+                        // its own completions own this index's state now,
+                        // including `diff_pending`.
+                        return None;
+                    }
+                    this.diff_pending.remove(&index);
+                    this.last_diff_ms = Some(elapsed_ms);
+                    let follow_up = match stage1 {
+                        Ok((payload, diff)) => {
+                            let follow_up = diff.syntax_pending.then_some(payload);
+                            this.diffs.insert(index, Arc::new(diff));
+                            this.diffstat_cache.set(None);
+                            follow_up
+                        }
+                        Err(err) => {
+                            let msg: SharedString =
+                                format!("failed to compute diff: {err:#}").into();
+                            this.diffs.insert(index, Arc::new(error_diff(msg)));
+                            this.diffstat_cache.set(None);
+                            None
+                        }
+                    };
+                    // Row indices may have shifted (gap expansion inserts rows
+                    // above); re-sync the list and re-anchor the viewport on
+                    // the current hunk so the content doesn't visually jump.
+                    if this.selected == Some(index) {
+                        let jumped = this.reset_diff_list(cx);
+                        if !jumped && reanchor {
+                            this.scroll_to_current_hunk(cx);
+                        }
+                    }
+                    cx.notify();
+                    follow_up
+                })
+                .ok()
+                .flatten();
+
+            // Stage 2: the whole-file tree-sitter pass, over the payload
+            // stage 1 already fetched — only reached when stage 1 landed
+            // current (guards above) and marked its rows `syntax_pending`.
+            let Some(payload) = follow_up else { return };
+            let highlight_started = std::time::Instant::now();
+            let (runs, rendered) = cx
+                .background_executor()
+                .spawn(async move {
+                    let old_runs =
+                        highlight::highlight_file(&payload.old_text, &payload.old_path, &hl.theme);
+                    let new_runs =
+                        highlight::highlight_file(&payload.new_text, &payload.new_path, &hl.theme);
+                    let runs = Arc::new((old_runs, new_runs));
+                    let rendered = render_payload(&payload, &runs.0, &runs.1, &hl, &expand, false);
+                    (runs, rendered)
+                })
+                .await;
+            let highlight_ms = highlight_started.elapsed().as_millis() as u64;
 
             this.update(cx, |this, cx| {
                 if this.source_epoch != epoch || this.highlight_epoch != highlight_epoch {
-                    // Stale: computed against a source that's since been
-                    // replaced, or a theme that's since been swapped again.
-                    // Discard outright rather than write rows for the wrong
-                    // file/palette into the cache under a reused index
-                    // (review finding P1-a; same reasoning for the theme
-                    // case, see `highlight_epoch`).
+                    return; // same staleness reasoning as stage 1
+                }
+                if this.diff_req_latest.get(&index) != Some(&seq) {
                     return;
                 }
-                this.diff_pending.remove(&index);
-                this.last_diff_ms = Some(elapsed_ms);
-                match rendered {
-                    Ok(diff) => {
-                        this.diffs.insert(index, Arc::new(diff));
-                        this.diffstat_cache.set(None);
-                    }
-                    Err(err) => {
-                        let msg: SharedString = format!("failed to compute diff: {err:#}").into();
-                        this.diffs.insert(index, Arc::new(error_diff(msg)));
-                        this.diffstat_cache.set(None);
-                    }
-                }
-                // Row indices may have shifted (gap expansion inserts rows
-                // above); re-sync the list and re-anchor the viewport on
-                // the current hunk so the content doesn't visually jump.
+                this.last_highlight_ms = Some(highlight_ms);
+                this.highlight_runs.insert(index, runs);
+                // Same text, same rows, same added/removed tallies — a pure
+                // recolor, so `diffstat_cache` stays valid and
+                // `reset_diff_list` (viewport-preserving for in-place
+                // updates) re-snapshots the display without any scroll jump.
+                this.diffs.insert(index, Arc::new(rendered));
                 if this.selected == Some(index) {
-                    let jumped = this.reset_diff_list(cx);
-                    if !jumped && reanchor {
-                        this.scroll_to_current_hunk(cx);
-                    }
+                    this.reset_diff_list(cx);
                 }
                 cx.notify();
             })
@@ -2989,6 +3167,12 @@ impl Workspace {
         self.pr_diff_cache.clear();
         self.pr_diff_lru.clear();
         self.pr_diff_cache_by_number.clear();
+        // Theme-baked like the rows themselves, and cheap to drop — cleared
+        // on BOTH branches below (the non-eager path keeps its stale ROWS
+        // only because it has nothing to replace them with; a stale runs
+        // cache has no such excuse and would recolor a future recompute
+        // with the old palette).
+        self.highlight_runs.clear();
         let host_reachable = eager
             || match &self.location {
                 RepoLocation::Wsl { distro, .. } => {
@@ -3000,6 +3184,7 @@ impl Workspace {
             self.diffs.clear();
             self.diffstat_cache.set(None);
             self.diff_pending.clear();
+            self.diff_req_latest.clear();
             self.diffs_theme_stale = false;
             if let Some(index) = self.selected {
                 self.request_diff(index, true, cx);
@@ -3348,6 +3533,13 @@ impl Workspace {
             self.diffstat_cache.set(None);
             self.expanded = hit.expanded;
             self.diff_pending.clear();
+            // Keyed by index into the outgoing source's file list — stale
+            // against the restored one (same reasoning as `diffs.clear()`
+            // on the miss path; the restored entries carry their own baked
+            // runs, and any restored `syntax_pending` entry re-requests on
+            // selection — see `RenderedDiff::syntax_pending`).
+            self.diff_req_latest.clear();
+            self.highlight_runs.clear();
             self.stale.clear();
             self.stale_checked = None;
             self.selected = None;
@@ -3575,6 +3767,11 @@ impl Workspace {
                             this.evict_pr_diff_cache();
                         }
                         this.diff_pending.clear();
+                        // Same index-keyed staleness as `diff_pending` —
+                        // whichever arm above ran, `diffs` was just
+                        // replaced or cleared wholesale.
+                        this.diff_req_latest.clear();
+                        this.highlight_runs.clear();
                         this.stale.clear();
                         this.stale_checked = None;
                         this.selected = None;
@@ -4118,6 +4315,22 @@ impl Workspace {
             "selected": self.selected,
             "current_hunk": self.current_hunk,
             "last_diff_ms": self.last_diff_ms,
+            // Two-stage diff pipeline (docs/backlog.md "Cold startup is
+            // tree-sitter-bound", lead (a)): `true` while the selected
+            // file's rows are pending, or on screen without their
+            // whole-file syntax colors yet. `wait_ready` deliberately does
+            // NOT block on this (it means time-to-interactive; see
+            // `automation_settled`) — a script that wants full
+            // colorization polls this down to `false` after `wait_ready`,
+            // exactly like `pr_meta_pending`.
+            "highlight_pending": match self.selected {
+                Some(i) => self.diff_pending.contains(&i)
+                    || self.diffs.get(&i).is_some_and(|d| d.syntax_pending),
+                None => false,
+            },
+            // Stage-2 wall time (whole-file tree-sitter + row rebuild) —
+            // the cost the pipeline moved off the interactive path.
+            "last_highlight_ms": self.last_highlight_ms,
             // Phase 7 D4 instrumentation: dispatch-to-settled wall time for
             // the PR-picker list fetch and the most recent `open_pr`.
             // `last_pr_list_ms` IS the S7-2 warm/cold signal (a warm picker
@@ -4387,6 +4600,12 @@ impl Workspace {
     /// early. A script that specifically wants to wait for the confirmed/
     /// patched header polls `state.pr_meta_pending` down to `false`
     /// separately, after `wait_ready` already returned.
+    ///
+    /// Likewise does NOT wait on the selected diff's background highlight
+    /// pass (`state.highlight_pending`) — the stage-1 rows are fully laid
+    /// out and interactive (select, scroll, comment) before the recolor
+    /// lands, and blocking on tree-sitter here would reintroduce exactly
+    /// the cold-start wait the two-stage `request_diff` pipeline removed.
     #[cfg(feature = "automation")]
     pub(crate) fn automation_settled(&self) -> bool {
         if self
@@ -5583,6 +5802,8 @@ impl Workspace {
                         this.diffs.clear();
                         this.diffstat_cache.set(None);
                         this.diff_pending.clear();
+                        this.diff_req_latest.clear();
+                        this.highlight_runs.clear();
                         this.expanded.clear();
                         this.stale.clear();
                         this.stale_checked = None;
@@ -10503,14 +10724,64 @@ fn resolve_source(repo: &GitRepo, source: DiffSource) -> anyhow::Result<DiffSour
     }
 }
 
-fn compute_diff(
+/// Everything `request_diff`'s stage-1 fetch produces that the background
+/// tree-sitter pass (stage 2) needs again: the structural diff plus both
+/// sides' full text and paths. Carried through the async pipeline rather
+/// than re-fetched, so the highlight pass never re-hits git.
+struct DiffPayload {
+    diff: FileDiff,
+    old_text: String,
+    new_text: String,
+    old_path: String,
+    new_path: String,
+}
+
+/// Whether a background highlight pass over `payload` would change anything
+/// at all — `false` means the unhighlighted stage-1 rows are already final
+/// (see [`RenderedDiff::syntax_pending`]).
+fn payload_wants_highlight(payload: &DiffPayload) -> bool {
+    !payload.diff.is_binary
+        && !payload.diff.hunks.is_empty()
+        && (highlight::wants_highlight(&payload.old_text, &payload.old_path)
+            || highlight::wants_highlight(&payload.new_text, &payload.new_path))
+}
+
+/// Assemble [`RenderedDiff`] rows from an already-fetched [`DiffPayload`]
+/// and per-side syntax runs — the shared row builder both stages of
+/// `request_diff` call: stage 1 with empty (or cached) runs for the fast
+/// first paint, stage 2 with the freshly tree-sittered runs for the
+/// recolor. Same payload + same `expand` in, same text/row structure out —
+/// only the style runs differ, which is what makes the stage-2 swap a pure
+/// recolor with no layout shift.
+fn render_payload(
+    payload: &DiffPayload,
+    old_runs: &LineRuns,
+    new_runs: &LineRuns,
+    hl: &HighlightInputs,
+    expand: &HashMap<usize, u32>,
+    syntax_pending: bool,
+) -> RenderedDiff {
+    build_rows(
+        &payload.diff,
+        old_runs,
+        new_runs,
+        hl,
+        &payload.new_text,
+        expand,
+        syntax_pending,
+    )
+}
+
+/// Fetch both sides' blobs and compute the structural diff for one file —
+/// the git-I/O + line-diff half of what used to be a single `compute_diff`
+/// (whole-file tree-sitter included); highlighting now runs as a separate
+/// stage over the returned payload so the first paint doesn't wait on it.
+fn fetch_and_diff(
     repo: &GitRepo,
     source: &DiffSource,
     file: &ChangedFile,
-    hl: &HighlightInputs,
-    expand: &HashMap<usize, u32>,
     context_lines: u32,
-) -> anyhow::Result<RenderedDiff> {
+) -> anyhow::Result<DiffPayload> {
     let old_path = file.old_path.as_deref().unwrap_or(&file.path);
 
     let old_spec = match (source, file.status) {
@@ -10564,8 +10835,6 @@ fn compute_diff(
         },
     );
 
-    // Syntax-highlight each side's full text once (tree-sitter needs whole-file
-    // context), then attach per-line runs while assembling rows.
     let old_text = old_bytes
         .as_deref()
         .map(|b| String::from_utf8_lossy(b).into_owned())
@@ -10574,12 +10843,14 @@ fn compute_diff(
         .as_deref()
         .map(|b| String::from_utf8_lossy(b).into_owned())
         .unwrap_or_default();
-    let old_runs = highlight::highlight_file(&old_text, old_path, &hl.theme);
-    let new_runs = highlight::highlight_file(&new_text, &file.path, &hl.theme);
 
-    Ok(build_rows(
-        &diff, &old_runs, &new_runs, hl, &new_text, expand,
-    ))
+    Ok(DiffPayload {
+        diff,
+        old_text,
+        new_text,
+        old_path: old_path.to_owned(),
+        new_path: file.path.clone(),
+    })
 }
 
 /// A diff line with its display text and merged style runs computed once,
@@ -10685,6 +10956,7 @@ fn build_rows(
     hl: &HighlightInputs,
     new_text: &str,
     expand: &HashMap<usize, u32>,
+    syntax_pending: bool,
 ) -> RenderedDiff {
     let mut unified = Vec::new();
     let mut split = Vec::new();
@@ -10704,6 +10976,7 @@ fn build_rows(
             added: 0,
             removed: 0,
             is_binary: true,
+            syntax_pending: false,
         };
     }
     if diff.hunks.is_empty() {
@@ -10718,6 +10991,7 @@ fn build_rows(
             added: 0,
             removed: 0,
             is_binary: false,
+            syntax_pending: false,
         };
     }
 
@@ -10937,6 +11211,7 @@ fn build_rows(
         added: added_count,
         removed: removed_count,
         is_binary: false,
+        syntax_pending,
     }
 }
 
@@ -11409,6 +11684,144 @@ mod tests {
     fn gap_revealed_lines_empty_gap_is_always_fully_revealed() {
         assert_eq!(gap_revealed_lines(0, 0), 0);
         assert_eq!(gap_revealed_lines(5, 0), 0);
+    }
+
+    /// The two-stage highlight pipeline's core invariant: rows built with
+    /// EMPTY syntax runs (stage 1's fast first paint) and rows built with
+    /// real per-line runs (stage 2's recolor) must be structurally
+    /// identical — same row counts, kinds, line numbers, TEXT, hunk
+    /// anchors, and diffstat tallies — so the stage-2 swap is a pure
+    /// recolor with zero layout shift. Only the style runs may differ.
+    #[test]
+    fn stage_two_recolor_changes_only_style_runs() {
+        use gpui_component::highlighter::HighlightTheme;
+
+        let old_text = "fn a() {\n    let x = 1;\n}\nfn keep() {}\n";
+        let new_text = "fn a() {\n    let x = 2;\n    let y = 3;\n}\nfn keep() {}\n";
+        let payload = super::DiffPayload {
+            diff: dv_core::diff::diff_blobs(
+                Some(old_text.as_bytes()),
+                Some(new_text.as_bytes()),
+                &dv_core::diff::DiffOptions::default(),
+            ),
+            old_text: old_text.to_owned(),
+            new_text: new_text.to_owned(),
+            old_path: "a.rs".into(),
+            new_path: "a.rs".into(),
+        };
+        assert!(super::payload_wants_highlight(&payload));
+
+        let theme = HighlightTheme::default_dark();
+        let neutral = gpui::Hsla {
+            h: 0.0,
+            s: 0.0,
+            l: 0.5,
+            a: 0.3,
+        };
+        let hl = super::HighlightInputs {
+            theme: theme.clone(),
+            intra_added: neutral,
+            intra_removed: neutral,
+            base_bg: gpui::Hsla {
+                h: 0.0,
+                s: 0.0,
+                l: 0.0,
+                a: 1.0,
+            },
+            intra_fg_fallback: gpui::Hsla {
+                h: 0.0,
+                s: 0.0,
+                l: 1.0,
+                a: 1.0,
+            },
+        };
+        let expand = std::collections::HashMap::new();
+
+        let empty = crate::highlight::LineRuns::new();
+        let plain = super::render_payload(&payload, &empty, &empty, &hl, &expand, true);
+        let old_runs = crate::highlight::highlight_file(&payload.old_text, "a.rs", &theme);
+        let new_runs = crate::highlight::highlight_file(&payload.new_text, "a.rs", &theme);
+        // Sanity: the recolor actually has runs to apply, or this test
+        // proves nothing.
+        assert!(!new_runs.is_empty());
+        let colored = super::render_payload(&payload, &old_runs, &new_runs, &hl, &expand, false);
+
+        assert!(plain.syntax_pending);
+        assert!(!colored.syntax_pending);
+        assert_eq!(plain.unified.len(), colored.unified.len());
+        assert_eq!(plain.split.len(), colored.split.len());
+        assert_eq!(plain.hunk_rows_unified, colored.hunk_rows_unified);
+        assert_eq!(plain.hunk_rows_split, colored.hunk_rows_split);
+        assert_eq!(plain.added, colored.added);
+        assert_eq!(plain.removed, colored.removed);
+        let mut saw_run_difference = false;
+        for (p, c) in plain.unified.iter().zip(colored.unified.iter()) {
+            match (p, c) {
+                (
+                    super::Row::Line {
+                        kind: pk,
+                        old_line: po,
+                        new_line: pn,
+                        text: pt,
+                        runs: pr,
+                    },
+                    super::Row::Line {
+                        kind: ck,
+                        old_line: co,
+                        new_line: cn,
+                        text: ct,
+                        runs: cr,
+                    },
+                ) => {
+                    assert_eq!(pk, ck);
+                    assert_eq!(po, co);
+                    assert_eq!(pn, cn);
+                    assert_eq!(pt, ct, "text must be byte-identical across stages");
+                    if pr.len() != cr.len() {
+                        saw_run_difference = true;
+                    }
+                }
+                (
+                    super::Row::HunkHeader { label: pl, .. },
+                    super::Row::HunkHeader { label: cl, .. },
+                ) => assert_eq!(pl, cl),
+                _ => panic!("row variant mismatch between stages"),
+            }
+        }
+        assert!(saw_run_difference, "recolor should attach syntax runs");
+    }
+
+    #[test]
+    fn payload_wants_highlight_skips_unknown_language_and_binary() {
+        let mk = |path: &str, old: &[u8], new: &[u8]| super::DiffPayload {
+            diff: dv_core::diff::diff_blobs(
+                Some(old),
+                Some(new),
+                &dv_core::diff::DiffOptions::default(),
+            ),
+            old_text: String::from_utf8_lossy(old).into_owned(),
+            new_text: String::from_utf8_lossy(new).into_owned(),
+            old_path: path.to_owned(),
+            new_path: path.to_owned(),
+        };
+        // Unknown extension: nothing to colorize, stage-1 rows are final.
+        assert!(!super::payload_wants_highlight(&mk(
+            "notes.xyz",
+            b"a\n",
+            b"b\n"
+        )));
+        // Binary: placeholder row only.
+        assert!(!super::payload_wants_highlight(&mk(
+            "blob.rs",
+            b"\x00binary\n",
+            b"\x00binary2\n"
+        )));
+        // Known language with hunks: highlight pass expected.
+        assert!(super::payload_wants_highlight(&mk(
+            "a.rs",
+            b"fn a() {}\n",
+            b"fn b() {}\n"
+        )));
     }
 
     fn line(kind: LineKind, old: Option<u32>, new: Option<u32>) -> PreparedLine {

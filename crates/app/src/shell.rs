@@ -43,6 +43,7 @@ actions!(
     [
         NewReview,
         RefreshBadges,
+        ToggleSidebar,
         OpenThemePicker,
         ThemePickerNext,
         ThemePickerPrev,
@@ -675,6 +676,10 @@ pub fn init(cx: &mut App) {
         KeyBinding::new("ctrl-shift-t", OpenThemePicker, shell),
         KeyBinding::new("cmd-,", OpenSettings, shell),
         KeyBinding::new("ctrl-,", OpenSettings, shell),
+        // Sidebar hide/show (R2) — the editor-world
+        // ctrl-b convention; cmd- twin per the S8i macOS pairing above.
+        KeyBinding::new("cmd-b", ToggleSidebar, shell),
+        KeyBinding::new("ctrl-b", ToggleSidebar, shell),
     ]);
     cx.bind_keys([
         KeyBinding::new("down", ThemePickerNext, theme_picker),
@@ -2661,6 +2666,7 @@ impl AppShell {
                 // `Workspace::automation_state`, since it's per-workspace
                 // render state, not a shell-level layout knob.
                 "sidebar_width": self.settings.sidebar_width,
+                "sidebar_visible": self.settings.sidebar_visible,
                 "summary_width": self.settings.summary_width,
                 // Sidebar grouping/filtering (deliverables 3/4).
                 "sidebar_grouping": grouping_word(self.settings.sidebar_grouping),
@@ -2872,6 +2878,12 @@ impl AppShell {
                     .ok_or_else(|| anyhow::anyhow!("summary_width must be a number"))?
                     as f32;
                 self.set_summary_width(width, cx);
+            }
+            "sidebar_visible" => {
+                let visible = value
+                    .as_bool()
+                    .ok_or_else(|| anyhow::anyhow!("sidebar_visible must be a bool"))?;
+                self.set_sidebar_visible(visible, cx);
             }
             "sidebar_grouping" => {
                 let requested = value
@@ -3574,6 +3586,28 @@ impl AppShell {
     fn set_sidebar_width(&mut self, width: f32, cx: &mut Context<Self>) {
         self.settings.sidebar_width = width.clamp(SIDEBAR_WIDTH_MIN, SIDEBAR_WIDTH_MAX);
         self.settings.save();
+        cx.notify();
+    }
+
+    fn on_toggle_sidebar(&mut self, _: &ToggleSidebar, _: &mut Window, cx: &mut Context<Self>) {
+        let visible = !self.settings.sidebar_visible;
+        self.set_sidebar_visible(visible, cx);
+    }
+
+    /// Sidebar hide/show (ctrl-b, R2). Hidden means
+    /// *omitted from the tree* — not width-0 — so `uniform_list` isn't
+    /// asked to lay out into a zero box and the drag handle can't resurrect
+    /// a "hidden" sidebar by widening it. Also closes the filter popover:
+    /// it's an overlay anchored to a sidebar button that no longer exists.
+    fn set_sidebar_visible(&mut self, visible: bool, cx: &mut Context<Self>) {
+        if self.settings.sidebar_visible == visible {
+            return;
+        }
+        self.settings.sidebar_visible = visible;
+        self.settings.save();
+        if !visible {
+            self.close_filter_popover(cx);
+        }
         cx.notify();
     }
 
@@ -4883,6 +4917,7 @@ impl AppShell {
             .child(hint(&["r"], "review"))
             .child(hint(&["f"], "jump"))
             .child(hint(&["ctrl-g"], "PRs"))
+            .child(hint(&["ctrl-b"], "sidebar"))
             .child(hint(&["ctrl-,"], "settings"))
             .child(hint(&["ctrl-shift-t"], "theme"))
             .child(hint(&["escape"], "close"))
@@ -4916,6 +4951,12 @@ impl Render for AppShell {
         // what a script asserts is exactly what's on screen.
         let sidebar_items = self.visible_sidebar_items();
         let sidebar_items_len = sidebar_items.len();
+        // Copy colors hoisted out of `theme` for the sidebar's `when`
+        // closure below (it needs `cx` uniquely, so it can't also hold
+        // `theme`'s shared borrow of `cx`).
+        let sidebar_seam = theme.muted;
+        let sidebar_bg = theme.sidebar;
+        let sidebar_label_fg = theme.muted_foreground;
 
         let active_title = self
             .selected_review_id
@@ -4965,6 +5006,7 @@ impl Render for AppShell {
             .key_context(key_context.as_str())
             .on_action(cx.listener(Self::on_new_review))
             .on_action(cx.listener(Self::on_refresh_badges))
+            .on_action(cx.listener(Self::on_toggle_sidebar))
             .on_action(cx.listener(Self::on_open_theme_picker))
             .on_action(cx.listener(Self::on_theme_picker_next))
             .on_action(cx.listener(Self::on_theme_picker_prev))
@@ -4993,132 +5035,150 @@ impl Render for AppShell {
                     .flex_1()
                     .min_h(px(0.))
                     .items_start()
-                    // Sidebar: the review navigator.
-                    .child(
-                        v_flex()
-                            .h_full()
-                            .w(px(self.settings.sidebar_width))
-                            .flex_none()
-                            .relative()
-                            .border_r_1()
-                            // muted, not `border`: Aura Dark defines
-                            // `border` as #000000 (a called-out
-                            // trap) — the divider should read as a soft
-                            // lightened seam.
-                            .border_color(theme.muted)
-                            .bg(theme.sidebar)
-                            .child(
-                                div().p_2().w_full().child(
-                                    // Quiet chrome (per the
-                                    // Sidebar's density pass, R1e): an
-                                    // outlined `primary` rather than a
-                                    // solid-filled one — still the row's
-                                    // most prominent control, but no longer
-                                    // a heavy block sitting above the dense,
-                                    // low-contrast card list below it.
-                                    Button::new("new-review")
-                                        .primary()
-                                        .outline()
-                                        .small()
-                                        .w_full()
-                                        .label("New Review")
-                                        .on_click(cx.listener(|this, _, window, cx| {
-                                            this.on_new_review(&NewReview, window, cx)
-                                        })),
-                                ),
-                            )
-                            .child(
-                                h_flex()
-                                    .px_2()
-                                    .py_1()
-                                    .gap_1()
-                                    .items_center()
-                                    .child(
-                                        div()
-                                            .flex_1()
-                                            .text_xs()
-                                            .text_color(theme.muted_foreground)
-                                            .child("REVIEWS"),
-                                    )
-                                    .child(
-                                        // Manual reopen of the onboarding page
-                                        // (S8e) — the only other entry point
-                                        // besides true first run / an
-                                        // auto-surfaced drift page /
-                                        // `--automation`'s `OpenOnboarding`
-                                        // action (`Self::on_open_onboarding`).
-                                        Button::new("open-onboarding")
-                                            .ghost()
-                                            .xsmall()
-                                            .label("Setup")
+                    // Sidebar: the review navigator. Omitted from the tree
+                    // entirely while hidden (ctrl-b) — not width-0; see
+                    // `Self::set_sidebar_visible`. The `when` closure needs
+                    // unique access to `cx` (the render_sidebar_* helpers),
+                    // so it uses the hoisted Copy colors above rather than
+                    // capturing `theme`'s shared borrow of the same `cx`.
+                    .when(self.settings.sidebar_visible, |el| {
+                        el.child(
+                            v_flex()
+                                .h_full()
+                                .w(px(self.settings.sidebar_width))
+                                .flex_none()
+                                .relative()
+                                .border_r_1()
+                                // muted, not `border`: Aura Dark defines
+                                // `border` as #000000 (a called-out
+                                // trap) — the divider should read as a soft
+                                // lightened seam.
+                                .border_color(sidebar_seam)
+                                .bg(sidebar_bg)
+                                .child(
+                                    div().p_2().w_full().child(
+                                        // Quiet chrome (the sidebar
+                                        // density pass, R1e): an
+                                        // outlined `primary` rather than a
+                                        // solid-filled one — still the row's
+                                        // most prominent control, but no longer
+                                        // a heavy block sitting above the dense,
+                                        // low-contrast card list below it.
+                                        Button::new("new-review")
+                                            .primary()
+                                            .outline()
+                                            .small()
+                                            .w_full()
+                                            .label("New Review")
                                             .on_click(cx.listener(|this, _, window, cx| {
-                                                this.on_open_onboarding(&OpenOnboarding, window, cx)
+                                                this.on_new_review(&NewReview, window, cx)
                                             })),
-                                    )
-                                    .child(
-                                        // Manual badge refresh (docs/phase-3-github.md
-                                        // deliverable 3) — same `refresh_all_badges`
-                                        // the app-open pass uses, but never
-                                        // WSL-skipped, since this is an explicit ask.
-                                        Button::new("refresh-badges")
-                                            .ghost()
-                                            .xsmall()
-                                            .label("\u{27f3}")
-                                            .on_click(cx.listener(|this, _, window, cx| {
-                                                this.on_refresh_badges(&RefreshBadges, window, cx)
-                                            })),
-                                    ),
-                            )
-                            // Grouping/filtering control row (docs/phase-6-
-                            // review-navigator.md deliverables 3/4) — mouse-
-                            // only throughout (cross-cutting risk E).
-                            .child(
-                                h_flex()
-                                    .px_2()
-                                    .pb_1()
-                                    .gap_1()
-                                    .items_center()
-                                    .child(self.render_sidebar_grouping_control(cx))
-                                    .child(div().flex_1())
-                                    .child(self.render_sidebar_filter_button(cx)),
-                            )
-                            .child(
-                                uniform_list(
-                                    "review-list",
-                                    sidebar_items_len,
-                                    cx.processor(
-                                        move |this, range: std::ops::Range<usize>, _, cx| {
-                                            range
-                                                .map(|i| match &sidebar_items[i] {
-                                                    SidebarItem::Header { key, label } => this
-                                                        .render_sidebar_header(
-                                                            key.clone(),
-                                                            label.clone(),
-                                                            cx,
-                                                        )
-                                                        .into_any_element(),
-                                                    SidebarItem::Review(idx) => {
-                                                        let entry = &this.index.entries()[*idx];
-                                                        let selected =
-                                                            this.selected_review_id.as_deref()
-                                                                == Some(entry.review_id.as_str());
-                                                        this.render_review_card(entry, selected, cx)
-                                                            .into_any_element()
-                                                    }
-                                                })
-                                                .collect::<Vec<_>>()
-                                        },
                                     ),
                                 )
-                                .flex_1()
-                                // px_2, not px_1: carries the side inset the
-                                // card itself cannot (root-node margins are
-                                // inert in uniform_list — see
-                                // render_review_card).
-                                .px_2(),
-                            )
-                            .child(self.render_sidebar_resize_handle(cx)),
-                    )
+                                .child(
+                                    h_flex()
+                                        .px_2()
+                                        .py_1()
+                                        .gap_1()
+                                        .items_center()
+                                        .child(
+                                            div()
+                                                .flex_1()
+                                                .text_xs()
+                                                .text_color(sidebar_label_fg)
+                                                .child("REVIEWS"),
+                                        )
+                                        .child(
+                                            // Manual reopen of the onboarding page
+                                            // (S8e) — the only other entry point
+                                            // besides true first run / an
+                                            // auto-surfaced drift page /
+                                            // `--automation`'s `OpenOnboarding`
+                                            // action (`Self::on_open_onboarding`).
+                                            Button::new("open-onboarding")
+                                                .ghost()
+                                                .xsmall()
+                                                .label("Setup")
+                                                .on_click(cx.listener(|this, _, window, cx| {
+                                                    this.on_open_onboarding(
+                                                        &OpenOnboarding,
+                                                        window,
+                                                        cx,
+                                                    )
+                                                })),
+                                        )
+                                        .child(
+                                            // Manual badge refresh (docs/phase-3-github.md
+                                            // deliverable 3) — same `refresh_all_badges`
+                                            // the app-open pass uses, but never
+                                            // WSL-skipped, since this is an explicit ask.
+                                            Button::new("refresh-badges")
+                                                .ghost()
+                                                .xsmall()
+                                                .label("\u{27f3}")
+                                                .on_click(cx.listener(|this, _, window, cx| {
+                                                    this.on_refresh_badges(
+                                                        &RefreshBadges,
+                                                        window,
+                                                        cx,
+                                                    )
+                                                })),
+                                        ),
+                                )
+                                // Grouping/filtering control row (docs/phase-6-
+                                // review-navigator.md deliverables 3/4) — mouse-
+                                // only throughout (cross-cutting risk E).
+                                .child(
+                                    h_flex()
+                                        .px_2()
+                                        .pb_1()
+                                        .gap_1()
+                                        .items_center()
+                                        .child(self.render_sidebar_grouping_control(cx))
+                                        .child(div().flex_1())
+                                        .child(self.render_sidebar_filter_button(cx)),
+                                )
+                                .child(
+                                    uniform_list(
+                                        "review-list",
+                                        sidebar_items_len,
+                                        cx.processor(
+                                            move |this, range: std::ops::Range<usize>, _, cx| {
+                                                range
+                                                    .map(|i| match &sidebar_items[i] {
+                                                        SidebarItem::Header { key, label } => this
+                                                            .render_sidebar_header(
+                                                                key.clone(),
+                                                                label.clone(),
+                                                                cx,
+                                                            )
+                                                            .into_any_element(),
+                                                        SidebarItem::Review(idx) => {
+                                                            let entry = &this.index.entries()[*idx];
+                                                            let selected = this
+                                                                .selected_review_id
+                                                                .as_deref()
+                                                                == Some(entry.review_id.as_str());
+                                                            this.render_review_card(
+                                                                entry, selected, cx,
+                                                            )
+                                                            .into_any_element()
+                                                        }
+                                                    })
+                                                    .collect::<Vec<_>>()
+                                            },
+                                        ),
+                                    )
+                                    .flex_1()
+                                    // px_2, not px_1: carries the side inset the
+                                    // card itself cannot (root-node margins are
+                                    // inert in uniform_list — see
+                                    // render_review_card).
+                                    .px_2(),
+                                )
+                                .child(self.render_sidebar_resize_handle(cx)),
+                        )
+                    })
                     .child(
                         div()
                             .h_full()

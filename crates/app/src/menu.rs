@@ -22,7 +22,7 @@
 use gpui::{App, Menu, MenuItem, actions};
 use gpui_component::WindowExt as _;
 
-use crate::shell::{NewReview, OpenSettings, OpenThemePicker};
+use crate::shell::{NewReview, OpenSettings, OpenThemePicker, ToggleSidebar};
 use crate::workspace::{JumpToFile, OpenPrPicker};
 
 actions!(menu, [About, Quit]);
@@ -123,7 +123,11 @@ pub fn app_menus() -> Vec<Menu> {
             MenuItem::separator(),
             MenuItem::action("Select All", gpui_component::input::SelectAll),
         ]),
-        Menu::new("View").items(vec![MenuItem::action("Theme...", OpenThemePicker)]),
+        Menu::new("View").items(vec![
+            MenuItem::action("Toggle Sidebar", ToggleSidebar),
+            MenuItem::separator(),
+            MenuItem::action("Theme...", OpenThemePicker),
+        ]),
         Menu::new("Go").items(vec![
             MenuItem::action("Jump to File", JumpToFile),
             MenuItem::action("Open PR...", OpenPrPicker),

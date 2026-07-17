@@ -218,6 +218,13 @@ pub struct Settings {
     /// Clamped to `SIDEBAR_WIDTH_MIN..=SIDEBAR_WIDTH_MAX`, same re-clamp
     /// posture as `mono_font_size`/`context_lines` (see [`Settings::load`]).
     pub sidebar_width: f32,
+    /// Whether the review-navigator sidebar is shown at all — ctrl-b
+    /// toggles it (R2). Field-level
+    /// `default_true`, not a bare `#[serde(default)]`: a settings.json
+    /// predating this field must keep its sidebar visible, the same
+    /// serde-bool footgun `SidebarFilters` documents at length.
+    #[serde(default = "default_true")]
+    pub sidebar_visible: bool,
     /// Review-summary panel width, in px — `workspace.rs`'s drag handle on
     /// its inner (left) edge. Clamped to
     /// `SUMMARY_WIDTH_MIN..=SUMMARY_WIDTH_MAX`.
@@ -242,6 +249,7 @@ impl Default for Settings {
             context_lines: DEFAULT_CONTEXT_LINES,
             view_mode_default: ViewModeSetting::Unified,
             sidebar_width: DEFAULT_SIDEBAR_WIDTH,
+            sidebar_visible: true,
             summary_width: DEFAULT_SUMMARY_WIDTH,
             sidebar_grouping: SidebarGrouping::None,
             sidebar_filters: SidebarFilters::default(),
@@ -341,6 +349,7 @@ mod tests {
         assert_eq!(s.context_lines, 3);
         assert_eq!(s.view_mode_default, ViewModeSetting::Unified);
         assert_eq!(s.sidebar_width, 280.0);
+        assert!(s.sidebar_visible);
         assert_eq!(s.summary_width, 320.0);
         assert_eq!(s.sidebar_grouping, SidebarGrouping::None);
         assert_eq!(s.sidebar_filters, SidebarFilters::default());
@@ -374,6 +383,9 @@ mod tests {
             context_lines: 5,
             view_mode_default: ViewModeSetting::Split,
             sidebar_width: 340.0,
+            // false, the non-default value — a round-trip that only ever
+            // carries the default can't catch a missing Serialize field.
+            sidebar_visible: false,
             summary_width: 400.0,
             sidebar_grouping: SidebarGrouping::Pr,
             sidebar_filters: SidebarFilters {
@@ -417,6 +429,10 @@ mod tests {
         assert_eq!(parsed.context_lines, Settings::default().context_lines);
         assert_eq!(parsed.view_mode_default, ViewModeSetting::Unified);
         assert_eq!(parsed.sidebar_width, DEFAULT_SIDEBAR_WIDTH);
+        assert!(
+            parsed.sidebar_visible,
+            "a settings.json predating sidebar_visible must not hide the sidebar"
+        );
         assert_eq!(parsed.summary_width, DEFAULT_SUMMARY_WIDTH);
         assert_eq!(parsed.sidebar_grouping, SidebarGrouping::None);
         assert_eq!(parsed.sidebar_filters, SidebarFilters::default());

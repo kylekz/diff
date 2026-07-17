@@ -49,7 +49,7 @@ impl StoreIo {
                 read_file_at(&path)
             }
             RepoLocation::Wsl { path: root, .. } => {
-                if let Some(result) = self.try_host_fs(|client| client.fs_read(root, rel)) {
+                if let Some(result) = self.try_host_fs("fs", |client| client.fs_read(root, rel)) {
                     return result;
                 }
                 let full = self.wsl_path(rel)?;
@@ -123,7 +123,7 @@ impl StoreIo {
             }
             RepoLocation::Wsl { path: root, .. } => {
                 if let Some(result) =
-                    self.try_host_fs(|client| client.fs_write_atomic(root, rel, bytes))
+                    self.try_host_fs("fs", |client| client.fs_write_atomic(root, rel, bytes))
                 {
                     return result;
                 }
@@ -157,7 +157,8 @@ impl StoreIo {
                 list_dir_names(&path)
             }
             RepoLocation::Wsl { path: root, .. } => {
-                if let Some(result) = self.try_host_fs(|client| client.fs_list(root, rel_dir)) {
+                if let Some(result) = self.try_host_fs("fs", |client| client.fs_list(root, rel_dir))
+                {
                     return result;
                 }
                 let full = self.wsl_path(rel_dir)?;
@@ -179,13 +180,61 @@ impl StoreIo {
                 remove_file_at(&path)
             }
             RepoLocation::Wsl { path: root, .. } => {
-                if let Some(result) = self.try_host_fs(|client| client.fs_remove(root, rel)) {
+                if let Some(result) = self.try_host_fs("fs", |client| client.fs_remove(root, rel)) {
                     return result;
                 }
                 let full = self.wsl_path(rel)?;
                 // `rm -f` already treats a missing target as success.
                 self.builder.run("rm", &["-f", "--", &full])?;
                 Ok(())
+            }
+        }
+    }
+
+    /// Atomically create `rel` with `bytes` ONLY IF it doesn't already
+    /// exist — `Ok(true)` when this call actually created it, `Ok(false)`
+    /// (not an error) when something is already there. The primitive
+    /// [`super::lock`] builds mutual exclusion on top of: unlike
+    /// [`Self::write_atomic`] (tmp-file-then-rename, which always
+    /// succeeds by *replacing* whatever's there), this is a real
+    /// create-if-absent — `O_CREAT|O_EXCL` locally (`create_new`, atomic
+    /// on both Windows and Linux), a POSIX `noclobber` redirect for the
+    /// WSL shell fallback (equally atomic — `set -C` uses the same
+    /// `O_EXCL` open under the hood), and a dedicated `fs/create_exclusive`
+    /// RPC gated on the `fs_lock` capability for a live host connection —
+    /// gated SEPARATELY from the general `fs` cap so an already-installed
+    /// older host (which answers `fs/read`|`fs/write_atomic`|`fs/list`|
+    /// `fs/remove` but predates this method) falls back to the shell arm
+    /// instead of getting a `bad_request` for a method it's never heard of.
+    pub(crate) fn create_exclusive(&self, rel: &str, bytes: &[u8]) -> Result<bool> {
+        match &self.location {
+            RepoLocation::Local(_) => {
+                let path = self.local_path(rel)?;
+                create_exclusive_at(&path, bytes)
+            }
+            RepoLocation::Wsl { path: root, .. } => {
+                if let Some(result) = self.try_host_fs("fs_lock", |client| {
+                    client.fs_create_exclusive(root, rel, bytes)
+                }) {
+                    return result;
+                }
+                let full = self.wsl_path(rel)?;
+                let dir = posix_parent(&full);
+                // `set -C` (noclobber) makes the `>` redirect fail (via
+                // `O_EXCL` under the hood) if `full` already exists — the
+                // shell-only equivalent of `create_new`. Content is small
+                // (a `<pid>:<created_ms>` lock payload — see `lock.rs`) and
+                // under our control, so it's piped through stdin rather than
+                // interpolated into the script, same as `write_atomic`'s
+                // `cat > tmp` above.
+                let script = format!(
+                    "mkdir -p '{}' && if ( set -C; cat > '{}' ) 2>/dev/null; then echo CREATED; \
+                     else echo EXISTS; fi",
+                    sh_escape(&dir),
+                    sh_escape(&full),
+                );
+                let out = self.builder.run_with_stdin("sh", &["-c", &script], bytes)?;
+                Ok(crate::command::decode_output(&out).trim_end() == "CREATED")
             }
         }
     }
@@ -213,13 +262,20 @@ impl StoreIo {
         Ok(format!("{}/{rel}", git_dir.trim_end_matches('/')))
     }
 
-    /// Attempt `op` against a live, `fs`-capable `dv-host` connection for
-    /// this builder's route. `None` means "no such connection exists (no
-    /// host, or the host doesn't advertise `fs`, or the channel just died)"
+    /// Attempt `op` against a live `dv-host` connection advertising `cap`
+    /// for this builder's route. `None` means "no such connection exists (no
+    /// host, or the host doesn't advertise `cap`, or the channel just died)"
     /// — the caller must fall back to the `sh -c`/`cat`/`ls`/`rm` arm below,
     /// exactly as if S5 had never shipped. `Some(result)` means the host
     /// actually answered (successfully or not) — that result is FINAL and
     /// must be returned as-is, never silently retried.
+    ///
+    /// `cap` is checked separately from a blanket `"fs"` so a NEW method
+    /// added to the `fs/*` family (`fs/create_exclusive`, gated on
+    /// `"fs_lock"`) can be rolled out without breaking an already-installed
+    /// older host that answers the original four but has never heard of the
+    /// new one — it simply doesn't advertise the new cap, and callers fall
+    /// back to the shell arm exactly as if no host were connected at all.
     ///
     /// Only a [`RequestFailure::is_connection_failure`] (the channel itself
     /// is dead) triggers the fallback — mirrors
@@ -228,18 +284,22 @@ impl StoreIo {
     /// failure is safe here specifically because every `fs/*` op is
     /// idempotent by construction: `read`/`list` are pure reads,
     /// `write_atomic` is tmp-then-rename (redoing it just clobbers the same
-    /// destination with identical bytes a second time), and `remove` is
-    /// already `rm -f`-equivalent (removing an already-removed file is a
-    /// no-op). A `Timeout` or an `Rpc` error is a COMPLETED round trip and
-    /// must surface as-is instead (see [`RequestFailure`]'s doc) — falling
-    /// back on either of those would risk running the op concurrently with
-    /// a still-in-flight original, or masking a real structured failure.
+    /// destination with identical bytes a second time), `remove` is already
+    /// `rm -f`-equivalent (removing an already-removed file is a no-op), and
+    /// `create_exclusive` redone after a lost response degrades to, at
+    /// worst, this caller seeing its OWN just-created lock as "contended"
+    /// and retrying the wait loop once more — never a false success. A
+    /// `Timeout` or an `Rpc` error is a COMPLETED round trip and must
+    /// surface as-is instead (see [`RequestFailure`]'s doc) — falling back
+    /// on either of those would risk running the op concurrently with a
+    /// still-in-flight original, or masking a real structured failure.
     fn try_host_fs<T>(
         &self,
+        cap: &str,
         op: impl FnOnce(&Arc<HostClient>) -> anyhow::Result<T>,
     ) -> Option<Result<T>> {
         let client = self.builder.host_client()?;
-        if !client.has_cap("fs") {
+        if !client.has_cap(cap) {
             return None;
         }
         match op(&client) {
@@ -277,6 +337,50 @@ pub fn read_file_at(path: &Path) -> Result<Option<Vec<u8>>> {
         Ok(bytes) => Ok(Some(bytes)),
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
         Err(err) => Err(err).with_context(|| format!("reading {}", path.display())),
+    }
+}
+
+/// Create `path` with `bytes` ONLY IF it doesn't already exist —
+/// `Ok(true)` when this call actually created it, `Ok(false)` (not an
+/// error) when something is already there. `OpenOptions::create_new` is
+/// `O_CREAT|O_EXCL` on Linux and `CREATE_NEW` on Windows — atomic on both,
+/// so this is the one primitive [`super::lock`]'s mutual exclusion can be
+/// built on top of (unlike [`write_file_atomic_at`], which always
+/// succeeds by replacing whatever's there). Shared by the LOCAL arm here
+/// and `dv-host`'s `fs/create_exclusive` handler — re-exported as
+/// [`crate::review::create_exclusive_at`].
+pub fn create_exclusive_at(path: &Path, bytes: &[u8]) -> Result<bool> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("creating {}", parent.display()))?;
+    }
+    match std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)
+    {
+        Ok(mut file) => {
+            use std::io::Write as _;
+            file.write_all(bytes)
+                .with_context(|| format!("writing {}", path.display()))?;
+            Ok(true)
+        }
+        Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => Ok(false),
+        // Windows-only quirk: NTFS briefly holds a just-removed file in a
+        // "pending delete" state, and a concurrent `CREATE_NEW` racing that
+        // window sees `ERROR_ACCESS_DENIED` (`PermissionDenied`), not
+        // `AlreadyExists` — observed directly under this module's own
+        // hammer test (two threads rapid-fire create/remove-cycling the
+        // exact same lock path). Functionally identical to "something's
+        // there" for a lock file that legitimately churns through fast
+        // create/remove cycles: treat it the same, `Ok(false)`, rather than
+        // surfacing a hard error from what's actually just contention.
+        // `#[cfg(windows)]` because on Linux/dv-host (which calls this same
+        // function — see the doc comment) a real `PermissionDenied` means a
+        // genuine ACL problem and must keep surfacing as an error.
+        #[cfg(windows)]
+        Err(err) if err.kind() == std::io::ErrorKind::PermissionDenied => Ok(false),
+        Err(err) => Err(err).with_context(|| format!("creating {}", path.display())),
     }
 }
 
@@ -536,6 +640,39 @@ mod tests {
         let path = dir.join("r-1.json");
         write_file_atomic_at(&path, b"first").unwrap();
         write_file_atomic_at(&path, b"second").unwrap();
+        assert_eq!(read_file_at(&path).unwrap().unwrap(), b"second");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn create_exclusive_at_creates_when_absent() {
+        let dir = scratch_dir("create-exclusive-fresh");
+        let path = dir.join("nested").join(".lock");
+        assert!(create_exclusive_at(&path, b"owner").unwrap());
+        assert_eq!(read_file_at(&path).unwrap().unwrap(), b"owner");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn create_exclusive_at_refuses_when_present_and_leaves_original_content() {
+        let dir = scratch_dir("create-exclusive-contended");
+        let path = dir.join(".lock");
+        assert!(create_exclusive_at(&path, b"first-owner").unwrap());
+        assert!(
+            !create_exclusive_at(&path, b"second-owner").unwrap(),
+            "must not clobber an existing lock file"
+        );
+        assert_eq!(read_file_at(&path).unwrap().unwrap(), b"first-owner");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn create_exclusive_at_can_recreate_after_removal() {
+        let dir = scratch_dir("create-exclusive-recreate");
+        let path = dir.join(".lock");
+        assert!(create_exclusive_at(&path, b"first").unwrap());
+        remove_file_at(&path).unwrap();
+        assert!(create_exclusive_at(&path, b"second").unwrap());
         assert_eq!(read_file_at(&path).unwrap().unwrap(), b"second");
         let _ = std::fs::remove_dir_all(&dir);
     }

@@ -59,6 +59,18 @@ pub fn remove(root: &str, rel: &str) -> anyhow::Result<()> {
     dv_core::review::remove_file_at(&path)
 }
 
+/// `fs/create_exclusive` (durable-concurrency slice, docs/backlog.md
+/// review-store-locking item): resolve `root`'s gitdir, then create
+/// `<gitdir>/<rel>` with `bytes` ONLY if it doesn't already exist.
+/// `Ok(true)` when this call actually created it, `Ok(false)` (not an
+/// error) when something was already there — mirrors
+/// `dv_core::review::create_exclusive_at`'s contract exactly, since that's
+/// literally what this calls.
+pub fn create_exclusive(root: &str, rel: &str, bytes: &[u8]) -> anyhow::Result<bool> {
+    let path = resolve(root, rel)?;
+    dv_core::review::create_exclusive_at(&path, bytes)
+}
+
 /// Resolve `root` (an absolute in-distro repo root) to its real gitdir and
 /// join `rel` onto it. Shared by all four ops above.
 fn resolve(root: &str, rel: &str) -> anyhow::Result<std::path::PathBuf> {

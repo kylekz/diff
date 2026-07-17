@@ -1643,51 +1643,59 @@ fn load_pr(repo: &GitRepo, number: u64, location: RepoLocation) -> anyhow::Resul
 
     let store = dv_core::ReviewStore::open(location);
     let slug = client.slug().to_string();
-    // Case-insensitive, matching main.rs's `resolve_pr_target` slug
-    // comparison — a host/owner/repo differing only in case is the same
-    // repo on GitHub. Only a Draft review is eligible for adoption here —
-    // see `review_adopts_pr` (review finding P1).
-    let existing = store
-        .list()?
-        .into_iter()
-        .find(|r| review_adopts_pr(r, &slug, number));
-    let review = match existing {
-        Some(review) => review,
-        None => {
-            // Re-list immediately before creating: closes the TOCTOU window
-            // against a concurrent creator (another `dv` process, or a CLI
-            // invocation racing this fetch) that also saw "no existing"
-            // from the list() above and would otherwise dupe the draft.
-            // The GUI itself can no longer race here (open_pr now refuses a
-            // second concurrent open — review finding P2-b), but this is a
-            // cheap belt-and-suspenders check against future regressions
-            // or an out-of-process writer.
-            let recheck = store
-                .list()?
-                .into_iter()
-                .find(|r| review_adopts_pr(r, &slug, number));
-            match recheck {
-                Some(review) => review,
-                None => {
-                    // A fresh draft, linked to the PR from the first click —
-                    // so comments accumulate against it immediately,
-                    // matching how a local review already targets the
-                    // latest draft by default.
-                    let mut review = store.create(source.clone())?;
-                    review.remote = Some(RemoteRef {
-                        provider: "github".to_string(),
-                        slug,
-                        pr: number,
-                        url: meta.url.clone(),
-                        submitted_review_id: None,
-                        submitted_url: None,
-                    });
-                    store.save(&review)?;
-                    review
+    // The whole find-or-create span runs under the store lock
+    // (docs/backlog.md durable-concurrency item) — real mutual exclusion,
+    // not just the re-list-before-creating belt-and-suspenders check below
+    // (kept as-is: harmless extra safety against, say, a lock-less older
+    // build of `dv` still running as the concurrent writer).
+    let review = store.with_lock(|| -> anyhow::Result<_> {
+        // Case-insensitive, matching main.rs's `resolve_pr_target` slug
+        // comparison — a host/owner/repo differing only in case is the same
+        // repo on GitHub. Only a Draft review is eligible for adoption here —
+        // see `review_adopts_pr` (review finding P1).
+        let existing = store
+            .list()?
+            .into_iter()
+            .find(|r| review_adopts_pr(r, &slug, number));
+        let review = match existing {
+            Some(review) => review,
+            None => {
+                // Re-list immediately before creating: closes the TOCTOU window
+                // against a concurrent creator (another `dv` process, or a CLI
+                // invocation racing this fetch) that also saw "no existing"
+                // from the list() above and would otherwise dupe the draft.
+                // The GUI itself can no longer race here (open_pr now refuses a
+                // second concurrent open — review finding P2-b), but this is a
+                // cheap belt-and-suspenders check against future regressions
+                // or an out-of-process writer.
+                let recheck = store
+                    .list()?
+                    .into_iter()
+                    .find(|r| review_adopts_pr(r, &slug, number));
+                match recheck {
+                    Some(review) => review,
+                    None => {
+                        // A fresh draft, linked to the PR from the first click —
+                        // so comments accumulate against it immediately,
+                        // matching how a local review already targets the
+                        // latest draft by default.
+                        let mut review = store.create(source.clone())?;
+                        review.remote = Some(RemoteRef {
+                            provider: "github".to_string(),
+                            slug,
+                            pr: number,
+                            url: meta.url.clone(),
+                            submitted_review_id: None,
+                            submitted_url: None,
+                        });
+                        store.save(&review)?;
+                        review
+                    }
                 }
             }
-        }
-    };
+        };
+        Ok(review)
+    })?;
 
     Ok(PrOpenOutcome {
         meta,
@@ -4816,8 +4824,9 @@ impl Workspace {
     }
 
     /// Finish the draft review with a verdict (recorded locally; Phase 3
-    /// maps this onto GitHub submission). Fresh-loads before mutating like
-    /// every other store write.
+    /// maps this onto GitHub submission). The whole fresh-load-mutate-save
+    /// span runs under the store lock (docs/backlog.md durable-concurrency
+    /// item).
     fn submit_review(&mut self, verdict: dv_core::Verdict, cx: &mut Context<Self>) {
         let Some(review) = self.review.clone() else {
             return;
@@ -4828,19 +4837,21 @@ impl Workspace {
                 .background_executor()
                 .spawn(async move {
                     let store = dv_core::ReviewStore::open(location);
-                    // `?`, not `.ok().flatten()`: a load ERROR is not "file
-                    // missing" (that's `Ok(None)`, where our clone is the
-                    // right fallback) — it's an unreadable or future-schema
-                    // file, and saving our stale clone over it would destroy
-                    // data this build can't even parse. Abort and surface
-                    // instead (docs/backlog.md schema-guard finding).
-                    let mut review = store.load(&review.id)?.unwrap_or(review);
-                    review.set_state(dv_core::ReviewState::Submitted {
-                        verdict,
-                        at_ms: dv_core::review::now_ms(),
-                    });
-                    store.save(&review)?;
-                    anyhow::Ok(review)
+                    store.with_lock(|| {
+                        // `?`, not `.ok().flatten()`: a load ERROR is not "file
+                        // missing" (that's `Ok(None)`, where our clone is the
+                        // right fallback) — it's an unreadable or future-schema
+                        // file, and saving our stale clone over it would destroy
+                        // data this build can't even parse. Abort and surface
+                        // instead (docs/backlog.md schema-guard finding).
+                        let mut review = store.load(&review.id)?.unwrap_or(review);
+                        review.set_state(dv_core::ReviewState::Submitted {
+                            verdict,
+                            at_ms: dv_core::review::now_ms(),
+                        });
+                        store.save(&review)?;
+                        anyhow::Ok(review)
+                    })
                 })
                 .await;
             this.update(cx, |this, cx| {
@@ -5409,84 +5420,108 @@ impl Workspace {
                 .background_executor()
                 .spawn(async move {
                     let store = dv_core::ReviewStore::open(location);
-                    // Never trust the UI's clone: a CLI write can land while
-                    // this task runs (there's a git subprocess below), and
-                    // saving the stale clone would erase it — unrepairable,
-                    // since the watcher's reload then agrees with our write.
-                    // Re-load the freshest state and mutate that.
-                    let mut review = match &existing {
-                        Some(known) => {
-                            let fresh = store
-                                .load(&known.id)
-                                .ok()
-                                .flatten()
-                                .unwrap_or_else(|| known.clone());
-                            if matches!(fresh.state, dv_core::ReviewState::Submitted { .. }) {
-                                // The active review has already been
-                                // submitted — to GitHub, or finished
-                                // locally via `submit_review` — so
-                                // appending here would strand the
-                                // comment where the verdict bar hides it
-                                // and the CLI refuses to touch it
-                                // (review finding P1, mutation-guard
-                                // half). Prefer an EXISTING draft for
-                                // the same PR before creating one (P3:
-                                // with an older matching draft + a newer
-                                // matching submitted review on disk, the
-                                // unconditional create spawned a THIRD
-                                // review here); else start a fresh
-                                // draft, carrying over the PR linkage
-                                // (minus the submission ids) — what
-                                // `submit_review`'s doc comment already
-                                // promises ("the next comment
-                                // auto-creates a fresh draft").
-                                let existing = fresh.remote.as_ref().and_then(|remote| {
-                                    store.list().unwrap_or_default().into_iter().find(|r| {
-                                        matches!(r.state, dv_core::ReviewState::Draft)
-                                            && r.remote.as_ref().is_some_and(|rr| {
-                                                rr.pr == remote.pr
-                                                    && rr.slug.eq_ignore_ascii_case(&remote.slug)
-                                            })
-                                    })
-                                });
-                                match existing {
-                                    Some(draft) => draft,
-                                    None => {
-                                        let mut draft = store.create(source.clone())?;
-                                        if let Some(remote) = &fresh.remote {
-                                            draft.remote = Some(dv_core::RemoteRef {
-                                                submitted_review_id: None,
-                                                submitted_url: None,
-                                                ..remote.clone()
-                                            });
-                                            store.save(&draft)?;
+                    // Two short, separately-locked spans (docs/backlog.md
+                    // durable-concurrency item) rather than one long one:
+                    // resolving the target review is pure store I/O
+                    // (locked — a CLI write racing this can no longer
+                    // interleave and get silently clobbered, or clobber
+                    // this in turn), but `blob_sha` below shells out to
+                    // `git`, and holding the lock across a subprocess spawn
+                    // would turn every OTHER writer's bounded acquire wait
+                    // into a lottery against however long `git` takes right
+                    // now. The final span fresh-loads again before saving —
+                    // same "never trust an unlocked-window-old copy"
+                    // convention as everywhere else here.
+                    let target = store.with_lock(|| {
+                        // Never trust the UI's clone: a CLI write can land
+                        // while this task runs, and saving the stale clone
+                        // would erase it — unrepairable, since the
+                        // watcher's reload then agrees with our write.
+                        // Re-load the freshest state and mutate that.
+                        let review = match &existing {
+                            Some(known) => {
+                                let fresh = store
+                                    .load(&known.id)
+                                    .ok()
+                                    .flatten()
+                                    .unwrap_or_else(|| known.clone());
+                                if matches!(fresh.state, dv_core::ReviewState::Submitted { .. }) {
+                                    // The active review has already been
+                                    // submitted — to GitHub, or finished
+                                    // locally via `submit_review` — so
+                                    // appending here would strand the
+                                    // comment where the verdict bar hides it
+                                    // and the CLI refuses to touch it
+                                    // (review finding P1, mutation-guard
+                                    // half). Prefer an EXISTING draft for
+                                    // the same PR before creating one (P3:
+                                    // with an older matching draft + a newer
+                                    // matching submitted review on disk, the
+                                    // unconditional create spawned a THIRD
+                                    // review here); else start a fresh
+                                    // draft, carrying over the PR linkage
+                                    // (minus the submission ids) — what
+                                    // `submit_review`'s doc comment already
+                                    // promises ("the next comment
+                                    // auto-creates a fresh draft").
+                                    let existing = fresh.remote.as_ref().and_then(|remote| {
+                                        store.list().unwrap_or_default().into_iter().find(|r| {
+                                            matches!(r.state, dv_core::ReviewState::Draft)
+                                                && r.remote.as_ref().is_some_and(|rr| {
+                                                    rr.pr == remote.pr
+                                                        && rr
+                                                            .slug
+                                                            .eq_ignore_ascii_case(&remote.slug)
+                                                })
+                                        })
+                                    });
+                                    match existing {
+                                        Some(draft) => draft,
+                                        None => {
+                                            let mut draft = store.create(source.clone())?;
+                                            if let Some(remote) = &fresh.remote {
+                                                draft.remote = Some(dv_core::RemoteRef {
+                                                    submitted_review_id: None,
+                                                    submitted_url: None,
+                                                    ..remote.clone()
+                                                });
+                                                store.save(&draft)?;
+                                            }
+                                            draft
                                         }
-                                        draft
                                     }
+                                } else {
+                                    fresh
                                 }
-                            } else {
-                                fresh
                             }
-                        }
-                        None => match store
-                            .list()
-                            .unwrap_or_default()
-                            .into_iter()
-                            .find(|r| matches!(r.state, dv_core::ReviewState::Draft))
-                        {
-                            Some(fresh) => fresh,
-                            None => store.create(source.clone())?,
-                        },
-                    };
+                            None => match store
+                                .list()
+                                .unwrap_or_default()
+                                .into_iter()
+                                .find(|r| matches!(r.state, dv_core::ReviewState::Draft))
+                            {
+                                Some(fresh) => fresh,
+                                None => store.create(source.clone())?,
+                            },
+                        };
+                        anyhow::Ok(review)
+                    })?;
+
                     // Anchor against the review's own source — it may have
                     // been created by the CLI over a different one.
                     let sha = repo
-                        .blob_sha(&dv_core::anchor_spec(&review.source, side, &anchor_path))
+                        .blob_sha(&dv_core::anchor_spec(&target.source, side, &anchor_path))
                         .ok()
                         .flatten();
-                    review.add_comment(path, side, start, end, sha, body, author)?;
-                    store.save(&review)?;
-                    anyhow::Ok(review)
+
+                    store.with_lock(|| {
+                        let mut review = store.load(&target.id)?.ok_or_else(|| {
+                            anyhow::anyhow!("review {} disappeared mid-add", target.id)
+                        })?;
+                        review.add_comment(path, side, start, end, sha, body, author)?;
+                        store.save(&review)?;
+                        anyhow::Ok(review)
+                    })
                 })
                 .await;
 
@@ -5543,22 +5578,26 @@ impl Workspace {
                 .background_executor()
                 .spawn(async move {
                     let store = dv_core::ReviewStore::open(location);
-                    // Fresh-load before mutating (see submit_comment).
-                    // `?`, not `.ok().flatten()`: a load ERROR is not "file
-                    // missing" (that's `Ok(None)`, where our clone is the
-                    // right fallback) — it's an unreadable or future-schema
-                    // file, and saving our stale clone over it would destroy
-                    // data this build can't even parse. Abort and surface
-                    // instead (docs/backlog.md schema-guard finding).
-                    let mut review = store.load(&review.id)?.unwrap_or(review);
-                    // Re-check against the freshly-loaded state, not the
-                    // stale clone the synchronous check above saw.
-                    if matches!(review.state, dv_core::ReviewState::Submitted { .. }) {
-                        return anyhow::Ok((review, false));
-                    }
-                    review.set_status(&comment_id, status)?;
-                    store.save(&review)?;
-                    anyhow::Ok((review, true))
+                    // The fresh-load-mutate-save span runs under the store
+                    // lock (docs/backlog.md durable-concurrency item; see
+                    // submit_comment).
+                    store.with_lock(|| {
+                        // `?`, not `.ok().flatten()`: a load ERROR is not "file
+                        // missing" (that's `Ok(None)`, where our clone is the
+                        // right fallback) — it's an unreadable or future-schema
+                        // file, and saving our stale clone over it would destroy
+                        // data this build can't even parse. Abort and surface
+                        // instead (docs/backlog.md schema-guard finding).
+                        let mut review = store.load(&review.id)?.unwrap_or(review);
+                        // Re-check against the freshly-loaded state, not the
+                        // stale clone the synchronous check above saw.
+                        if matches!(review.state, dv_core::ReviewState::Submitted { .. }) {
+                            return anyhow::Ok((review, false));
+                        }
+                        review.set_status(&comment_id, status)?;
+                        store.save(&review)?;
+                        anyhow::Ok((review, true))
+                    })
                 })
                 .await;
             this.update(cx, |this, cx| {
@@ -5601,21 +5640,25 @@ impl Workspace {
                 .background_executor()
                 .spawn(async move {
                     let store = dv_core::ReviewStore::open(location);
-                    // Fresh-load before mutating (see submit_comment).
-                    // `?`, not `.ok().flatten()`: a load ERROR is not "file
-                    // missing" (that's `Ok(None)`, where our clone is the
-                    // right fallback) — it's an unreadable or future-schema
-                    // file, and saving our stale clone over it would destroy
-                    // data this build can't even parse. Abort and surface
-                    // instead (docs/backlog.md schema-guard finding).
-                    let mut review = store.load(&review.id)?.unwrap_or(review);
-                    if matches!(review.state, dv_core::ReviewState::Submitted { .. }) {
-                        return anyhow::Ok((review, false));
-                    }
-                    review.comments.retain(|c| c.id != comment_id);
-                    review.updated_ms = dv_core::review::now_ms();
-                    store.save(&review)?;
-                    anyhow::Ok((review, true))
+                    // The fresh-load-mutate-save span runs under the store
+                    // lock (docs/backlog.md durable-concurrency item; see
+                    // submit_comment).
+                    store.with_lock(|| {
+                        // `?`, not `.ok().flatten()`: a load ERROR is not "file
+                        // missing" (that's `Ok(None)`, where our clone is the
+                        // right fallback) — it's an unreadable or future-schema
+                        // file, and saving our stale clone over it would destroy
+                        // data this build can't even parse. Abort and surface
+                        // instead (docs/backlog.md schema-guard finding).
+                        let mut review = store.load(&review.id)?.unwrap_or(review);
+                        if matches!(review.state, dv_core::ReviewState::Submitted { .. }) {
+                            return anyhow::Ok((review, false));
+                        }
+                        review.comments.retain(|c| c.id != comment_id);
+                        review.updated_ms = dv_core::review::now_ms();
+                        store.save(&review)?;
+                        anyhow::Ok((review, true))
+                    })
                 })
                 .await;
             this.update(cx, |this, cx| {
@@ -5841,38 +5884,43 @@ impl Workspace {
                 .background_executor()
                 .spawn(async move {
                     let store = dv_core::ReviewStore::open(location);
-                    // `?`, not `.ok().flatten()`: a load ERROR is not "file
-                    // missing" (that's `Ok(None)`, where our clone is the
-                    // right fallback) — it's an unreadable or future-schema
-                    // file, and saving our stale clone over it would destroy
-                    // data this build can't even parse. Abort and surface
-                    // instead (docs/backlog.md schema-guard finding).
-                    let mut review = store.load(&review.id)?.unwrap_or(review);
-                    // Re-check against the freshly-loaded state — the
-                    // `review_is_readonly` check `open_thread_input` did
-                    // when this input was opened can be stale by now.
-                    if matches!(review.state, dv_core::ReviewState::Submitted { .. }) {
-                        return anyhow::Ok((review, false));
-                    }
-                    match mode {
-                        ThreadInputMode::Reply => {
-                            review.reply(&comment_id, body, author)?;
+                    // The fresh-load-mutate-save span runs under the store
+                    // lock (docs/backlog.md durable-concurrency item; see
+                    // submit_comment).
+                    store.with_lock(|| {
+                        // `?`, not `.ok().flatten()`: a load ERROR is not "file
+                        // missing" (that's `Ok(None)`, where our clone is the
+                        // right fallback) — it's an unreadable or future-schema
+                        // file, and saving our stale clone over it would destroy
+                        // data this build can't even parse. Abort and surface
+                        // instead (docs/backlog.md schema-guard finding).
+                        let mut review = store.load(&review.id)?.unwrap_or(review);
+                        // Re-check against the freshly-loaded state — the
+                        // `review_is_readonly` check `open_thread_input` did
+                        // when this input was opened can be stale by now.
+                        if matches!(review.state, dv_core::ReviewState::Submitted { .. }) {
+                            return anyhow::Ok((review, false));
                         }
-                        ThreadInputMode::EditBody => {
-                            let comment = review
-                                .comments
-                                .iter_mut()
-                                .find(|c| c.id == comment_id)
-                                .ok_or_else(|| {
-                                anyhow::anyhow!("comment {comment_id} is gone")
-                            })?;
-                            comment.body = body;
-                            comment.updated_ms = dv_core::review::now_ms();
-                            review.updated_ms = comment.updated_ms;
+                        match mode {
+                            ThreadInputMode::Reply => {
+                                review.reply(&comment_id, body, author)?;
+                            }
+                            ThreadInputMode::EditBody => {
+                                let comment = review
+                                    .comments
+                                    .iter_mut()
+                                    .find(|c| c.id == comment_id)
+                                    .ok_or_else(|| {
+                                        anyhow::anyhow!("comment {comment_id} is gone")
+                                    })?;
+                                comment.body = body;
+                                comment.updated_ms = dv_core::review::now_ms();
+                                review.updated_ms = comment.updated_ms;
+                            }
                         }
-                    }
-                    store.save(&review)?;
-                    anyhow::Ok((review, true))
+                        store.save(&review)?;
+                        anyhow::Ok((review, true))
+                    })
                 })
                 .await;
 

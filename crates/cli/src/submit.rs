@@ -491,11 +491,14 @@ pub fn writeback_failure_message(
 /// Fresh-load `review_id` from `store`, mark it `Submitted`, attach
 /// `remote` (the just-created GitHub review's linkage), and save — the
 /// shared post-success step once `submitted` proves GitHub already
-/// accepted the review. Fresh-loads before mutating like every other store
-/// write (the review may have changed since the caller's own copy was
-/// read). A failure here is returned as [`writeback_failure_message`]'s
-/// ready-to-show text, not a raw error — the caller must never retry the
-/// whole submit after seeing this, or it would create a duplicate review.
+/// accepted the review. The whole load-mutate-save span runs under the
+/// store lock (docs/backlog.md durable-concurrency item) rather than just
+/// fresh-loading before mutating: this is the one write every submit path
+/// (CLI `dv review submit`, the GUI's submit flow) funnels through, so
+/// locking it here covers both for free. A failure here is returned as
+/// [`writeback_failure_message`]'s ready-to-show text, not a raw error —
+/// the caller must never retry the whole submit after seeing this, or it
+/// would create a duplicate review.
 pub fn writeback_submitted_review(
     store: &ReviewStore,
     review_id: &str,
@@ -504,36 +507,20 @@ pub fn writeback_submitted_review(
     remote: RemoteRef,
     submitted: &SubmittedReview,
 ) -> Result<Review, String> {
-    let mut fresh = match store.load(review_id) {
-        Ok(Some(r)) => r,
-        Ok(None) => {
-            return Err(writeback_failure_message(
-                pr_number,
-                submitted,
-                &format!("review {review_id} disappeared from the local store"),
-            ));
-        }
-        Err(err) => {
-            return Err(writeback_failure_message(
-                pr_number,
-                submitted,
-                &format!("{err:#}"),
-            ));
-        }
-    };
-    fresh.set_state(ReviewState::Submitted {
-        verdict,
-        at_ms: dv_core::review::now_ms(),
-    });
-    fresh.remote = Some(remote);
-    if let Err(err) = store.save(&fresh) {
-        return Err(writeback_failure_message(
-            pr_number,
-            submitted,
-            &format!("{err:#}"),
-        ));
-    }
-    Ok(fresh)
+    store
+        .with_lock(|| -> anyhow::Result<Review> {
+            let mut fresh = store.load(review_id)?.ok_or_else(|| {
+                anyhow::anyhow!("review {review_id} disappeared from the local store")
+            })?;
+            fresh.set_state(ReviewState::Submitted {
+                verdict,
+                at_ms: dv_core::review::now_ms(),
+            });
+            fresh.remote = Some(remote);
+            store.save(&fresh)?;
+            Ok(fresh)
+        })
+        .map_err(|err| writeback_failure_message(pr_number, submitted, &format!("{err:#}")))
 }
 
 /// Preflighted, slug-bound `GithubClient` for `repo`, matching the CLI's own

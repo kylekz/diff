@@ -11,6 +11,7 @@
 //! rather than silently pointing at the wrong lines.
 
 mod io;
+mod lock;
 mod prompt;
 mod store;
 mod watch;
@@ -24,7 +25,8 @@ use serde::{Deserialize, Serialize};
 use crate::git::{BlobSpec, DiffSource};
 
 pub use io::{
-    list_dir_names, read_file_at, remove_file_at, resolve_local_git_dir, write_file_atomic_at,
+    create_exclusive_at, list_dir_names, read_file_at, remove_file_at, resolve_local_git_dir,
+    write_file_atomic_at,
 };
 pub use prompt::format_review_as_prompt;
 pub use store::ReviewStore;

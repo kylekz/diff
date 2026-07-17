@@ -18,9 +18,10 @@ use serde_json::Value;
 use crate::command::decode_output;
 
 use super::proto::{
-    self, BlobGetParams, BlobGetResult, ExecParams, ExecResult, FsListParams, FsListResult,
-    FsReadParams, FsReadResult, FsRemoveParams, FsWriteParams, Hello, Notification, PROTO_VERSION,
-    Request, RpcError, RpcResult, WatchEventParams, WatchSubscribeParams, WatchSubscribeResult,
+    self, BlobGetParams, BlobGetResult, ExecParams, ExecResult, FsCreateExclusiveParams,
+    FsCreateExclusiveResult, FsListParams, FsListResult, FsReadParams, FsReadResult,
+    FsRemoveParams, FsWriteParams, Hello, Notification, PROTO_VERSION, Request, RpcError,
+    RpcResult, WatchEventParams, WatchSubscribeParams, WatchSubscribeResult,
     WatchUnsubscribeParams,
 };
 
@@ -545,6 +546,29 @@ impl HostClient {
             serde_json::to_value(params).context("serializing fs/remove params")?,
         )?;
         Ok(())
+    }
+
+    /// Typed `fs/create_exclusive` wrapper (durable-concurrency slice):
+    /// base64-encodes `bytes` and returns whether this call actually
+    /// created `rel` (`false`, not an error, when something was already
+    /// there) — the primitive [`crate::review`]'s store-level lock builds
+    /// mutual exclusion on top of. Gated on the `fs_lock` capability by
+    /// callers (see [`crate::remote::proto::FsCreateExclusiveParams`]'s
+    /// doc), not just `fs`, so an older host that never heard of this
+    /// method isn't asked for it.
+    pub fn fs_create_exclusive(&self, root: &str, rel: &str, bytes: &[u8]) -> Result<bool> {
+        let params = FsCreateExclusiveParams {
+            root: root.to_string(),
+            rel: rel.to_string(),
+            bytes_b64: BASE64.encode(bytes),
+        };
+        let value = self.request(
+            proto::method::FS_CREATE_EXCLUSIVE,
+            serde_json::to_value(params).context("serializing fs/create_exclusive params")?,
+        )?;
+        let result: FsCreateExclusiveResult =
+            serde_json::from_value(value).context("decoding fs/create_exclusive result")?;
+        Ok(result.created)
     }
 
     /// Whether `cap` is one of the host's advertised capabilities (the

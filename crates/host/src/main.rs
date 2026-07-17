@@ -52,7 +52,12 @@ fn main() {
         "proto": PROTO_VERSION,
         "version": env!("DV_HOST_VERSION"),
         "pid": std::process::id(),
-        "caps": ["exec", "blob", "watch", "fs"],
+        // "fs_lock" gates `fs/create_exclusive` SEPARATELY from the general
+        // "fs" cap (durable-concurrency slice, docs/backlog.md) so an
+        // older already-installed host (this binary, before this method
+        // existed) never gets asked for a method it doesn't have — see
+        // `dv_core::remote::proto::FsCreateExclusiveParams`'s doc.
+        "caps": ["exec", "blob", "watch", "fs", "fs_lock"],
     });
     write_line(&stdout, &hello);
 
@@ -177,6 +182,10 @@ fn dispatch(job: Job, stdout: &Arc<Mutex<std::io::Stdout>>) -> Value {
             Err(err) => json!({"id": id, "err": {"code": err.code, "message": err.message}}),
         },
         "fs/remove" => match handle_fs_remove(params) {
+            Ok(result) => json!({"id": id, "ok": result}),
+            Err(err) => json!({"id": id, "err": {"code": err.code, "message": err.message}}),
+        },
+        "fs/create_exclusive" => match handle_fs_create_exclusive(params) {
             Ok(result) => json!({"id": id, "ok": result}),
             Err(err) => json!({"id": id, "err": {"code": err.code, "message": err.message}}),
         },
@@ -479,6 +488,34 @@ fn handle_fs_remove(params: Value) -> Result<Value, HostError> {
         ))
     })?;
     Ok(json!({}))
+}
+
+/// `fs/create_exclusive` (durable-concurrency slice, docs/backlog.md
+/// review-store-locking item). `created: false` (not an error) when `rel`
+/// already exists.
+fn handle_fs_create_exclusive(params: Value) -> Result<Value, HostError> {
+    let root = params
+        .get("root")
+        .and_then(Value::as_str)
+        .ok_or_else(|| HostError::bad_request("fs/create_exclusive: missing \"root\""))?;
+    let rel = params
+        .get("rel")
+        .and_then(Value::as_str)
+        .ok_or_else(|| HostError::bad_request("fs/create_exclusive: missing \"rel\""))?;
+    let bytes_b64 = params
+        .get("bytes_b64")
+        .and_then(Value::as_str)
+        .ok_or_else(|| HostError::bad_request("fs/create_exclusive: missing \"bytes_b64\""))?;
+    let bytes = BASE64.decode(bytes_b64).map_err(|err| {
+        HostError::bad_request(format!("fs/create_exclusive: bad bytes_b64: {err}"))
+    })?;
+
+    match fs::create_exclusive(root, rel, &bytes) {
+        Ok(created) => Ok(json!({ "created": created })),
+        Err(err) => Err(HostError::io(format!(
+            "fs/create_exclusive failed for root={root:?} rel={rel:?}: {err:#}"
+        ))),
+    }
 }
 
 fn write_line(stdout: &Arc<Mutex<std::io::Stdout>>, value: &Value) {

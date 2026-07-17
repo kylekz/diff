@@ -162,6 +162,16 @@ fn op_err(err: anyhow::Error) -> CliError {
     CliError::Op(format!("{err:#}"))
 }
 
+/// Lets `ReviewStore::with_lock`'s `E: From<anyhow::Error>` bound work with
+/// `CliError` directly — a lock-acquisition failure (contention timeout,
+/// an I/O error acquiring it) is exactly the same "operation error" shape
+/// [`op_err`] already gives every other store failure.
+impl From<anyhow::Error> for CliError {
+    fn from(err: anyhow::Error) -> Self {
+        op_err(err)
+    }
+}
+
 /// Print the error (stderr always; `{"error":...}` on stdout too when
 /// `--json` was requested — the output contract's error rule applies
 /// regardless of *why* the command failed) and return the exit code.
@@ -573,9 +583,22 @@ fn cmd_comment_add(
         .author
         .unwrap_or_else(|| crate::author::resolve_author(&repo));
     let store = ReviewStore::open(repo.location().clone());
-    let (mut review, created) = target_review_for_add(&store, parsed.review.as_deref())?;
 
-    let anchor = dv_core::anchor_spec(&review.source, parsed.side, &parsed.file);
+    // Two short, separately-locked spans (docs/backlog.md
+    // durable-concurrency item) rather than one long one: `find-or-create`
+    // is pure store I/O (locked — closes the "two racing invocations both
+    // create a draft" TOCTOU), but `blob_sha` below can shell out to `git`,
+    // and holding the lock across a subprocess spawn would turn every
+    // OTHER writer's bounded acquire wait into a lottery against however
+    // long `git` takes on this machine right now. Splitting means the lock
+    // is only ever held for actual JSON load/save work — milliseconds, as
+    // the whole timeout budget assumes — and the final span fresh-loads
+    // again anyway, the same "never trust an unlocked-window-old copy"
+    // convention every other mutator here already follows.
+    let (target, created) =
+        store.with_lock(|| target_review_for_add(&store, parsed.review.as_deref()))?;
+
+    let anchor = dv_core::anchor_spec(&target.source, parsed.side, &parsed.file);
     // GUI parity (Phase-2 review P3): a blob_sha FAILURE — e.g. a Commit
     // source whose rev has no parent, so the old side's `<sha>^` isn't a
     // rev at all — degrades to an unverifiable anchor (warned, sha None)
@@ -591,19 +614,26 @@ fn cmd_comment_add(
     };
     let unverifiable = blob_sha.is_none();
 
-    let comment = review
-        .add_comment(
-            parsed.file,
-            parsed.side,
-            parsed.start,
-            parsed.end,
-            blob_sha,
-            parsed.body,
-            author,
-        )
-        .map_err(op_err)?
-        .clone();
-    store.save(&review).map_err(op_err)?;
+    let (review, comment) = store.with_lock(|| -> Result<_, CliError> {
+        let mut review = store
+            .load(&target.id)
+            .map_err(op_err)?
+            .ok_or_else(|| CliError::Op(format!("review {} disappeared mid-add", target.id)))?;
+        let comment = review
+            .add_comment(
+                parsed.file,
+                parsed.side,
+                parsed.start,
+                parsed.end,
+                blob_sha,
+                parsed.body,
+                author,
+            )
+            .map_err(op_err)?
+            .clone();
+        store.save(&review).map_err(op_err)?;
+        Ok((review, comment))
+    })?;
 
     print_comment_add(&review.id, &comment, created, unverifiable, json);
     Ok(())
@@ -659,10 +689,15 @@ fn cmd_comment_reply(
     let repo = resolve_repo(location)?;
     let author = author.unwrap_or_else(|| crate::author::resolve_author(&repo));
     let store = ReviewStore::open(repo.location().clone());
-    let mut review = find_review_for_comment(&store, review_id.as_deref(), &comment_id)?;
 
-    review.reply(&comment_id, body, author).map_err(op_err)?;
-    store.save(&review).map_err(op_err)?;
+    // Lock the whole find-review → mutate → save span (docs/backlog.md
+    // durable-concurrency item) — see `cmd_comment_add`'s comment.
+    let review = store.with_lock(|| -> Result<_, CliError> {
+        let mut review = find_review_for_comment(&store, review_id.as_deref(), &comment_id)?;
+        review.reply(&comment_id, body, author).map_err(op_err)?;
+        store.save(&review).map_err(op_err)?;
+        Ok(review)
+    })?;
 
     // "reply returns the whole updated comment" (docs/phase-2-review-layer.md
     // § Agent CLI) — the reply we just appended is on it, not a top-level
@@ -718,12 +753,17 @@ fn cmd_comment_status(
 
     let repo = resolve_repo(location)?;
     let store = ReviewStore::open(repo.location().clone());
-    let mut review = find_review_for_comment(&store, review_id.as_deref(), &comment_id)?;
 
-    review.set_status(&comment_id, status).map_err(op_err)?;
-    store.save(&review).map_err(op_err)?;
+    // Lock the whole find-review → mutate → save span (docs/backlog.md
+    // durable-concurrency item) — see `cmd_comment_add`'s comment.
+    let review_id_out = store.with_lock(|| -> Result<_, CliError> {
+        let mut review = find_review_for_comment(&store, review_id.as_deref(), &comment_id)?;
+        review.set_status(&comment_id, status).map_err(op_err)?;
+        store.save(&review).map_err(op_err)?;
+        Ok(review.id)
+    })?;
 
-    print_comment_status(&review.id, &comment_id, status, json);
+    print_comment_status(&review_id_out, &comment_id, status, json);
     Ok(())
 }
 

@@ -90,6 +90,33 @@ impl ReviewStore {
         self.save(&review)?;
         Ok(review)
     }
+
+    /// Run `f` (a load-mutate-save critical section) while holding the
+    /// store's cross-process lock — the durable-concurrency fix
+    /// (docs/backlog.md: "the real fix is a lock file around
+    /// load-mutate-save", Phase-2 review P1 residual). Every mutation the
+    /// GUI and CLI perform is `load` (fresh, ignoring whatever stale copy
+    /// the caller had) → mutate the in-memory `Review` → `save`; wrapping
+    /// that whole span here means two writers (GUI + CLI, two CLI
+    /// invocations, ...) can never interleave a load and a save and
+    /// silently drop each other's update, closing the race the pre-
+    /// existing "fresh-load-before-mutating" convention only narrowed.
+    ///
+    /// Pure reads (`list`/`load` on their own) don't need this — only a
+    /// span that reads then later writes back based on what it read.
+    ///
+    /// `E` needs `From<anyhow::Error>` so callers using `anyhow::Result`
+    /// get it for free (the reflexive `impl<T> From<T> for T`), while
+    /// callers with their own error enum (`dv_cli`'s `CliError`) only need
+    /// one `From` impl to use this too. See [`super::lock`] for the
+    /// locking algorithm (representation, staleness, timeout).
+    pub fn with_lock<T, E>(&self, f: impl FnOnce() -> Result<T, E>) -> Result<T, E>
+    where
+        E: From<anyhow::Error>,
+    {
+        let _guard = super::lock::acquire(&self.io).map_err(E::from)?;
+        f()
+    }
 }
 
 fn review_path(id: &str) -> String {

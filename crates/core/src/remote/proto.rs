@@ -35,6 +35,10 @@ pub mod method {
     pub const FS_WRITE: &str = "fs/write_atomic";
     pub const FS_LIST: &str = "fs/list";
     pub const FS_REMOVE: &str = "fs/remove";
+    /// Durable-concurrency slice (docs/backlog.md): create-if-absent, gated
+    /// on the separate `fs_lock` capability — see [`super::FsCreateExclusiveParams`]'s
+    /// doc for why.
+    pub const FS_CREATE_EXCLUSIVE: &str = "fs/create_exclusive";
 }
 
 /// [`Notification::event`] value for a live `watch/subscribe`'s pushed
@@ -372,6 +376,32 @@ pub struct FsRemoveParams {
     pub rel: String,
 }
 
+/// `fs/create_exclusive` params (durable-concurrency slice, docs/backlog.md
+/// review-store-locking item): create `rel` (relative to the gitdir the
+/// host resolves from `root`) with `bytes_b64`, but ONLY if nothing is
+/// there yet — `crate::review::io::create_exclusive_at`'s
+/// `O_CREAT|O_EXCL`/`CREATE_NEW` semantics, run host-side. Gated on the
+/// `fs_lock` capability rather than the general `fs` one, so an
+/// already-installed host built before this method existed (which still
+/// answers the original four `fs/*` methods) doesn't get a `bad_request`
+/// for one it's never heard of — callers fall back to the shell
+/// `noclobber` arm instead. The primitive [`crate::review`]'s store-level
+/// lock is built on.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct FsCreateExclusiveParams {
+    pub root: String,
+    pub rel: String,
+    pub bytes_b64: String,
+}
+
+/// `fs/create_exclusive` result: `created` is `true` only when this call
+/// actually made the file; `false` (not an error) when something was
+/// already there.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct FsCreateExclusiveResult {
+    pub created: bool,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -680,5 +710,31 @@ mod tests {
         let line = serde_json::to_string(&params).unwrap();
         let parsed: FsRemoveParams = serde_json::from_str(&line).unwrap();
         assert_eq!(parsed, params);
+    }
+
+    #[test]
+    fn fs_create_exclusive_params_and_result_round_trip() {
+        let params = FsCreateExclusiveParams {
+            root: "/home/kyle/proj".into(),
+            rel: "dv/.lock".into(),
+            bytes_b64: "MTIzNDU6MTcwMDAwMDAwMDAwMA==".into(),
+        };
+        let line = serde_json::to_string(&params).unwrap();
+        let parsed: FsCreateExclusiveParams = serde_json::from_str(&line).unwrap();
+        assert_eq!(parsed, params);
+
+        let result = FsCreateExclusiveResult { created: true };
+        let line = serde_json::to_string(&result).unwrap();
+        let parsed: FsCreateExclusiveResult = serde_json::from_str(&line).unwrap();
+        assert_eq!(parsed, result);
+
+        let result = FsCreateExclusiveResult { created: false };
+        let line = serde_json::to_string(&result).unwrap();
+        assert_eq!(line, r#"{"created":false}"#);
+    }
+
+    #[test]
+    fn fs_create_exclusive_method_name() {
+        assert_eq!(method::FS_CREATE_EXCLUSIVE, "fs/create_exclusive");
     }
 }

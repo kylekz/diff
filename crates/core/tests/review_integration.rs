@@ -384,6 +384,79 @@ fn r7_delete_of_unknown_review_when_store_dir_absent_is_ok() {
         .expect("delete against an absent store dir is not an error");
 }
 
+/// Durable-concurrency slice (docs/backlog.md: "Review store: durable
+/// concurrency answer ... the real fix is a lock file around
+/// load-mutate-save", Phase-2 review P1 residual): two threads hammering
+/// interleaved `comment add`-shaped load-mutate-save cycles against ONE
+/// review, through the real public `ReviewStore`/`Review` API (not the
+/// lower-level `StoreIo` primitive `crates/core/src/review/lock.rs`'s own
+/// unit tests exercise) — the actual shape every real call site (CLI
+/// `cmd_comment_add`, the GUI's `submit_comment`) uses. Asserts zero lost
+/// updates across 2 × 50 = 100 comments.
+#[test]
+fn r9_with_lock_contention_two_threads_hammering_comment_adds() {
+    let repo = TestRepo::new("r9");
+    repo.write("a.txt", b"hello\n");
+    repo.commit("seed");
+
+    let git_repo = open(&repo);
+    let store = std::sync::Arc::new(ReviewStore::open(git_repo.location().clone()));
+    let review_id = store
+        .create(DiffSource::WorkingTree)
+        .expect("create draft")
+        .id;
+
+    const PER_THREAD: usize = 50;
+    let mut handles = Vec::new();
+    for t in 0..2 {
+        let store = std::sync::Arc::clone(&store);
+        let review_id = review_id.clone();
+        handles.push(std::thread::spawn(move || {
+            for i in 0..PER_THREAD {
+                store
+                    .with_lock(|| -> anyhow::Result<()> {
+                        let mut review = store
+                            .load(&review_id)?
+                            .expect("review must still exist mid-test");
+                        review.add_comment(
+                            "a.txt",
+                            Side::New,
+                            1,
+                            1,
+                            None,
+                            format!("t{t}-c{i}"),
+                            format!("worker-{t}"),
+                        )?;
+                        store.save(&review)?;
+                        Ok(())
+                    })
+                    .expect("with_lock critical section");
+            }
+        }));
+    }
+    for h in handles {
+        h.join().expect("worker thread panicked");
+    }
+
+    let review = store
+        .load(&review_id)
+        .expect("final load")
+        .expect("review still exists");
+    assert_eq!(
+        review.comments.len(),
+        2 * PER_THREAD,
+        "every comment from both threads must have landed — got {}",
+        review.comments.len()
+    );
+    let unique_ids: std::collections::HashSet<_> =
+        review.comments.iter().map(|c| c.id.clone()).collect();
+    assert_eq!(
+        unique_ids.len(),
+        2 * PER_THREAD,
+        "every comment id must be unique — no overwritten/duplicated entries"
+    );
+}
+
 /// Exercises the real WSL branch of StoreIo (sh -c write pipeline, cat
 /// read, ls list, rm delete) against an actual distro. Requires WSL with
 /// an Ubuntu distro and a git repo at ~/zed-perf — run manually:

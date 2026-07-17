@@ -16,7 +16,7 @@
 //! processes at once, and a loaded WSL distro can flake under that —
 //! `spawn_wsl`'s 15s handshake timing out, or a plain setup `wsl.exe --exec
 //! sh -c ...` failing outright — for reasons that have nothing to do with
-//! the actual behavior under test. Serialized, all 9 tests here pass
+//! the actual behavior under test. Serialized, all 11 tests here pass
 //! reliably.
 //!
 //! `DV_HOST_PATH` overrides the default built-binary path below (must be
@@ -365,6 +365,60 @@ fn fs_round_trip_through_host() {
             .is_none(),
         "fs/read after fs/remove must report not-found"
     );
+
+    wsl_sh(&format!("rm -rf '{repo}'"));
+}
+
+#[test]
+#[ignore = "requires WSL Ubuntu with dv-host built inside it — see module docs"]
+fn fs_create_exclusive_round_trip_through_host() {
+    // Durable-concurrency slice (docs/backlog.md): `fs/create_exclusive`
+    // is the one primitive `ReviewStore`'s store-level lock is built on —
+    // this proves the REAL RPC round trip (not just the local-filesystem
+    // arm every other test in this workspace exercises).
+    let repo = temp_repo_path("fs-create-exclusive");
+    wsl_sh(&format!("mkdir -p '{repo}' && cd '{repo}' && git init -q"));
+
+    let client = HostClient::spawn_wsl(DISTRO, &host_path()).expect("spawn_wsl");
+    assert!(
+        client.caps().iter().any(|cap| cap == "fs_lock"),
+        "a dv-host built from this slice must advertise fs_lock: {:?}",
+        client.caps()
+    );
+
+    let rel = "dv/.lock";
+
+    // Nothing there yet: must actually create it.
+    let created = client
+        .fs_create_exclusive(&repo, rel, b"111:1000")
+        .expect("fs/create_exclusive (fresh)");
+    assert!(created, "must create when nothing is there yet");
+
+    // Already there: must report `false` (not an error) and must NOT
+    // clobber the original content — the whole point of this primitive
+    // over `fs/write_atomic`.
+    let created_again = client
+        .fs_create_exclusive(&repo, rel, b"222:2000")
+        .expect("fs/create_exclusive (contended)");
+    assert!(
+        !created_again,
+        "must refuse to create over an existing file"
+    );
+    let contents = client
+        .fs_read(&repo, rel)
+        .expect("fs/read")
+        .expect("lock file must still exist");
+    assert_eq!(
+        contents, b"111:1000",
+        "the original content must survive the refused create"
+    );
+
+    // Remove, then recreate: proves the primitive isn't a one-shot latch.
+    client.fs_remove(&repo, rel).expect("fs/remove");
+    let recreated = client
+        .fs_create_exclusive(&repo, rel, b"333:3000")
+        .expect("fs/create_exclusive (after removal)");
+    assert!(recreated, "must be able to recreate after removal");
 
     wsl_sh(&format!("rm -rf '{repo}'"));
 }

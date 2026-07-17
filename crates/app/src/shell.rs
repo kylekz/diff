@@ -2981,7 +2981,7 @@ impl AppShell {
         self.open_review(location, DiffSource::WorkingTree, None, None, window, cx);
     }
 
-    /// `{"cmd":"select_review","id":"..."}`: explicit row selection by
+    /// `{"cmd":"select_review","review_id":"..."}`: explicit row selection by
     /// review id — the S6c incident-fix entry point for automation, same
     /// pin-and-reopen path a sidebar card click takes
     /// ([`Self::open_review_row`]). Errors (rather than silently no-oping)

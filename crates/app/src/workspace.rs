@@ -8195,21 +8195,35 @@ impl Workspace {
         }
     }
 
-    /// The review summary panel: every thread across files, filterable,
-    /// click to jump, with the finish-review verdict at the bottom.
     /// "Copy as prompt" (R3 item 3):
     /// the review's open threads as one
     /// agent-ready block (`dv_core::format_review_as_prompt`) onto the
     /// clipboard. Pure clipboard — no AI integration (R4 stays dropped).
+    ///
+    /// "Open" here must agree with the summary panel's own accounting
+    /// (R3 review, P2): a thread GitHub reports resolved on dv's own
+    /// submitted review (`github_resolved`, Phase-6 S6f) counts as
+    /// resolved in the panel's header right next to this button — copying
+    /// it as "open" would send an agent off to address a settled comment.
+    /// The formatter only reads local `status`, so stamp those threads
+    /// `Resolved` on a throwaway clone first.
     fn copy_review_prompt(&self, cx: &mut Context<Self>) {
         let Some(review) = &self.review else {
             return;
         };
+        let mut effective = review.clone();
+        for comment in &mut effective.comments {
+            if self.github_resolved.contains(&comment.id) {
+                comment.status = dv_core::CommentStatus::Resolved;
+            }
+        }
         cx.write_to_clipboard(ClipboardItem::new_string(dv_core::format_review_as_prompt(
-            review, false,
+            &effective, false,
         )));
     }
 
+    /// The review summary panel: every thread across files, filterable,
+    /// click to jump, with the finish-review verdict at the bottom.
     fn render_summary(&self, cx: &mut Context<Self>) -> Option<Div> {
         use gpui_component::Selectable as _;
         use gpui_component::Sizable as _;

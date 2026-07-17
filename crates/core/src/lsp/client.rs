@@ -617,17 +617,6 @@ fn hash_text(text: &str) -> u64 {
     hasher.finish()
 }
 
-/// Normalize `textDocument/hover`'s `Hover.contents` (S8g) — one of three
-/// wire shapes (a single `MarkedString`, a `MarkedString[]`, or a
-/// `MarkupContent`) — into plain-ish text for the app's minimal hover
-/// popover (docs/phase-8-lsp-and-polish.md § LSP: "hover for types/docs";
-/// this is deliberately NOT a markdown renderer — a `LanguageString`/code
-/// fence keeps its backtick delimiters as literal text, readable as-is in
-/// the popover's monospace font rather than actually rendered). `None` when
-/// every shape normalizes to empty text — the caller's cue to show no
-/// popover at all rather than an empty box (the same "hover empty space ->
-/// no popover" case a `null` `Hover` response covers at the [`LspHandle::hover`]
-/// layer).
 /// True when any definition target's NAME token covers (`uri`, `pos`)
 /// itself — the hover sits ON the symbol's own declaration, so a popover
 /// would only echo the line already under the cursor (the "tautological
@@ -642,9 +631,22 @@ pub fn definition_covers_position(
     uri: &str,
     pos: lsp_types::Position,
 ) -> bool {
+    // Compare decoded paths, not raw URI strings (R3 review, P3): dv's
+    // `percent_encode_path` escapes everything outside RFC 3986
+    // unreserved+`/`, while vtsls (vscode-uri) leaves several of those
+    // sub-delims literal in path segments — `utils(old).ts` would never
+    // string-match and the suppression would silently go inert for that
+    // file. Undecodable URIs (either side) fall back to exact equality.
+    let self_path = super::path_from_file_uri(uri);
     targets.iter().any(|target| {
-        target.target_uri.as_str() == uri
-            && range_contains_position(&target.target_selection_range, pos)
+        let same_file = match (
+            &self_path,
+            super::path_from_file_uri(target.target_uri.as_str()),
+        ) {
+            (Some(a), Some(b)) => *a == b,
+            _ => target.target_uri.as_str() == uri,
+        };
+        same_file && range_contains_position(&target.target_selection_range, pos)
     })
 }
 
@@ -658,6 +660,17 @@ fn range_contains_position(range: &lsp_types::Range, pos: lsp_types::Position) -
     after_start && before_end
 }
 
+/// Normalize `textDocument/hover`'s `Hover.contents` (S8g) — one of three
+/// wire shapes (a single `MarkedString`, a `MarkedString[]`, or a
+/// `MarkupContent`) — into plain-ish text for the app's minimal hover
+/// popover (docs/phase-8-lsp-and-polish.md § LSP: "hover for types/docs";
+/// this is deliberately NOT a markdown renderer — a `LanguageString`/code
+/// fence keeps its backtick delimiters as literal text, readable as-is in
+/// the popover's monospace font rather than actually rendered). `None` when
+/// every shape normalizes to empty text — the caller's cue to show no
+/// popover at all rather than an empty box (the same "hover empty space ->
+/// no popover" case a `null` `Hover` response covers at the [`LspHandle::hover`]
+/// layer).
 pub fn hover_contents_to_text(contents: &lsp_types::HoverContents) -> Option<String> {
     let text = match contents {
         lsp_types::HoverContents::Scalar(marked) => marked_string_to_text(marked),

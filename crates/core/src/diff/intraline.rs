@@ -53,9 +53,14 @@ pub(super) fn diff_pair(removed: &str, added: &str) -> (Vec<Range<usize>>, Vec<R
     }
 
     // Mostly-rewritten pair: suppress BOTH sides when either side crossed
-    // the fraction (a one-sided suppression would leave an
-    // asymmetric, more-confusing highlight). `trim_end` mirrors that rule too:
-    // trailing whitespace shouldn't dilute the denominator.
+    // the fraction (a one-sided suppression would leave an asymmetric,
+    // more-confusing highlight). `trim_end` keeps trailing whitespace
+    // from diluting the denominator. Known quirk (R3 review, P3): a pair
+    // differing ONLY in trailing whitespace has changed-range bytes past
+    // the trimmed length (fraction > 1.0) and always suppresses — the row
+    // tint still marks the line changed, but the word tint won't point at
+    // the invisible whitespace. Accepted as-is; clamp the numerator to
+    // the trimmed length if it ever bites.
     let changed = |ranges: &[Range<usize>], len: usize| {
         len > 0
             && ranges.iter().map(|r| r.len()).sum::<usize>() as f32 / len as f32

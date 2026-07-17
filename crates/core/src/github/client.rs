@@ -306,6 +306,13 @@ impl GithubClient {
             }
             let out = self.run_gh(&args)?;
             let (page, next) = super::models::parse_mentionable_page(&out)?;
+            // Termination backstop (R3 review, P3): a buggy proxy answering
+            // `nodes: [], hasNextPage: true` with a repeating cursor would
+            // otherwise spin gh subprocesses forever — an empty page can
+            // never make progress, cursor or not.
+            if page.is_empty() {
+                break;
+            }
             users.extend(page);
             match next {
                 Some(next) if users.len() < MAX_MENTIONABLE => cursor = Some(next),

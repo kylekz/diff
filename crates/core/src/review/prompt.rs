@@ -17,6 +17,12 @@
 //! src/main.rs:L12-14 (kyle)
 //! second thread
 //! ```
+//!
+//! Deliberately unescaped (R3 review, P3, accepted): a comment body whose
+//! own line is exactly `=====` reads as an extra thread boundary to the
+//! consuming agent, and interior `\r` in a CRLF-authored body survives
+//! (only trailing whitespace is trimmed). Both are acceptable — this
+//! is a human/agent-readable prompt, not a parseable wire format.
 
 use crate::git::DiffSource;
 
@@ -34,7 +40,11 @@ pub fn format_review_as_prompt(review: &Review, include_resolved: bool) -> Strin
         .map(format_thread)
         .collect();
     let body = if threads.is_empty() {
-        "(no open comments)".to_string()
+        if include_resolved {
+            "(no comments)".to_string()
+        } else {
+            "(no open comments)".to_string()
+        }
     } else {
         threads.join("\n=====\n")
     };

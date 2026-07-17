@@ -727,6 +727,84 @@ impl CreatedPr {
     }
 }
 
+/// One @-mentionable user (R3 item 2) — from the
+/// GraphQL `mentionableUsers` connection, the same set GitHub's own
+/// comment box autocompletes from.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct Mention {
+    pub login: String,
+    /// Display name; often absent.
+    #[serde(default)]
+    pub name: Option<String>,
+}
+
+/// One page of the `mentionableUsers` connection: the page's users plus
+/// the cursor for the next page (`None` on the last page). Pagination
+/// lives in `GithubClient::mentionable_users`; this is just the parse,
+/// split out for unit tests (same pattern as [`RemoteThread::parse_graphql`]).
+pub(super) fn parse_mentionable_page(
+    bytes: &[u8],
+) -> Result<(Vec<Mention>, Option<String>), GhError> {
+    #[derive(Deserialize)]
+    struct Envelope {
+        #[serde(default)]
+        data: Option<Data>,
+        #[serde(default)]
+        errors: Option<Vec<RawGraphQlError>>,
+    }
+    #[derive(Deserialize)]
+    struct Data {
+        #[serde(default)]
+        repository: Option<Repository>,
+    }
+    #[derive(Deserialize)]
+    struct Repository {
+        #[serde(rename = "mentionableUsers")]
+        mentionable_users: Connection,
+    }
+    #[derive(Deserialize)]
+    struct Connection {
+        nodes: Vec<Mention>,
+        #[serde(rename = "pageInfo")]
+        page_info: PageInfo,
+    }
+    #[derive(Deserialize)]
+    struct PageInfo {
+        #[serde(rename = "hasNextPage")]
+        has_next_page: bool,
+        #[serde(rename = "endCursor")]
+        end_cursor: Option<String>,
+    }
+
+    let envelope: Envelope = serde_json::from_slice(bytes)
+        .map_err(|e| invalid("gh api graphql mentionableUsers response", e))?;
+    if let Some(errors) = envelope.errors.filter(|errors| !errors.is_empty()) {
+        let detail = errors
+            .into_iter()
+            .map(|e| e.message)
+            .collect::<Vec<_>>()
+            .join("; ");
+        return Err(GhError::InvalidResponse {
+            detail: format!("GraphQL error: {detail}"),
+        });
+    }
+    let connection = envelope
+        .data
+        .and_then(|d| d.repository)
+        .ok_or_else(|| GhError::InvalidResponse {
+            detail: "GraphQL mentionableUsers response had no repository (wrong owner/repo, or \
+                     no access)"
+                .to_string(),
+        })?
+        .mentionable_users;
+    let next = if connection.page_info.has_next_page {
+        connection.page_info.end_cursor
+    } else {
+        None
+    };
+    Ok((connection.nodes, next))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1118,6 +1196,50 @@ mod tests {
             r#"{"data": {"repository": {"pullRequest": {"reviewThreads": {"nodes": []}}}}}"#;
         let threads = RemoteThread::parse_graphql(fixture.as_bytes()).unwrap();
         assert!(threads.is_empty());
+    }
+
+    // --- parse_mentionable_page (R3 item 2) -------------------------------
+
+    #[test]
+    fn mentionable_page_parses_users_and_next_cursor() {
+        let fixture = r#"{"data": {"repository": {"mentionableUsers": {
+            "nodes": [{"login": "kylekz", "name": "Kyle"}, {"login": "octocat", "name": null}],
+            "pageInfo": {"hasNextPage": true, "endCursor": "abc123"}}}}}"#;
+        let (users, next) = parse_mentionable_page(fixture.as_bytes()).unwrap();
+        assert_eq!(users.len(), 2);
+        assert_eq!(users[0].login, "kylekz");
+        assert_eq!(users[0].name.as_deref(), Some("Kyle"));
+        assert_eq!(users[1].login, "octocat");
+        assert!(users[1].name.is_none());
+        assert_eq!(next.as_deref(), Some("abc123"));
+    }
+
+    #[test]
+    fn mentionable_page_last_page_has_no_cursor() {
+        // GitHub still populates endCursor on the last page — hasNextPage
+        // is the authority, so `next` must come back None regardless.
+        let fixture = r#"{"data": {"repository": {"mentionableUsers": {
+            "nodes": [{"login": "kylekz"}],
+            "pageInfo": {"hasNextPage": false, "endCursor": "zzz"}}}}}"#;
+        let (users, next) = parse_mentionable_page(fixture.as_bytes()).unwrap();
+        assert_eq!(users.len(), 1);
+        assert!(next.is_none());
+    }
+
+    #[test]
+    fn mentionable_page_graphql_errors_become_invalid_response() {
+        let fixture = r#"{"data": null, "errors": [{"message": "no access"}]}"#;
+        let err = parse_mentionable_page(fixture.as_bytes()).unwrap_err();
+        match err {
+            GhError::InvalidResponse { detail } => assert!(detail.contains("no access")),
+            other => panic!("expected InvalidResponse, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn mentionable_page_missing_repository_is_invalid_response() {
+        let fixture = r#"{"data": {"repository": null}}"#;
+        assert!(parse_mentionable_page(fixture.as_bytes()).is_err());
     }
 
     #[test]

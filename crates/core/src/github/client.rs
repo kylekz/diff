@@ -16,7 +16,7 @@ use std::time::{Duration, Instant};
 
 use super::error::GhError;
 use super::models::{
-    CreatePr, CreatedPr, PrMeta, PrStatus, PrSummary, RemoteThread, ReviewSubmission,
+    CreatePr, CreatedPr, Mention, PrMeta, PrStatus, PrSummary, RemoteThread, ReviewSubmission,
     SubmittedReview,
 };
 use super::slug::RepoSlug;
@@ -34,6 +34,17 @@ repository(owner: $owner, name: $repo) { pullRequest(number: $number) { \
 reviewThreads(first: 100) { nodes { id isResolved path line diffSide \
 comments(first: 50) { nodes { author { login } body createdAt \
 pullRequestReview { fullDatabaseId } } } } } } } }";
+
+/// GraphQL query for [`GithubClient::mentionable_users`] — one page of the
+/// `mentionableUsers` connection ($after is null on the first page).
+const MENTIONABLE_QUERY: &str = "query($owner: String!, $repo: String!, $after: String) { \
+repository(owner: $owner, name: $repo) { mentionableUsers(first: 100, after: $after) { \
+nodes { login name } pageInfo { hasNextPage endCursor } } } }";
+
+/// Pagination cap for [`GithubClient::mentionable_users`] — big-org repos
+/// have tens of thousands of mentionable users; the autocomplete only needs
+/// a workable pool.
+pub const MAX_MENTIONABLE: usize = 500;
 
 /// A resolved `gh` binary pinned to one repo's GitHub identity.
 pub struct GithubClient {
@@ -262,6 +273,47 @@ impl GithubClient {
         }
         let out = self.run_gh(&args)?;
         RemoteThread::parse_graphql(&out)
+    }
+
+    /// Users who can be @-mentioned on this repo (R3 item 2) — the
+    /// GraphQL `mentionableUsers` connection, the same set
+    /// GitHub's own comment box completes from. Paginated 100 at a time up
+    /// to [`MAX_MENTIONABLE`]; big-org repos have tens of thousands, and
+    /// the autocomplete only needs a workable pool of the most relevant
+    /// (GitHub returns them relevance-ordered). Blocking — call from a
+    /// background executor, like every other method here.
+    pub fn mentionable_users(&self) -> Result<Vec<Mention>, GhError> {
+        let owner_arg = format!("owner={}", self.slug.owner);
+        let repo_arg = format!("repo={}", self.slug.repo);
+        let query_arg = format!("query={MENTIONABLE_QUERY}");
+        let mut users: Vec<Mention> = Vec::new();
+        let mut cursor: Option<String> = None;
+        loop {
+            // `-f` (raw string) for every variable — see
+            // `pr_review_threads`' comment on `-f` vs `-F` coercion.
+            let mut args: Vec<&str> = vec![
+                "api", "graphql", "-f", &query_arg, "-f", &owner_arg, "-f", &repo_arg,
+            ];
+            let after_arg;
+            if let Some(after) = &cursor {
+                after_arg = format!("after={after}");
+                args.push("-f");
+                args.push(&after_arg);
+            }
+            if self.slug.host != "github.com" {
+                args.push("--hostname");
+                args.push(&self.slug.host);
+            }
+            let out = self.run_gh(&args)?;
+            let (page, next) = super::models::parse_mentionable_page(&out)?;
+            users.extend(page);
+            match next {
+                Some(next) if users.len() < MAX_MENTIONABLE => cursor = Some(next),
+                _ => break,
+            }
+        }
+        users.truncate(MAX_MENTIONABLE);
+        Ok(users)
     }
 
     fn spawn(&self, args: &[&str]) -> Command {

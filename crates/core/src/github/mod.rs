@@ -13,11 +13,12 @@ mod models;
 mod open_target;
 mod slug;
 
-pub use client::{GithubClient, gh_status};
+pub use client::{GithubClient, MAX_MENTIONABLE, gh_status};
 pub use error::GhError;
 pub use models::{
-    ChecksSummary, CreatePr, CreatedPr, DraftComment, GhSide, PrMeta, PrState, PrStatus, PrSummary,
-    RemoteComment, RemoteThread, ReviewDecision, ReviewEvent, ReviewSubmission, SubmittedReview,
+    ChecksSummary, CreatePr, CreatedPr, DraftComment, GhSide, Mention, PrMeta, PrState, PrStatus,
+    PrSummary, RemoteComment, RemoteThread, ReviewDecision, ReviewEvent, ReviewSubmission,
+    SubmittedReview,
 };
 pub use open_target::{OpenTarget, parse_open_target};
 pub use slug::RepoSlug;
@@ -72,6 +73,38 @@ mod integration_test {
     /// ```text
     /// cargo test -p dv-core --lib github:: -- --ignored --nocapture
     /// ```
+    /// Live-verifies `mentionable_users`' paginated `gh api graphql` query
+    /// parses against the real difftest repo (R3 item 2). Run manually:
+    ///
+    /// ```text
+    /// cargo test -p dv-core --lib github:: -- --ignored --nocapture
+    /// ```
+    #[test]
+    #[ignore = "hits the real gh binary and a live GitHub repo; run manually"]
+    fn mentionable_users_smoke() {
+        let repo_path = std::env::var("DV_DIFFTEST_PATH").unwrap_or_else(|_| {
+            std::env::current_dir()
+                .unwrap()
+                .join("../../../difftest")
+                .to_string_lossy()
+                .into_owned()
+        });
+        let repo = GitRepo::open(RepoLocation::Local(repo_path.into()))
+            .expect("open the difftest checkout (set DV_DIFFTEST_PATH if it's elsewhere)");
+
+        let client = GithubClient::for_repo(&repo).expect("resolve gh + parse origin remote");
+        client.preflight().expect("gh --version + gh auth status");
+
+        let users = client
+            .mentionable_users()
+            .expect("gh api graphql mentionableUsers");
+        println!("mentionable users: {}", users.len());
+        assert!(
+            users.iter().any(|u| u.login == "kylekz"),
+            "the repo owner must be mentionable"
+        );
+    }
+
     #[test]
     #[ignore = "hits the real gh binary and a live GitHub repo; run manually"]
     fn pr_review_threads_smoke() {

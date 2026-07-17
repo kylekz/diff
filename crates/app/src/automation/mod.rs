@@ -15,6 +15,7 @@ pub mod capture;
 
 use std::io::{BufRead as _, Write as _};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, bail};
@@ -138,12 +139,21 @@ enum Cmd {
     /// Write a PNG of the window to `path`; responds with physical pixel
     /// dimensions.
     Screenshot { path: PathBuf },
-    /// Sleep, for pacing scripted sessions. Capped at [`MAX_WAIT_MS`]: the
-    /// stdin-EOF quit only runs after the in-flight command, so an unbounded
-    /// wait could leave a zombie window long after the driver died.
+    /// Sleep, for pacing scripted sessions. Capped at [`MAX_WAIT_MS`] and
+    /// polled in short steps against [`quit_now`] — a stdin EOF while this
+    /// is the last thing the driver ever sent (nothing else queued behind
+    /// it — the backlog's target case: a huge `ms` right before the driver
+    /// closes the pipe) interrupts it within roughly one poll step rather
+    /// than running out the full duration. An ordinary script's `wait`
+    /// mid-sequence (more real commands already queued behind it) is
+    /// unaffected even though the file itself was fully read long ago.
     Wait { ms: u64 },
     /// Block until the app is settled (repo loaded, selected diff computed)
     /// or the timeout elapses. Makes one-shot piped scripts deterministic.
+    /// Same [`quit_now`] polling as `Wait` — a huge `timeout_ms` that's the
+    /// last thing the driver ever sent still exits promptly once stdin
+    /// hits EOF, without affecting an ordinary script's leading
+    /// `wait_ready` (real commands still queued behind it).
     WaitReady {
         #[serde(default)]
         timeout_ms: Option<u64>,
@@ -152,10 +162,15 @@ enum Cmd {
     Quit,
 }
 
-/// Upper bound on `wait`/`wait_ready` durations — bounds how long a dead
-/// driver's window can linger, since EOF-quit queues behind the in-flight
-/// command.
+/// Upper bound on `wait`/`wait_ready` durations — a backstop bounding how
+/// long a dead driver's window could linger even if [`QUIT_REQUESTED`]
+/// somehow went unnoticed; the polling below is what actually makes EOF
+/// interrupt these promptly instead of relying on this cap.
 const MAX_WAIT_MS: u64 = 60_000;
+
+/// How often `Wait`/`WaitReady` re-check [`QUIT_REQUESTED`] while blocked —
+/// the upper bound on how late a stdin-EOF quit can be noticed.
+const QUIT_POLL_MS: u64 = 100;
 
 /// `true` once [`start`] has wired the channel — i.e. this process is being
 /// driven by a script, not a mouse. Exists for the one place synthetic
@@ -167,18 +182,62 @@ const MAX_WAIT_MS: u64 = 60_000;
 /// `Workspace`'s hover completion consults this to skip that one check
 /// when scripted; every other input path hit-tests dispatched positions
 /// and needs no such carve-out.
-static ACTIVE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static ACTIVE: AtomicBool = AtomicBool::new(false);
 
 /// Whether this process is running under `--automation` (see [`ACTIVE`]).
 pub fn is_active() -> bool {
-    ACTIVE.load(std::sync::atomic::Ordering::Relaxed)
+    ACTIVE.load(Ordering::Relaxed)
+}
+
+/// Set by the stdin-pump thread the instant it sees EOF (backlog: "automation
+/// EOF-quit races long commands"). By itself this is NOT enough to
+/// interrupt a long-blocking `Wait`/`WaitReady`: reading a redirected FILE
+/// (the documented `< cmds.jsonl` usage) is effectively instantaneous, so
+/// the pump thread races far ahead of the main command loop and this flag
+/// is already `true` before the very first queued command even starts —
+/// unconditionally bailing on it would wrongly cut short every ordinary
+/// script's first `wait_ready`. [`PENDING`] is what disambiguates a
+/// finished, well-formed script (more real commands already queued behind
+/// the current one — not abandoned) from a genuinely abandoned wait (this
+/// is the last thing the driver ever sent, and it's now gone) — see that
+/// static's doc comment. Never cleared: a single process is only ever
+/// driven by one stdin, and once EOF happened there is nothing left to
+/// un-quit for.
+static QUIT_REQUESTED: AtomicBool = AtomicBool::new(false);
+
+/// Count of REAL (driver-sent, not the synthetic EOF quit) command lines
+/// the stdin-pump thread has handed to the channel but the main command
+/// loop hasn't dequeued yet. The pump thread increments this for every
+/// line it reads from stdin (before sending it); the main loop decrements
+/// it (saturating — the untracked synthetic quit line must never drive
+/// this negative) the moment it dequeues ANY line, real or synthetic,
+/// before dispatching it.
+///
+/// Combined with [`QUIT_REQUESTED`], `PENDING == 0` means "nothing else
+/// the driver sent is still waiting behind the command currently running"
+/// — for a normal multi-line script that's only ever true once the FINAL
+/// line (by convention an explicit `quit`, per every committed automation
+/// script and CLAUDE.md's own template) is what's dispatching, so an
+/// ordinary script's `wait_ready`/`wait` calls run untouched even though
+/// the file itself was fully read, and `QUIT_REQUESTED`, in an eyeblink.
+/// Only a `Wait`/`WaitReady` that truly is the last thing ever sent (the
+/// backlog's target case: a script issues one huge-timeout wait then
+/// closes stdin with nothing queued after it) sees `PENDING == 0` while
+/// still in flight, and interrupts promptly instead of running out its
+/// full duration.
+static PENDING: AtomicUsize = AtomicUsize::new(0);
+
+/// `Wait`/`WaitReady` poll this — see [`QUIT_REQUESTED`] and [`PENDING`]'s
+/// doc comments for why both conditions are required.
+fn quit_now() -> bool {
+    QUIT_REQUESTED.load(Ordering::Relaxed) && PENDING.load(Ordering::Relaxed) == 0
 }
 
 /// Wire up the channel: a thread pumps stdin lines into the foreground
 /// executor, which handles commands strictly in order (a command finishes
 /// before the next is read, so scripts need no client-side pacing).
 pub fn start(window: WindowHandle<Root>, shell: Entity<AppShell>, cx: &mut App) {
-    ACTIVE.store(true, std::sync::atomic::Ordering::Relaxed);
+    ACTIVE.store(true, Ordering::Relaxed);
     let (tx, mut rx) = mpsc::unbounded::<String>();
     std::thread::Builder::new()
         .name("automation-stdin".into())
@@ -189,11 +248,22 @@ pub fn start(window: WindowHandle<Root>, shell: Entity<AppShell>, cx: &mut App) 
                 if line.trim().is_empty() {
                     continue;
                 }
+                // Counted BEFORE sending — see `PENDING`'s doc comment: the
+                // main loop must never observe a real line as "sent" before
+                // it's reflected here, or a `PENDING == 0` false negative
+                // could let a genuinely-last wait run its full timeout.
+                PENDING.fetch_add(1, Ordering::Relaxed);
                 if tx.unbounded_send(line).is_err() {
                     return; // app side is gone
                 }
             }
             // EOF: the driver hung up — quit rather than linger headless.
+            // Flip the flag so a `Wait`/`WaitReady` that's already the last
+            // real command in flight (see `PENDING`) notices on its very
+            // next poll, rather than only learning about it once this
+            // synthetic quit (deliberately NOT counted in `PENDING`) is
+            // dequeued behind whatever's currently running.
+            QUIT_REQUESTED.store(true, Ordering::Relaxed);
             tx.unbounded_send(r#"{"cmd":"quit"}"#.into()).ok();
         })
         .expect("failed to spawn automation stdin thread");
@@ -205,6 +275,14 @@ pub fn start(window: WindowHandle<Root>, shell: Entity<AppShell>, cx: &mut App) 
     cx.spawn(async move |cx| {
         emit(&json!({"event": "ready"}));
         while let Some(line) = rx.next().await {
+            // Saturating: the synthetic quit line was never counted (it's
+            // not a real driver command), so dequeuing it here must not
+            // drive a real, already-zeroed count negative.
+            PENDING
+                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
+                    Some(n.saturating_sub(1))
+                })
+                .ok();
             let (id, cmd) = parse_line(&line);
             let quit = matches!(cmd, Ok(Cmd::Quit));
             let result = match cmd {
@@ -499,10 +577,23 @@ async fn handle(
             if ms > MAX_WAIT_MS {
                 bail!("wait ms is capped at {MAX_WAIT_MS}");
             }
-            cx.background_executor()
-                .timer(Duration::from_millis(ms))
-                .await;
-            Ok(json!({"waited_ms": ms}))
+            let target = Duration::from_millis(ms);
+            let started = Instant::now();
+            loop {
+                let remaining = target.saturating_sub(started.elapsed());
+                if remaining.is_zero() {
+                    return Ok(json!({"waited_ms": ms}));
+                }
+                if quit_now() {
+                    bail!(
+                        "wait interrupted by stdin EOF after {}ms",
+                        started.elapsed().as_millis()
+                    );
+                }
+                cx.background_executor()
+                    .timer(remaining.min(Duration::from_millis(QUIT_POLL_MS)))
+                    .await;
+            }
         }
 
         Cmd::WaitReady { timeout_ms } => {
@@ -518,9 +609,17 @@ async fn handle(
                     let elapsed = started.elapsed().as_millis() as u64;
                     return Ok(json!({"ready": true, "elapsed_ms": elapsed}));
                 }
+                if quit_now() {
+                    bail!(
+                        "wait_ready interrupted by stdin EOF after {}ms",
+                        started.elapsed().as_millis()
+                    );
+                }
                 if started.elapsed() > timeout {
                     bail!("not ready after {}ms", timeout.as_millis());
                 }
+                // Already well under QUIT_POLL_MS — settling itself wants a
+                // tight poll, and the quit check rides along for free.
                 cx.background_executor()
                     .timer(Duration::from_millis(50))
                     .await;

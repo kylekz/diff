@@ -1736,6 +1736,52 @@ fn reconcile_file_selection(
     (new_selected, true)
 }
 
+/// What a [`Workspace::refresh_stale_inner`] background-check completion
+/// should do (backlog: "a failed git check isn't retried until the next
+/// mutation"). Pulled out as a pure function so the generation-race guard
+/// and the bounded-retry decision are unit-testable without gpui.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StaleCompletion {
+    /// A newer check was issued while this one was in flight (review
+    /// switch, mutation, or an earlier retry already firing) — its
+    /// verdicts are the current ones; applying this completion's would
+    /// move staleness backwards, so drop it entirely.
+    Superseded,
+    /// Apply this completion's verdicts.
+    Apply {
+        /// True when every side's git call failed this round (a transient
+        /// index.lock/WSL hiccup, not "nothing to check") — the memo must
+        /// be cleared so it doesn't freeze on unverified old verdicts
+        /// until some UNRELATED trigger happens to change the memo key.
+        clear_memo: bool,
+        /// `clear_memo` AND this completion is itself allowed to schedule
+        /// a proactive retry — false for the one bounded retry attempt
+        /// itself, so a persistently wedged git gives up after a single
+        /// re-check instead of retrying forever. When false but
+        /// `clear_memo` is true, the check still re-runs eventually (next
+        /// natural trigger: file/review switch or mutation), just without
+        /// the proactive timer.
+        schedule_retry: bool,
+    },
+}
+
+fn stale_completion_action(
+    stale_gen: u64,
+    completion_gen: u64,
+    git_failed: bool,
+    checked_empty: bool,
+    allow_retry: bool,
+) -> StaleCompletion {
+    if stale_gen != completion_gen {
+        return StaleCompletion::Superseded;
+    }
+    let failed = git_failed && checked_empty;
+    StaleCompletion::Apply {
+        clear_memo: failed,
+        schedule_retry: failed && allow_retry,
+    }
+}
+
 impl Workspace {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
@@ -4399,6 +4445,13 @@ impl Workspace {
     /// off-thread; keyed on (file, review.updated_ms) so display rebuilds
     /// don't re-run it needlessly.
     fn refresh_stale(&mut self, cx: &mut Context<Self>) {
+        self.refresh_stale_inner(cx, true);
+    }
+
+    /// `allow_retry` gates whether a transient git failure schedules the
+    /// one bounded backoff retry (see [`StaleCompletion`]) — `false` only
+    /// for that retry's own re-check, so it can't chain into a second one.
+    fn refresh_stale_inner(&mut self, cx: &mut Context<Self>, allow_retry: bool) {
         let (Some(file), Some(review), Some(repo)) =
             (self.selected, self.review.as_ref(), self.repo.clone())
         else {
@@ -4465,12 +4518,19 @@ impl Workspace {
                 .await;
 
             this.update(cx, |this, cx| {
-                if this.stale_gen != generation {
-                    // A newer refresh was issued while this one ran (review
-                    // switch, mutation) — its verdicts are the current
-                    // ones; applying these would move staleness backwards.
-                    return;
-                }
+                let (clear_memo, schedule_retry) = match stale_completion_action(
+                    this.stale_gen,
+                    generation,
+                    git_failed,
+                    checked.is_empty(),
+                    allow_retry,
+                ) {
+                    StaleCompletion::Superseded => return,
+                    StaleCompletion::Apply {
+                        clear_memo,
+                        schedule_retry,
+                    } => (clear_memo, schedule_retry),
+                };
                 // Fresh verdicts for everything checked this round; other
                 // files' verdicts are left as last computed.
                 for id in &checked {
@@ -4479,12 +4539,39 @@ impl Workspace {
                 for id in stale_ids {
                     this.stale.insert(id);
                 }
-                if git_failed && checked.is_empty() {
+                if clear_memo {
                     // Every side's git call failed (transient index.lock /
-                    // WSL hiccup): clear the memo so the NEXT display
-                    // rebuild retries, instead of freezing the old verdicts
-                    // until the next review mutation.
+                    // WSL hiccup): clear the memo so it doesn't freeze on
+                    // unverified old verdicts until some UNRELATED trigger
+                    // (a different file/review switch) happens to change
+                    // the memo key.
                     this.stale_checked = None;
+                }
+                if schedule_retry {
+                    // Proactively schedule one bounded re-check after a
+                    // short backoff, instead of waiting on the next review
+                    // mutation/file switch to trigger it.
+                    let retry_gen = generation;
+                    cx.spawn(async move |this, cx| {
+                        // Same order of magnitude as the worktree-watch
+                        // debounce below — long enough to clear a
+                        // momentary `index.lock`/WSL hiccup, short enough
+                        // that a real drift still surfaces promptly.
+                        cx.background_executor()
+                            .timer(std::time::Duration::from_millis(2000))
+                            .await;
+                        this.update(cx, |this, cx| {
+                            // A newer check (mutation, file/review switch)
+                            // already superseded this failure — its
+                            // verdicts are current, don't stack a
+                            // redundant retry on top.
+                            if this.stale_gen == retry_gen {
+                                this.refresh_stale_inner(cx, false);
+                            }
+                        })
+                        .ok();
+                    })
+                    .detach();
                 }
                 cx.notify();
             })
@@ -10863,11 +10950,11 @@ impl Render for Workspace {
 mod tests {
     use super::{
         ChecksSummary, GAP_EXPAND_STEP, PrHeader, PrMeta, PrState, PreparedLine, SplitRow,
-        SubmissionOutcome, SubmitFlow, SubmitPrep, Violation, ViolationKind, build_split_rows,
-        cancel_submit_flow_outcome, gap_above, gap_below, gap_revealed_lines, pick_review,
-        pr_source_key, reconcile_file_selection, resolved_pin, review_adopts_pr,
-        submit_flow_from_submission, submit_flow_from_validation, trim_trailing_newlines,
-        verdict_label,
+        StaleCompletion, SubmissionOutcome, SubmitFlow, SubmitPrep, Violation, ViolationKind,
+        build_split_rows, cancel_submit_flow_outcome, gap_above, gap_below, gap_revealed_lines,
+        pick_review, pr_source_key, reconcile_file_selection, resolved_pin, review_adopts_pr,
+        stale_completion_action, submit_flow_from_submission, submit_flow_from_validation,
+        trim_trailing_newlines, verdict_label,
     };
     // Automation-only word functions (see their `#[cfg(feature =
     // "automation")]` gates above) — only the tests exercising them
@@ -11903,5 +11990,73 @@ mod tests {
         let old = [cf("a.txt")];
         let new = [cf("a.txt"), cf("b.txt")];
         assert_eq!(reconcile_file_selection(&old, &new, None), (None, true));
+    }
+
+    // --- stale_completion_action (backlog: stale-check retry scheduling) ---
+
+    #[test]
+    fn stale_completion_superseded_by_a_newer_generation() {
+        // A newer refresh_stale was issued (review switch/mutation) while
+        // this one was still in flight — its verdicts must be discarded
+        // outright, success or failure, so staleness never moves backwards.
+        assert_eq!(
+            stale_completion_action(2, 1, false, false, true),
+            StaleCompletion::Superseded
+        );
+        assert_eq!(
+            stale_completion_action(2, 1, true, true, true),
+            StaleCompletion::Superseded
+        );
+    }
+
+    #[test]
+    fn stale_completion_success_neither_clears_memo_nor_retries() {
+        // Same generation, git succeeded (or there was simply nothing to
+        // check) — apply the verdicts, no memo clear, no retry.
+        assert_eq!(
+            stale_completion_action(1, 1, false, false, true),
+            StaleCompletion::Apply {
+                clear_memo: false,
+                schedule_retry: false,
+            }
+        );
+        // `git_failed` alone (some sides failed) doesn't count as a total
+        // failure if at least one comment was actually checked.
+        assert_eq!(
+            stale_completion_action(1, 1, true, false, true),
+            StaleCompletion::Apply {
+                clear_memo: false,
+                schedule_retry: false,
+            }
+        );
+    }
+
+    #[test]
+    fn stale_completion_total_failure_clears_memo_and_schedules_retry() {
+        // Every side's git call failed this round, and retries are still
+        // allowed (this is a fresh check, not itself a retry) — clear the
+        // memo AND schedule the one bounded backoff retry.
+        assert_eq!(
+            stale_completion_action(1, 1, true, true, true),
+            StaleCompletion::Apply {
+                clear_memo: true,
+                schedule_retry: true,
+            }
+        );
+    }
+
+    #[test]
+    fn stale_completion_retry_failure_clears_memo_but_does_not_chain() {
+        // This completion IS the bounded retry (`allow_retry: false`) and
+        // it failed too — the memo still clears (so the next unrelated
+        // trigger re-attempts), but no further timer is scheduled, or a
+        // persistently wedged git would retry forever.
+        assert_eq!(
+            stale_completion_action(1, 1, true, true, false),
+            StaleCompletion::Apply {
+                clear_memo: true,
+                schedule_retry: false,
+            }
+        );
     }
 }

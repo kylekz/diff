@@ -2631,6 +2631,10 @@ impl AppShell {
                     "checks": checks_word(pr.checks),
                 })),
                 "health": index_health_word(e.health),
+                "diffstat": e.diffstat.map(|ds| json!({
+                    "additions": ds.additions,
+                    "deletions": ds.deletions,
+                })),
                 "last_opened_ms": e.last_opened_ms,
             })).collect::<Vec<_>>(),
             // Theme deliverable: the currently-applied theme's own name
@@ -3831,6 +3835,7 @@ impl AppShell {
         let review_id = entry.review_id.clone();
         let repo = dv_core::repo_label(&entry.location, entry.remote.as_ref());
         let age = relative_age(entry.updated_ms);
+        let diffstat = entry.diffstat;
         let title = entry.title.clone();
         let open_comments = entry.open_comments;
         let submitted = matches!(entry.state, dv_core::ReviewState::Submitted { .. });
@@ -3891,6 +3896,26 @@ impl AppShell {
                             .bg(dot_color),
                     )
                     .child(div().flex_1().min_w(px(0.)).truncate().child(repo))
+                    // Whole-review +/− totals (R2) —
+                    // same `+N`/`−N` recipe as the title bar's diffstat
+                    // (workspace.rs render_header), sitting left of the age
+                    // so recency keeps the right edge. Absent (None) on a
+                    // not-yet-hydrated entry — the card just omits it.
+                    .children(diffstat.map(|ds| {
+                        h_flex()
+                            .flex_none()
+                            .gap_1()
+                            .child(
+                                div()
+                                    .text_color(success)
+                                    .child(format!("+{}", ds.additions)),
+                            )
+                            .child(
+                                div()
+                                    .text_color(danger)
+                                    .child(format!("\u{2212}{}", ds.deletions)),
+                            )
+                    }))
                     .child(div().flex_none().text_color(text_secondary).child(age)),
             )
             .child(
@@ -5318,6 +5343,7 @@ mod tests {
             open_comments: 0,
             remote: None,
             pr_status: None,
+            diffstat: None,
             updated_ms: 1,
             last_opened_ms: 1,
             health: dv_core::EntryHealth::Ok,

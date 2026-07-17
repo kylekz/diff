@@ -72,6 +72,15 @@ pub enum ChangeStatus {
     Unknown(char),
 }
 
+/// Whole-diff insertion/deletion totals for one diff source — the sidebar
+/// card's `+N −N` summary (R2). Serde-derived because
+/// it's persisted inside [`crate::index::IndexEntry`]'s cache file.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct DiffTotals {
+    pub additions: u64,
+    pub deletions: u64,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ChangedFile {
     /// Path of the file on the "new" side (for deletes: the old side).
@@ -402,6 +411,69 @@ impl GitRepo {
         }
     }
 
+    /// Whole-diff `+/−` line totals for a diff source, via `--numstat`
+    /// (never `--shortstat`: its "N insertions(+)" sentence is localized
+    /// porcelain — the same locale trap Phase 5 hit with `sh -c` — while
+    /// numstat is stable tab-separated numbers). Binary files (numstat's
+    /// `-\t-`) contribute nothing. Mirrors [`Self::changed_files`]'s
+    /// per-source command shapes exactly, including the unborn-HEAD
+    /// empty-tree fallback and the merge-commit first-parent rule — but
+    /// NOT its untracked-files append: `git diff` doesn't count untracked
+    /// content and neither does this (matching `git diff --stat`'s own
+    /// behavior for a working-tree diff).
+    pub fn diffstat(&self, source: &DiffSource) -> Result<DiffTotals> {
+        let text = match source {
+            DiffSource::WorkingTree => {
+                let root = self.diff_root()?;
+                self.git_text(&["diff", &root, "--numstat", "-M"])?
+            }
+            DiffSource::Staged => {
+                let root = self.diff_root()?;
+                self.git_text(&["diff", "--cached", &root, "--numstat", "-M"])?
+            }
+            DiffSource::Range {
+                base,
+                head,
+                merge_base,
+            } => {
+                let range = if *merge_base {
+                    format!("{base}...{head}")
+                } else {
+                    format!("{base}..{head}")
+                };
+                self.git_text(&["diff", "--numstat", "-M", range.as_str()])?
+            }
+            DiffSource::Commit(sha) => {
+                let parent = format!("{sha}^");
+                if self
+                    .git_text(&["rev-parse", "--verify", "-q", &parent])
+                    .is_ok()
+                {
+                    self.git_text(&[
+                        "diff-tree",
+                        "-r",
+                        "--no-commit-id",
+                        "--numstat",
+                        "-M",
+                        parent.as_str(),
+                        sha.as_str(),
+                    ])?
+                } else {
+                    self.git_text(&[
+                        "diff-tree",
+                        "-r",
+                        "--root",
+                        "--no-commit-id",
+                        "--numstat",
+                        "-M",
+                        sha.as_str(),
+                    ])?
+                }
+            }
+        };
+        Ok(parse_numstat_totals(&text))
+    }
+
     /// Appends untracked (never-added) working-tree files — from
     /// `git ls-files --others --exclude-standard -z` — to `files` as
     /// synthetic `Added` entries, skipping any path already present.
@@ -679,6 +751,29 @@ fn parse_ls_files_stage0_sha(output: &str) -> Option<String> {
     None
 }
 
+/// Sum a `--numstat` body into whole-diff totals. Each line is
+/// `<added>\t<deleted>\t<path>`; binary files print `-` for both counts
+/// and are skipped (as are any malformed lines — totals are a summary
+/// hint, not something worth failing a hydration pass over).
+fn parse_numstat_totals(output: &str) -> DiffTotals {
+    let mut totals = DiffTotals {
+        additions: 0,
+        deletions: 0,
+    };
+    for line in output.lines() {
+        let mut fields = line.split('\t');
+        let (Some(added), Some(deleted)) = (fields.next(), fields.next()) else {
+            continue;
+        };
+        let (Ok(added), Ok(deleted)) = (added.parse::<u64>(), deleted.parse::<u64>()) else {
+            continue;
+        };
+        totals.additions += added;
+        totals.deletions += deleted;
+    }
+    totals
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -847,5 +942,45 @@ mod tests {
     #[test]
     fn client_supports_blob_get_false_for_no_caps_at_all() {
         assert!(!client_supports_blob_get(&[]));
+    }
+
+    // --- parse_numstat_totals (sidebar card diffstat, R2) -----------------
+
+    #[test]
+    fn numstat_totals_sums_lines() {
+        let output = "10\t2\tsrc/a.rs\n0\t7\tsrc/b.rs\n3\t3\tREADME.md\n";
+        assert_eq!(
+            parse_numstat_totals(output),
+            DiffTotals {
+                additions: 13,
+                deletions: 12,
+            }
+        );
+    }
+
+    #[test]
+    fn numstat_totals_skips_binary_and_malformed_lines() {
+        // Binary files print `-` for both counts; a rename line's path
+        // field can itself contain tabs under -z (not used here) — either
+        // way a non-numeric count must be skipped, not summed or panicked.
+        let output = "-\t-\tassets/icon.png\n5\t1\tsrc/a.rs\nnot-a-numstat-line\n";
+        assert_eq!(
+            parse_numstat_totals(output),
+            DiffTotals {
+                additions: 5,
+                deletions: 1,
+            }
+        );
+    }
+
+    #[test]
+    fn numstat_totals_empty_output_is_zero() {
+        assert_eq!(
+            parse_numstat_totals(""),
+            DiffTotals {
+                additions: 0,
+                deletions: 0,
+            }
+        );
     }
 }

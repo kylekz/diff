@@ -24,7 +24,7 @@ use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
-use crate::git::DiffSource;
+use crate::git::{DiffSource, DiffTotals, GitRepo};
 use crate::github::{ChecksSummary, PrState, ReviewDecision};
 use crate::location::RepoLocation;
 use crate::review::{CommentStatus, RemoteRef, Review, ReviewState, ReviewStore, now_ms};
@@ -54,6 +54,16 @@ pub struct IndexEntry {
     /// set by [`IndexEntry::from_review`] itself.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pr_status: Option<CachedPrStatus>,
+    /// Whole-review `+/−` totals for the sidebar card (R2). Filled by
+    /// [`hydrate_location`] (a git numstat per review);
+    /// never by [`IndexEntry::from_review`] — so, like `pr_status`, it's a
+    /// cache field that [`ReviewIndex::upsert`] and
+    /// [`ReviewIndex::apply_hydration`] carry forward when an incoming
+    /// entry lacks it. `None` on a pre-R2 index file or when the numstat
+    /// failed (e.g. a PR review whose head oid was pruned) — the card just
+    /// omits the cluster.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub diffstat: Option<DiffTotals>,
     /// == [`Review::updated_ms`].
     pub updated_ms: u64,
     #[serde(default)]
@@ -174,6 +184,16 @@ impl ReviewIndex {
                 if !opened {
                     entry.last_opened_ms = self.entries[index].last_opened_ms;
                 }
+                // A cache-field carry: most upsert callers build their
+                // entry via `from_review` (which never computes a
+                // diffstat), so an incoming `None` means "unknown", not
+                // "zero" — keep the total the last hydration pass
+                // computed. (`pr_status` is deliberately NOT carried here:
+                // its callers each decide explicitly what status to stamp,
+                // see shell.rs's badge-merge logic.)
+                if entry.diffstat.is_none() {
+                    entry.diffstat = self.entries[index].diffstat;
+                }
                 self.entries[index] = entry;
                 index
             }
@@ -230,20 +250,33 @@ impl ReviewIndex {
                 // the same review.
                 let fresh_ids: std::collections::HashSet<&str> =
                     fresh.iter().map(|e| e.review_id.as_str()).collect();
-                let mut carried: HashMap<String, (u64, Option<CachedPrStatus>)> = self
+                let mut carried: HashMap<
+                    String,
+                    (u64, Option<CachedPrStatus>, Option<DiffTotals>),
+                > = self
                     .entries
                     .iter()
                     .filter(|e| fresh_ids.contains(e.review_id.as_str()))
-                    .map(|e| (e.review_id.clone(), (e.last_opened_ms, e.pr_status.clone())))
+                    .map(|e| {
+                        (
+                            e.review_id.clone(),
+                            (e.last_opened_ms, e.pr_status.clone(), e.diffstat),
+                        )
+                    })
                     .collect();
                 self.entries.retain(|e| {
                     &e.location != location && !fresh_ids.contains(e.review_id.as_str())
                 });
                 for mut entry in fresh {
-                    if let Some((last_opened_ms, pr_status)) = carried.remove(&entry.review_id) {
+                    if let Some((last_opened_ms, pr_status, diffstat)) =
+                        carried.remove(&entry.review_id)
+                    {
                         entry.last_opened_ms = last_opened_ms;
                         if entry.pr_status.is_none() {
                             entry.pr_status = pr_status;
+                        }
+                        if entry.diffstat.is_none() {
+                            entry.diffstat = diffstat;
                         }
                     }
                     entry.health = EntryHealth::Ok;
@@ -322,6 +355,7 @@ impl IndexEntry {
             open_comments,
             remote: review.remote.clone(),
             pr_status: None,
+            diffstat: None,
             updated_ms: review.updated_ms,
             last_opened_ms: 0,
             health: EntryHealth::Ok,
@@ -341,12 +375,25 @@ impl IndexEntry {
 pub fn hydrate_location(location: &RepoLocation) -> HydrateOutcome {
     let store = ReviewStore::open(location.clone());
     match store.list() {
-        Ok(reviews) => HydrateOutcome::Reviews(
-            reviews
-                .iter()
-                .map(|r| IndexEntry::from_review(location, r))
-                .collect(),
-        ),
+        Ok(reviews) => {
+            // One repo handle for the whole pass; a per-review numstat
+            // fills the card diffstat. Both are best-effort — a failed
+            // open/numstat leaves `diffstat: None`, and
+            // `apply_hydration`'s carry-forward keeps whatever total a
+            // previous pass cached rather than blanking the card.
+            let repo = GitRepo::open(location.clone()).ok();
+            HydrateOutcome::Reviews(
+                reviews
+                    .iter()
+                    .map(|r| {
+                        let mut entry = IndexEntry::from_review(location, r);
+                        entry.diffstat =
+                            repo.as_ref().and_then(|repo| repo.diffstat(&r.source).ok());
+                        entry
+                    })
+                    .collect(),
+            )
+        }
         Err(_) => HydrateOutcome::Unavailable,
     }
 }
@@ -464,6 +511,10 @@ mod tests {
                 decision: Some(ReviewDecision::Approved),
                 checks: ChecksSummary::Passing,
             }),
+            diffstat: Some(DiffTotals {
+                additions: 12,
+                deletions: 3,
+            }),
             updated_ms: 1_700_000_000_000,
             last_opened_ms: 1_700_000_000_500,
             health: EntryHealth::Ok,
@@ -500,6 +551,7 @@ mod tests {
         obj.remove("open_comments");
         obj.remove("remote");
         obj.remove("pr_status");
+        obj.remove("diffstat");
         obj.remove("last_opened_ms");
         obj.remove("health");
 
@@ -508,6 +560,7 @@ mod tests {
         assert_eq!(parsed.open_comments, 0);
         assert!(parsed.remote.is_none());
         assert!(parsed.pr_status.is_none());
+        assert!(parsed.diffstat.is_none());
         assert_eq!(parsed.last_opened_ms, 0);
         assert_eq!(parsed.health, EntryHealth::Ok);
     }
@@ -694,6 +747,61 @@ mod tests {
             vec!["r-a", "r-b", "r-c"],
             "must stay last_opened_ms-desc (300, 200, 100) after re-hydration"
         );
+    }
+
+    #[test]
+    fn upsert_carries_diffstat_forward_when_incoming_lacks_it() {
+        // Shell upsert callers build entries via `from_review`, which
+        // never computes a diffstat — a live metadata refresh must not
+        // blank the total the last hydration pass cached.
+        let mut index = ReviewIndex {
+            path: None,
+            entries: Vec::new(),
+        };
+        let hydrated = sample_entry("r-1");
+        let cached = hydrated.diffstat;
+        assert!(cached.is_some());
+        index.upsert(hydrated, false);
+
+        let mut refresh = sample_entry("r-1");
+        refresh.diffstat = None; // as `from_review` would produce
+        refresh.open_comments = 9;
+        index.upsert(refresh, false);
+        assert_eq!(index.entries()[0].diffstat, cached);
+        assert_eq!(index.entries()[0].open_comments, 9);
+
+        // But a *known* fresh total wins — carry-forward only fills the
+        // unknown case, it never pins the first value forever.
+        let mut newer = sample_entry("r-1");
+        newer.diffstat = Some(DiffTotals {
+            additions: 100,
+            deletions: 50,
+        });
+        index.upsert(newer.clone(), false);
+        assert_eq!(index.entries()[0].diffstat, newer.diffstat);
+    }
+
+    #[test]
+    fn apply_hydration_carries_diffstat_forward_when_fresh_lacks_it() {
+        // A hydration pass where the numstat failed (repo open error, a
+        // pruned PR head oid) produces `diffstat: None`; the previously
+        // cached total must survive, same as `pr_status`.
+        let loc = local("difftest");
+        let mut existing = sample_entry("r-1");
+        existing.location = loc.clone();
+        let cached = existing.diffstat;
+        assert!(cached.is_some());
+        let mut index = ReviewIndex {
+            path: None,
+            entries: vec![existing],
+        };
+
+        let mut fresh = sample_entry("r-1");
+        fresh.location = loc.clone();
+        fresh.diffstat = None;
+        fresh.last_opened_ms = 0;
+        index.apply_hydration(&loc, HydrateOutcome::Reviews(vec![fresh]));
+        assert_eq!(index.get("r-1").unwrap().diffstat, cached);
     }
 
     #[test]

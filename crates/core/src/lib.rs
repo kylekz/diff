@@ -19,7 +19,7 @@ pub mod review;
 
 pub use command::CommandBuilder;
 pub use diff::{DiffLine, DiffOptions, FileDiff, Hunk, LineKind};
-pub use git::{BlobSpec, ChangeStatus, ChangedFile, DiffSource, GitRepo, parse_range};
+pub use git::{BlobSpec, ChangeStatus, ChangedFile, DiffSource, DiffTotals, GitRepo, parse_range};
 pub use github::{
     ChecksSummary, CreatePr, CreatedPr, DraftComment, GhError, GhSide, GithubClient, PrMeta,
     PrState, PrStatus, PrSummary, RemoteComment, RemoteThread, RepoSlug, ReviewDecision,

@@ -8812,6 +8812,15 @@ impl Workspace {
         // as "resolved" (deliverable 6).
         let local_resolved = comment.status == dv_core::CommentStatus::Resolved;
         let resolved = local_resolved || self.github_resolved.contains(&comment.id);
+        // Backlog item (Phase-6 S6c, P3): on a SUBMITTED review the four
+        // action handlers below are unconditionally refused
+        // (`open_thread_input`/`set_comment_status`/`delete_comment`'s
+        // readonly gates), but the buttons used to render fully live and
+        // silently no-op. Disable them instead — the standard dimmed
+        // affordance — matching the suppress-the-entry-point posture while
+        // no longer inviting dead clicks; the summary panel's read-only
+        // banner explains the state.
+        let readonly = self.review_is_readonly();
         let id = comment.id.clone();
         let id_for_delete = comment.id.clone();
         let id_for_reply = comment.id.clone();
@@ -8917,6 +8926,7 @@ impl Workspace {
                                         Button::new(("resolve", comment_ix))
                                             .ghost()
                                             .small()
+                                            .disabled(readonly)
                                             .label(if local_resolved {
                                                 "Unresolve"
                                             } else {
@@ -8935,6 +8945,7 @@ impl Workspace {
                                         Button::new(("reply", comment_ix))
                                             .ghost()
                                             .small()
+                                            .disabled(readonly)
                                             .label("Reply")
                                             .on_click(cx.listener(move |this, _, window, cx| {
                                                 this.open_thread_input(
@@ -8949,6 +8960,7 @@ impl Workspace {
                                         Button::new(("edit", comment_ix))
                                             .ghost()
                                             .small()
+                                            .disabled(readonly)
                                             .label("Edit")
                                             .on_click(cx.listener(move |this, _, window, cx| {
                                                 this.open_thread_input(
@@ -8963,6 +8975,7 @@ impl Workspace {
                                         Button::new(("delete", comment_ix))
                                             .danger()
                                             .small()
+                                            .disabled(readonly)
                                             .label("Delete")
                                             .on_click(cx.listener(move |this, _, _, cx| {
                                                 this.delete_comment(id_for_delete.clone(), cx);

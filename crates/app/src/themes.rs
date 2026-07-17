@@ -565,4 +565,54 @@ mod tests {
             );
         }
     }
+
+    #[test]
+    fn bundled_themes_share_the_reference_key_set_exactly() {
+        // Backlog item (theme-slice review, P3): `Theme::apply_config` only
+        // overwrites keys the JSON actually carries, so a bundled theme
+        // missing a key silently inherits the PREVIOUSLY-ACTIVE theme's
+        // value on a live swap — invisible in isolation, wrong the moment
+        // someone flips between themes. Assert every bundled theme's
+        // ThemeConfig-visible key-path set matches the reference theme's
+        // exactly (the dv-owned `"dv"` override section is exempt: its
+        // keys are Optional by design, with documented derivations).
+        fn key_paths(
+            prefix: &str,
+            value: &serde_json::Value,
+            out: &mut std::collections::BTreeSet<String>,
+        ) {
+            if let Some(obj) = value.as_object() {
+                for (key, child) in obj {
+                    let path = if prefix.is_empty() {
+                        key.clone()
+                    } else {
+                        format!("{prefix}.{key}")
+                    };
+                    key_paths(&path, child, out);
+                    out.insert(path);
+                }
+            }
+        }
+        fn theme_config_paths(json: &str) -> std::collections::BTreeSet<String> {
+            let value: serde_json::Value = serde_json::from_str(json).expect("theme JSON parses");
+            let mut paths = std::collections::BTreeSet::new();
+            key_paths("", &value, &mut paths);
+            paths.retain(|p| p != "dv" && !p.starts_with("dv."));
+            paths
+        }
+
+        let reference = theme_config_paths(find(DEFAULT_THEME).json);
+        assert!(!reference.is_empty());
+        for entry in &THEMES {
+            let got = theme_config_paths(entry.json);
+            let missing: Vec<_> = reference.difference(&got).collect();
+            let extra: Vec<_> = got.difference(&reference).collect();
+            assert!(
+                missing.is_empty() && extra.is_empty(),
+                "{}: key set must match {DEFAULT_THEME}'s exactly \
+                 (missing: {missing:?}, extra: {extra:?})",
+                entry.name
+            );
+        }
+    }
 }

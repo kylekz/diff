@@ -92,9 +92,9 @@
     "syntax": {
       "attribute": { "color": "#50fa7b" },
       "boolean": { "color": "#bd93f9" },
-      "comment": { "color": "#6272a4" },
-      "comment.doc": { "color": "#bd93f9" },
-      "comment_doc": { "color": "#bd93f9" },
+      "comment": { "color": "#6272a4", "font_style": "normal" },
+      "comment.doc": { "color": "#bd93f9", "font_style": "normal" },
+      "comment_doc": { "color": "#bd93f9", "font_style": "normal" },
       "constant": { "color": "#bd93f9" },
       "constructor": { "color": "#8be9fd" },
       "embedded": { "color": "#f8f8f2" },

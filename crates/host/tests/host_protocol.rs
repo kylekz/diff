@@ -452,10 +452,16 @@ fn watch_store_touch_fires_event_then_unsubscribe_silences_it() {
     client
         .watch_unsubscribe(watch_id)
         .expect("watch/unsubscribe");
-    // Drain anything already in flight from the write above (coalescing
-    // means there's at most one, but don't assume), then prove silence: a
-    // FRESH write after unsubscribing must produce nothing more.
-    while rx.try_recv().is_ok() {}
+    // SETTLE, don't just drain: the first write can have late/duplicate
+    // notifications still in flight through the host when unsubscribe
+    // returns (Windows readily delivers two Modify events for one write),
+    // and a bare `try_recv` drain only clears what has ALREADY crossed the
+    // channel — a straggler landing a moment later was then misread as a
+    // post-unsubscribe event (the windows-latest CI flake this test was
+    // known for). Consume events until the channel stays quiet for a full
+    // second; only then does the negative assertion below prove anything
+    // about the FRESH write.
+    while recv_watch_event(&rx, Duration::from_secs(1)).is_some() {}
     std::fs::write(reviews_dir.join("r-test-2.json"), b"{}").expect("write second review file");
     assert!(
         recv_watch_event(&rx, Duration::from_millis(800)).is_none(),

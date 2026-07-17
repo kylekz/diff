@@ -155,6 +155,110 @@ pub(crate) enum LspSessionState {
     Unavailable(String),
 }
 
+/// The last position a go-to-definition click or a hover actually resolved
+/// against (docs/backlog.md find-references task: "operating on... the last
+/// hover/click position") — `Workspace::lsp_last_symbol_anchor`'s value.
+/// This is what the `FindReferences` ACTION (palette/keybinding, no click
+/// event of its own) replays: the primary path is still a fresh
+/// shift-ctrl-click, which always carries its own click-time position
+/// instead of consulting this at all (see `Workspace::on_find_references`).
+/// Session-scoped, like `LspSessionState` itself — cleared on file switch
+/// and on `Workspace::park_lsp_session` (belongs to a position on a
+/// specific file under a specific vtsls session, not something worth
+/// carrying across either).
+#[derive(Debug, Clone)]
+pub(crate) struct SymbolAnchor {
+    pub(crate) rel_path: String,
+    pub(crate) uri: String,
+    pub(crate) position: lsp_types::Position,
+    pub(crate) language_id: &'static str,
+    /// Best-effort identifier text extracted at the anchor position (see
+    /// [`extract_identifier`]) — purely cosmetic (the results panel's
+    /// header label), never what actually drives the `textDocument/references`
+    /// request (`position` alone does that).
+    pub(crate) label: String,
+}
+
+/// One `textDocument/references` hit, normalized from `lsp_types::Location`
+/// into a plain, gpui-free value — [`group_references`] and the results
+/// panel operate on these rather than `lsp_types::Location` directly so the
+/// grouping/ordering logic below is unit-testable without a live vtsls.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ReferenceHit {
+    pub(crate) uri: String,
+    pub(crate) line: u32,
+    pub(crate) start_char: u32,
+    pub(crate) end_char: u32,
+}
+
+impl ReferenceHit {
+    pub(crate) fn from_location(loc: &lsp_types::Location) -> Self {
+        ReferenceHit {
+            uri: loc.uri.as_str().to_string(),
+            line: loc.range.start.line,
+            start_char: loc.range.start.character,
+            end_char: loc.range.end.character,
+        }
+    }
+}
+
+/// Group [`ReferenceHit`]s by `uri` and sort deterministically — groups
+/// ascending by uri, hits within a group by `(line, start_char)` — the
+/// results panel's own "grouped by file" ordering (docs/backlog.md
+/// find-references task: "a panel/popover listing references grouped by
+/// file"). Factored out here, separate from `workspace.rs`'s gpui-heavy
+/// panel-construction code, so it's unit-testable headlessly: LSP doesn't
+/// guarantee any particular order in `textDocument/references`'s wire
+/// result, and an unstable grouping would make the panel's row order (and
+/// therefore up/down keyboard navigation) jump around between two runs of
+/// the exact same search against the exact same vtsls answer.
+pub(crate) fn group_references(hits: Vec<ReferenceHit>) -> Vec<(String, Vec<ReferenceHit>)> {
+    let mut by_uri: std::collections::BTreeMap<String, Vec<ReferenceHit>> = Default::default();
+    for hit in hits {
+        by_uri.entry(hit.uri.clone()).or_default().push(hit);
+    }
+    for hits in by_uri.values_mut() {
+        hits.sort_by_key(|h| (h.line, h.start_char));
+    }
+    by_uri.into_iter().collect()
+}
+
+/// Best-effort identifier extraction for the find-references panel's header
+/// label ("N references to `<name>`...") — scans outward from `byte_col`
+/// over ASCII word bytes (`[A-Za-z0-9_$]`, covering every legal JS/TS
+/// identifier byte) to recover the clicked/hovered token's own text.
+/// Purely cosmetic: a miss (the column lands on punctuation/whitespace, or
+/// the identifier itself is non-ASCII) falls back to an empty string, which
+/// the panel header just renders a little plainer — this never blocks the
+/// actual references search, which is driven by the LSP `Position` alone,
+/// computed independently of whatever this extracts.
+pub(crate) fn extract_identifier(line: &str, byte_col: usize) -> String {
+    let bytes = line.as_bytes();
+    let is_word = |b: u8| b.is_ascii_alphanumeric() || b == b'_' || b == b'$';
+    let col = byte_col.min(bytes.len());
+    let on_word = col < bytes.len() && is_word(bytes[col]);
+    // A click/hover column can land exactly one byte past a token's last
+    // character (`hit_test_byte_column` rounds to the nearest glyph
+    // boundary, which is often a token's own end) — fall back to the byte
+    // just before `col` in that case.
+    let anchor = if on_word {
+        col
+    } else if col > 0 && is_word(bytes[col - 1]) {
+        col - 1
+    } else {
+        return String::new();
+    };
+    let mut start = anchor;
+    while start > 0 && is_word(bytes[start - 1]) {
+        start -= 1;
+    }
+    let mut end = anchor + 1;
+    while end < bytes.len() && is_word(bytes[end]) {
+        end += 1;
+    }
+    line[start..end].to_string()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -261,5 +365,125 @@ mod tests {
         assert_eq!(location.uri, "file:///a.ts");
         assert_eq!(location.line, 4);
         assert_eq!(location.character, 2);
+    }
+
+    // --- group_references: grouping + deterministic ordering -------------
+
+    fn hit(uri: &str, line: u32, start: u32, end: u32) -> ReferenceHit {
+        ReferenceHit {
+            uri: uri.to_string(),
+            line,
+            start_char: start,
+            end_char: end,
+        }
+    }
+
+    #[test]
+    fn group_references_groups_by_uri() {
+        let hits = vec![
+            hit("file:///a.ts", 1, 0, 5),
+            hit("file:///b.ts", 2, 0, 5),
+            hit("file:///a.ts", 3, 0, 5),
+        ];
+        let groups = group_references(hits);
+        assert_eq!(groups.len(), 2);
+        assert_eq!(groups[0].0, "file:///a.ts");
+        assert_eq!(groups[0].1.len(), 2);
+        assert_eq!(groups[1].0, "file:///b.ts");
+        assert_eq!(groups[1].1.len(), 1);
+    }
+
+    #[test]
+    fn group_references_orders_groups_by_uri_ascending() {
+        let hits = vec![hit("file:///z.ts", 0, 0, 1), hit("file:///a.ts", 0, 0, 1)];
+        let groups = group_references(hits);
+        assert_eq!(groups[0].0, "file:///a.ts");
+        assert_eq!(groups[1].0, "file:///z.ts");
+    }
+
+    #[test]
+    fn group_references_orders_hits_within_a_group_by_line_then_char() {
+        let hits = vec![
+            hit("file:///a.ts", 5, 3, 8),
+            hit("file:///a.ts", 2, 9, 12),
+            hit("file:///a.ts", 2, 1, 4),
+        ];
+        let groups = group_references(hits);
+        let ordered = &groups[0].1;
+        assert_eq!(
+            ordered
+                .iter()
+                .map(|h| (h.line, h.start_char))
+                .collect::<Vec<_>>(),
+            vec![(2, 1), (2, 9), (5, 3)]
+        );
+    }
+
+    #[test]
+    fn group_references_is_deterministic_regardless_of_input_order() {
+        let a = vec![
+            hit("file:///b.ts", 1, 0, 1),
+            hit("file:///a.ts", 1, 0, 1),
+            hit("file:///a.ts", 0, 0, 1),
+        ];
+        let mut b = a.clone();
+        b.reverse();
+        assert_eq!(group_references(a), group_references(b));
+    }
+
+    #[test]
+    fn group_references_empty_input_is_empty() {
+        assert!(group_references(Vec::new()).is_empty());
+    }
+
+    // --- extract_identifier: best-effort label extraction -----------------
+
+    #[test]
+    fn extract_identifier_finds_the_token_under_the_column() {
+        let line = "console.log(greet(\"world\"));";
+        // column 13 sits inside "greet"
+        assert_eq!(extract_identifier(line, 13), "greet");
+    }
+
+    #[test]
+    fn extract_identifier_at_the_start_of_the_token() {
+        let line = "function greet(name: string) {}";
+        assert_eq!(extract_identifier(line, 9), "greet");
+    }
+
+    #[test]
+    fn extract_identifier_one_past_the_end_falls_back_to_the_preceding_token() {
+        // `hit_test_byte_column` can round to exactly one byte past a
+        // token's last character.
+        let line = "greet(x)";
+        assert_eq!(extract_identifier(line, 5), "greet");
+    }
+
+    #[test]
+    fn extract_identifier_on_punctuation_with_no_adjacent_token_is_empty() {
+        // The '+' at column 2 has a space on both sides — neither the
+        // "sitting on a word" nor the "one past a token" fallback applies.
+        let line = "a + b;";
+        assert_eq!(extract_identifier(line, 2), "");
+    }
+
+    #[test]
+    fn extract_identifier_supports_dollar_and_underscore() {
+        let line = "const $_private_2 = 1;";
+        assert_eq!(extract_identifier(line, 8), "$_private_2");
+    }
+
+    #[test]
+    fn extract_identifier_out_of_bounds_column_clamps_to_the_line_end() {
+        // A column past the line's length clamps to `bytes.len()` — same
+        // "one past the last character" case a legitimate end-of-line click
+        // hits, just further out; never panics, never indexes out of
+        // bounds.
+        assert_eq!(extract_identifier("short", 100), "short");
+    }
+
+    #[test]
+    fn extract_identifier_empty_line_is_empty() {
+        assert_eq!(extract_identifier("", 0), "");
     }
 }

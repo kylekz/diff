@@ -54,7 +54,22 @@ actions!(
         // ungated list).
         NavBack,
         NavForward,
-        CloseTargetViewer
+        CloseTargetViewer,
+        // Find-references (docs/backlog.md "find-references UI"): a
+        // shift-ctrl/cmd-click on an identifier is the primary trigger
+        // (`Self::on_find_references`, mirroring go-to-def's ctrl-click);
+        // `FindReferences` is the palette/keybinding twin that replays
+        // `Self::lsp_last_symbol_anchor` instead of a fresh click position.
+        // `References*` navigate/dismiss the results panel the same way
+        // `Palette*` does for the jump-to-file palette. Not gated behind
+        // the `automation` feature — same rationale as `NavBack`/
+        // `NavForward`/`CloseTargetViewer` just above: real product
+        // surface, not a test seam.
+        FindReferences,
+        ReferencesNext,
+        ReferencesPrev,
+        ReferencesChoose,
+        ReferencesClose
     ]
 );
 
@@ -160,6 +175,24 @@ fn utf16_column(text: &str, byte_offset: usize) -> u32 {
         }
     }
 }
+
+/// The inverse of [`utf16_column`]: a 0-based UTF-16 code-unit column back to
+/// a byte offset into `text` — needed to slice a [`ReferenceItem`]'s
+/// `preview` around `start_char`/`end_char` (LSP's own coordinate system)
+/// for the find-references panel's match highlight. Clamps to `text.len()`
+/// if `col` runs past the line's actual UTF-16 length (the preview line can
+/// legitimately have moved on since vtsls reported the reference — never
+/// panics, never lands mid-character).
+fn byte_offset_for_utf16_column(text: &str, col: u32) -> usize {
+    let mut units = 0u32;
+    for (byte_ix, ch) in text.char_indices() {
+        if units >= col {
+            return byte_ix;
+        }
+        units += ch.len_utf16() as u32;
+    }
+    text.len()
+}
 /// Extra identifier stamped onto the workspace node while the jump-to-file
 /// palette is open. Single-char bindings are scoped to `!PaletteOpen` so
 /// they keep bubbling into the palette's text input instead of firing.
@@ -170,14 +203,22 @@ const PR_PICKER_CONTEXT: &str = "PrPickerOpen";
 /// (`Workspace::target_viewer`) is open — scopes its `escape`-to-close
 /// binding the same way [`PALETTE_CONTEXT`] scopes the palette's.
 const TARGET_VIEWER_CONTEXT: &str = "TargetViewerOpen";
+/// Stamped onto the workspace node while the find-references results panel
+/// (`Workspace::references_panel`) is open — scopes its up/down/enter/escape
+/// bindings the same way [`TARGET_VIEWER_CONTEXT`] scopes the target
+/// viewer's, and excludes single-char `browse` bindings the same way.
+const REFERENCES_PANEL_CONTEXT: &str = "ReferencesPanelOpen";
 
 pub fn init(cx: &mut App) {
-    let browse =
-        Some("Workspace && !PaletteOpen && !EditorOpen && !PrPickerOpen && !TargetViewerOpen");
+    let browse = Some(
+        "Workspace && !PaletteOpen && !EditorOpen && !PrPickerOpen && !TargetViewerOpen \
+         && !ReferencesPanelOpen",
+    );
     let palette = Some("Workspace && PaletteOpen");
     let editor = Some("Workspace && EditorOpen");
     let pr_picker = Some("Workspace && PrPickerOpen");
     let target_viewer = Some("Workspace && TargetViewerOpen");
+    let references_panel = Some("Workspace && ReferencesPanelOpen");
     // Nav back/forward (S8f) stay live both while browsing the diff AND
     // while the target viewer itself is open (jumping BACK from a target
     // viewer to the diff is the common case) — everything `browse` excludes
@@ -223,6 +264,17 @@ pub fn init(cx: &mut App) {
         KeyBinding::new("ctrl-[", NavBack, nav),
         KeyBinding::new("cmd-]", NavForward, nav),
         KeyBinding::new("ctrl-]", NavForward, nav),
+        // Find-references (docs/backlog.md "find-references UI") — VS Code's
+        // own convention for the equivalent command, so a TS-familiar user's
+        // muscle memory transfers. The primary trigger stays the
+        // shift-ctrl/cmd-click gesture itself (`Self::wrap_symbol_click_target`);
+        // this is the keybinding/palette twin `Self::on_find_references_action`
+        // answers, replaying `Self::lsp_last_symbol_anchor`.
+        KeyBinding::new("shift-f12", FindReferences, browse),
+        KeyBinding::new("down", ReferencesNext, references_panel),
+        KeyBinding::new("up", ReferencesPrev, references_panel),
+        KeyBinding::new("enter", ReferencesChoose, references_panel),
+        KeyBinding::new("escape", ReferencesClose, references_panel),
     ]);
 }
 
@@ -704,6 +756,179 @@ struct PendingDefinition {
     from: crate::lsp::Location,
     range_head: Option<String>,
     epoch: u64,
+}
+
+/// A find-references request stashed while `Workspace::lsp_session` is
+/// still `Spawning` — the exact same race `PendingDefinition` exists to fix
+/// (see its doc comment), just for `textDocument/references` instead of
+/// `textDocument/definition`. `Self::ensure_lsp_session`'s spawn completion
+/// replays whichever of `lsp_pending_definition`/`lsp_pending_references` is
+/// currently set — independently: a click and a shift-click landing while
+/// the same spawn is in flight both get replayed once it lands.
+struct PendingReferences {
+    repo: Arc<GitRepo>,
+    rel_path: String,
+    uri: String,
+    language_id: &'static str,
+    position: lsp_types::Position,
+    range_head: Option<String>,
+    epoch: u64,
+    /// Best-effort identifier label (see `crate::lsp::extract_identifier`),
+    /// carried through so the panel's header can show it once
+    /// `Self::run_references_request` actually opens the panel.
+    label: String,
+}
+
+/// Everything a symbol gesture (go-to-def click, shift-click for
+/// find-references, or the `FindReferences` action) needs to dispatch a
+/// vtsls request — built once by `Workspace::prepare_symbol_click`, shared
+/// by both gestures so the honest-view/WSL/TS/session gating logic lives in
+/// exactly one place.
+struct SymbolClickContext {
+    repo: Arc<GitRepo>,
+    rel_path: String,
+    uri: String,
+    language_id: &'static str,
+    position: lsp_types::Position,
+    range_head: Option<String>,
+    epoch: u64,
+}
+
+/// One `textDocument/references` hit, already resolved to a repo-relative
+/// path and a one-line code preview — built off the UI thread in
+/// `Self::run_references_request`'s background task (it needs a blob read
+/// per referenced file, which does not belong on the UI thread), then
+/// installed onto `Workspace::references_panel` verbatim by
+/// `Self::handle_references_result`.
+#[derive(Debug, Clone)]
+struct ReferenceItem {
+    /// 0-based line (LSP's own coordinate system).
+    line: u32,
+    /// 0-based UTF-16 column span of the matched token on `line`, for the
+    /// preview's highlight — straight from `textDocument/references`'s own
+    /// `Location.range`, not re-derived (vtsls reports the exact reference
+    /// span, sparing this a second `extract_identifier`-style guess).
+    start_char: u32,
+    end_char: u32,
+    /// The referenced line's raw text, read from the SAME working-tree
+    /// bytes `Self::open_target_at` would show if this row is opened —
+    /// honest by construction, same reasoning as that fn's own doc comment.
+    preview: String,
+}
+
+/// One file's worth of [`ReferenceItem`]s, in the results panel's
+/// "grouped by file" layout (docs/backlog.md find-references task).
+#[derive(Debug, Clone)]
+struct ReferencesGroup {
+    /// Repo-relative path.
+    path: String,
+    items: Vec<ReferenceItem>,
+}
+
+/// One rendered row of [`ReferencesPanel::rows`] — a file-header row (not
+/// independently selectable) or an item row (selectable, opens the target
+/// viewer). Precomputed once when the panel's `groups` are installed
+/// (`Self::handle_references_result`) rather than re-walked by
+/// `Self::render_references_panel`'s virtualized `uniform_list` processor on
+/// every call.
+#[derive(Debug, Clone, Copy)]
+enum ReferenceRow {
+    Header {
+        group_ix: usize,
+    },
+    Item {
+        group_ix: usize,
+        item_ix: usize,
+        /// This item's own index into `ReferencesPanel::item_rows` — stashed
+        /// at build time so a row click (`Self::render_references_row`) can
+        /// set `ReferencesPanel::selected` directly instead of scanning
+        /// `item_rows` for a match.
+        flat_ix: usize,
+    },
+}
+
+/// The find-references results overlay (docs/backlog.md "find-references
+/// UI"), opened by a shift-ctrl/cmd-click (`Self::on_find_references`) or
+/// the `FindReferences` action (`Self::on_find_references_action`) —
+/// the shared modal-picker recipe, same as `Palette`/`TargetViewer`.
+/// Keyboard-navigable over `item_rows` (indices into `rows` that are
+/// `ReferenceRow::Item`, in display order) so up/down/enter skip over
+/// header rows automatically.
+struct ReferencesPanel {
+    /// Best-effort identifier text for the header ("N references to
+    /// `<label>` in M files") — see `crate::lsp::extract_identifier`.
+    label: String,
+    /// Where the search itself was raised from — the `NavCommit::Push`
+    /// origin `Self::references_choose` hands `Self::open_target_at` when a
+    /// row is opened, so back-navigation from the target viewer returns to
+    /// the token that was searched from, same as go-to-definition's own
+    /// `from`.
+    origin: crate::lsp::Location,
+    /// `Workspace::lsp_request_epoch` as of the request this panel was
+    /// raised for — `Self::run_references_request`'s completion uses this
+    /// (not just the current epoch, which it also checks) to tell "this IS
+    /// the panel that request opened, still loading" apart from "a fresher
+    /// request has already replaced it", so a superseded request's
+    /// completion never clobbers a newer panel's results (P3-class race,
+    /// same posture as `TargetViewer`/`lsp_request_epoch` elsewhere in this
+    /// file).
+    request_epoch: u64,
+    loading: bool,
+    groups: Vec<ReferencesGroup>,
+    rows: Vec<ReferenceRow>,
+    /// Indices into `rows` that are `ReferenceRow::Item`, in display order.
+    item_rows: Vec<usize>,
+    /// Index into `item_rows` (NOT a raw `rows` index) of the current
+    /// selection — always valid when `item_rows` is non-empty.
+    selected: usize,
+    scroll: UniformListScrollHandle,
+    /// Set whenever `selected` changes (including on construction, so the
+    /// very first render scrolls row 0 into view) — consumed at most once
+    /// per change by `Self::render_references_panel`, mirroring
+    /// `TargetViewer::scrolled_to_highlight`'s exact "fire once, then leave
+    /// the user's own scroll alone" contract.
+    pending_scroll: bool,
+}
+
+impl ReferencesPanel {
+    /// Build `rows`/`item_rows` from `groups` — a header row per group
+    /// (skipped by keyboard nav) followed by one item row per reference.
+    fn build_rows(groups: &[ReferencesGroup]) -> (Vec<ReferenceRow>, Vec<usize>) {
+        let mut rows = Vec::new();
+        let mut item_rows = Vec::new();
+        for (group_ix, group) in groups.iter().enumerate() {
+            rows.push(ReferenceRow::Header { group_ix });
+            for item_ix in 0..group.items.len() {
+                let flat_ix = item_rows.len();
+                item_rows.push(rows.len());
+                rows.push(ReferenceRow::Item {
+                    group_ix,
+                    item_ix,
+                    flat_ix,
+                });
+            }
+        }
+        (rows, item_rows)
+    }
+
+    fn total_items(&self) -> usize {
+        self.item_rows.len()
+    }
+
+    fn total_files(&self) -> usize {
+        self.groups.len()
+    }
+
+    /// The currently selected `(group_ix, item_ix)` pair, if any.
+    fn selected_item(&self) -> Option<(usize, usize)> {
+        let row_ix = *self.item_rows.get(self.selected)?;
+        match self.rows.get(row_ix)? {
+            ReferenceRow::Item {
+                group_ix, item_ix, ..
+            } => Some((*group_ix, *item_ix)),
+            ReferenceRow::Header { .. } => None,
+        }
+    }
 }
 
 /// How long a mouse-move over an eligible token waits, with no further
@@ -1445,6 +1670,17 @@ pub struct Workspace {
     /// THIS root, mirroring how `Self::wrap_symbol_click_target`'s own probe
     /// turns a window-relative click into a row-relative column.
     root_bounds: Rc<Cell<Option<Bounds<Pixels>>>>,
+    /// Find-references (docs/backlog.md "find-references UI"): a request
+    /// received while `lsp_session` is still `Spawning` — see
+    /// `PendingReferences`'s doc comment.
+    lsp_pending_references: Option<PendingReferences>,
+    /// The last position a go-to-definition click or a hover actually
+    /// resolved against — see `crate::lsp::SymbolAnchor`'s doc comment for
+    /// why `FindReferences` (the action/keybinding path, as opposed to a
+    /// fresh shift-ctrl-click) replays this instead of a click event.
+    lsp_last_symbol_anchor: Option<crate::lsp::SymbolAnchor>,
+    /// The find-references results overlay, if one is open.
+    references_panel: Option<ReferencesPanel>,
 }
 
 /// Which review the workspace should display, from a store listing
@@ -2054,6 +2290,9 @@ impl Workspace {
             hover_request_epoch: 0,
             hover_request_line: None,
             root_bounds: Rc::new(Cell::new(None)),
+            lsp_pending_references: None,
+            lsp_last_symbol_anchor: None,
+            references_panel: None,
         };
 
         cx.spawn(async move |this, cx| {
@@ -3012,6 +3251,10 @@ impl Workspace {
         self.hover_popover = None;
         self.hover_request_epoch += 1;
         self.hover_request_line = None;
+        // Same reasoning again for find-references: the anchor and any open
+        // results panel belong to the file/position being left.
+        self.lsp_last_symbol_anchor = None;
+        self.references_panel = None;
         self.selected = Some(index);
         self.current_hunk = 0;
         self.file_scroll
@@ -4154,6 +4397,12 @@ impl Workspace {
         if self.target_viewer.is_some() {
             return;
         }
+        // Same reasoning, for the find-references results panel — it's the
+        // same modal-overlay recipe as the target viewer, painted after it
+        // in `render`'s child order.
+        if self.references_panel.is_some() {
+            return;
+        }
         // Decline while a shell-level overlay (theme picker / settings
         // panel) is genuinely open, the same way `on_open_theme_picker`
         // declines if `settings_panel` is already up (review finding P1).
@@ -4715,6 +4964,18 @@ impl Workspace {
                     "line": h.line,
                     "markdown": h.markdown,
                 })),
+                // Find-references (docs/backlog.md "find-references UI"):
+                // panel open/loading/count/selected state, so a script can
+                // assert the results panel without a screenshot the same
+                // way `target_viewer`/`hover` already let it assert
+                // go-to-definition/hover.
+                "references": self.references_panel.as_ref().map(|p| json!({
+                    "loading": p.loading,
+                    "label": p.label,
+                    "count": p.total_items(),
+                    "files": p.total_files(),
+                    "selected": p.selected,
+                })),
             }),
         })
     }
@@ -4780,7 +5041,9 @@ impl Workspace {
         }
         if matches!(self.lsp_session, crate::lsp::LspSessionState::Spawning)
             || self.lsp_pending_definition.is_some()
+            || self.lsp_pending_references.is_some()
             || self.lsp_inflight_requests > 0
+            || self.references_panel.as_ref().is_some_and(|p| p.loading)
         {
             return false;
         }
@@ -6806,7 +7069,16 @@ impl Workspace {
                         local_x,
                         window,
                     );
-                    this.on_symbol_click(new_line, byte_col, text.clone(), window, cx);
+                    // shift-ctrl/cmd-click (docs/backlog.md "find-references
+                    // UI") mirrors go-to-def's ctrl/cmd-click exactly, plus
+                    // shift — the same modifier plumbing S8g's automation
+                    // `click` command already carries (`parse_modifiers`
+                    // combines dash-separated tokens, e.g. `"ctrl-shift"`).
+                    if ev.modifiers.shift {
+                        this.on_find_references(new_line, byte_col, text.clone(), window, cx);
+                    } else {
+                        this.on_symbol_click(new_line, byte_col, text.clone(), window, cx);
+                    }
                     cx.stop_propagation();
                 }),
             )
@@ -6866,87 +7138,85 @@ impl Workspace {
             .into_any_element()
     }
 
-    /// Entry point for a ctrl/cmd-click on an eligible (New-side, real line)
-    /// diff row/cell — `new_line` is the 1-based diff line number, `byte_col`
-    /// a byte offset into `line_text` from `Self::hit_test_byte_column`.
-    /// Every early-out sets `self.lsp_status` to a short, human-readable
-    /// reason rather than silently doing nothing (docs/phase-8-lsp-and-polish.md
-    /// § LSP: "surface a gentle warning ... don't fail" — this is that
-    /// warning's UI-visible half).
-    fn on_symbol_click(
+    /// Shared preamble for both go-to-definition (`Self::on_symbol_click`)
+    /// and find-references (`Self::on_find_references`) — the honest-view/
+    /// WSL/selected-file/TS-file gates, the click-time position/uri/
+    /// range_head computation, the `lsp_request_epoch` bump, and the
+    /// stale-session cleanup every LSP gesture needs before it can even
+    /// consider dispatching to vtsls. Every early-out here sets
+    /// `self.lsp_status` to a short, human-readable reason rather than
+    /// silently doing nothing (docs/phase-8-lsp-and-polish.md § LSP:
+    /// "surface a gentle warning ... don't fail") — find-references is
+    /// gated IDENTICALLY to go-to-def (docs/backlog.md find-references
+    /// task: "same honest-view + WSL-repos-only gating as go-to-def").
+    /// `new_line`/`byte_col` mirror `Self::hit_test_byte_column`'s output;
+    /// `line_text` is the row's raw text (for the UTF-16 column conversion).
+    fn prepare_symbol_click(
         &mut self,
         new_line: u32,
         byte_col: usize,
-        line_text: SharedString,
-        _window: &mut Window,
+        line_text: &SharedString,
         cx: &mut Context<Self>,
-    ) {
+    ) -> Option<SymbolClickContext> {
         if !self.lsp_view_is_honest() {
             self.lsp_status =
                 Some("code intelligence: only available on the working-tree view".into());
             cx.notify();
-            return;
+            return None;
         }
         let RepoLocation::Wsl {
-            distro,
-            path: root_path,
-        } = self.location.clone()
+            path: root_path, ..
+        } = &self.location
         else {
             self.lsp_status = Some(
                 "code intelligence: WSL repos only (docs/phase-8-lsp-and-polish.md § LSP)".into(),
             );
             cx.notify();
-            return;
+            return None;
         };
-        let Some(rel_path) = self.selected_file_path() else {
-            return;
-        };
+        let root_path = root_path.clone();
+        let rel_path = self.selected_file_path()?;
         let Some(language_id) = dv_core::lsp::language_id_for_path(&rel_path) else {
             self.lsp_status = Some("code intelligence: not a TypeScript/JavaScript file".into());
             cx.notify();
-            return;
+            return None;
         };
-        let Some(repo) = self.repo.clone() else {
-            return;
-        };
+        let repo = self.repo.clone()?;
 
-        let character = utf16_column(&line_text, byte_col);
+        let character = utf16_column(line_text, byte_col);
         let position = lsp_types::Position {
             line: new_line.saturating_sub(1),
             character,
         };
-        let root_trimmed = root_path.trim_end_matches('/').to_string();
+        let root_trimmed = root_path.trim_end_matches('/');
         let uri = dv_core::lsp::file_uri(&format!("{root_trimmed}/{rel_path}"));
-        let from_location = crate::lsp::Location {
-            uri: uri.clone(),
-            line: position.line,
-            character: position.character,
-        };
-        // This click supersedes any earlier in-flight go-to-def round trip
-        // (definition request, target-file read, or a queued click still
-        // waiting on `Spawning`) — see `lsp_request_epoch`'s doc comment.
-        self.lsp_request_epoch += 1;
-        let epoch = self.lsp_request_epoch;
         // `Self::lsp_view_is_honest` only compares the WHOLE view's oid
         // against the worktree HEAD; for a `Range` view that still leaves a
         // per-file gap — the displayed bytes are `head`'s committed blob,
         // but vtsls always reads THIS file's on-disk bytes, which can carry
         // uncommitted local edits even when `head == worktree HEAD` (P3
-        // finding). `run_definition_request` re-checks this file specifically
-        // (in the background, alongside the sync it already does) before
-        // ever asking vtsls anything.
+        // finding). `Self::run_definition_request`/`Self::run_references_request`
+        // re-check this file specifically (in the background, alongside the
+        // sync they already do) before ever asking vtsls anything.
         let range_head = match &self.source {
             DiffSource::Range { head, .. } => Some(head.clone()),
             _ => None,
         };
 
+        // This gesture supersedes any earlier in-flight LSP round trip
+        // (definition/references request, target-file read, or a queued
+        // click still waiting on `Spawning`) — see `lsp_request_epoch`'s
+        // doc comment.
+        self.lsp_request_epoch += 1;
+        let epoch = self.lsp_request_epoch;
+
         // A vtsls child that died mid-session (crash, `wsl --terminate`,
         // OOM) otherwise leaves `Ready` installed forever: the reader thread
         // flips `is_alive()` false, but nothing else observes it, so every
-        // click here would keep failing with "lsp connection lost" until the
-        // workspace is parked or a fresh one is opened (P3 finding). Reset
-        // to `Unattempted` so THIS click falls straight into the same lazy
-        // respawn path below a brand-new workspace would take.
+        // gesture here would keep failing with "lsp connection lost" until
+        // the workspace is parked or a fresh one is opened (P3 finding).
+        // Reset to `Unattempted` so THIS gesture falls straight into the
+        // same lazy respawn path a brand-new workspace would take.
         if let crate::lsp::LspSessionState::Ready(handle) = &self.lsp_session
             && !handle.is_alive()
         {
@@ -6962,10 +7232,10 @@ impl Workspace {
         // it can change. The common trigger is a ctrl-click landing mid-
         // install (S8e's up-to-180s consent-triggered `npm install -g`,
         // before the reverify flips the onboarding row to `Ok`): without
-        // this reset, every later click kept reading the same stale
+        // this reset, every later gesture kept reading the same stale
         // verdict forever, even once vtsls was actually installed and
         // working, with only a park (review switch away/back) or an app
-        // restart able to heal it (P2 finding). Treat this fresh click —
+        // restart able to heal it (P2 finding). Treat this fresh gesture —
         // itself a deliberate user action, not an automatic retry — as
         // license to re-detect rather than trust the old answer.
         if matches!(
@@ -6975,6 +7245,237 @@ impl Workspace {
             self.lsp_session = crate::lsp::LspSessionState::Unattempted;
         }
 
+        Some(SymbolClickContext {
+            repo,
+            rel_path,
+            uri,
+            language_id,
+            position,
+            range_head,
+            epoch,
+        })
+    }
+
+    /// Kick off a lazy vtsls spawn attempt (`LspSessionState::Unattempted ->
+    /// Spawning -> Ready/Unavailable`) — the shared second half of both
+    /// go-to-definition's and find-references's `Unattempted` dispatch arm
+    /// (`Self::on_symbol_click`/`Self::on_find_references`/
+    /// `Self::on_find_references_action`). Callers must stash their own
+    /// request (`self.lsp_pending_definition`/`self.lsp_pending_references`)
+    /// BEFORE calling this — the spawn's completion replays whichever of the
+    /// two is currently set (either, both, or neither), the same "replay
+    /// whatever's CURRENTLY stashed" posture `lsp_pending_definition`'s doc
+    /// comment describes, now shared across both request kinds.
+    fn ensure_lsp_session(&mut self, cx: &mut Context<Self>) {
+        let RepoLocation::Wsl { distro, path } = self.location.clone() else {
+            // Every caller already gated on `self.location` being Wsl (via
+            // `Self::prepare_symbol_click`) before stashing a pending
+            // request — reaching here otherwise would be a caller bug, not
+            // a runtime condition worth a status banner. Never-fail-hard:
+            // bail rather than panic.
+            return;
+        };
+        self.lsp_session = crate::lsp::LspSessionState::Spawning;
+        self.lsp_status = Some("code intelligence: starting…".into());
+        cx.notify();
+        self.lsp_spawn_generation += 1;
+        let spawn_gen = self.lsp_spawn_generation;
+        let root_trimmed = path.trim_end_matches('/').to_string();
+        let root_uri = dv_core::lsp::file_uri(&root_trimmed);
+        let location = self.location.clone();
+        cx.spawn(async move |this, cx| {
+            let spawned = cx
+                .background_spawn(async move {
+                    match dv_core::provision::detect_node_vtsls(&distro, None) {
+                        Ok(nv) if nv.vtsls_path.is_some() => {
+                            dv_core::lsp::LspHandle::spawn(&location, &nv, &root_uri).map(
+                                |handle| {
+                                    // docs/phase-8-lsp-and-polish.md §
+                                    // LSP.1: "surface a gentle warning
+                                    // when absent, don't fail" — run
+                                    // this bounded check in the same
+                                    // background task, before the
+                                    // handle is ever handed back to
+                                    // the UI thread (P2 finding: this
+                                    // warning didn't exist at all).
+                                    let node_modules_missing =
+                                        !dv_core::lsp::node_modules_present(&location);
+                                    (handle, node_modules_missing)
+                                },
+                            )
+                        }
+                        Ok(_) => Err(dv_core::lsp::LspError::Unavailable(
+                            "node found but vtsls is not installed for this distro".to_string(),
+                        )),
+                        Err(err) => Err(dv_core::lsp::LspError::Unavailable(format!(
+                            "node/vtsls detection failed: {err:#}"
+                        ))),
+                    }
+                })
+                .await;
+
+            // `spawned` must survive past `this.update` even when the
+            // closure below never runs at all — not just when it runs
+            // and finds a generation mismatch. If the workspace
+            // entity was released outright while this spawn was in
+            // flight (e.g. a no-review workspace dropped rather than
+            // parked by `Self::stash_active` — capstone P3 finding),
+            // `update` returns `Err` without invoking its closure, so
+            // a `spawned` moved directly into that closure would be
+            // dropped right here, inline on this task's executor
+            // (the same foreground executor driving the UI — see the
+            // comment below on why that matters). Stash it in a cell
+            // the closure borrows from instead, so it's still ours to
+            // dispose of in the `Err` case after `update` returns.
+            let spawned = std::cell::RefCell::new(Some(spawned));
+            let updated = this.update(cx, |this, cx| {
+                let spawned = spawned
+                    .borrow_mut()
+                    .take()
+                    .expect("update's closure runs at most once");
+                // The workspace was parked (`Self::park_lsp_session`
+                // resets `Spawning` -> `Unattempted` AND bumps the
+                // generation) or a later gesture already kicked off
+                // its OWN spawn attempt (also bumping the
+                // generation) while this attempt was in flight —
+                // either way, this attempt has been superseded and
+                // must not mutate `lsp_session`/
+                // `lsp_pending_definition`/`lsp_pending_references` at
+                // all: not to install `Ready`/`Unavailable` (would
+                // resurrect a vtsls child, or permanently poison retry,
+                // on a session nobody's looking at anymore — P2
+                // finding), and not even to clear either pending field
+                // on `Err` (would eat whatever the winning attempt has
+                // stashed — P3 finding: a bare `Spawning`-only guard
+                // couldn't tell two overlapping attempts apart, so a
+                // stale attempt's `Err` could clobber a second,
+                // still-in-flight attempt's state, discarding its
+                // gesture even though that second attempt goes on to
+                // succeed). Discard `spawned`'s `Ok` handle off the
+                // UI thread rather than dropping it inline here:
+                // `LspClient`'s `Drop` runs a bounded but real
+                // shutdown handshake (up to ~1.5s if vtsls is
+                // wedged) that must never block the thread driving
+                // this update — often the UI thread (P3 finding).
+                if this.lsp_spawn_generation != spawn_gen {
+                    if let Ok((handle, _)) = spawned {
+                        cx.background_spawn(async move { drop(handle) }).detach();
+                    }
+                    return;
+                }
+                match spawned {
+                    Ok((handle, node_modules_missing)) => {
+                        this.lsp_session = crate::lsp::LspSessionState::Ready(handle.clone());
+                        this.lsp_status = None;
+                        this.lsp_ready_since = Some(std::time::Instant::now());
+                        this.lsp_node_modules_warning = node_modules_missing.then(|| {
+                            SharedString::from(
+                                "code intelligence: node_modules not installed — \
+                                 definitions into packages may be unavailable",
+                            )
+                        });
+                        // Replay whichever request is CURRENTLY
+                        // stashed — not necessarily this attempt's
+                        // own triggering gesture (see
+                        // `Self::lsp_pending_definition`'s doc
+                        // comment) — and only if nothing has
+                        // superseded it since (another gesture, a nav,
+                        // a file switch). Both kinds are independent:
+                        // a click and a shift-click landing while the
+                        // same spawn is in flight both get replayed.
+                        if let Some(pending) = this.lsp_pending_definition.take()
+                            && this.lsp_request_epoch == pending.epoch
+                        {
+                            let ready_since = this.lsp_ready_since;
+                            this.run_definition_request(
+                                handle.clone(),
+                                pending.repo,
+                                pending.rel_path,
+                                pending.uri,
+                                pending.language_id,
+                                pending.position,
+                                pending.from,
+                                pending.range_head,
+                                pending.epoch,
+                                ready_since,
+                                cx,
+                            );
+                        }
+                        if let Some(pending) = this.lsp_pending_references.take()
+                            && this.lsp_request_epoch == pending.epoch
+                        {
+                            let ready_since = this.lsp_ready_since;
+                            this.run_references_request(
+                                handle,
+                                pending.repo,
+                                pending.rel_path,
+                                pending.uri,
+                                pending.language_id,
+                                pending.position,
+                                pending.range_head,
+                                pending.epoch,
+                                ready_since,
+                                pending.label,
+                                cx,
+                            );
+                        }
+                        // See the `Err` arm below — this closure has
+                        // no other reason to repaint (a replay above,
+                        // if any, notifies on its own once its round
+                        // trip resolves), but the banner/warning just
+                        // changed either way (P3 finding: this was
+                        // missing here, so a superseded pending
+                        // gesture left the "code intelligence:
+                        // starting…" status and the freshly set
+                        // node_modules warning both stuck on-screen
+                        // until some unrelated repaint).
+                        cx.notify();
+                    }
+                    Err(err) => {
+                        this.lsp_status =
+                            Some(format!("code intelligence unavailable: {err}").into());
+                        this.lsp_session =
+                            crate::lsp::LspSessionState::Unavailable(err.to_string());
+                        this.lsp_pending_definition = None;
+                        this.lsp_pending_references = None;
+                        cx.notify();
+                    }
+                }
+            });
+            // `update`'s closure above takes at most once — if it
+            // never ran at all (entity released, not just
+            // superseded), `spawned` is still sitting in the cell;
+            // dispose of any `Ok` handle the same way the
+            // generation-mismatch arm does, off this task's
+            // executor.
+            if updated.is_err()
+                && let Some(Ok((handle, _))) = spawned.into_inner()
+            {
+                cx.background_spawn(async move { drop(handle) }).detach();
+            }
+        })
+        .detach();
+    }
+
+    /// Dispatch a go-to-definition request built from `ctx` — the
+    /// session-state match every LSP gesture needs (`Ready` -> ask now,
+    /// `Spawning` -> stash, `Unavailable` -> banner, `Unattempted` -> stash +
+    /// spawn), specialized for `PendingDefinition`/`Self::run_definition_request`.
+    fn dispatch_definition(
+        &mut self,
+        ctx: SymbolClickContext,
+        from: crate::lsp::Location,
+        cx: &mut Context<Self>,
+    ) {
+        let SymbolClickContext {
+            repo,
+            rel_path,
+            uri,
+            language_id,
+            position,
+            range_head,
+            epoch,
+        } = ctx;
         match &self.lsp_session {
             crate::lsp::LspSessionState::Ready(handle) => {
                 let handle = handle.clone();
@@ -6986,7 +7487,7 @@ impl Workspace {
                     uri,
                     language_id,
                     position,
-                    from_location,
+                    from,
                     range_head,
                     epoch,
                     ready_since,
@@ -6995,17 +7496,17 @@ impl Workspace {
             }
             crate::lsp::LspSessionState::Spawning => {
                 self.lsp_status = Some("code intelligence: starting…".into());
-                // Stash this click's request rather than dropping it — see
-                // `Self::lsp_pending_definition`'s doc comment for the races
-                // this fixes. A later click while still `Spawning` simply
-                // replaces whatever was stashed before.
+                // Stash rather than dropping — see `Self::lsp_pending_definition`'s
+                // doc comment for the races this fixes. A later gesture
+                // while still `Spawning` simply replaces whatever was
+                // stashed before.
                 self.lsp_pending_definition = Some(PendingDefinition {
                     repo,
                     rel_path,
                     uri,
                     language_id,
                     position,
-                    from: from_location,
+                    from,
                     range_head,
                     epoch,
                 });
@@ -7016,186 +7517,209 @@ impl Workspace {
                 cx.notify();
             }
             crate::lsp::LspSessionState::Unattempted => {
-                self.lsp_session = crate::lsp::LspSessionState::Spawning;
-                self.lsp_status = Some("code intelligence: starting…".into());
-                // Stash this click's request the same way the `Spawning` arm
-                // above does — this click happens to be the one that
-                // triggers the spawn, but the completion below always
-                // replays whatever's CURRENTLY stashed rather than assuming
-                // it's still this one (see `Self::lsp_pending_definition`'s
-                // doc comment — a park+reactivate racing two spawn attempts
-                // is exactly the case that requires this).
                 self.lsp_pending_definition = Some(PendingDefinition {
                     repo,
                     rel_path,
                     uri,
                     language_id,
                     position,
-                    from: from_location,
+                    from,
                     range_head,
                     epoch,
                 });
-                cx.notify();
-                self.lsp_spawn_generation += 1;
-                let spawn_gen = self.lsp_spawn_generation;
-                let root_uri = dv_core::lsp::file_uri(&root_trimmed);
-                let location = self.location.clone();
-                cx.spawn(async move |this, cx| {
-                    let spawned = cx
-                        .background_spawn(async move {
-                            match dv_core::provision::detect_node_vtsls(&distro, None) {
-                                Ok(nv) if nv.vtsls_path.is_some() => {
-                                    dv_core::lsp::LspHandle::spawn(&location, &nv, &root_uri).map(
-                                        |handle| {
-                                            // docs/phase-8-lsp-and-polish.md §
-                                            // LSP.1: "surface a gentle warning
-                                            // when absent, don't fail" — run
-                                            // this bounded check in the same
-                                            // background task, before the
-                                            // handle is ever handed back to
-                                            // the UI thread (P2 finding: this
-                                            // warning didn't exist at all).
-                                            let node_modules_missing =
-                                                !dv_core::lsp::node_modules_present(&location);
-                                            (handle, node_modules_missing)
-                                        },
-                                    )
-                                }
-                                Ok(_) => Err(dv_core::lsp::LspError::Unavailable(
-                                    "node found but vtsls is not installed for this distro"
-                                        .to_string(),
-                                )),
-                                Err(err) => Err(dv_core::lsp::LspError::Unavailable(format!(
-                                    "node/vtsls detection failed: {err:#}"
-                                ))),
-                            }
-                        })
-                        .await;
-
-                    // `spawned` must survive past `this.update` even when the
-                    // closure below never runs at all — not just when it runs
-                    // and finds a generation mismatch. If the workspace
-                    // entity was released outright while this spawn was in
-                    // flight (e.g. a no-review workspace dropped rather than
-                    // parked by `Self::stash_active` — capstone P3 finding),
-                    // `update` returns `Err` without invoking its closure, so
-                    // a `spawned` moved directly into that closure would be
-                    // dropped right here, inline on this task's executor
-                    // (the same foreground executor driving the UI — see the
-                    // comment below on why that matters). Stash it in a cell
-                    // the closure borrows from instead, so it's still ours to
-                    // dispose of in the `Err` case after `update` returns.
-                    let spawned = std::cell::RefCell::new(Some(spawned));
-                    let updated = this.update(cx, |this, cx| {
-                        let spawned = spawned
-                            .borrow_mut()
-                            .take()
-                            .expect("update's closure runs at most once");
-                        // The workspace was parked (`Self::park_lsp_session`
-                        // resets `Spawning` -> `Unattempted` AND bumps the
-                        // generation) or a later click already kicked off
-                        // its OWN spawn attempt (also bumping the
-                        // generation) while this attempt was in flight —
-                        // either way, this attempt has been superseded and
-                        // must not mutate `lsp_session`/
-                        // `lsp_pending_definition` at all: not to install
-                        // `Ready`/`Unavailable` (would resurrect a vtsls
-                        // child, or permanently poison retry, on a session
-                        // nobody's looking at anymore — P2 finding), and not
-                        // even to clear `lsp_pending_definition` on `Err`
-                        // (would eat whatever the winning attempt has
-                        // stashed — P3 finding: a bare `Spawning`-only guard
-                        // couldn't tell two overlapping attempts apart, so a
-                        // stale attempt's `Err` could clobber a second,
-                        // still-in-flight attempt's state, discarding its
-                        // click even though that second attempt goes on to
-                        // succeed). Discard `spawned`'s `Ok` handle off the
-                        // UI thread rather than dropping it inline here:
-                        // `LspClient`'s `Drop` runs a bounded but real
-                        // shutdown handshake (up to ~1.5s if vtsls is
-                        // wedged) that must never block the thread driving
-                        // this update — often the UI thread (P3 finding).
-                        if this.lsp_spawn_generation != spawn_gen {
-                            if let Ok((handle, _)) = spawned {
-                                cx.background_spawn(async move { drop(handle) }).detach();
-                            }
-                            return;
-                        }
-                        match spawned {
-                            Ok((handle, node_modules_missing)) => {
-                                this.lsp_session =
-                                    crate::lsp::LspSessionState::Ready(handle.clone());
-                                this.lsp_status = None;
-                                this.lsp_ready_since = Some(std::time::Instant::now());
-                                this.lsp_node_modules_warning = node_modules_missing.then(|| {
-                                    SharedString::from(
-                                        "code intelligence: node_modules not installed — \
-                                         definitions into packages may be unavailable",
-                                    )
-                                });
-                                // Replay whichever request is CURRENTLY
-                                // stashed — not necessarily this attempt's
-                                // own triggering click (see
-                                // `Self::lsp_pending_definition`'s doc
-                                // comment) — and only if nothing has
-                                // superseded it since (another click, a nav,
-                                // a file switch).
-                                if let Some(pending) = this.lsp_pending_definition.take()
-                                    && this.lsp_request_epoch == pending.epoch
-                                {
-                                    let ready_since = this.lsp_ready_since;
-                                    this.run_definition_request(
-                                        handle,
-                                        pending.repo,
-                                        pending.rel_path,
-                                        pending.uri,
-                                        pending.language_id,
-                                        pending.position,
-                                        pending.from,
-                                        pending.range_head,
-                                        pending.epoch,
-                                        ready_since,
-                                        cx,
-                                    );
-                                }
-                                // See the `Err` arm below — this closure has
-                                // no other reason to repaint (the replay
-                                // above, if any, notifies on its own once
-                                // the definition round trip resolves), but
-                                // the banner/warning just changed either way
-                                // (P3 finding: this was missing here, so a
-                                // superseded pending click left the "code
-                                // intelligence: starting…" status and the
-                                // freshly set node_modules warning both
-                                // stuck on-screen until some unrelated
-                                // repaint).
-                                cx.notify();
-                            }
-                            Err(err) => {
-                                this.lsp_status =
-                                    Some(format!("code intelligence unavailable: {err}").into());
-                                this.lsp_session =
-                                    crate::lsp::LspSessionState::Unavailable(err.to_string());
-                                this.lsp_pending_definition = None;
-                                cx.notify();
-                            }
-                        }
-                    });
-                    // `update`'s closure above takes at most once — if it
-                    // never ran at all (entity released, not just
-                    // superseded), `spawned` is still sitting in the cell;
-                    // dispose of any `Ok` handle the same way the
-                    // generation-mismatch arm does, off this task's
-                    // executor.
-                    if updated.is_err()
-                        && let Some(Ok((handle, _))) = spawned.into_inner()
-                    {
-                        cx.background_spawn(async move { drop(handle) }).detach();
-                    }
-                })
-                .detach();
+                self.ensure_lsp_session(cx);
             }
         }
+    }
+
+    /// Twin of `Self::dispatch_definition`, for find-references
+    /// (`PendingReferences`/`Self::run_references_request`).
+    fn dispatch_references(
+        &mut self,
+        ctx: SymbolClickContext,
+        label: String,
+        cx: &mut Context<Self>,
+    ) {
+        let SymbolClickContext {
+            repo,
+            rel_path,
+            uri,
+            language_id,
+            position,
+            range_head,
+            epoch,
+        } = ctx;
+        match &self.lsp_session {
+            crate::lsp::LspSessionState::Ready(handle) => {
+                let handle = handle.clone();
+                let ready_since = self.lsp_ready_since;
+                self.run_references_request(
+                    handle,
+                    repo,
+                    rel_path,
+                    uri,
+                    language_id,
+                    position,
+                    range_head,
+                    epoch,
+                    ready_since,
+                    label,
+                    cx,
+                );
+            }
+            crate::lsp::LspSessionState::Spawning => {
+                self.lsp_status = Some("code intelligence: starting…".into());
+                self.lsp_pending_references = Some(PendingReferences {
+                    repo,
+                    rel_path,
+                    uri,
+                    language_id,
+                    position,
+                    range_head,
+                    epoch,
+                    label,
+                });
+                cx.notify();
+            }
+            crate::lsp::LspSessionState::Unavailable(reason) => {
+                self.lsp_status = Some(format!("code intelligence unavailable: {reason}").into());
+                cx.notify();
+            }
+            crate::lsp::LspSessionState::Unattempted => {
+                self.lsp_pending_references = Some(PendingReferences {
+                    repo,
+                    rel_path,
+                    uri,
+                    language_id,
+                    position,
+                    range_head,
+                    epoch,
+                    label,
+                });
+                self.ensure_lsp_session(cx);
+            }
+        }
+    }
+
+    /// Entry point for a ctrl/cmd-click on an eligible (New-side, real line)
+    /// diff row/cell — `new_line` is the 1-based diff line number, `byte_col`
+    /// a byte offset into `line_text` from `Self::hit_test_byte_column`.
+    fn on_symbol_click(
+        &mut self,
+        new_line: u32,
+        byte_col: usize,
+        line_text: SharedString,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(ctx) = self.prepare_symbol_click(new_line, byte_col, &line_text, cx) else {
+            return;
+        };
+        let from = crate::lsp::Location {
+            uri: ctx.uri.clone(),
+            line: ctx.position.line,
+            character: ctx.position.character,
+        };
+        self.lsp_last_symbol_anchor = Some(crate::lsp::SymbolAnchor {
+            rel_path: ctx.rel_path.clone(),
+            uri: ctx.uri.clone(),
+            position: ctx.position,
+            language_id: ctx.language_id,
+            label: crate::lsp::extract_identifier(&line_text, byte_col),
+        });
+        self.dispatch_definition(ctx, from, cx);
+    }
+
+    /// Entry point for a shift-ctrl/cmd-click on an eligible diff row/cell
+    /// (docs/backlog.md "find-references UI") — same hit-testing and
+    /// argument shape as `Self::on_symbol_click`, gated identically
+    /// (`Self::prepare_symbol_click`), dispatching to
+    /// `textDocument/references` instead of `textDocument/definition`.
+    fn on_find_references(
+        &mut self,
+        new_line: u32,
+        byte_col: usize,
+        line_text: SharedString,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(ctx) = self.prepare_symbol_click(new_line, byte_col, &line_text, cx) else {
+            return;
+        };
+        let label = crate::lsp::extract_identifier(&line_text, byte_col);
+        self.lsp_last_symbol_anchor = Some(crate::lsp::SymbolAnchor {
+            rel_path: ctx.rel_path.clone(),
+            uri: ctx.uri.clone(),
+            position: ctx.position,
+            language_id: ctx.language_id,
+            label: label.clone(),
+        });
+        self.dispatch_references(ctx, label, cx);
+    }
+
+    /// The `FindReferences` action (palette/keybinding) — the twin trigger
+    /// docs/backlog.md's find-references task asks for alongside the
+    /// shift-ctrl-click gesture, for when there's no fresh click event to
+    /// carry a position: replays `Self::lsp_last_symbol_anchor` (the last
+    /// go-to-def click or hover that actually resolved) instead. No-ops
+    /// with a status hint when there's no anchor, or when the anchor no
+    /// longer matches the file currently on screen (the user switched files
+    /// since setting it) — never silently searches the wrong file.
+    fn on_find_references_action(
+        &mut self,
+        _: &FindReferences,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(anchor) = self.lsp_last_symbol_anchor.clone() else {
+            self.lsp_status =
+                Some("find references: ctrl-shift-click (or hover) a symbol first".into());
+            cx.notify();
+            return;
+        };
+        if !self.lsp_view_is_honest() {
+            self.lsp_status =
+                Some("code intelligence: only available on the working-tree view".into());
+            cx.notify();
+            return;
+        }
+        if self.selected_file_path().as_deref() != Some(anchor.rel_path.as_str()) {
+            self.lsp_status =
+                Some("find references: switch back to the file the symbol was on".into());
+            cx.notify();
+            return;
+        }
+        let Some(repo) = self.repo.clone() else {
+            return;
+        };
+        let range_head = match &self.source {
+            DiffSource::Range { head, .. } => Some(head.clone()),
+            _ => None,
+        };
+        self.lsp_request_epoch += 1;
+        let epoch = self.lsp_request_epoch;
+        if let crate::lsp::LspSessionState::Ready(handle) = &self.lsp_session
+            && !handle.is_alive()
+        {
+            self.lsp_session = crate::lsp::LspSessionState::Unattempted;
+            self.lsp_ready_since = None;
+        }
+        if matches!(
+            self.lsp_session,
+            crate::lsp::LspSessionState::Unavailable(_)
+        ) {
+            self.lsp_session = crate::lsp::LspSessionState::Unattempted;
+        }
+        let ctx = SymbolClickContext {
+            repo,
+            rel_path: anchor.rel_path,
+            uri: anchor.uri,
+            language_id: anchor.language_id,
+            position: anchor.position,
+            range_head,
+            epoch,
+        };
+        self.dispatch_references(ctx, anchor.label, cx);
     }
 
     // ---- Hover (S8g, docs/phase-8-lsp-and-polish.md § LSP) -------------
@@ -7277,6 +7801,20 @@ impl Workspace {
             DiffSource::Range { head, .. } => Some(head.clone()),
             _ => None,
         };
+        // A hover that actually reaches vtsls is as good a "last resolved
+        // symbol position" as a click — see `crate::lsp::SymbolAnchor`'s doc
+        // comment for why `FindReferences` (the action/keybinding path)
+        // replays this. Stored here (session already `Ready`, position/uri
+        // already computed) rather than earlier in this fn: hover never
+        // spawns a session (see this section's scope note above), so an
+        // anchor from a gated-off hover would be no more useful than none.
+        self.lsp_last_symbol_anchor = Some(crate::lsp::SymbolAnchor {
+            rel_path: rel_path.clone(),
+            uri: uri.clone(),
+            position,
+            language_id,
+            label: crate::lsp::extract_identifier(&line_text, byte_col),
+        });
         // Captured here, not read fresh inside the background task (which
         // has no `&self`) — same pattern `Self::on_symbol_click` uses before
         // calling `Self::run_definition_request`.
@@ -7557,6 +8095,227 @@ impl Workspace {
         }
     }
 
+    /// `LspHandle::sync_document` + `textDocument/references`, off the UI
+    /// thread — the find-references twin of `Self::run_definition_request`,
+    /// same honest-view re-check, same warm-up retry posture. Additionally
+    /// resolves every hit into a repo-relative path + one-line preview
+    /// (`ReferencesGroup`/`ReferenceItem`) IN THE BACKGROUND TASK, since that
+    /// needs a blob read per referenced file — deliberately not done in the
+    /// `this.update` completion closure, which runs on the UI thread.
+    /// `label` is the best-effort identifier text for the panel header (see
+    /// `crate::lsp::extract_identifier`).
+    #[allow(clippy::too_many_arguments)]
+    fn run_references_request(
+        &mut self,
+        handle: dv_core::lsp::LspHandle,
+        repo: Arc<GitRepo>,
+        rel_path: String,
+        uri: String,
+        language_id: &'static str,
+        position: lsp_types::Position,
+        range_head: Option<String>,
+        epoch: u64,
+        ready_since: Option<std::time::Instant>,
+        label: String,
+        cx: &mut Context<Self>,
+    ) {
+        let origin = crate::lsp::Location {
+            uri: uri.clone(),
+            line: position.line,
+            character: position.character,
+        };
+        // Open the panel immediately in a loading state (docs/backlog.md
+        // find-references task: "Long-running requests: don't block the UI
+        // thread; a loading state in the panel") — replaces whatever panel
+        // (if any) an earlier search left open, same "a fresh gesture
+        // replaces the old one" posture `open_target_at` uses for the
+        // target viewer.
+        self.references_panel = Some(ReferencesPanel {
+            label,
+            origin,
+            request_epoch: epoch,
+            loading: true,
+            groups: Vec::new(),
+            rows: Vec::new(),
+            item_rows: Vec::new(),
+            selected: 0,
+            scroll: UniformListScrollHandle::new(),
+            pending_scroll: true,
+        });
+        cx.notify();
+
+        // Decremented at the top of the completion closure below,
+        // unconditionally (epoch match or not) — see
+        // `Self::lsp_inflight_requests`'s doc comment (shared with
+        // `Self::run_definition_request`/`Self::open_target_at`: `wait_ready`
+        // treats a nonzero count as "not settled" regardless of which of the
+        // three kinds of LSP round trip is actually in flight).
+        self.lsp_inflight_requests += 1;
+        let location = self.location.clone();
+        cx.spawn(async move |this, cx| {
+            let result = cx
+                .background_spawn(async move {
+                    if let Some(head) = &range_head
+                        && !Self::range_head_matches_working(&repo, &rel_path, head)
+                    {
+                        return Err(dv_core::lsp::LspError::Unavailable(
+                            "this file has uncommitted changes since the reviewed \
+                             revision — only available on the working-tree view"
+                                .to_string(),
+                        ));
+                    }
+                    let text = repo
+                        .blob_bytes(&BlobSpec::Working {
+                            path: rel_path.clone(),
+                        })
+                        .ok()
+                        .flatten()
+                        .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
+                        .unwrap_or_default();
+                    let _ = handle.sync_document(&uri, language_id, &text);
+                    let mut locations = handle.references(&uri, position)?;
+                    // Same warm-up posture as `Self::run_definition_request`
+                    // — vtsls's semantic tsserver can still be indexing for a
+                    // few seconds after a session first reaches `Ready`.
+                    if locations.is_empty()
+                        && ready_since.is_some_and(|since| since.elapsed() < LSP_WARMUP_WINDOW)
+                    {
+                        for _ in 0..LSP_WARMUP_RETRIES {
+                            std::thread::sleep(LSP_WARMUP_RETRY_DELAY);
+                            locations = handle.references(&uri, position)?;
+                            if !locations.is_empty() {
+                                break;
+                            }
+                        }
+                    }
+
+                    // Resolve every hit to a repo-relative path + preview —
+                    // best-effort per file: a hit that can't be resolved
+                    // into this repo (a bundled library file, same case
+                    // `Self::open_target_at` declines for a single target)
+                    // is simply dropped rather than failing the whole
+                    // search over one bad location.
+                    let RepoLocation::Wsl {
+                        path: root_path, ..
+                    } = &location
+                    else {
+                        return Ok(Vec::new());
+                    };
+                    let root_prefix = format!("{}/", root_path.trim_end_matches('/'));
+                    let hits: Vec<crate::lsp::ReferenceHit> = locations
+                        .iter()
+                        .map(crate::lsp::ReferenceHit::from_location)
+                        .collect();
+                    let mut groups = Vec::new();
+                    for (file_uri, file_hits) in crate::lsp::group_references(hits) {
+                        let Some(posix_path) = dv_core::lsp::path_from_file_uri(&file_uri) else {
+                            continue;
+                        };
+                        let Some(file_rel_path) = posix_path.strip_prefix(&root_prefix) else {
+                            continue;
+                        };
+                        let file_rel_path = file_rel_path.to_string();
+                        let lines: Vec<String> = repo
+                            .blob_bytes(&BlobSpec::Working {
+                                path: file_rel_path.clone(),
+                            })
+                            .ok()
+                            .flatten()
+                            .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
+                            .map(|text| text.lines().map(str::to_string).collect())
+                            .unwrap_or_default();
+                        let items: Vec<ReferenceItem> = file_hits
+                            .into_iter()
+                            .map(|hit| ReferenceItem {
+                                line: hit.line,
+                                start_char: hit.start_char,
+                                end_char: hit.end_char,
+                                preview: lines.get(hit.line as usize).cloned().unwrap_or_default(),
+                            })
+                            .collect();
+                        if !items.is_empty() {
+                            groups.push(ReferencesGroup {
+                                path: file_rel_path,
+                                items,
+                            });
+                        }
+                    }
+                    Ok(groups)
+                })
+                .await;
+
+            this.update(cx, |this, cx| {
+                this.lsp_inflight_requests = this.lsp_inflight_requests.saturating_sub(1);
+                if this.lsp_request_epoch != epoch {
+                    // Superseded. The loading panel this request opened (if
+                    // it's still sitting there — nothing else has replaced
+                    // it) will never resolve now; clear it rather than
+                    // leaving a permanent spinner, since unlike a definition
+                    // lookup (which shows nothing until it succeeds) this
+                    // request has UI-visible loading state of its own to
+                    // clean up.
+                    if this
+                        .references_panel
+                        .as_ref()
+                        .is_some_and(|p| p.request_epoch == epoch && p.loading)
+                    {
+                        this.references_panel = None;
+                        cx.notify();
+                    }
+                    return;
+                }
+                this.handle_references_result(result, epoch, cx);
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// Install `result` onto `Workspace::references_panel` — empty/error
+    /// results close the panel and set `lsp_status` instead, the same
+    /// "no definition found"/"go-to-definition failed" degrade
+    /// `Self::handle_definition_result` uses (an empty modal reads worse
+    /// than no modal at all).
+    fn handle_references_result(
+        &mut self,
+        result: Result<Vec<ReferencesGroup>, dv_core::lsp::LspError>,
+        epoch: u64,
+        cx: &mut Context<Self>,
+    ) {
+        // Belt-and-suspenders against `Self::run_references_request`'s own
+        // epoch check: only ever mutate the panel THIS request raised.
+        if self
+            .references_panel
+            .as_ref()
+            .is_none_or(|p| p.request_epoch != epoch)
+        {
+            return;
+        }
+        match result {
+            Ok(groups) if groups.iter().map(|g| g.items.len()).sum::<usize>() > 0 => {
+                let (rows, item_rows) = ReferencesPanel::build_rows(&groups);
+                if let Some(panel) = self.references_panel.as_mut() {
+                    panel.loading = false;
+                    panel.groups = groups;
+                    panel.rows = rows;
+                    panel.item_rows = item_rows;
+                    panel.selected = 0;
+                    panel.pending_scroll = true;
+                }
+                self.lsp_status = None;
+            }
+            Ok(_) => {
+                self.references_panel = None;
+                self.lsp_status = Some("no references found".into());
+            }
+            Err(err) => {
+                self.references_panel = None;
+                self.lsp_status = Some(format!("find references failed: {err}").into());
+            }
+        }
+        cx.notify();
+    }
+
     /// Open (or re-point) the read-only target viewer at `target`, reading
     /// its current worktree content via the same `BlobSpec::Working` path
     /// the diff pane's own `WorkingTree` side uses (`compute_diff`'s
@@ -7789,6 +8548,107 @@ impl Workspace {
         cx.notify();
     }
 
+    // ---- Find-references results panel (docs/backlog.md "find-references
+    // UI") — up/down/enter/escape, mirroring `Palette*`'s exact shape.
+
+    fn on_references_next(
+        &mut self,
+        _: &ReferencesNext,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(panel) = self.references_panel.as_mut()
+            && !panel.item_rows.is_empty()
+        {
+            panel.selected = (panel.selected + 1).min(panel.item_rows.len() - 1);
+            panel.pending_scroll = true;
+            cx.notify();
+        }
+    }
+
+    fn on_references_prev(
+        &mut self,
+        _: &ReferencesPrev,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(panel) = self.references_panel.as_mut() {
+            panel.selected = panel.selected.saturating_sub(1);
+            panel.pending_scroll = true;
+            cx.notify();
+        }
+    }
+
+    fn on_references_close(
+        &mut self,
+        _: &ReferencesClose,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.close_references_panel(cx);
+    }
+
+    fn close_references_panel(&mut self, cx: &mut Context<Self>) {
+        if self.references_panel.take().is_some() {
+            self.lsp_request_epoch += 1;
+            cx.notify();
+        }
+    }
+
+    fn on_references_choose(
+        &mut self,
+        _: &ReferencesChoose,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.references_choose(window, cx);
+    }
+
+    /// Open the currently selected reference in the read-only target viewer
+    /// — same path go-to-definition uses (`Self::open_target_at`), pushing
+    /// `ReferencesPanel::origin` onto `nav_stack` so back/forward work
+    /// exactly the same way a go-to-def jump's history does. Closes the
+    /// panel first: docs/backlog.md's find-references task follows go-to-
+    /// def's own precedent throughout, and go-to-def never keeps any
+    /// picker-style UI open once a jump lands.
+    fn references_choose(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
+        let Some(panel) = self.references_panel.as_ref() else {
+            return;
+        };
+        let Some((group_ix, item_ix)) = panel.selected_item() else {
+            return;
+        };
+        let Some(group) = panel.groups.get(group_ix) else {
+            return;
+        };
+        let Some(item) = group.items.get(item_ix) else {
+            return;
+        };
+        let RepoLocation::Wsl {
+            path: root_path, ..
+        } = &self.location
+        else {
+            return;
+        };
+        let target = crate::lsp::Location {
+            uri: dv_core::lsp::file_uri(&format!(
+                "{}/{}",
+                root_path.trim_end_matches('/'),
+                group.path
+            )),
+            line: item.line,
+            character: item.start_char,
+        };
+        let origin = panel.origin.clone();
+        self.close_references_panel(cx);
+        // `close_references_panel` already bumped the epoch — bump again so
+        // this specific jump gets its own (the same "every distinct nav
+        // gets a fresh epoch" posture `on_nav_back`/`on_nav_forward` use).
+        self.lsp_request_epoch += 1;
+        let epoch = self.lsp_request_epoch;
+        self.open_target_at(target, Some(crate::lsp::NavCommit::Push(origin)), epoch, cx);
+    }
+
     /// Tear down this workspace's LSP session when it's about to be
     /// PARKED (`AppShell::stash_active`, Phase-7 S7-3's workspace-LRU
     /// cache) rather than actually closed. The LRU deliberately keeps a
@@ -7822,6 +8682,7 @@ impl Workspace {
         // if relevant, re-detects node_modules) from scratch, so carrying
         // either forward would only ever be stale.
         self.lsp_pending_definition = None;
+        self.lsp_pending_references = None;
         self.lsp_node_modules_warning = None;
         self.lsp_ready_since = None;
         // The S8g hover popover (and any debounced request still chasing an
@@ -7830,6 +8691,10 @@ impl Workspace {
         self.hover_popover = None;
         self.hover_request_epoch += 1;
         self.hover_request_line = None;
+        // Same reasoning for the find-references anchor and any open
+        // results panel — both belong to the session being torn down here.
+        self.lsp_last_symbol_anchor = None;
+        self.references_panel = None;
         // Invalidate any spawn attempt still in flight from before this
         // park — without this, a stale attempt completing after parking
         // (but before any reactivation click starts a new one) would still
@@ -7896,7 +8761,11 @@ impl Workspace {
     /// cache that a later render (once the overlay closes, if the mouse is
     /// still over that same token) can still show.
     fn hover_popover_visible(&self) -> Option<&crate::lsp::HoverPopover> {
-        if self.target_viewer.is_some() || self.palette.is_some() || self.pr_picker.is_some() {
+        if self.target_viewer.is_some()
+            || self.palette.is_some()
+            || self.pr_picker.is_some()
+            || self.references_panel.is_some()
+        {
             return None;
         }
         self.hover_popover.as_ref()
@@ -8142,6 +9011,255 @@ impl Workspace {
         )
     }
 
+    // ---- Find-references results panel (docs/backlog.md "find-references
+    // UI") — same modal-picker recipe as `Self::render_palette`/
+    // `Self::render_target_viewer`.
+
+    /// One row of `Self::render_references_panel`'s `uniform_list` — a
+    /// file-header row or a selectable reference row with its matched span
+    /// highlighted, built from `ReferencesPanel::rows[idx]`.
+    fn render_references_row(&self, idx: usize, cx: &mut Context<Self>) -> AnyElement {
+        let Some(panel) = self.references_panel.as_ref() else {
+            return div().into_any_element();
+        };
+        let Some(row) = panel.rows.get(idx).copied() else {
+            return div().into_any_element();
+        };
+        let theme = cx.theme();
+        let dv = crate::themes::dv_theme(cx);
+
+        match row {
+            ReferenceRow::Header { group_ix } => {
+                let Some(group) = panel.groups.get(group_ix) else {
+                    return div().into_any_element();
+                };
+                let count = group.items.len();
+                h_flex()
+                    .w_full()
+                    .px_2()
+                    .py_1()
+                    .bg(dv.surface_active.opacity(0.35))
+                    .child(
+                        div()
+                            .min_w(px(0.))
+                            .flex_1()
+                            .truncate()
+                            .text_xs()
+                            .font_semibold()
+                            .text_color(theme.muted_foreground)
+                            .child(group.path.clone()),
+                    )
+                    .child(
+                        div()
+                            .flex_none()
+                            .text_xs()
+                            .text_color(theme.muted_foreground.opacity(0.8))
+                            .child(format!(
+                                "{count} reference{}",
+                                if count == 1 { "" } else { "s" }
+                            )),
+                    )
+                    .into_any_element()
+            }
+            ReferenceRow::Item {
+                group_ix,
+                item_ix,
+                flat_ix,
+            } => {
+                let Some(item) = panel
+                    .groups
+                    .get(group_ix)
+                    .and_then(|g| g.items.get(item_ix))
+                else {
+                    return div().into_any_element();
+                };
+                let selected = panel.selected == flat_ix;
+                // Slice the preview around the matched span (LSP's own
+                // UTF-16 coordinate system — see
+                // `byte_offset_for_utf16_column`'s doc comment). Falls back
+                // to the whole, unhighlighted preview on any out-of-bounds
+                // slice (the line can legitimately have moved on since
+                // vtsls reported this reference) — never panics.
+                let start = byte_offset_for_utf16_column(&item.preview, item.start_char);
+                let end = byte_offset_for_utf16_column(&item.preview, item.end_char).max(start);
+                let (prefix, matched, suffix) = match (
+                    item.preview.get(..start),
+                    item.preview.get(start..end),
+                    item.preview.get(end..),
+                ) {
+                    (Some(p), Some(m), Some(s)) => (p.to_string(), m.to_string(), s.to_string()),
+                    _ => (item.preview.clone(), String::new(), String::new()),
+                };
+                h_flex()
+                    .id(("references-row", idx))
+                    .w_full()
+                    .px_2()
+                    .gap_2()
+                    .cursor_pointer()
+                    .when(selected, |el| el.bg(dv.surface_active))
+                    .hover(|el| el.bg(dv.surface_active.opacity(0.5)))
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |this, _, window, cx| {
+                            if let Some(panel) = this.references_panel.as_mut() {
+                                panel.selected = flat_ix;
+                            }
+                            this.references_choose(window, cx);
+                        }),
+                    )
+                    .child(
+                        div()
+                            .w(px(48.))
+                            .flex_none()
+                            .text_right()
+                            .text_xs()
+                            .font_family(theme.mono_font_family.clone())
+                            .text_color(theme.muted_foreground.opacity(0.8))
+                            .child((item.line + 1).to_string()),
+                    )
+                    .child(
+                        h_flex()
+                            .min_w(px(0.))
+                            .flex_1()
+                            .overflow_hidden()
+                            .whitespace_nowrap()
+                            .text_xs()
+                            .font_family(theme.mono_font_family.clone())
+                            .child(prefix)
+                            .child(
+                                div()
+                                    .text_color(theme.primary)
+                                    .bg(theme.primary.opacity(0.18))
+                                    .child(matched),
+                            )
+                            .child(suffix),
+                    )
+                    .into_any_element()
+            }
+        }
+    }
+
+    /// The find-references results overlay, when open — same modal backdrop
+    /// pattern as `Self::render_target_viewer`.
+    fn render_references_panel(&mut self, cx: &mut Context<Self>) -> Option<Div> {
+        use gpui_component::Sizable as _;
+        use gpui_component::button::{Button, ButtonVariants as _};
+
+        let panel = self.references_panel.as_mut()?;
+        if panel.pending_scroll {
+            if let Some(&row_ix) = panel.item_rows.get(panel.selected) {
+                panel.scroll.scroll_to_item(row_ix, ScrollStrategy::Center);
+            }
+            // Fire at most once per selection change — mirrors
+            // `TargetViewer::scrolled_to_highlight`'s exact contract (see
+            // that field's doc comment).
+            panel.pending_scroll = false;
+        }
+        let panel = self.references_panel.as_ref()?;
+        let theme = cx.theme();
+        let border = theme.border;
+        let popover = theme.popover;
+        let popover_fg = theme.popover_foreground;
+        let muted = theme.muted_foreground;
+        let total_items = panel.total_items();
+        let total_files = panel.total_files();
+        let row_count = panel.rows.len();
+        let label = panel.label.clone();
+        let loading = panel.loading;
+
+        Some(
+            div()
+                .absolute()
+                .inset_0()
+                .flex()
+                .items_center()
+                .justify_center()
+                .bg(theme.background.opacity(0.6))
+                .occlude()
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(|this, _, _window, cx| {
+                        this.close_references_panel(cx);
+                        cx.stop_propagation();
+                    }),
+                )
+                .child(
+                    v_flex()
+                        .id("references-panel")
+                        .w(px(720.))
+                        .max_w_full()
+                        .h(px(560.))
+                        .max_h_full()
+                        .overflow_hidden()
+                        .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                        .bg(popover)
+                        .text_color(popover_fg)
+                        .border_1()
+                        .border_color(border)
+                        .rounded_lg()
+                        .shadow_lg()
+                        .child(
+                            h_flex()
+                                .justify_between()
+                                .items_center()
+                                .px_3()
+                                .py_2()
+                                .border_b_1()
+                                .border_color(border)
+                                .child(
+                                    div()
+                                        .min_w(px(0.))
+                                        .flex_1()
+                                        .truncate()
+                                        .text_sm()
+                                        .font_semibold()
+                                        .child(if label.is_empty() {
+                                            "References".to_string()
+                                        } else {
+                                            format!("References to `{label}`")
+                                        }),
+                                )
+                                .child(
+                                    Button::new("references-panel-close")
+                                        .ghost()
+                                        .xsmall()
+                                        .label("Close")
+                                        .on_click(cx.listener(|this, _, _window, cx| {
+                                            this.close_references_panel(cx);
+                                        })),
+                                ),
+                        )
+                        .child(
+                            div()
+                                .px_2()
+                                .pt_1()
+                                .text_xs()
+                                .text_color(muted)
+                                .child(if loading {
+                                    "searching…".to_string()
+                                } else {
+                                    format!("{total_items} references in {total_files} files")
+                                }),
+                        )
+                        .child(
+                            div().flex_1().min_h(px(0.)).child(
+                                uniform_list(
+                                    "references-panel-rows",
+                                    row_count,
+                                    cx.processor(|this, range: Range<usize>, _, cx| {
+                                        range
+                                            .map(|i| this.render_references_row(i, cx))
+                                            .collect::<Vec<_>>()
+                                    }),
+                                )
+                                .track_scroll(&panel.scroll)
+                                .size_full(),
+                            ),
+                        ),
+                ),
+        )
+    }
+
     // ---- Jump-to-file palette ----------------------------------------
 
     fn on_jump_to_file(&mut self, _: &JumpToFile, window: &mut Window, cx: &mut Context<Self>) {
@@ -8167,6 +9285,7 @@ impl Workspace {
             || self.editor.is_some()
             || self.thread_input.is_some()
             || self.target_viewer.is_some()
+            || self.references_panel.is_some()
             || self
                 .shell
                 .upgrade()
@@ -11716,6 +12835,10 @@ impl Render for Workspace {
             key_context.push(' ');
             key_context.push_str(TARGET_VIEWER_CONTEXT);
         }
+        if self.references_panel.is_some() {
+            key_context.push(' ');
+            key_context.push_str(REFERENCES_PANEL_CONTEXT);
+        }
 
         // S8g: keeps `self.root_bounds` current every paint — the nearest
         // positioned ancestor `Self::render_hover_popover`'s `.absolute()`
@@ -11759,11 +12882,17 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::on_nav_back))
             .on_action(cx.listener(Self::on_nav_forward))
             .on_action(cx.listener(Self::on_close_target_viewer))
+            .on_action(cx.listener(Self::on_find_references_action))
+            .on_action(cx.listener(Self::on_references_next))
+            .on_action(cx.listener(Self::on_references_prev))
+            .on_action(cx.listener(Self::on_references_choose))
+            .on_action(cx.listener(Self::on_references_close))
             .child(self.render_header(cx))
             .child(body)
             .children(self.render_palette(cx))
             .children(self.render_pr_picker(cx))
             .children(self.render_target_viewer(cx))
+            .children(self.render_references_panel(cx))
             .children(self.render_hover_popover(cx))
     }
 }

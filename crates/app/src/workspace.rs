@@ -14,7 +14,7 @@ use dv_cli::submit::ViolationKind;
 use dv_core::{
     BlobSpec, ChangeStatus, ChangedFile, ChecksSummary, DiffOptions, DiffSource, FileDiff, GhSide,
     GitRepo, GithubClient, LineKind, PrMeta, PrState, PrSummary, RemoteRef, RemoteThread,
-    RepoLocation, RepoSlug, ReviewDecision,
+    RepoLocation, RepoSlug, ReviewDecision, repo_label,
 };
 use gpui::prelude::FluentBuilder;
 use gpui::*;
@@ -790,6 +790,18 @@ pub struct Workspace {
     files: Vec<ChangedFile>,
     selected: Option<usize>,
     diffs: HashMap<usize, Arc<RenderedDiff>>,
+    /// Memoizes [`Self::diffstat`]'s row walk (review finding P3-5: that
+    /// walk is O(total loaded rows) over every `self.diffs` entry, and
+    /// `render_header` — plus `automation_state`'s `state` dump — calls it
+    /// on every render, an unbounded per-frame cost as a large review
+    /// accumulates loaded files). `None` means dirty; every explicit
+    /// `self.diffs` mutation site (the `request_diff` completion, all
+    /// `self.diffs.clear()` sites, and the PR-cache restore/miss paths)
+    /// resets it to `None`, and `diffstat` repopulates it lazily on next
+    /// read. A `Cell` rather than a plain field because `diffstat` is
+    /// called from `&self` render/automation paths that can't take
+    /// `&mut self` just to memoize.
+    diffstat_cache: Cell<Option<(u32, u32)>>,
     diff_pending: HashSet<usize>,
     /// Bumped by [`Self::invalidate_diff_cache`] (theme swaps via
     /// [`Self::on_theme_changed`], and context-lines changes via
@@ -1312,6 +1324,37 @@ fn resolved_pin(pinned_id: Option<String>, review: &Option<dv_core::Review>) -> 
     pinned_id.filter(|pin| review.as_ref().is_some_and(|r| &r.id == pin))
 }
 
+/// The bordered "LSP chip" (title-bar spec: `border color@0.45, bg
+/// color@0.1, rounded_sm`, 11px text) — the reference design's
+/// LSP-status recipe, adopted
+/// verbatim per the spec rather than forced through `shell::state_pill`'s
+/// `Tag::custom` recipe (`.15`/`.4` opacity), which is a visually distinct
+/// pill meant for PR/file/review state. `Self::render_header` renders one of
+/// these per populated LSP field (`lsp_status`, `lsp_node_modules_warning`)
+/// — both can show at once, capped/truncating so a long message can't blow
+/// out the header's right cluster. `flex_shrink_1` + `min_w(0)` rather than
+/// `flex_none` (review finding P3-4): at `max_w`, up to two of these plus an
+/// unbounded refs label could together exceed a narrow (1280px) window's
+/// width with nothing able to give, pushing the trailing action buttons off
+/// screen — letting the chip itself compress under pressure (it still never
+/// grows past `max_w`) keeps the buttons on screen instead.
+fn lsp_chip(text: SharedString, color: Hsla) -> impl IntoElement {
+    div()
+        .flex_shrink_1()
+        .flex_grow_0()
+        .min_w(px(0.))
+        .max_w(px(280.))
+        .truncate()
+        .px_2()
+        .rounded_sm()
+        .border_1()
+        .border_color(color.opacity(0.45))
+        .bg(color.opacity(0.1))
+        .text_size(px(11.))
+        .text_color(color)
+        .child(text)
+}
+
 /// A one-row "diff" carrying an error message where the hunks would be.
 fn error_diff(msg: SharedString) -> RenderedDiff {
     RenderedDiff {
@@ -1648,6 +1691,7 @@ impl Workspace {
             files: Vec::new(),
             selected: None,
             diffs: HashMap::new(),
+            diffstat_cache: Cell::new(None),
             diff_pending: HashSet::new(),
             view_mode: view_mode_default.into(),
             context_lines,
@@ -2059,6 +2103,66 @@ impl Workspace {
         live + pr_cached
     }
 
+    /// Count of `self.diffs` entries that are a genuine rendered diff, NOT
+    /// an [`error_diff`] placeholder (inserted when a per-file diff compute
+    /// fails, e.g. a host connection drop mid-`request_diff` — see the
+    /// `Err` arm that populates `self.diffs`). Backs both `Self::
+    /// render_header`'s `· n/N files` qualifier and `Self::automation_
+    /// state`'s `diffstat.files_loaded`: counting an errored placeholder as
+    /// "loaded" would let `files_loaded == files_total` once every file has
+    /// merely been *visited*, even though one contributed nothing to `+N`/
+    /// `−N` (an `error_diff` has no `Row::Line`s) — silently hiding the
+    /// partial-total qualifier `Self::diffstat`'s own doc comment exists to
+    /// keep honest (review finding P3-1).
+    fn files_loaded(&self) -> usize {
+        self.diffs.values().filter(|d| !d.error).count()
+    }
+
+    /// Added/removed line totals for the title-bar-anatomy header's `+N`/
+    /// `−N` (R1c title-bar spec). **Deliberate scope
+    /// limit**: this sums `Row::Line` kinds over whatever `self.diffs`
+    /// already holds — the files diffed so far this session — NOT a true
+    /// whole-review total. dv's per-file diffs load lazily (Phase 7;
+    /// unlike a design that diffs every file eagerly at PR-load time
+    /// and folds `additions`/`deletions` once), and a
+    /// real whole-review number needs either eagerly diffing every file
+    /// (reintroducing exactly the cold-open cost Phase 7 removed) or a
+    /// cheap dv-core `--numstat`-style computation cached at index-hydration
+    /// time — which is precisely the scope the restyle's phasing
+    /// already carves out as R2 item 3 ("Sidebar total +/− diffstat per
+    /// review card", an `IndexEntry` change) and R1c's own files_touched
+    /// excludes dv-core. So: exact once every file has been visited (the
+    /// common case for the small screenshot fixtures this slice verifies
+    /// against), a partial running total otherwise — `Self::render_header`
+    /// only shows it once `self.diffs` is non-empty, and
+    /// `Self::automation_state`'s `diffstat.files_loaded` vs `files_total`
+    /// makes the partial-vs-complete distinction assertable rather than
+    /// silently misleading.
+    fn diffstat(&self) -> (u32, u32) {
+        if let Some(cached) = self.diffstat_cache.get() {
+            return cached;
+        }
+        let mut added = 0u32;
+        let mut removed = 0u32;
+        for diff in self.diffs.values() {
+            for row in &diff.unified {
+                match row {
+                    Row::Line {
+                        kind: LineKind::Added,
+                        ..
+                    } => added += 1,
+                    Row::Line {
+                        kind: LineKind::Removed,
+                        ..
+                    } => removed += 1,
+                    _ => {}
+                }
+            }
+        }
+        self.diffstat_cache.set(Some((added, removed)));
+        (added, removed)
+    }
+
     /// Evict least-recently-used `pr_diff_cache` entries until at most
     /// [`MAX_PR_DIFF_ENTRIES`] remain (Phase 7 D3) — the count cap this
     /// small cache uses instead of a byte budget of its own, since its
@@ -2178,6 +2282,7 @@ impl Workspace {
             reconcile_file_selection(&old_files, &self.files, self.selected);
         if needs_invalidation {
             self.diffs.clear();
+            self.diffstat_cache.set(None);
             self.diff_pending.clear();
             self.expanded.clear();
             self.pending_jump = None;
@@ -2261,6 +2366,7 @@ impl Workspace {
         if self.diffs_theme_stale {
             self.diffs_theme_stale = false;
             self.diffs.clear();
+            self.diffstat_cache.set(None);
             self.diff_pending.clear();
             if let Some(index) = self.selected {
                 self.request_diff(index, cx);
@@ -2547,10 +2653,12 @@ impl Workspace {
                 match rendered {
                     Ok(diff) => {
                         this.diffs.insert(index, Arc::new(diff));
+                        this.diffstat_cache.set(None);
                     }
                     Err(err) => {
                         let msg: SharedString = format!("failed to compute diff: {err:#}").into();
                         this.diffs.insert(index, Arc::new(error_diff(msg)));
+                        this.diffstat_cache.set(None);
                     }
                 }
                 // Row indices may have shifted (gap expansion inserts rows
@@ -2647,6 +2755,7 @@ impl Workspace {
             };
         if host_reachable {
             self.diffs.clear();
+            self.diffstat_cache.set(None);
             self.diff_pending.clear();
             self.diffs_theme_stale = false;
             if let Some(index) = self.selected {
@@ -2962,6 +3071,7 @@ impl Workspace {
                             }
                             this.files = hit.files;
                             this.diffs = hit.diffs;
+                            this.diffstat_cache.set(None);
                             // `expanded` is a render input baked into the
                             // restored `diffs` (which hunk-gaps are open) —
                             // restore it alongside files/diffs rather than
@@ -2978,6 +3088,7 @@ impl Workspace {
                             // render the wrong file's content under the
                             // right name.
                             this.diffs.clear();
+                            this.diffstat_cache.set(None);
                             this.expanded.clear();
                             this.last_pr_open_cache_hit = Some(false);
                         }
@@ -3499,6 +3610,7 @@ impl Workspace {
             Status::Ready => "ready".to_string(),
             Status::Failed(err) => format!("failed: {err}"),
         };
+        let (diffstat_added, diffstat_removed) = self.diffstat();
         json!({
             "title": self.title.to_string(),
             "head": self.head.to_string(),
@@ -3595,6 +3707,24 @@ impl Workspace {
                 "unified": diff.unified.len(),
                 "split": diff.split.len(),
             })),
+            // R1c title-bar `+N`/`−N`:
+            // `added`/`removed` are `Self::diffstat`'s running total over
+            // `self.diffs` — see that method's doc comment for why this is
+            // partial-until-`files_loaded == files_total`, not a true
+            // whole-review number (that's R2 item 3, an `IndexEntry`
+            // change). Exposed so a script can assert the header's rendered
+            // digits against the exact numbers backing them, rather than
+            // pixel-reading a screenshot. `files_loaded` uses `Self::
+            // files_loaded` (excludes `error_diff` placeholders — review
+            // finding P3-1) so a script asserting `files_loaded ==
+            // files_total ⇒ exact` can't be fooled by a failed file that
+            // was merely visited.
+            "diffstat": {
+                "added": diffstat_added,
+                "removed": diffstat_removed,
+                "files_loaded": self.files_loaded(),
+                "files_total": self.files.len(),
+            },
             "pr": self.pr.as_ref().map(|pr| json!({
                 "number": pr.number,
                 "title": pr.title.to_string(),
@@ -4840,6 +4970,7 @@ impl Workspace {
                         // caches would render the wrong file under the
                         // right name (same as `open_pr`).
                         this.diffs.clear();
+                        this.diffstat_cache.set(None);
                         this.diff_pending.clear();
                         this.expanded.clear();
                         this.stale.clear();
@@ -7025,18 +7156,53 @@ impl Workspace {
         )
     }
 
-    /// The compact PR header band, shown above the diff area whenever a PR
-    /// is open (docs/phase-3-github.md deliverable 2): `#N title`, author,
-    /// `base ← head`, a state pill, a CI pill, a review-decision pill, and a
-    /// "details" toggle that expands the PR body underneath. Same
-    /// `state_pill` recipe as the sidebar's `render_pr_glyphs` (R1b review
-    /// finding: this band used to render checks/decision as a bare glyph and
-    /// plain text while the sidebar had already moved to pills).
-    fn render_pr_header(&self, cx: &mut Context<Self>) -> Option<Div> {
-        use crate::shell::state_pill;
+    /// The workspace's title-bar-anatomy header (R1c title-bar spec)
+    /// — the single row above the diff area that replaces the
+    /// old two-tier header (a generic per-review strip always shown, plus a
+    /// PR-only band underneath when a PR was open). One row now, in either
+    /// of two shapes:
+    ///
+    /// - **PR variant**: state pill (open/merged/closed/draft) → bold
+    ///   truncating PR title → `#N`/`by <author>` in `text_secondary` →
+    ///   optional approved/changes-requested decision pill (`review
+    ///   required` is intentionally dropped here — the title bar only
+    ///   surfaces a *resolved* decision by design; the sidebar's
+    ///   `render_pr_glyphs` still shows all three, unchanged) → right
+    ///   cluster: `base ← head` in `muted.foreground`, `+N`/`−N` diffstat
+    ///   (see `Self::diffstat`'s doc comment for the scope limit), LSP
+    ///   chip(s), a "details" toggle (dv-only — keeps the existing
+    ///   PR-body-expansion feature the reference anatomy has no analogue
+    ///   for), an external-link ghost button, then the three real action
+    ///   buttons (PR picker / split / review toggle) this bar has always
+    ///   carried.
+    /// - **Local variant**: a `primary`-colored "local" `Tag` + bold repo
+    ///   dirname (`dv_core::repo_label`, no PR) on the left; the same right
+    ///   cluster minus the PR-only pieces (decision pill, details, external
+    ///   link) — `base ← head` becomes dv's own `source_desc`/`head` pair
+    ///   (dv's `DiffSource` has no base/head ref pair for a plain working-
+    ///   tree or commit diff).
+    /// - **PR-linked-but-not-`open_pr`'d variant**: `self.pr` is only
+    ///   populated by [`Self::open_pr`]'s own fetch — a sidebar card click
+    ///   (`AppShell::open_review_row` passes `pending_pr: None`), a
+    ///   submitted GitHub review reopened later, or the transient window
+    ///   while a background `dv pr <n>` fetch is still in flight all leave
+    ///   `self.pr` `None` even though the review genuinely has a remote
+    ///   (`self.pr_remote`, stamped from `review.remote` at load time). The
+    ///   `local` tag would misstate these (review finding P2-1), so this
+    ///   case gets its own muted/neutral "PR" pill + bold `owner/repo#N`
+    ///   (`dv_core::repo_label(location, self.pr_remote)`) instead of either
+    ///   the PR variant (no `PrHeader` to source state/title/author from
+    ///   yet) or the `local` tag.
+    ///
+    /// `pr_error`/`source_switch_error` (surfaced failures) are kept as
+    /// their own capped, truncating segments — dropping them would be a
+    /// functional regression, not a restyle.
+    fn render_header(&self, cx: &mut Context<Self>) -> Div {
+        use crate::shell::{pr_state_pill, state_pill};
+        use gpui_component::IconName;
+        use gpui_component::Selectable as _;
         use gpui_component::Sizable as _;
         use gpui_component::button::{Button, ButtonVariants as _};
-        let pr = self.pr.as_ref()?;
 
         // Owned copies before any `cx.listener`/`Button` setup below — see
         // CLAUDE.md's gpui gotcha (and `render_summary`) on why holding
@@ -7049,119 +7215,363 @@ impl Workspace {
         let success = theme.success;
         let danger = theme.danger;
         let warning = theme.warning;
-        // Same "purple link" hue as the sidebar's PR state pill
-        // (`shell::render_pr_glyphs`) and the renamed-file pill
-        // (`render_file_row`) — one recipe, one color per state everywhere
-        // it's shown (the badge-mapping rule).
-        let merged = crate::themes::dv_theme(cx).accent_alt;
+        let primary = theme.primary;
+        let dv = crate::themes::dv_theme(cx);
+        let text_secondary = dv.text_secondary;
+        let accent_alt = dv.accent_alt;
 
-        let (chip_label, chip_color) = if pr.is_draft {
-            ("draft", muted)
-        } else {
-            match pr.state {
-                PrState::Open => ("open", success),
-                PrState::Merged => ("merged", merged),
-                PrState::Closed => ("closed", danger),
-            }
-        };
-        let checks_glyph = match pr.checks {
-            ChecksSummary::Passing => Some(("\u{2713}", success)),
-            ChecksSummary::Failing => Some(("\u{2717}", danger)),
-            ChecksSummary::Pending => Some(("\u{25cf}", warning)),
-            ChecksSummary::None => None,
-        };
-        let decision = pr.review_decision.map(|d| match d {
-            ReviewDecision::Approved => ("approved", success),
-            ReviewDecision::ChangesRequested => ("changes requested", danger),
-            ReviewDecision::ReviewRequired => ("review required", muted),
-        });
-
-        let number = pr.number;
-        let title = pr.title.clone();
-        let base_head = format!("{} \u{2190} {}", pr.base_ref, pr.head_ref);
-        let author = pr.author.clone();
+        let mode = self.view_mode;
+        let summary_open = self.summary_open;
         let details_open = self.pr_details_open;
-        let body_text = pr.body.clone();
-        let url = pr.url.clone();
+        let (added, removed) = self.diffstat();
+        // `self.diffs` loads lazily, per file visited (see `Self::diffstat`'s
+        // doc comment) — `diffstat_known` alone can't distinguish "this is
+        // the whole review's total" from "only the files opened so far",
+        // and rendering the partial sum in the exact spot readers expect a
+        // whole-PR total misinforms anyone who hasn't visited every file
+        // (review finding P2-1). `diffstat_partial` drives a visible
+        // "· n/total files" qualifier below so the number is never silently
+        // mistaken for the total. `Self::files_loaded` (not a raw
+        // `self.diffs.len()`) excludes `error_diff` placeholders, so a
+        // failed file keeps this qualifier showing even after every file
+        // has been *visited* (review finding P3-1).
+        let files_loaded = self.files_loaded();
+        let files_total = self.files.len();
+        let diffstat_known = files_loaded > 0;
+        let diffstat_partial = diffstat_known && files_loaded < files_total;
 
-        Some(
-            v_flex()
-                .w_full()
-                .flex_none()
-                .border_b_1()
-                .border_color(border)
-                .bg(band_bg)
-                .child(
-                    h_flex()
-                        .w_full()
-                        .items_center()
-                        .gap_2()
-                        .px_3()
-                        .py_1p5()
-                        .child(
-                            div()
-                                .flex_none()
-                                .font_semibold()
-                                .child(format!("#{number}")),
-                        )
-                        .child(div().flex_1().min_w(px(0.)).truncate().child(title))
-                        .child(state_pill(chip_color, chip_label).flex_none())
-                        .children(
-                            checks_glyph.map(|(glyph, color)| state_pill(color, glyph).flex_none()),
-                        )
-                        .children(
-                            decision.map(|(label, color)| state_pill(color, label).flex_none()),
-                        )
-                        .child(
-                            div()
-                                .flex_none()
-                                .text_sm()
-                                .text_color(muted)
-                                .child(base_head),
-                        )
-                        .child(div().flex_none().text_sm().text_color(muted).child(author))
-                        .child(
-                            Button::new("pr-details-toggle")
-                                .ghost()
-                                .small()
-                                .label(if details_open {
-                                    "hide details"
-                                } else {
-                                    "details"
-                                })
-                                .on_click(cx.listener(|this, _, _, cx| {
-                                    this.pr_details_open = !this.pr_details_open;
-                                    cx.notify();
-                                })),
-                        ),
-                )
-                .when(details_open, |el| {
-                    el.child(
-                        v_flex()
-                            .id("pr-body")
-                            .w_full()
-                            .max_h(px(200.))
-                            .overflow_y_scroll()
-                            .px_3()
-                            .py_2()
-                            .gap_1()
-                            .border_t_1()
-                            .border_color(border)
-                            .child(
-                                div()
-                                    .text_sm()
-                                    .whitespace_normal()
-                                    .text_color(foreground)
-                                    .child(if body_text.trim().is_empty() {
-                                        SharedString::from("(no description)")
-                                    } else {
-                                        body_text
-                                    }),
-                            )
-                            .child(div().text_xs().text_color(muted).child(url)),
+        let left: AnyElement = match &self.pr {
+            Some(pr) => {
+                let (chip_label, chip_color) =
+                    pr_state_pill(pr.is_draft, pr.state, muted, success, danger, accent_alt);
+                let decision = pr.review_decision.and_then(|d| match d {
+                    ReviewDecision::Approved => Some(("approved", success)),
+                    ReviewDecision::ChangesRequested => Some(("changes requested", danger)),
+                    ReviewDecision::ReviewRequired => None,
+                });
+                h_flex()
+                    .flex_1()
+                    .min_w(px(0.))
+                    .items_center()
+                    .gap_2()
+                    .child(state_pill(chip_color, chip_label).flex_none())
+                    .child(
+                        div()
+                            .flex_shrink_1()
+                            .flex_grow_0()
+                            .min_w(px(0.))
+                            .font_semibold()
+                            .truncate()
+                            .child(pr.title.clone()),
                     )
-                }),
-        )
+                    .child(
+                        div()
+                            .flex_none()
+                            .text_color(text_secondary)
+                            .child(format!("#{}", pr.number)),
+                    )
+                    .child(
+                        div()
+                            .flex_none()
+                            .text_color(text_secondary)
+                            .child(format!("by {}", pr.author)),
+                    )
+                    .children(decision.map(|(label, color)| state_pill(color, label).flex_none()))
+                    .into_any_element()
+            }
+            // `self.pr` is `None` but the review is still remote-linked —
+            // render a PR-shaped (not `local`) left cluster (review finding
+            // P2-1; see this fn's doc comment's third bullet).
+            None if self.pr_remote.is_some() => h_flex()
+                .flex_1()
+                .min_w(px(0.))
+                .items_center()
+                .gap_2()
+                .child(state_pill(muted, "PR").flex_none())
+                .child(
+                    div()
+                        .flex_shrink_1()
+                        .flex_grow_0()
+                        .min_w(px(0.))
+                        .font_semibold()
+                        .truncate()
+                        .child(repo_label(self.location(), self.pr_remote.as_ref())),
+                )
+                .into_any_element(),
+            None => h_flex()
+                .flex_1()
+                .min_w(px(0.))
+                .items_center()
+                .gap_2()
+                .child(state_pill(primary, "local").flex_none())
+                .child(
+                    div()
+                        .flex_shrink_1()
+                        .flex_grow_0()
+                        .min_w(px(0.))
+                        .font_semibold()
+                        .truncate()
+                        .child(repo_label(self.location(), None)),
+                )
+                .into_any_element(),
+        };
+
+        // Right cluster: refs, diffstat, LSP chip(s), then the action
+        // buttons. Split into two groups (review finding P3-4): `info`
+        // (refs/diffstat/LSP chips) is allowed to shrink — its own children
+        // are bounded (`max_w` + `.truncate()`) and individually shrinkable
+        // — while `actions` (the only *interactive* elements in this
+        // cluster: PR-picker/split/review-toggle, plus the PR-only details/
+        // external-link buttons) stays `flex_none` so it's never the side
+        // that gives. Previously everything lived in one `flex_none`
+        // cluster: an unbounded refs label alone, or an LSP chip/warning
+        // that couldn't compress, could together exceed a narrow (1280px)
+        // window's width with nothing able to yield, pushing the action
+        // buttons off-screen and out of mouse reach.
+        let refs_label: Option<String> = match &self.pr {
+            Some(pr) => Some(format!("{} \u{2190} {}", pr.base_ref, pr.head_ref)),
+            // Base (the branch HEAD) on the left, the reviewed side on the
+            // right — same convention as the PR arm above (`base ← head`),
+            // not reversed (review finding P3-3: this used to render
+            // `{source_desc} ← {head}`, e.g. "working tree ← main", which
+            // reads as main's changes flowing into the working tree —
+            // backwards from what's actually being diffed).
+            //
+            // The arrow only holds for `WorkingTree`/`Staged`, where `head`
+            // (the checked-out branch/commit label) genuinely *is* the base
+            // being diffed against. For `Range`/`Commit` sources, `head` is
+            // just whatever happens to be checked out right now — unrelated
+            // to the diff's actual base — so asserting an arrow between them
+            // would claim a relationship that isn't there (review finding
+            // adversarial-P3: a Range review read as "current-branch ←
+            // range", falsely implying the range diffs against the current
+            // checkout). Fall back to the plain source description — for
+            // `Range`/`Commit` that's only the generic `source_label` word
+            // ("range" / "range (merge base)" / "commit"), not the actual
+            // endpoints; `DiffSource::Range` carries `base`/`head` fields
+            // that could render a real pair here, but that's future work,
+            // not this fix.
+            None if !self.head.is_empty()
+                && matches!(self.source, DiffSource::WorkingTree | DiffSource::Staged) =>
+            {
+                Some(format!("{} \u{2190} {}", self.head, self.source_desc))
+            }
+            None if !self.source_desc.is_empty() => Some(self.source_desc.to_string()),
+            None => None,
+        };
+        // An out-of-diff comment jump (`Self::switch_to_comment_source`)
+        // repoints `source`/`source_desc` at the review's recorded range
+        // without clearing `self.pr` — so the PR arm above would otherwise
+        // keep showing the live PR's `base ← head` while the rows on screen
+        // are the older recorded range (review finding P2-2). `open_pr`
+        // always stamps `source_desc` as `"PR #{number}"` on success, so a
+        // mismatch here means a jump has since repointed the source.
+        let viewing_label = match &self.pr {
+            Some(_) if !self.source_desc.starts_with("PR ") => {
+                Some(format!("viewing: {}", self.source_desc))
+            }
+            _ => None,
+        };
+
+        let mut info = h_flex()
+            .flex_shrink_1()
+            .flex_grow_0()
+            .min_w(px(0.))
+            .items_center()
+            .gap_2();
+        info = info.children(refs_label.map(|label| {
+            div()
+                .flex_shrink_1()
+                .flex_grow_0()
+                .min_w(px(0.))
+                .max_w(px(260.))
+                .truncate()
+                .text_color(muted)
+                .child(label)
+        }));
+        info = info.children(viewing_label.map(|label| {
+            div()
+                .flex_shrink_1()
+                .flex_grow_0()
+                .min_w(px(0.))
+                .max_w(px(200.))
+                .truncate()
+                .text_color(muted)
+                .child(label)
+        }));
+        if diffstat_known {
+            info = info
+                .child(
+                    div()
+                        .flex_none()
+                        .text_color(success)
+                        .child(format!("+{added}")),
+                )
+                .child(
+                    div()
+                        .flex_none()
+                        .text_color(danger)
+                        .child(format!("\u{2212}{removed}")),
+                )
+                .when(diffstat_partial, |el| {
+                    el.child(
+                        div()
+                            .flex_none()
+                            .text_color(muted)
+                            .child(format!("\u{00b7} {files_loaded}/{files_total} files")),
+                    )
+                });
+        }
+        info = info
+            .children(
+                self.lsp_status
+                    .clone()
+                    .map(|status| lsp_chip(status, muted)),
+            )
+            .children(
+                self.lsp_node_modules_warning
+                    .clone()
+                    .map(|warning_text| lsp_chip(warning_text, warning)),
+            );
+
+        let mut actions = h_flex().flex_none().items_center().gap_2();
+        if let Some(pr) = &self.pr {
+            let url = pr.url.clone();
+            actions = actions
+                .child(
+                    Button::new("pr-details-toggle")
+                        .ghost()
+                        .small()
+                        .label(if details_open {
+                            "hide details"
+                        } else {
+                            "details"
+                        })
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.pr_details_open = !this.pr_details_open;
+                            cx.notify();
+                        })),
+                )
+                .child(
+                    Button::new("pr-open-in-browser")
+                        .icon(IconName::ExternalLink)
+                        .ghost()
+                        .xsmall()
+                        .on_click(move |_, _, cx| cx.open_url(&url)),
+                );
+        }
+        actions = actions
+            .child(
+                Button::new("pr-picker-hint")
+                    .ghost()
+                    .small()
+                    .label("PRs · ctrl-g")
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        // Same guard the `ctrl-g` keybinding gets for free
+                        // from its `!EditorOpen` key context: a click
+                        // mustn't steal focus from a focused comment/thread
+                        // input — the picker would open but sit
+                        // keyboard-dead behind it.
+                        if this.editor.is_some() || this.thread_input.is_some() {
+                            return;
+                        }
+                        this.on_open_pr_picker(&OpenPrPicker, window, cx)
+                    })),
+            )
+            .child(
+                Button::new("view-toggle")
+                    .ghost()
+                    .small()
+                    .label(match mode {
+                        ViewMode::Unified => "unified · s",
+                        ViewMode::Split => "split · s",
+                    })
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        this.on_toggle_split(&ToggleSplit, window, cx)
+                    })),
+            )
+            .child(
+                Button::new("summary-toggle")
+                    .ghost()
+                    .small()
+                    .selected(summary_open)
+                    .label("review · r")
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        this.on_toggle_summary(&ToggleSummary, window, cx)
+                    })),
+            );
+
+        let body_text = self.pr.as_ref().map(|pr| pr.body.clone());
+        let url_text = self.pr.as_ref().map(|pr| pr.url.clone());
+
+        v_flex()
+            .w_full()
+            .flex_none()
+            .border_b_1()
+            .border_color(border)
+            .bg(band_bg)
+            .child(
+                h_flex()
+                    .w_full()
+                    .items_center()
+                    .gap_2()
+                    .px_3()
+                    .py_1p5()
+                    .child(left)
+                    .when_some(self.pr_error.clone(), |el, err| {
+                        el.child(
+                            div()
+                                .flex_none()
+                                .max_w(px(200.))
+                                .text_sm()
+                                .text_color(danger)
+                                .truncate()
+                                .child(format!("PR: {err}")),
+                        )
+                    })
+                    .when_some(self.source_switch_error.clone(), |el, err| {
+                        el.child(
+                            div()
+                                .flex_none()
+                                .max_w(px(200.))
+                                .text_sm()
+                                .text_color(danger)
+                                .truncate()
+                                .child(format!("Jump: {err}")),
+                        )
+                    })
+                    .child(info)
+                    .child(actions),
+            )
+            .when(details_open, |el| {
+                let Some(body_text) = body_text else {
+                    return el;
+                };
+                el.child(
+                    v_flex()
+                        .id("pr-body")
+                        .w_full()
+                        .max_h(px(200.))
+                        .overflow_y_scroll()
+                        .px_3()
+                        .py_2()
+                        .gap_1()
+                        .border_t_1()
+                        .border_color(border)
+                        .child(
+                            div()
+                                .text_sm()
+                                .whitespace_normal()
+                                .text_color(foreground)
+                                .child(if body_text.trim().is_empty() {
+                                    SharedString::from("(no description)")
+                                } else {
+                                    body_text
+                                }),
+                        )
+                        .children(url_text.map(|url| div().text_xs().text_color(muted).child(url))),
+                )
+            })
     }
 
     /// The PR picker overlay (`ctrl-g`), when open: same positioning/chrome
@@ -9052,12 +9462,8 @@ impl Focusable for Workspace {
 
 impl Render for Workspace {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        use gpui_component::Selectable as _;
-        use gpui_component::Sizable as _;
-        use gpui_component::button::{Button, ButtonVariants as _};
         let summary = self.render_summary(cx);
         let theme = cx.theme();
-        let mode = self.view_mode;
 
         let body: Div = match &self.status {
             Status::Loading => div()
@@ -9231,114 +9637,7 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::on_nav_back))
             .on_action(cx.listener(Self::on_nav_forward))
             .on_action(cx.listener(Self::on_close_target_viewer))
-            .child(
-                // Per-review header strip (the window title bar is the
-                // shell's; this shows which review is active).
-                h_flex()
-                    .flex_none()
-                    .w_full()
-                    .gap_2()
-                    .px_3()
-                    .py_1()
-                    .border_b_1()
-                    .border_color(theme.border)
-                    .bg(theme.secondary)
-                    .child(
-                        div()
-                            .flex_1()
-                            .min_w(px(0.))
-                            .truncate()
-                            .child(self.title.clone()),
-                    )
-                    .child(
-                        div()
-                            .text_color(theme.muted_foreground)
-                            .child(self.head.clone()),
-                    )
-                    .child(
-                        div()
-                            .text_color(theme.muted_foreground)
-                            .child(self.source_desc.clone()),
-                    )
-                    .when_some(self.pr_error.clone(), |el, err| {
-                        el.child(
-                            div()
-                                .text_sm()
-                                .text_color(theme.danger)
-                                .truncate()
-                                .child(format!("PR: {err}")),
-                        )
-                    })
-                    .when_some(self.source_switch_error.clone(), |el, err| {
-                        el.child(
-                            div()
-                                .text_sm()
-                                .text_color(theme.danger)
-                                .truncate()
-                                .child(format!("Jump: {err}")),
-                        )
-                    })
-                    .when_some(self.lsp_status.clone(), |el, status| {
-                        el.child(
-                            div()
-                                .text_sm()
-                                .text_color(theme.muted_foreground)
-                                .truncate()
-                                .child(status),
-                        )
-                    })
-                    .when_some(self.lsp_node_modules_warning.clone(), |el, warning| {
-                        el.child(
-                            div()
-                                .text_sm()
-                                .text_color(theme.muted_foreground)
-                                .truncate()
-                                .child(warning),
-                        )
-                    })
-                    .child(div().flex_1())
-                    .child(
-                        Button::new("pr-picker-hint")
-                            .ghost()
-                            .small()
-                            .label("PRs · ctrl-g")
-                            .on_click(cx.listener(|this, _, window, cx| {
-                                // Same guard the `ctrl-g` keybinding gets
-                                // for free from its `!EditorOpen` key
-                                // context: a click mustn't steal focus
-                                // from a focused comment/thread input —
-                                // the picker would open but sit
-                                // keyboard-dead behind it.
-                                if this.editor.is_some() || this.thread_input.is_some() {
-                                    return;
-                                }
-                                this.on_open_pr_picker(&OpenPrPicker, window, cx)
-                            })),
-                    )
-                    .child(
-                        Button::new("view-toggle")
-                            .ghost()
-                            .small()
-                            .label(match mode {
-                                ViewMode::Unified => "unified · s",
-                                ViewMode::Split => "split · s",
-                            })
-                            .on_click(cx.listener(|this, _, window, cx| {
-                                this.on_toggle_split(&ToggleSplit, window, cx)
-                            })),
-                    )
-                    .child(
-                        Button::new("summary-toggle")
-                            .ghost()
-                            .small()
-                            .selected(self.summary_open)
-                            .label("review · r")
-                            .on_click(cx.listener(|this, _, window, cx| {
-                                this.on_toggle_summary(&ToggleSummary, window, cx)
-                            })),
-                    ),
-            )
-            .children(self.render_pr_header(cx))
+            .child(self.render_header(cx))
             .child(body)
             .children(self.render_palette(cx))
             .children(self.render_pr_picker(cx))

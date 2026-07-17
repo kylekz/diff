@@ -566,16 +566,44 @@ pub(crate) fn state_pill(color: Hsla, label: impl Into<SharedString>) -> Tag {
         .child(label.into())
 }
 
+/// PR state pill label + color (draft/open/merged/closed), shared by the
+/// sidebar's PR-status cluster ([`render_pr_glyphs`]) and the workspace's
+/// title-bar-anatomy header (`Workspace::render_header`, R1c) — both used to
+/// carry their own copy of this exact match, and a review finding (R1b) flagged
+/// the duplication risk before a third call site (R1c) made it worth fixing.
+/// Color mapping: open=success,
+/// merged=`accent_alt` (the deliberate "purple link" hue, shared with the
+/// renamed-file pill in `Workspace::render_file_row`), closed=danger,
+/// draft=muted — draft takes precedence over `state` when both are true,
+/// matching a real GitHub PR (a draft is always reported as `OPEN`).
+pub(crate) fn pr_state_pill(
+    is_draft: bool,
+    state: PrState,
+    muted: Hsla,
+    success: Hsla,
+    danger: Hsla,
+    accent_alt: Hsla,
+) -> (&'static str, Hsla) {
+    if is_draft {
+        ("draft", muted)
+    } else {
+        match state {
+            PrState::Open => ("open", success),
+            PrState::Merged => ("merged", accent_alt),
+            PrState::Closed => ("closed", danger),
+        }
+    }
+}
+
 /// Sidebar PR-status pill cluster: state (draft/open/merged/closed),
-/// review-decision marker, CI marker. Colors per the
-/// Badges/pills' mapping (open=success, merged=`accent_alt`, closed=danger,
-/// draft=muted): the merged badge deliberately shares the "purple link"
-/// hue with the renamed-file pill (`render_file_row`) rather than reusing
-/// `primary` as the old glyph cluster did. The decision and CI markers keep
-/// their own compact glyphs (✓/±/▪) rather than spelling out full words —
-/// unlike the title bar (R1c), this cluster can carry three pills at once
-/// in a two-line sidebar card, so content stays short by design (the
-/// slice's own flagged risk: pill weight overpowering a dense row).
+/// review-decision marker, CI marker. Colors follow the shared badge/pill
+/// mapping (see [`pr_state_pill`] for the state pill itself).
+/// The decision and CI markers keep their own compact glyphs (✓/±/▪) rather
+/// than spelling out full words — unlike the title bar (R1c), which spells
+/// `approved`/`changes requested` out in full, this cluster can carry three
+/// pills at once in a two-line sidebar card, so content stays short by
+/// design (the slice's own flagged risk: pill weight overpowering a dense
+/// row).
 #[allow(clippy::too_many_arguments)]
 fn render_pr_glyphs(
     is_draft: bool,
@@ -588,15 +616,8 @@ fn render_pr_glyphs(
     warning: Hsla,
     accent_alt: Hsla,
 ) -> impl IntoElement {
-    let (state_label, state_color) = if is_draft {
-        ("draft", muted)
-    } else {
-        match state {
-            PrState::Merged => ("merged", accent_alt),
-            PrState::Open => ("open", success),
-            PrState::Closed => ("closed", danger),
-        }
-    };
+    let (state_label, state_color) =
+        pr_state_pill(is_draft, state, muted, success, danger, accent_alt);
     let decision_pill = match decision {
         Some(ReviewDecision::Approved) => Some(("\u{2713}", success)),
         Some(ReviewDecision::ChangesRequested) => Some(("\u{b1}", danger)),

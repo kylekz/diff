@@ -927,6 +927,16 @@ pub struct AppShell {
     /// `window.focus` anything onto the shell (cross-cutting risk E: no
     /// key bindings means no dispatch-path ambiguity to sidestep).
     filter_popover_open: bool,
+    /// The "open anything" quick-open input pinned above the sidebar list
+    /// (R2): a PR URL / `owner/repo#123` / `#123` /
+    /// filesystem path, parsed by `dv_core::parse_open_target` on Enter
+    /// (see [`Self::quick_open_submit`]).
+    quick_open: Entity<InputState>,
+    /// Keeps the quick-open input's Enter/Change subscription alive.
+    _quick_open_subscription: Subscription,
+    /// Inline error under the quick-open input. Cleared by the next edit
+    /// (`InputEvent::Change`) or by clicking the error line itself.
+    quick_open_error: Option<SharedString>,
     /// Keeps the active workspace's ReviewChanged subscription alive.
     _ws_subscription: Option<Subscription>,
     /// Keeps the active workspace's `SummaryWidthChanged` subscription
@@ -1137,6 +1147,26 @@ impl AppShell {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
+        // "Open anything" quick-open (R2). Built
+        // before the struct because `InputState::new` needs the `Window`.
+        let quick_open = cx.new(|cx| {
+            InputState::new(window, cx).placeholder("Open PR URL, owner/repo#123, or path")
+        });
+        let quick_open_subscription = cx.subscribe_in(
+            &quick_open,
+            window,
+            |this, _, event: &InputEvent, window, cx| match event {
+                InputEvent::PressEnter { .. } => this.quick_open_submit(window, cx),
+                // Any edit invalidates a stale inline error.
+                InputEvent::Change => {
+                    let had_error = this.quick_open_error.take().is_some();
+                    if had_error {
+                        cx.notify();
+                    }
+                }
+                _ => {}
+            },
+        );
         let mut this = Self {
             focus_handle: cx.focus_handle(),
             recent: RecentStore::load(),
@@ -1148,6 +1178,9 @@ impl AppShell {
             index_hydration_gens: HashMap::new(),
             sidebar_dragging: false,
             filter_popover_open: false,
+            quick_open,
+            _quick_open_subscription: quick_open_subscription,
+            quick_open_error: None,
             _ws_subscription: None,
             _ws_summary_subscription: None,
             settings,
@@ -2480,6 +2513,144 @@ impl AppShell {
         }
     }
 
+    // ---- "Open anything" quick-open (R2) -----------------------------------
+
+    /// Enter in the quick-open input. Resolution is deliberately cheap and
+    /// offline: an `owner/repo#N` (or PR URL) target is looked up against
+    /// the index's existing PR linkage only — never a `git remote` call per
+    /// known repo, which would spawn git across every location (and worse,
+    /// touch WSL distros) on every Enter. A repo dv has never seen a PR for
+    /// simply isn't found: the error says to open the repo folder first
+    /// (after which ctrl-g's PR picker — or this field again — works).
+    pub(crate) fn quick_open_submit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let text = self.quick_open.read(cx).value().trim().to_string();
+        if text.is_empty() {
+            return;
+        }
+        let target = match dv_core::parse_open_target(&text) {
+            Ok(target) => target,
+            Err(message) => {
+                self.set_quick_open_error(message, cx);
+                return;
+            }
+        };
+        match target {
+            dv_core::OpenTarget::Path(path) => {
+                let Ok(location) = RepoLocation::from_path_arg(&path) else {
+                    self.set_quick_open_error(format!("not a repo path: {path}"), cx);
+                    return;
+                };
+                // Catch the typo here, where the inline error can say so —
+                // `open_review` on a nonexistent local path would open a
+                // workspace that fails with a less-attributable git error.
+                // WSL locations skip the check (existence would need a
+                // distro round trip); their failure surfaces in-workspace,
+                // same as the CLI's `--wsl` flag.
+                if let RepoLocation::Local(p) = &location
+                    && !p.is_dir()
+                {
+                    self.set_quick_open_error(format!("no such directory: {path}"), cx);
+                    return;
+                }
+                self.clear_quick_open(window, cx);
+                self.open_review(location, DiffSource::WorkingTree, None, None, window, cx);
+            }
+            dv_core::OpenTarget::PrNumber(number) => {
+                let Some(ws) = self.active.clone() else {
+                    self.set_quick_open_error(
+                        format!("no active repo for #{number} — use owner/repo#{number} or open a repo first"),
+                        cx,
+                    );
+                    return;
+                };
+                self.clear_quick_open(window, cx);
+                // The active workspace's own PR-open path (same one the
+                // ctrl-g picker's Enter uses) — validates in-flight
+                // comment saves before switching, surfaces fetch errors.
+                ws.update(cx, |ws, cx| ws.open_pr(number, window, cx));
+            }
+            dv_core::OpenTarget::Pr {
+                host,
+                owner,
+                repo,
+                number,
+            } => {
+                let slug = format!("{host}/{owner}/{repo}");
+                let location = self
+                    .index
+                    .entries()
+                    .iter()
+                    .find(|e| e.remote.as_ref().is_some_and(|r| r.slug == slug))
+                    .map(|e| e.location.clone());
+                let Some(location) = location else {
+                    self.set_quick_open_error(
+                        format!(
+                            "no known local clone of {owner}/{repo} — open the repo folder first"
+                        ),
+                        cx,
+                    );
+                    return;
+                };
+                self.clear_quick_open(window, cx);
+                if self
+                    .active
+                    .as_ref()
+                    .is_some_and(|ws| ws.read(cx).location() == &location)
+                {
+                    if let Some(ws) = self.active.clone() {
+                        ws.update(cx, |ws, cx| ws.open_pr(number, window, cx));
+                    }
+                } else {
+                    // A different (or no) active repo: the `dv pr <n>`
+                    // launch shape — fresh workspace for that location with
+                    // the PR fetch pending (`open_review`'s cache-miss
+                    // branch; no pin, so the LRU fast path can't
+                    // mis-reactivate some other review).
+                    self.open_review(
+                        location,
+                        DiffSource::WorkingTree,
+                        Some(number),
+                        None,
+                        window,
+                        cx,
+                    );
+                }
+            }
+        }
+    }
+
+    /// `{"cmd":"quick_open","text":"..."}`: stuff the input and submit —
+    /// the scripted stand-in for click-focus + per-key typing + Enter
+    /// (coordinate clicks are the one flaky automation primitive; see
+    /// CLAUDE.md's stale-frame caveat). Everything from the parse on is
+    /// the real [`Self::quick_open_submit`] path.
+    #[cfg(feature = "automation")]
+    pub(crate) fn automation_quick_open(
+        &mut self,
+        text: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.quick_open.update(cx, |input, cx| {
+            input.set_value(text.to_string(), window, cx)
+        });
+        self.quick_open_submit(window, cx);
+    }
+
+    fn set_quick_open_error(&mut self, message: impl Into<SharedString>, cx: &mut Context<Self>) {
+        self.quick_open_error = Some(message.into());
+        cx.notify();
+    }
+
+    /// Successful submit: blank the input (ready for the next target) and
+    /// drop any stale error.
+    fn clear_quick_open(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.quick_open
+            .update(cx, |input, cx| input.set_value("", window, cx));
+        self.quick_open_error = None;
+        cx.notify();
+    }
+
     /// Which focus handle currently owns window focus, as a stable label
     /// for `--automation` assertions (Phase 7 D0: the PR-picker Enter
     /// regression was invisible because focus location wasn't assertable).
@@ -2687,6 +2858,9 @@ impl AppShell {
                 }),
             }),
             "settings_open": self.settings_panel.is_some(),
+            // Quick-open (R2): the inline error, or
+            // null — the `quick_open` command's primary assert surface.
+            "quick_open_error": self.quick_open_error.as_ref().map(|e| e.to_string()),
             // Onboarding spine (S8e): the whole page's row set, so a script
             // can assert first-run behavior and drift-driven re-provisioning
             // without a screenshot (`{"cmd":"action","name":"OpenOnboarding"}`
@@ -4982,6 +5156,8 @@ impl Render for AppShell {
         let sidebar_seam = theme.muted;
         let sidebar_bg = theme.sidebar;
         let sidebar_label_fg = theme.muted_foreground;
+        let sidebar_danger = theme.danger;
+        let quick_open_error = self.quick_open_error.clone();
 
         let active_title = self
             .selected_review_id
@@ -5080,6 +5256,32 @@ impl Render for AppShell {
                                 // lightened seam.
                                 .border_color(sidebar_seam)
                                 .bg(sidebar_bg)
+                                // "Open anything"
+                                // (R2): one field for a PR URL /
+                                // owner/repo#123 / #123 / path, with an
+                                // inline error that the next edit (or a
+                                // click on it) dismisses.
+                                .child(
+                                    v_flex()
+                                        .px_2()
+                                        .pt_2()
+                                        .gap_1()
+                                        .w_full()
+                                        .child(Input::new(&self.quick_open).small().w_full())
+                                        .children(quick_open_error.map(|message| {
+                                            div()
+                                                .id("quick-open-error")
+                                                .w_full()
+                                                .text_size(px(11.))
+                                                .text_color(sidebar_danger)
+                                                .cursor_pointer()
+                                                .on_click(cx.listener(|this, _, _, cx| {
+                                                    this.quick_open_error = None;
+                                                    cx.notify();
+                                                }))
+                                                .child(message)
+                                        })),
+                                )
                                 .child(
                                     div().p_2().w_full().child(
                                         // Quiet chrome (the sidebar

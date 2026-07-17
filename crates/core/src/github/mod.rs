@@ -10,6 +10,7 @@
 mod client;
 mod error;
 mod models;
+mod open_target;
 mod slug;
 
 pub use client::{GithubClient, gh_status};
@@ -18,6 +19,7 @@ pub use models::{
     ChecksSummary, CreatePr, CreatedPr, DraftComment, GhSide, PrMeta, PrState, PrStatus, PrSummary,
     RemoteComment, RemoteThread, ReviewDecision, ReviewEvent, ReviewSubmission, SubmittedReview,
 };
+pub use open_target::{OpenTarget, parse_open_target};
 pub use slug::RepoSlug;
 
 #[cfg(test)]

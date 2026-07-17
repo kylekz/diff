@@ -21,9 +21,9 @@ pub use command::CommandBuilder;
 pub use diff::{DiffLine, DiffOptions, FileDiff, Hunk, LineKind};
 pub use git::{BlobSpec, ChangeStatus, ChangedFile, DiffSource, DiffTotals, GitRepo, parse_range};
 pub use github::{
-    ChecksSummary, CreatePr, CreatedPr, DraftComment, GhError, GhSide, GithubClient, PrMeta,
-    PrState, PrStatus, PrSummary, RemoteComment, RemoteThread, RepoSlug, ReviewDecision,
-    ReviewEvent, ReviewSubmission, SubmittedReview, gh_status,
+    ChecksSummary, CreatePr, CreatedPr, DraftComment, GhError, GhSide, GithubClient, OpenTarget,
+    PrMeta, PrState, PrStatus, PrSummary, RemoteComment, RemoteThread, RepoSlug, ReviewDecision,
+    ReviewEvent, ReviewSubmission, SubmittedReview, gh_status, parse_open_target,
 };
 pub use index::{
     CachedPrStatus, EntryHealth, HydrateOutcome, IndexEntry, ReviewIndex, entry_title,

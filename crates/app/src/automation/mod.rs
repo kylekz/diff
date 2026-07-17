@@ -115,6 +115,12 @@ enum Cmd {
     /// matches `Settings`'s JSON field names (`theme`, `mono_font_size`,
     /// `view_mode_default`, ...).
     SetSetting { key: String, value: Value },
+    /// Set the "open anything" quick-open input's text and submit it —
+    /// same parse/resolve path as typing + Enter
+    /// (`AppShell::quick_open_submit`); assert the outcome via
+    /// `state.shell.quick_open_error` (null on success) plus the usual
+    /// workspace fields after a `wait_ready`.
+    QuickOpen { text: String },
     /// Click the onboarding page's consent-install button on the row at
     /// index `row` (`state.shell.onboarding.rows[row]`), the scripted
     /// stand-in for clicking "Install" (`AppShell::
@@ -449,6 +455,13 @@ async fn handle(
                 shell
                     .automation_set_setting(&key, value, window, cx)
                     .map(|()| json!({"key": key}))
+            })
+        })?,
+
+        Cmd::QuickOpen { text } => cx.update_window(window, |_, window, cx| {
+            shell.update(cx, |shell, cx| {
+                shell.automation_quick_open(&text, window, cx);
+                Ok(json!({"submitted": text}))
             })
         })?,
 

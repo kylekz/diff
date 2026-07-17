@@ -7122,10 +7122,21 @@ impl Workspace {
 
     /// The jump-to-file palette overlay, when open: centered near the top,
     /// a query input above the ranked matches.
+    /// The shared modal-picker recipe (R2 item 6)
+    /// — see `AppShell::render_theme_picker`'s
+    /// doc comment for the full spec, with one scope caveat: this overlay
+    /// lives in the *workspace's* render tree, so its `inset_0()` scrim
+    /// dims the workspace pane only (the shell-owned theme picker dims the
+    /// whole window). This one also keeps its blur-closes semantics: a
+    /// backdrop click blurs the input too, so both paths funnel into
+    /// `close_palette` (idempotent).
     fn render_palette(&self, cx: &mut Context<Self>) -> Option<Div> {
+        use gpui_component::Sizable as _;
         const VISIBLE: usize = 12;
         let palette = self.palette.as_ref()?;
         let theme = cx.theme();
+        let dv = crate::themes::dv_theme(cx);
+        let surface_active = dv.surface_active;
 
         // Keep the selection visible within the capped row window.
         let first = palette.selected.saturating_sub(VISIBLE - 1);
@@ -7140,12 +7151,15 @@ impl Workspace {
                 div()
                     .id(("palette-row", match_ix))
                     .w_full()
+                    .h(px(30.))
+                    .mx_1()
                     .px_2()
-                    .py_0p5()
-                    .rounded_sm()
+                    .flex()
+                    .items_center()
+                    .rounded_md()
                     .cursor_pointer()
-                    .when(selected, |el| el.bg(theme.accent))
-                    .hover(|el| el.bg(theme.accent.opacity(0.5)))
+                    .when(selected, |el| el.bg(surface_active))
+                    .hover(|el| el.bg(surface_active.opacity(0.5)))
                     .on_mouse_down(
                         MouseButton::Left,
                         cx.listener(move |this, _, window, cx| {
@@ -7157,7 +7171,7 @@ impl Workspace {
                     )
                     .child(
                         div()
-                            .text_sm()
+                            .w_full()
                             .truncate()
                             .child(self.files[file_ix].path.clone()),
                     )
@@ -7167,42 +7181,56 @@ impl Workspace {
         Some(
             div()
                 .absolute()
-                .top(px(48.))
-                .left_0()
-                .right_0()
-                .flex()
-                .justify_center()
+                .inset_0()
+                .occlude()
+                .bg(dv.backdrop)
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(|this, _, window, cx| {
+                        this.close_palette(window, cx);
+                        cx.stop_propagation();
+                    }),
+                )
                 .child(
-                    v_flex()
-                        .w(px(560.))
-                        .max_w_full()
-                        .p_2()
-                        .gap_2()
-                        // Swallow clicks on the popover chrome (padding,
-                        // gaps): otherwise they bubble to the workspace
-                        // root's focus-on-mousedown, blurring the input and
-                        // closing the palette out from under the user.
-                        .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-                        .bg(theme.popover)
-                        .text_color(theme.popover_foreground)
-                        .border_1()
-                        .border_color(theme.border)
-                        .rounded_lg()
-                        .shadow_lg()
-                        .child(gpui_component::input::Input::new(&palette.input))
-                        .child(v_flex().w_full().children(rows).when(
-                            palette.matches.is_empty(),
-                            |el| {
-                                el.child(
-                                    div()
-                                        .px_2()
-                                        .py_1()
-                                        .text_sm()
-                                        .text_color(theme.muted_foreground)
-                                        .child("no matching files"),
-                                )
-                            },
-                        )),
+                    div()
+                        .absolute()
+                        .top(px(48.))
+                        .left_0()
+                        .right_0()
+                        .flex()
+                        .justify_center()
+                        .child(
+                            v_flex()
+                                .w(px(560.))
+                                .max_w_full()
+                                .p_2()
+                                .gap_2()
+                                // Swallow clicks on the popover chrome (padding,
+                                // gaps): otherwise they bubble to the workspace
+                                // root's focus-on-mousedown, blurring the input and
+                                // closing the palette out from under the user.
+                                .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                                .bg(theme.sidebar)
+                                .text_color(theme.foreground)
+                                .text_size(px(13.))
+                                .border_1()
+                                .border_color(theme.muted)
+                                .rounded_lg()
+                                .shadow_lg()
+                                .child(gpui_component::input::Input::new(&palette.input).small())
+                                .child(v_flex().w_full().children(rows).when(
+                                    palette.matches.is_empty(),
+                                    |el| {
+                                        el.child(
+                                            div()
+                                                .px_2()
+                                                .py_1()
+                                                .text_color(theme.muted_foreground)
+                                                .child("no matching files"),
+                                        )
+                                    },
+                                )),
+                        ),
                 ),
         )
     }
@@ -7628,19 +7656,25 @@ impl Workspace {
     /// The PR picker overlay (`ctrl-g`), when open: same positioning/chrome
     /// as [`Self::render_palette`], but no text input — a background `gh pr
     /// list` call and up/down/enter/escape over whatever it returns.
+    /// The shared modal-picker recipe (R2 item 6)
+    /// — see `AppShell::render_theme_picker`'s
+    /// doc comment for the full spec, and `render_palette`'s for the
+    /// workspace-pane scrim-scope caveat both workspace pickers share.
     fn render_pr_picker(&self, cx: &mut Context<Self>) -> Option<Div> {
         use crate::shell::state_pill;
 
         let picker = self.pr_picker.as_ref()?;
 
         let theme = cx.theme();
-        let border = theme.border;
-        let popover = theme.popover;
-        let popover_fg = theme.popover_foreground;
-        let accent = theme.accent;
+        let seam = theme.muted;
+        let panel_bg = theme.sidebar;
+        let fg = theme.foreground;
         let muted = theme.muted_foreground;
         let danger = theme.danger;
         let mono = theme.mono_font_family.clone();
+        let dv = crate::themes::dv_theme(cx);
+        let backdrop = dv.backdrop;
+        let surface_active = dv.surface_active;
 
         // Phase 7 D2 freshness hint: a warning if the background revalidation
         // most recently failed (stale list stays on screen either way — see
@@ -7686,21 +7720,18 @@ impl Workspace {
                 PrPickerState::Loading => div()
                     .px_2()
                     .py_1()
-                    .text_sm()
                     .text_color(muted)
                     .child("loading…")
                     .into_any_element(),
                 PrPickerState::Error(err) => div()
                     .px_2()
                     .py_1()
-                    .text_sm()
                     .text_color(danger)
                     .child(err.clone())
                     .into_any_element(),
                 PrPickerState::Loaded(prs) if prs.is_empty() => div()
                     .px_2()
                     .py_1()
-                    .text_sm()
                     .text_color(muted)
                     .child("no open PRs")
                     .into_any_element(),
@@ -7723,13 +7754,15 @@ impl Workspace {
                                 h_flex()
                                     .id(("pr-picker-row", i))
                                     .w_full()
+                                    .h(px(30.))
+                                    .mx_1()
                                     .gap_2()
                                     .px_2()
-                                    .py_1()
-                                    .rounded_sm()
+                                    .items_center()
+                                    .rounded_md()
                                     .cursor_pointer()
-                                    .when(selected, |el| el.bg(accent))
-                                    .hover(|el| el.bg(accent.opacity(0.5)))
+                                    .when(selected, |el| el.bg(surface_active))
+                                    .hover(|el| el.bg(surface_active.opacity(0.5)))
                                     .on_mouse_down(
                                         MouseButton::Left,
                                         cx.listener(move |this, _, window, cx| {
@@ -7747,7 +7780,6 @@ impl Workspace {
                                         div()
                                             .flex_1()
                                             .min_w(px(0.))
-                                            .text_sm()
                                             .truncate()
                                             .child(pr.title.clone()),
                                     )
@@ -7770,59 +7802,76 @@ impl Workspace {
         Some(
             div()
                 .absolute()
-                .top(px(48.))
-                .left_0()
-                .right_0()
-                .flex()
-                .justify_center()
+                .inset_0()
+                .occlude()
+                .bg(backdrop)
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(|this, _, window, cx| {
+                        this.close_pr_picker(window, cx);
+                        cx.stop_propagation();
+                    }),
+                )
                 .child(
-                    v_flex()
-                        .w(px(560.))
-                        .max_w_full()
-                        .max_h(px(420.))
-                        .overflow_hidden()
-                        .p_2()
-                        .gap_2()
-                        // Same swallow-the-click-on-chrome reasoning as
-                        // `render_palette`.
-                        .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-                        .bg(popover)
-                        .text_color(popover_fg)
-                        .border_1()
-                        .border_color(border)
-                        .rounded_lg()
-                        .shadow_lg()
+                    div()
+                        .absolute()
+                        .top(px(48.))
+                        .left_0()
+                        .right_0()
+                        .flex()
+                        .justify_center()
                         .child(
-                            h_flex()
-                                .w_full()
-                                .justify_between()
-                                .px_2()
-                                .pt_1()
+                            v_flex()
+                                .w(px(560.))
+                                .max_w_full()
+                                .max_h(px(420.))
+                                .overflow_hidden()
+                                .p_2()
+                                .gap_2()
+                                // Same swallow-the-click-on-chrome reasoning as
+                                // `render_palette`.
+                                .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                                .bg(panel_bg)
+                                .text_color(fg)
+                                .text_size(px(13.))
+                                .border_1()
+                                .border_color(seam)
+                                .rounded_lg()
+                                .shadow_lg()
                                 .child(
-                                    div()
-                                        .flex_shrink_0()
-                                        .text_xs()
-                                        .text_color(muted)
-                                        .child("Open PRs \u{b7} enter to open, esc to close"),
+                                    h_flex()
+                                        .w_full()
+                                        .justify_between()
+                                        .px_2()
+                                        .pt_1()
+                                        .child(
+                                            div()
+                                                .flex_shrink_0()
+                                                .text_size(px(11.))
+                                                .text_color(muted)
+                                                .child(
+                                                    "Open PRs \u{b7} enter to open, esc to close",
+                                                ),
+                                        )
+                                        .when_some(freshness, |el, hint| {
+                                            let color = if picker.refresh_error.is_some() {
+                                                danger
+                                            } else {
+                                                muted
+                                            };
+                                            el.child(
+                                                div()
+                                                    .min_w(px(0.))
+                                                    .max_w(px(260.))
+                                                    .truncate()
+                                                    .text_size(px(11.))
+                                                    .text_color(color)
+                                                    .child(hint),
+                                            )
+                                        }),
                                 )
-                                .when_some(freshness, |el, hint| {
-                                    let color = if picker.refresh_error.is_some() {
-                                        danger
-                                    } else {
-                                        muted
-                                    };
-                                    el.child(
-                                        div()
-                                            .min_w(px(0.))
-                                            .max_w(px(260.))
-                                            .truncate()
-                                            .text_xs()
-                                            .text_color(color)
-                                            .child(hint),
-                                    )
-                                }),
-                        )
-                        .child(body),
+                                .child(body),
+                        ),
                 ),
         )
     }

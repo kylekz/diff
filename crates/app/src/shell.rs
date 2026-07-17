@@ -4471,80 +4471,114 @@ impl AppShell {
     /// popover-over-everything chrome as `workspace.rs`'s `render_pr_picker`,
     /// but listing the static theme registry instead — no loading/error
     /// state, since there's no async fetch involved.
+    /// The shared modal-picker recipe
+    /// (R2 item 6): full-viewport `occlude()` scrim at
+    /// DvTheme `backdrop` (click closes, matching escape), 560px panel on
+    /// `sidebar.background` with a `muted` seam border (never `border` —
+    /// Aura's is #000), 13px base text, 11px caption, 30px rows
+    /// (`mx_1 px_2 rounded_md`, selected = `surface_active`). Same recipe
+    /// as `Workspace::render_palette`/`render_pr_picker`.
     fn render_theme_picker(&self, cx: &mut Context<Self>) -> Option<Div> {
         let picker = self.theme_picker.as_ref()?;
 
         let theme = cx.theme();
-        let border = theme.border;
-        let popover = theme.popover;
-        let popover_fg = theme.popover_foreground;
-        let accent = theme.accent;
+        let seam = theme.muted;
+        let panel_bg = theme.sidebar;
+        let fg = theme.foreground;
         let muted = theme.muted_foreground;
         let success = theme.success;
+        let dv = themes::dv_theme(cx);
+        let backdrop = dv.backdrop;
+        let surface_active = dv.surface_active;
         let active_theme = self.settings.theme.clone();
 
         Some(
             div()
                 .absolute()
-                .top(px(48.))
-                .left_0()
-                .right_0()
-                .flex()
-                .justify_center()
+                .inset_0()
+                .occlude()
+                .bg(backdrop)
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(|this, _, window, cx| {
+                        this.close_theme_picker(window, cx);
+                        cx.stop_propagation();
+                    }),
+                )
                 .child(
-                    v_flex()
-                        .w(px(360.))
-                        .max_w_full()
-                        .overflow_hidden()
-                        .p_2()
-                        .gap_2()
-                        // Same swallow-the-click-on-chrome reasoning as
-                        // `render_pr_picker`.
-                        .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-                        .bg(popover)
-                        .text_color(popover_fg)
-                        .border_1()
-                        .border_color(border)
-                        .rounded_lg()
-                        .shadow_lg()
+                    div()
+                        .absolute()
+                        .top(px(48.))
+                        .left_0()
+                        .right_0()
+                        .flex()
+                        .justify_center()
                         .child(
-                            div()
-                                .px_2()
-                                .pt_1()
-                                .text_xs()
-                                .text_color(muted)
-                                .child("Theme \u{b7} enter to apply, esc to close"),
-                        )
-                        .child(v_flex().w_full().children(themes::names().enumerate().map(
-                            |(i, name)| {
-                                let selected = i == picker.selected;
-                                let is_active = name == active_theme;
-                                h_flex()
-                                    .id(("theme-picker-row", i))
-                                    .w_full()
-                                    .gap_2()
-                                    .px_2()
-                                    .py_1()
-                                    .rounded_sm()
-                                    .cursor_pointer()
-                                    .when(selected, |el| el.bg(accent))
-                                    .hover(|el| el.bg(accent.opacity(0.5)))
-                                    .on_mouse_down(
-                                        MouseButton::Left,
-                                        cx.listener(move |this, _, window, cx| {
-                                            this.choose_theme(name, window, cx);
-                                        }),
-                                    )
-                                    .child(
-                                        div()
-                                            .flex_none()
-                                            .w(px(16.))
-                                            .text_color(success)
-                                            .child(if is_active { "\u{2713}" } else { "" }),
-                                    )
-                                    .child(div().flex_1().text_sm().child(name))
-                            },
-                        ))),
+                            v_flex()
+                                .w(px(560.))
+                                .max_w_full()
+                                .overflow_hidden()
+                                .p_2()
+                                .gap_2()
+                                // Same swallow-the-click-on-chrome reasoning as
+                                // `render_pr_picker`.
+                                .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                                .bg(panel_bg)
+                                .text_color(fg)
+                                .text_size(px(13.))
+                                .border_1()
+                                .border_color(seam)
+                                .rounded_lg()
+                                .shadow_lg()
+                                .child(
+                                    div()
+                                        .px_2()
+                                        .pt_1()
+                                        .text_size(px(11.))
+                                        .text_color(muted)
+                                        .child("Theme \u{b7} enter to apply, esc to close"),
+                                )
+                                .child(v_flex().w_full().children(
+                                    themes::names().enumerate().map(|(i, name)| {
+                                        let selected = i == picker.selected;
+                                        let is_active = name == active_theme;
+                                        h_flex()
+                                            .id(("theme-picker-row", i))
+                                            .w_full()
+                                            .h(px(30.))
+                                            .mx_1()
+                                            .gap_2()
+                                            .px_2()
+                                            .items_center()
+                                            .rounded_md()
+                                            .cursor_pointer()
+                                            .when(selected, |el| el.bg(surface_active))
+                                            .hover(|el| el.bg(surface_active.opacity(0.5)))
+                                            .on_mouse_down(
+                                                MouseButton::Left,
+                                                cx.listener(move |this, _, window, cx| {
+                                                    this.choose_theme(name, window, cx);
+                                                }),
+                                            )
+                                            .child(
+                                                div()
+                                                    .flex_none()
+                                                    .w(px(16.))
+                                                    .text_color(success)
+                                                    // `Icon`, not U+2713 text — the UI
+                                                    // font tofus the glyph at small
+                                                    // sizes (R1e finding).
+                                                    .children(is_active.then(|| {
+                                                        gpui_component::Icon::new(
+                                                            gpui_component::IconName::Check,
+                                                        )
+                                                        .xsmall()
+                                                    })),
+                                            )
+                                            .child(div().flex_1().child(name))
+                                    }),
+                                )),
+                        ),
                 ),
         )
     }
@@ -4559,10 +4593,14 @@ impl AppShell {
         let panel = self.settings_panel.as_ref()?;
 
         let theme = cx.theme();
-        let border = theme.border;
-        let popover = theme.popover;
-        let popover_fg = theme.popover_foreground;
+        // R2 item 6: the modal chrome tokens the pickers standardized on
+        // (dv `backdrop` scrim, `sidebar` panel, `muted` seam border) —
+        // one modal recipe app-wide.
+        let border = theme.muted;
+        let popover = theme.sidebar;
+        let popover_fg = theme.foreground;
         let muted = theme.muted_foreground;
+        let backdrop = themes::dv_theme(cx).backdrop;
 
         let segmented_row =
             |id_prefix: &'static str,
@@ -4598,7 +4636,7 @@ impl AppShell {
                 .flex()
                 .items_center()
                 .justify_center()
-                .bg(theme.background.opacity(0.6))
+                .bg(backdrop)
                 // `occlude()` blocks hover/scroll from bleeding through to
                 // whatever's dimmed underneath (e.g. a recent-review row's
                 // hover state lighting up through the backdrop). Click on
@@ -4909,10 +4947,13 @@ impl AppShell {
         let page = self.onboarding.as_ref()?;
 
         let theme = cx.theme();
-        let border = theme.border;
-        let popover = theme.popover;
-        let popover_fg = theme.popover_foreground;
+        // Same app-wide modal chrome as the pickers/settings panel (R2
+        // item 6) — see `render_settings_panel`.
+        let border = theme.muted;
+        let popover = theme.sidebar;
+        let popover_fg = theme.foreground;
         let muted = theme.muted_foreground;
+        let backdrop = themes::dv_theme(cx).backdrop;
 
         let title = if page.first_run {
             "Welcome to dv"
@@ -4932,7 +4973,7 @@ impl AppShell {
                 .flex()
                 .items_center()
                 .justify_center()
-                .bg(theme.background.opacity(0.6))
+                .bg(backdrop)
                 .occlude()
                 .on_mouse_down(
                     MouseButton::Left,

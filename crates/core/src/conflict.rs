@@ -6,16 +6,17 @@
 //! [`crate::git::GitRepo::conflict_probe`]:
 //!
 //! - **Range reviews** (`DiffSource::Range`): `git merge-tree --write-tree
-//!   --name-only <base> <head>` (git >= 2.38) asks git to simulate the
+//!   --name-only -z <base> <head>` (git >= 2.38) asks git to simulate the
 //!   merge in memory. Exit 0 means clean; exit 1 with a tree-oid first
-//!   line means conflicted, and the remaining lines up to the first blank
-//!   line are the conflicted paths (`--name-only`'s condensed form,
-//!   verified against real git 2.53 output — see this module's tests for
-//!   the exact byte shapes). Anything else — an old git rejecting the
-//!   flag (a usage-error exit outside {0, 1}), or exit 1 with no leading
-//!   oid (git's "not something we can merge" for an unresolvable rev) —
-//!   is [`ConflictProbe::Unsupported`]: callers render no indicator at
-//!   all rather than guessing.
+//!   field means conflicted, and the following NUL-terminated fields up to
+//!   the first empty one are the conflicted paths — raw and unquoted
+//!   thanks to `-z` (without it git C-quotes spaces/unicode, breaking path
+//!   matching — capstone P3-4; verified against real git 2.53 output, see
+//!   this module's tests for the exact byte shapes). Anything else — an
+//!   old git rejecting a flag (a usage-error exit outside {0, 1}), or
+//!   exit 1 with no leading oid (git's "not something we can merge" for
+//!   an unresolvable rev) — is [`ConflictProbe::Unsupported`]: callers
+//!   render no indicator at all rather than guessing.
 //! - **WorkingTree/Staged reviews**: `git ls-files -u -z` — a non-empty
 //!   result means the index already has unmerged (stage 1/2/3) entries,
 //!   i.e. the user is mid-merge/rebase with unresolved conflicts left in
@@ -70,16 +71,26 @@ impl ConflictProbe {
     }
 }
 
-/// Parse `git merge-tree --write-tree --name-only <base> <head>`'s result.
+/// Parse `git merge-tree --write-tree --name-only -z <base> <head>`'s
+/// result. `-z` matters for correctness, not just framing (capstone P3-4):
+/// without it git C-quotes any path with spaces/quotes/non-ASCII bytes
+/// (`"\303\274nicode file.txt"` — verified against real git 2.53), so the
+/// stored conflicted paths would never match dv's own unquoted
+/// repo-relative paths. With `-z` every field is NUL-terminated and paths
+/// arrive as raw, unquoted bytes: the layout is the tree oid, then each
+/// conflicted filename, then an EMPTY field (the `\0\0` section
+/// separator) followed by the NUL-framed informational messages, which
+/// this parser stops at (also verified byte-for-byte against git 2.53).
+///
 /// `success` true (exit 0) is always clean — merge-tree's exit-0 output is
 /// just the merged tree's oid, nothing else to read. A non-zero exit is
 /// conflict data ONLY when it's exactly 1 (git's documented "merge
-/// succeeded, with conflicts" code) AND stdout's first line looks like a
+/// succeeded, with conflicts" code) AND stdout's first field looks like a
 /// tree oid (hex, non-empty) — anything else on exit 1 is git's "not
 /// something we can merge" error path (bad rev, e.g.), which prints
 /// nothing to stdout. Any OTHER exit code (2 = merge couldn't happen at
 /// all; a usage-error exit from an old git rejecting `--write-tree`/
-/// `--name-only`) is `Unsupported`.
+/// `--name-only`/`-z`) is `Unsupported`.
 pub(crate) fn parse_merge_tree_probe(
     success: bool,
     exit_code: Option<i32>,
@@ -92,15 +103,18 @@ pub(crate) fn parse_merge_tree_probe(
         return ConflictProbe::Unsupported;
     }
     let text = String::from_utf8_lossy(stdout);
-    let mut lines = text.lines();
-    let Some(first) = lines.next() else {
+    let mut fields = text.split('\0');
+    let Some(first) = fields.next() else {
         return ConflictProbe::Unsupported;
     };
+    // Real `-z` output NUL-terminates the oid with no newline (verified);
+    // tolerate one defensively rather than misread the whole shape.
+    let first = first.trim_end_matches('\n');
     if first.is_empty() || !first.bytes().all(|b| b.is_ascii_hexdigit()) {
         return ConflictProbe::Unsupported;
     }
-    let files = lines
-        .take_while(|line| !line.is_empty())
+    let files = fields
+        .take_while(|field| !field.is_empty())
         .map(str::to_string)
         .collect();
     ConflictProbe::Determined(ConflictInfo::from_unsorted(files))
@@ -165,20 +179,22 @@ mod tests {
 
     #[test]
     fn merge_tree_clean_exit_zero_is_determined_empty() {
-        // Real git 2.53 output on a clean merge: just the tree oid.
-        let stdout = b"8e58d60c892ceec26013d14cd2ff7bf91ef23ae7\n";
+        // Real git 2.53 `-z` output on a clean merge: just the tree oid.
+        let stdout = b"8e58d60c892ceec26013d14cd2ff7bf91ef23ae7\0";
         let probe = parse_merge_tree_probe(true, Some(0), stdout);
         assert_eq!(probe, ConflictProbe::Determined(ConflictInfo::default()));
     }
 
     #[test]
     fn merge_tree_single_file_conflict() {
-        // Real git 2.53 output for one conflicted file (--name-only).
-        let stdout = b"27c1c1481bb758152909d2e8b223af292ca642cb\n\
-f.txt\n\
-\n\
-Auto-merging f.txt\n\
-CONFLICT (content): Merge conflict in f.txt\n";
+        // Real git 2.53 `-z` output for one conflicted file
+        // (--name-only -z): oid, filenames, then an EMPTY field (`\0\0`)
+        // before the NUL-framed informational section.
+        let stdout = b"27c1c1481bb758152909d2e8b223af292ca642cb\0\
+f.txt\0\
+\0\
+1\0f.txt\0Auto-merging\0Auto-merging f.txt\n\0\
+1\0f.txt\0CONFLICT (contents)\0CONFLICT (content): Merge conflict in f.txt\n\0";
         let probe = parse_merge_tree_probe(false, Some(1), stdout);
         assert_eq!(
             probe,
@@ -189,21 +205,28 @@ CONFLICT (content): Merge conflict in f.txt\n";
     }
 
     #[test]
-    fn merge_tree_multi_file_conflict() {
-        // Real git 2.53 output for two conflicted files.
-        let stdout = b"3178b29be779ddb63940987525c1b07061f74572\n\
-f.txt\n\
-g.txt\n\
-\n\
-Auto-merging f.txt\n\
-CONFLICT (content): Merge conflict in f.txt\n\
-Auto-merging g.txt\n\
-CONFLICT (add/add): Merge conflict in g.txt\n";
-        let probe = parse_merge_tree_probe(false, Some(1), stdout);
+    fn merge_tree_multi_file_conflict_with_unicode_and_spaces() {
+        // Byte-for-byte the shape real git 2.53 emitted for a conflict in
+        // `f.txt` + `ünïcode file.txt` (capstone P3-4's motivating case:
+        // withOUT `-z` that second path arrives C-quoted as
+        // `"\303\274n\303\257code file.txt"` and could never match dv's own
+        // unquoted paths).
+        let stdout = "f0965dd54b0b801b641c7ac12bf8d0e3a7b7f8b0\0\
+f.txt\0\
+\u{fc}n\u{ef}code file.txt\0\
+\0\
+1\0f.txt\0Auto-merging\0Auto-merging f.txt\n\0\
+1\0f.txt\0CONFLICT (contents)\0CONFLICT (content): Merge conflict in f.txt\n\0\
+1\0\u{fc}n\u{ef}code file.txt\0Auto-merging\0Auto-merging \u{fc}n\u{ef}code file.txt\n\0\
+1\0\u{fc}n\u{ef}code file.txt\0CONFLICT (contents)\0CONFLICT (content): Merge conflict in \u{fc}n\u{ef}code file.txt\n\0";
+        let probe = parse_merge_tree_probe(false, Some(1), stdout.as_bytes());
         assert_eq!(
             probe,
             ConflictProbe::Determined(ConflictInfo {
-                files: vec!["f.txt".to_string(), "g.txt".to_string()]
+                files: vec![
+                    "f.txt".to_string(),
+                    "\u{fc}n\u{ef}code file.txt".to_string()
+                ]
             })
         );
     }

@@ -233,7 +233,23 @@ pub fn rel_path_from_uri(location: &RepoLocation, uri: &str) -> Option<String> {
             let root = normalize_windows_path(&path.to_string_lossy())?;
             let target = path_from_windows_file_uri(uri)?;
             let root_prefix = format!("{}/", root.trim_end_matches('/'));
-            target.strip_prefix(&root_prefix).map(str::to_string)
+            // Windows paths are case-INSENSITIVE (capstone P3-7):
+            // `normalize_windows_path` canonicalizes separators and the
+            // drive letter, but the rest of the root's casing comes from
+            // `git rev-parse --show-toplevel` while the target's comes from
+            // however vtsls/TypeScript resolved the file — the two commonly
+            // disagree (`C:/CODE/Proj` vs `C:/code/proj`), and a
+            // case-sensitive prefix match silently rejected every in-repo
+            // target. ASCII-case-insensitive comparison is the right scope
+            // for drive-letter paths; the rel path is sliced by matched
+            // LENGTH so it keeps the TARGET's own casing.
+            let prefix_len = root_prefix.len();
+            let candidate = target.get(..prefix_len)?;
+            if candidate.eq_ignore_ascii_case(&root_prefix) {
+                Some(target[prefix_len..].to_string())
+            } else {
+                None
+            }
         }
     }
 }
@@ -482,5 +498,33 @@ mod tests {
             rel_path_from_uri(&local_loc, uri).as_deref(),
             Some("src/a.ts")
         );
+    }
+
+    #[test]
+    fn rel_path_from_uri_local_is_case_insensitive_beyond_the_drive_letter() {
+        // Capstone P3-7: Windows paths are case-insensitive END TO END,
+        // not just at the drive letter — git may report the root as
+        // `C:/code/proj` while vtsls resolves targets under `C:/CODE/Proj`
+        // (or vice versa). The prefix must match ASCII-case-insensitively,
+        // and the returned rel path keeps the TARGET's own casing.
+        let local_loc = local(r"C:\code\proj");
+        let uri = "file:///c%3A/CODE/Proj/src/Widget.ts";
+        assert_eq!(
+            rel_path_from_uri(&local_loc, uri).as_deref(),
+            Some("src/Widget.ts")
+        );
+
+        // And the mirror direction: an upper-cased stored root against a
+        // lower-cased target URI.
+        let upper_root = local(r"C:\CODE\Proj");
+        let uri = "file:///c%3A/code/proj/src/widget.ts";
+        assert_eq!(
+            rel_path_from_uri(&upper_root, uri).as_deref(),
+            Some("src/widget.ts")
+        );
+
+        // Still None for a genuinely different path, casing aside.
+        let outside = "file:///c%3A/CODE/Other/lib.ts";
+        assert_eq!(rel_path_from_uri(&local_loc, outside), None);
     }
 }

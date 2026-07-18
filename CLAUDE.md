@@ -84,7 +84,10 @@ Notes that save debugging time:
 - Commands run strictly in order, each completing before the next; use
   `wait_ready` after anything that loads (launch, `open`, select_file) so
   one-shot scripts are deterministic. Stdin EOF quits the app (after the
-  in-flight command; waits are capped at 60s) — no orphan windows.
+  in-flight command; waits are capped at 60s) — no orphan windows. End
+  scripts with an explicit `quit`: a trailing `wait`/`wait_ready` after
+  the last real command is now interrupted at stdin EOF rather than
+  padding shutdown.
 - `state` is the semantic dump (files, selection, view mode, row counts):
   assert behavior there, reserve screenshots for style. `actions` lists
   every dispatchable action name. `key`/`click` exercise real input paths
@@ -289,7 +292,9 @@ cross-slice findings — headline P2: a ctrl-click during the up-to-180s
 vtsls consent install latched code intelligence off permanently (S8e×S8f);
 plus consistency-check cooldowns, persisted drift dismissal, menu-dispatch
 vs target-viewer guards, and CI coverage for the shipped build shape — all
-fixed. DEFERRED (backlog): find-references UI surfacing (core API is
-live-tested, no call site); a local/Windows LSP spawn path; macOS runtime
-is CARRIED-FORWARD-UNVERIFIED pending a real Mac hand-run (checklist in
+fixed. The find-references UI and the local/Windows LSP spawn path — both
+originally deferred here — shipped in the post-Phase-8 capstone batch
+(S10/S11; the local vtsls happy path awaits a machine with node, see
+docs/backlog.md). DEFERRED (backlog): macOS runtime is
+CARRIED-FORWARD-UNVERIFIED pending a real Mac hand-run (checklist in
 docs/backlog.md); the real v* tag → Release cut is Kyle's to trigger.

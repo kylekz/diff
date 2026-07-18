@@ -191,6 +191,58 @@ impl StoreIo {
         }
     }
 
+    /// Remove `rel` ONLY IF its current content is exactly `expected` —
+    /// the compare-and-remove primitive [`super::lock`]'s
+    /// verify-before-remove break (and token-checked release) is built on.
+    /// Best-effort like [`Self::remove`]: a no-op (not an error) when the
+    /// file is missing or holds different content. The LOCAL arm is fully
+    /// race-free via an atomic rename-claim
+    /// ([`remove_file_if_matches_at`]); the WSL shell fallback runs the
+    /// compare and remove as a SINGLE `sh -c` invocation (one-op window);
+    /// only the host-RPC arm is two ops (read then remove) — the residual
+    /// sliver that leaves is what `lock::acquire`'s read-back-after-create
+    /// verification exists to absorb.
+    pub(crate) fn remove_if_matches(&self, rel: &str, expected: &[u8]) -> Result<()> {
+        match &self.location {
+            RepoLocation::Local(_) => {
+                let path = self.local_path(rel)?;
+                remove_file_if_matches_at(&path, expected)
+            }
+            RepoLocation::Wsl { .. } => {
+                // With a live fs-capable host, both ops run distro-side as
+                // cheap RPCs; without one, a single shell invocation keeps
+                // the compare-and-remove window one op wide. The host-arm
+                // detection mirrors `try_host_fs`'s cap gate — a plain
+                // "does a live fs-capable client exist" probe; the actual
+                // read/remove below route through the ordinary methods
+                // (host first, shell fallback) either way.
+                let host_has_fs = self
+                    .builder
+                    .host_client()
+                    .is_some_and(|client| client.has_cap("fs"));
+                if host_has_fs {
+                    if self.read(rel)?.as_deref() == Some(expected) {
+                        self.remove(rel)?;
+                    }
+                    return Ok(());
+                }
+                let full = self.wsl_path(rel)?;
+                // `$(cat)` reads the expected payload from stdin; command
+                // substitution strips trailing newlines from BOTH sides
+                // identically, and lock payloads (the only caller) carry
+                // none. Exit 0 whether or not the compare matched — the
+                // caller treats this as best-effort, same as `remove`.
+                let script = format!(
+                    "if [ \"$(cat -- '{p}' 2>/dev/null)\" = \"$(cat)\" ]; then rm -f -- '{p}'; fi",
+                    p = sh_escape(&full),
+                );
+                self.builder
+                    .run_with_stdin("sh", &["-c", &script], expected)?;
+                Ok(())
+            }
+        }
+    }
+
     /// Atomically create `rel` with `bytes` ONLY IF it doesn't already
     /// exist — `Ok(true)` when this call actually created it, `Ok(false)`
     /// (not an error) when something is already there. The primitive
@@ -223,18 +275,33 @@ impl StoreIo {
                 // `set -C` (noclobber) makes the `>` redirect fail (via
                 // `O_EXCL` under the hood) if `full` already exists — the
                 // shell-only equivalent of `create_new`. Content is small
-                // (a `<pid>:<created_ms>` lock payload — see `lock.rs`) and
-                // under our control, so it's piped through stdin rather than
+                // (an owner-token lock payload — see `lock.rs`) and under
+                // our control, so it's piped through stdin rather than
                 // interpolated into the script, same as `write_atomic`'s
                 // `cat > tmp` above.
+                //
+                // A failed noclobber write is NOT assumed to mean "already
+                // exists" (capstone P3: read-only filesystem, permission
+                // denial, and a full disk all fail the redirect too, and
+                // reporting those as contention would spin the lock's
+                // acquire loop until its timeout with a misleading
+                // "another process is using this store" error): the script
+                // re-probes with `[ -e ]` after the failure and only then
+                // reports EXISTS; any other failure surfaces as `ERR:` with
+                // the write's captured stderr, which
+                // [`parse_create_exclusive_shell_output`] turns into a real
+                // error.
                 let script = format!(
-                    "mkdir -p '{}' && if ( set -C; cat > '{}' ) 2>/dev/null; then echo CREATED; \
-                     else echo EXISTS; fi",
-                    sh_escape(&dir),
-                    sh_escape(&full),
+                    "mkdir -p '{dir}' || {{ echo 'ERR:mkdir failed'; exit 0; }}; \
+                     msg=$( {{ ( set -C; cat > '{full}' ); }} 2>&1 ); \
+                     if [ $? -eq 0 ]; then echo CREATED; \
+                     elif [ -e '{full}' ]; then echo EXISTS; \
+                     else echo \"ERR:$msg\"; fi",
+                    dir = sh_escape(&dir),
+                    full = sh_escape(&full),
                 );
                 let out = self.builder.run_with_stdin("sh", &["-c", &script], bytes)?;
-                Ok(crate::command::decode_output(&out).trim_end() == "CREATED")
+                parse_create_exclusive_shell_output(&crate::command::decode_output(&out))
             }
         }
     }
@@ -320,6 +387,29 @@ impl StoreIo {
     }
 }
 
+/// Interpret the WSL-shell `create_exclusive` script's one-line verdict:
+/// `CREATED` → created, `EXISTS` → genuine contention (the path was
+/// verifiably present after the failed noclobber write), `ERR:<msg>` → a
+/// real failure (read-only fs, permissions, mkdir failure, ...) surfaced
+/// as an error rather than mislabeled contention. Anything else is a
+/// protocol violation and also an error.
+fn parse_create_exclusive_shell_output(text: &str) -> Result<bool> {
+    let verdict = text.trim_end();
+    match verdict {
+        "CREATED" => Ok(true),
+        "EXISTS" => Ok(false),
+        other => {
+            if let Some(msg) = other.strip_prefix("ERR:") {
+                Err(anyhow!("creating lock file over WSL shell failed: {msg}"))
+            } else {
+                Err(anyhow!(
+                    "unexpected create_exclusive shell output: {other:?}"
+                ))
+            }
+        }
+    }
+}
+
 fn tmp_name() -> String {
     format!(
         ".tmp-{}-{}",
@@ -349,38 +439,109 @@ pub fn read_file_at(path: &Path) -> Result<Option<Vec<u8>>> {
 /// succeeds by replacing whatever's there). Shared by the LOCAL arm here
 /// and `dv-host`'s `fs/create_exclusive` handler — re-exported as
 /// [`crate::review::create_exclusive_at`].
+// The retry loop only ever loops on Windows (the pending-delete arm below);
+// on other platforms every arm returns on the first pass, which is exactly
+// the intent — silence clippy's never_loop there rather than fork the body.
+#[cfg_attr(not(windows), allow(clippy::never_loop))]
 pub fn create_exclusive_at(path: &Path, bytes: &[u8]) -> Result<bool> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)
             .with_context(|| format!("creating {}", parent.display()))?;
     }
-    match std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(path)
-    {
-        Ok(mut file) => {
-            use std::io::Write as _;
-            file.write_all(bytes)
-                .with_context(|| format!("writing {}", path.display()))?;
-            Ok(true)
+    // Windows-only quirk: NTFS briefly holds a just-removed file in a
+    // "pending delete" state, and a concurrent `CREATE_NEW` racing that
+    // window sees `ERROR_ACCESS_DENIED` (`PermissionDenied`), not
+    // `AlreadyExists` — observed directly under this module's own hammer
+    // test (two threads rapid-fire create/remove-cycling the exact same
+    // lock path). That case is functionally "something's there"
+    // (contention, `Ok(false)`) — but a GENUINE ACL denial raises the same
+    // error kind and must not be masked as contention forever (capstone
+    // P3: the lock's acquire loop would spin to its timeout with a
+    // misleading "another process is using this store" error). The two are
+    // told apart by a metadata probe + a couple of bounded retries — see
+    // [`classify_permission_denied`]. `#[cfg(windows)]` because on
+    // Linux/dv-host (which calls this same function — see the doc comment)
+    // a real `PermissionDenied` always means a genuine ACL problem and
+    // must keep surfacing as an error.
+    #[cfg(windows)]
+    let mut pd_retries = 0u32;
+    loop {
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(path)
+        {
+            Ok(mut file) => {
+                use std::io::Write as _;
+                file.write_all(bytes)
+                    .with_context(|| format!("writing {}", path.display()))?;
+                return Ok(true);
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => return Ok(false),
+            #[cfg(windows)]
+            Err(err) if err.kind() == std::io::ErrorKind::PermissionDenied => {
+                match classify_permission_denied(
+                    std::fs::symlink_metadata(path)
+                        .map(|_| ())
+                        .map_err(|e| e.kind()),
+                    pd_retries,
+                ) {
+                    PermissionDeniedClass::Contention => return Ok(false),
+                    PermissionDeniedClass::RetryCreate => {
+                        pd_retries += 1;
+                        std::thread::sleep(std::time::Duration::from_millis(1));
+                    }
+                    PermissionDeniedClass::GenuineDenial => {
+                        return Err(err).with_context(|| {
+                            format!(
+                                "creating {} (persistent permission denial — not the \
+                                 transient NTFS pending-delete race)",
+                                path.display()
+                            )
+                        });
+                    }
+                }
+            }
+            Err(err) => return Err(err).with_context(|| format!("creating {}", path.display())),
         }
-        Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => Ok(false),
-        // Windows-only quirk: NTFS briefly holds a just-removed file in a
-        // "pending delete" state, and a concurrent `CREATE_NEW` racing that
-        // window sees `ERROR_ACCESS_DENIED` (`PermissionDenied`), not
-        // `AlreadyExists` — observed directly under this module's own
-        // hammer test (two threads rapid-fire create/remove-cycling the
-        // exact same lock path). Functionally identical to "something's
-        // there" for a lock file that legitimately churns through fast
-        // create/remove cycles: treat it the same, `Ok(false)`, rather than
-        // surfacing a hard error from what's actually just contention.
-        // `#[cfg(windows)]` because on Linux/dv-host (which calls this same
-        // function — see the doc comment) a real `PermissionDenied` means a
-        // genuine ACL problem and must keep surfacing as an error.
-        #[cfg(windows)]
-        Err(err) if err.kind() == std::io::ErrorKind::PermissionDenied => Ok(false),
-        Err(err) => Err(err).with_context(|| format!("creating {}", path.display())),
+    }
+}
+
+/// What a `CREATE_NEW` `PermissionDenied` on Windows actually means, given
+/// a follow-up metadata probe of the same path (pure and unit-testable —
+/// see [`create_exclusive_at`]'s comment for the scenario):
+///
+/// - probe sees the file (or the probe itself is denied — a pending-delete
+///   entry blocks metadata access too): something IS there → contention.
+/// - probe says the path is gone: either the pending delete completed in
+///   the gap (a retry of the create will now succeed) or this is a genuine
+///   ACL denial where the file never existed (every retry fails the same
+///   way). A couple of bounded, millisecond-spaced retries separates the
+///   two: transient races clear on the first retry; a persistent denial
+///   exhausts the budget and surfaces as the real error it is.
+#[cfg(windows)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PermissionDeniedClass {
+    Contention,
+    RetryCreate,
+    GenuineDenial,
+}
+
+#[cfg(windows)]
+const PERMISSION_DENIED_MAX_RETRIES: u32 = 3;
+
+#[cfg(windows)]
+fn classify_permission_denied(
+    probe: std::result::Result<(), std::io::ErrorKind>,
+    retries_so_far: u32,
+) -> PermissionDeniedClass {
+    match probe {
+        Ok(()) => PermissionDeniedClass::Contention,
+        Err(std::io::ErrorKind::PermissionDenied) => PermissionDeniedClass::Contention,
+        Err(_) if retries_so_far < PERMISSION_DENIED_MAX_RETRIES => {
+            PermissionDeniedClass::RetryCreate
+        }
+        Err(_) => PermissionDeniedClass::GenuineDenial,
     }
 }
 
@@ -418,6 +579,62 @@ pub fn list_dir_names(path: &Path) -> Result<Vec<String>> {
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
         Err(err) => Err(err).with_context(|| format!("listing {}", path.display())),
     }
+}
+
+/// Remove `path` ONLY IF its content is exactly `expected`, atomically
+/// with respect to concurrent breakers: a naive read→compare→remove pair
+/// lets a second breaker's remove land AFTER the first breaker has already
+/// broken and a winner has re-created the lock — deleting a LIVE lock (the
+/// exact two-holder race dv-core's own two-contender lock test reproduced
+/// deterministically). Instead the removal is CLAIMED first by an atomic
+/// `rename` to a unique sibling name: exactly one contender's rename can
+/// succeed (the loser's fails with NotFound and is a no-op), and once
+/// renamed the claimant owns the file exclusively — nothing else writes to
+/// the claim path — so the content check that follows is race-free.
+///
+/// On a content mismatch (the claimed file was NOT the expected payload —
+/// only reachable if the lock changed hands in the sliver between the
+/// caller's last read and this rename), the file is restored via
+/// `hard_link` (atomic, fails-if-target-exists on both Windows and Linux,
+/// so a successor's fresh lock is never clobbered) + claim cleanup; if the
+/// filesystem refuses hard links the claim file is simply left behind as
+/// inert debris (`dv/.lock.break-*` — a sibling of `dv/reviews`, so
+/// invisible to the store watchers, same placement argument as the lock
+/// itself). A claimant crashing mid-break leaves the same inert debris,
+/// never a stuck lock.
+pub fn remove_file_if_matches_at(path: &Path, expected: &[u8]) -> Result<()> {
+    let claim = match (path.parent(), path.file_name()) {
+        (Some(parent), Some(name)) => parent.join(format!(
+            "{}.break-{}-{}",
+            name.display(),
+            std::process::id(),
+            TMP_COUNTER.fetch_add(1, Ordering::Relaxed)
+        )),
+        // A bare/rootless path can't occur for the lock's real callers;
+        // degrade to the (non-atomic) read-compare-remove rather than fail.
+        _ => {
+            if read_file_at(path)?.as_deref() == Some(expected) {
+                remove_file_at(path)?;
+            }
+            return Ok(());
+        }
+    };
+    if std::fs::rename(path, &claim).is_err() {
+        // Missing (already released/broken) or lost the claim race —
+        // either way there is nothing left that we are entitled to remove.
+        return Ok(());
+    }
+    let content = std::fs::read(&claim).unwrap_or_default();
+    if content == expected {
+        let _ = std::fs::remove_file(&claim);
+    } else {
+        // Claimed a lock that is NOT the one the caller observed — put it
+        // back without clobbering any successor (see doc comment).
+        if std::fs::hard_link(&claim, path).is_ok() {
+            let _ = std::fs::remove_file(&claim);
+        }
+    }
+    Ok(())
 }
 
 /// Remove `path`. Not an error if it's already gone. Shared by the LOCAL
@@ -675,6 +892,74 @@ mod tests {
         assert!(create_exclusive_at(&path, b"second").unwrap());
         assert_eq!(read_file_at(&path).unwrap().unwrap(), b"second");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn remove_if_matches_removes_only_on_exact_content_match() {
+        let dir = scratch_dir("remove-if-matches");
+        std::fs::create_dir_all(dir.join(".git")).unwrap();
+        let io = StoreIo::new(crate::location::RepoLocation::Local(dir.clone()));
+        io.write_atomic("dv/.lock", b"owner-a").unwrap();
+
+        // Wrong expected content: file must survive untouched.
+        io.remove_if_matches("dv/.lock", b"owner-b").unwrap();
+        assert_eq!(
+            io.read("dv/.lock").unwrap().as_deref(),
+            Some(&b"owner-a"[..])
+        );
+
+        // Exact match: removed.
+        io.remove_if_matches("dv/.lock", b"owner-a").unwrap();
+        assert!(io.read("dv/.lock").unwrap().is_none());
+
+        // Missing file: a no-op, not an error.
+        io.remove_if_matches("dv/.lock", b"owner-a").unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn parse_create_exclusive_shell_output_distinguishes_the_three_verdicts() {
+        assert!(parse_create_exclusive_shell_output("CREATED\n").unwrap());
+        assert!(!parse_create_exclusive_shell_output("EXISTS\n").unwrap());
+        let err = parse_create_exclusive_shell_output(
+            "ERR:sh: 1: cannot create /x/.lock: Read-only file system\n",
+        )
+        .expect_err("a non-EXISTS failure must surface as an error, not contention");
+        assert!(
+            err.to_string().contains("Read-only file system"),
+            "the shell's captured message should ride along: {err}"
+        );
+        assert!(parse_create_exclusive_shell_output("garbage").is_err());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn classify_permission_denied_probe_matrix() {
+        use std::io::ErrorKind;
+        // Something is there (or the probe itself is blocked by the
+        // pending-delete entry): contention.
+        assert_eq!(
+            classify_permission_denied(Ok(()), 0),
+            PermissionDeniedClass::Contention
+        );
+        assert_eq!(
+            classify_permission_denied(Err(ErrorKind::PermissionDenied), 0),
+            PermissionDeniedClass::Contention
+        );
+        // Path gone: bounded retries first...
+        assert_eq!(
+            classify_permission_denied(Err(ErrorKind::NotFound), 0),
+            PermissionDeniedClass::RetryCreate
+        );
+        assert_eq!(
+            classify_permission_denied(Err(ErrorKind::NotFound), PERMISSION_DENIED_MAX_RETRIES - 1),
+            PermissionDeniedClass::RetryCreate
+        );
+        // ...then a persistent denial surfaces as the real error it is.
+        assert_eq!(
+            classify_permission_denied(Err(ErrorKind::NotFound), PERMISSION_DENIED_MAX_RETRIES),
+            PermissionDeniedClass::GenuineDenial
+        );
     }
 
     #[test]

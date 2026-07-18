@@ -191,6 +191,147 @@ pub fn has_running_host(distro: &str) -> bool {
     client_if_running(distro).is_some()
 }
 
+/// How long one `wsl.exe --list --running` answer is shared before the
+/// next probe. Deliberately SUB-SECOND: the supervisors' boot-capable ops
+/// tick at 1s, so a sub-tick TTL means every tick's gate decision rests on
+/// a probe fresher than the previous tick — a `wsl --shutdown` is noticed
+/// by the very next tick instead of surviving a multi-second stale-
+/// positive window (live-observed: a 3s TTL let the first post-shutdown
+/// digest tick run on a stale "running" answer and boot the distro right
+/// back). Still long enough that N supervisors ticking in the same second
+/// share one `wsl.exe` spawn instead of firing N each.
+const RUNNING_PROBE_TTL: Duration = Duration::from_millis(600);
+
+/// How long [`distro_running`] reports `false` unconditionally after
+/// [`note_boot_suspect`] — the self-correction for the one race no probe
+/// can close (see [`note_boot_suspect`]'s doc). Comfortably longer than
+/// WSL2's idle auto-termination of a process-less distro (measured ~15s on
+/// this machine), so an accidentally-booted distro is left entirely alone
+/// long enough to shut itself back down before probing resumes.
+const BOOT_SUSPECT_QUARANTINE: Duration = Duration::from_secs(30);
+
+/// Cached result of the last `wsl.exe --list --running` probe.
+struct RunningProbe {
+    at: Instant,
+    distros: Vec<String>,
+}
+
+fn running_probe_cache() -> &'static Mutex<Option<RunningProbe>> {
+    static CACHE: OnceLock<Mutex<Option<RunningProbe>>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(None))
+}
+
+/// `distro -> quarantine expiry` — see [`note_boot_suspect`].
+fn quarantine_map() -> &'static Mutex<HashMap<String, Instant>> {
+    static MAP: OnceLock<Mutex<HashMap<String, Instant>>> = OnceLock::new();
+    MAP.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Whether `distro` is ACTUALLY running right now, per `wsl.exe --list
+/// --running` — a WSL service query that never boots anything (verified
+/// empirically: repeated calls against a stopped distro leave `--list
+/// --running` empty). Shared process-wide for [`RUNNING_PROBE_TTL`] so N
+/// watch supervisors ticking in the same second cost one `wsl.exe` spawn,
+/// not N (capstone P2-D).
+///
+/// This is the gate that keeps background machinery (the store watcher's
+/// digest-poll fallback, every supervisor's per-tick `client_for`
+/// reacquisition) from resurrecting a distro the user deliberately stopped
+/// (`wsl --shutdown`): while the distro is down the supervisors idle on
+/// this cheap probe alone — no digest polls, no spawn attempts — and
+/// recover automatically once the probe sees it running again. A distro
+/// under a [`note_boot_suspect`] quarantine reports not-running without
+/// even probing. Distro names compare ASCII-case-insensitively, matching
+/// `wsl -d`'s own behavior. A failed probe reports "not running": if
+/// `wsl.exe` itself is broken/absent, nothing could be booted through it
+/// anyway, and the next probe (post-TTL) retries.
+pub fn distro_running(distro: &str) -> bool {
+    {
+        let mut quarantine = quarantine_map().lock().unwrap_or_else(|e| e.into_inner());
+        match quarantine.get(distro) {
+            Some(until) if Instant::now() < *until => return false,
+            Some(_) => {
+                quarantine.remove(distro);
+            }
+            None => {}
+        }
+    }
+    let mut cache = running_probe_cache()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let fresh = cache
+        .as_ref()
+        .is_some_and(|p| p.at.elapsed() < RUNNING_PROBE_TTL);
+    if !fresh {
+        *cache = Some(RunningProbe {
+            at: Instant::now(),
+            distros: list_running_distros(),
+        });
+    }
+    cache
+        .as_ref()
+        .map(|p| {
+            p.distros
+                .iter()
+                .any(|name| name.eq_ignore_ascii_case(distro))
+        })
+        .unwrap_or(false)
+}
+
+/// A gated background op that should have been near-instant against a
+/// running distro took boot-scale time — the caller suspects its own
+/// command BOOTED the distro despite the fresh-probe gate. That race is
+/// irreducible with polling (a `wsl --shutdown` can always land in the
+/// tens-of-ms between a probe's answer and the gated command's spawn),
+/// and it LATCHES without correction: the accidental boot makes every
+/// subsequent probe honestly report "running", the resumed 1s polls then
+/// keep re-waking the distro forever, and the user's shutdown is undone
+/// permanently. Quarantining the distro for [`BOOT_SUSPECT_QUARANTINE`]
+/// breaks the latch: all gated activity stops, a process-less distro
+/// idle-terminates itself (~15s), and when probing resumes the world is
+/// back to what the user chose. A false positive (the distro was genuinely
+/// running, the command was just slow) costs one quarantine window of
+/// paused background polling — degraded, visible only as briefly-stale
+/// badges, and self-healing.
+pub fn note_boot_suspect(distro: &str) {
+    eprintln!(
+        "[dv remote] boot-suspect quarantine for {distro}: a gated background op took \
+         boot-scale time; pausing background polling for {}s",
+        BOOT_SUSPECT_QUARANTINE.as_secs()
+    );
+    quarantine_map()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(distro.to_string(), Instant::now() + BOOT_SUSPECT_QUARANTINE);
+}
+
+/// Raw `wsl.exe --list --running --quiet` (UTF-16LE-decoded), one distro
+/// name per line. Empty on failure or off Windows — see
+/// [`distro_running`]'s failure semantics.
+fn list_running_distros() -> Vec<String> {
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt as _;
+        let output = std::process::Command::new("wsl.exe")
+            .args(["--list", "--running", "--quiet"])
+            .creation_flags(crate::command::CREATE_NO_WINDOW)
+            .output();
+        match output {
+            Ok(output) if output.status.success() => crate::command::decode_output(&output.stdout)
+                .lines()
+                .map(str::trim)
+                .filter(|line| !line.is_empty())
+                .map(str::to_string)
+                .collect(),
+            _ => Vec::new(),
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        Vec::new()
+    }
+}
+
 /// Distros with a background warm-up already kicked off and not yet
 /// resolved (spawned OR failed) — de-dupes [`warm_up_in_background`] so a
 /// burst of `GitRepo::open` calls for the same distro in quick succession

@@ -64,7 +64,15 @@ pub fn watch_worktree(
         root: path.clone(),
         kind: "worktree",
         on_change: Arc::from(on_change),
+        // `distro_running`-gated for the same reason as the store watcher's
+        // source (capstone P2-D): a per-tick `client_for` retry can spawn a
+        // host, and spawning boots a stopped distro — a background watcher
+        // must idle (cheap throttled probe only) until the user starts the
+        // distro again, then recover on its own.
         client_source: Box::new(move || {
+            if !manager::distro_running(&distro) {
+                return None;
+            }
             manager::client_for(&distro)
                 .filter(|client| client.is_alive() && client.has_cap("watch"))
         }),

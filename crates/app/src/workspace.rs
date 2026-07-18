@@ -380,8 +380,10 @@ struct HighlightInputs {
 struct RenderedDiff {
     unified: Vec<Row>,
     split: Vec<SplitRow>,
-    /// Row index where each hunk starts (its header — or, once its gap is
-    /// expanded, its first revealed line), per view. n/p jump through these.
+    /// Row index n/p anchor to for each hunk, per view: its header row
+    /// while no gap lines above it are revealed, or the hunk's OWN first
+    /// line once any are — jumps target the change itself, never the top
+    /// of an expanded run of context (see `build_rows`'s anchor comment).
     hunk_rows_unified: Vec<usize>,
     hunk_rows_split: Vec<usize>,
     /// This "diff" is a cached failure message; re-selecting the file
@@ -1476,7 +1478,17 @@ pub struct Workspace {
     /// `wait_ready` for interactivity and then separately poll this down to
     /// `false` before asserting on header freshness (Phase 7 D3 follow-up,
     /// docs/backlog.md "PR reopen still pays the network round-trip").
-    pr_meta_pending: bool,
+    ///
+    /// BOUND TO THE `source_epoch` IT WAS SET UNDER (capstone P2-F), read
+    /// through [`Self::pr_meta_pending`]: a bare bool could wedge `true`
+    /// forever if the completion that owned clearing it never ran (a newer
+    /// `open_pr` superseding the confirm whose own completion then hit an
+    /// arm that didn't clear it), permanently early-returning `refresh_pr`
+    /// and lying to automation. Epoch-binding makes any superseding
+    /// `open_pr` (which always bumps `source_epoch`) implicitly retire a
+    /// stale pending flag, with the explicit clears kept as belt and
+    /// braces.
+    pr_meta_pending_epoch: Option<u64>,
     /// Comment/reply author, resolved once in the background at load
     /// (`dv_cli::author::resolve_author`). `None` until that resolves —
     /// callers fall back to a placeholder rather than block on it.
@@ -2269,7 +2281,7 @@ impl Workspace {
             pr_diff_lru: VecDeque::new(),
             pr_diff_cache_by_number: HashMap::new(),
             last_pr_open_cache_hit: None,
-            pr_meta_pending: false,
+            pr_meta_pending_epoch: None,
             author: None,
             submit: None,
             submit_epoch: 0,
@@ -2908,15 +2920,23 @@ impl Workspace {
         let old_files = std::mem::replace(&mut self.files, files);
         let (new_selected, needs_invalidation) =
             reconcile_file_selection(&old_files, &self.files, self.selected);
+        // Cleared on EVERY worktree reload, path-stable or not (capstone
+        // P2-E): a worktree event means CONTENT may have changed even when
+        // the file list's paths didn't move at all (the common "edited the
+        // selected file externally" case, where `needs_invalidation` is
+        // false). `highlight_runs` is keyed by index but caches runs for a
+        // specific CONTENT — a later gap-expand recompute fetches fresh
+        // blobs, sees cached runs, paints them over the new text, and
+        // clears `syntax_pending`, pinning wrong colors with nothing left
+        // to correct them. Dropping the runs (and `diff_req_latest`, for
+        // the same index-vs-content consistency) is cheap: the next
+        // recompute's stage 2 rebuilds them.
+        self.diff_req_latest.clear();
+        self.highlight_runs.clear();
         if needs_invalidation {
             self.diffs.clear();
             self.diffstat_cache.set(None);
             self.diff_pending.clear();
-            // Both index-keyed against the old list, and the runs were
-            // computed against possibly-changed content — same staleness as
-            // `diffs` itself (see each field's doc comment).
-            self.diff_req_latest.clear();
-            self.highlight_runs.clear();
             self.expanded.clear();
             self.pending_jump = None;
             match new_selected {
@@ -2942,6 +2962,17 @@ impl Workspace {
                     // after an external commit emptied the list).
                     self.selected = None;
                 }
+            }
+        } else {
+            // Path-stable list. The `diff_req_latest` clear above orphans
+            // any in-flight request's completion (it keys on its captured
+            // seq), which would otherwise leave `diff_pending` wedged true
+            // and block `select_file`'s re-request forever — clear it and
+            // recompute the selected file from fresh blobs (reanchor=false:
+            // an in-place content refresh must not yank the viewport).
+            self.diff_pending.clear();
+            if let Some(index) = self.selected {
+                self.request_diff(index, false, cx);
             }
         }
     }
@@ -3417,6 +3448,10 @@ impl Workspace {
                             None
                         }
                     };
+                    // Rows just landed — if this entity is parked, the
+                    // shell re-enforces the LRU byte budget off this (see
+                    // `DiffBytesChanged`'s doc comment).
+                    cx.emit(DiffBytesChanged);
                     // Row indices may have shifted (gap expansion inserts rows
                     // above); re-sync the list and re-anchor the viewport on
                     // the current hunk so the content doesn't visually jump.
@@ -3465,6 +3500,10 @@ impl Workspace {
                 // `reset_diff_list` (viewport-preserving for in-place
                 // updates) re-snapshots the display without any scroll jump.
                 this.diffs.insert(index, Arc::new(rendered));
+                // Recolored rows can still grow the footprint (runs are
+                // heavier than plain rows) — same parked-LRU re-enforcement
+                // hook as stage 1 (see `DiffBytesChanged`'s doc comment).
+                cx.emit(DiffBytesChanged);
                 if this.selected == Some(index) {
                     this.reset_diff_list(cx);
                 }
@@ -3593,6 +3632,13 @@ impl Workspace {
             return;
         }
         self.context_lines = context_lines;
+        // Gap-expansion click counts are meaningless against the NEW hunk
+        // layout (a context-lines change moves/merges the very gaps those
+        // clicks were counted against — capstone P3-2): reset them here
+        // rather than in `invalidate_diff_cache`, which is shared with the
+        // theme path, where hunk structure (and thus `expanded`) is
+        // unchanged and deliberately preserved.
+        self.expanded.clear();
         self.invalidate_diff_cache(eager, cx);
     }
 
@@ -3936,7 +3982,7 @@ impl Workspace {
             self.pr = Some(hit.header);
             self.pr_details_open = false;
             self.pr_loading = None;
-            self.pr_meta_pending = true;
+            self.pr_meta_pending_epoch = Some(epoch);
             // `CachedPrDiff` predates this feature and carries no conflict
             // data for the PR being painted — `None` (no indicator) rather
             // than leaving the OUTGOING pr's conflict flag showing under
@@ -3955,6 +4001,12 @@ impl Workspace {
         } else {
             self.pr_loading = Some(number);
             self.status = Status::Loading;
+            // A cold dispatch has no optimistic paint pending — clear any
+            // flag a superseded earlier paint left behind (capstone P2-F:
+            // this is one of the two arms that wedged it true forever; the
+            // epoch binding above already retires it implicitly, this keeps
+            // the state honest immediately).
+            self.pr_meta_pending_epoch = None;
         }
         cx.notify();
 
@@ -4015,7 +4067,7 @@ impl Workspace {
                             this.review = Some(review);
                             cx.emit(ReviewChanged);
                             this.pr = Some(meta.into());
-                            this.pr_meta_pending = false;
+                            this.pr_meta_pending_epoch = None;
                             // The optimistic paint (`CachedPrDiff`) predates
                             // this feature and carries no conflict data —
                             // this confirm is the first point with a real
@@ -4042,7 +4094,7 @@ impl Workspace {
                                 || this.thread_input.as_ref().is_some_and(|t| t.saving)
                                 || this.submit_in_flight())
                         {
-                            this.pr_meta_pending = false;
+                            this.pr_meta_pending_epoch = None;
                             this.pr_error = Some(
                                 "this PR changed since it was reopened — finish or discard \
                                  your edit, then reopen to refresh."
@@ -4178,7 +4230,7 @@ impl Workspace {
                         cx.emit(ReviewChanged);
                         this.pr = Some(meta.into());
                         this.pr_details_open = false;
-                        this.pr_meta_pending = false;
+                        this.pr_meta_pending_epoch = None;
                         this.status = Status::Ready;
                         this.refresh_remote_threads(cx);
                         if this.files.is_empty() {
@@ -4201,7 +4253,7 @@ impl Workspace {
                             // via `pr_error` rather than discarded via
                             // `last_pr_open_cache_hit = None` the way a
                             // genuine miss's failure does below.
-                            this.pr_meta_pending = false;
+                            this.pr_meta_pending_epoch = None;
                             this.pr_error = Some(format!("{err:#}"));
                             cx.notify();
                             return;
@@ -4219,6 +4271,11 @@ impl Workspace {
                         this.status = Status::Ready;
                         this.pr_error = Some(format!("{err:#}"));
                         this.last_pr_open_cache_hit = None;
+                        // The other arm that used to wedge the pending flag
+                        // (capstone P2-F): a cold open failing after a
+                        // superseded paint left it set must not leave
+                        // `refresh_pr` dead and automation lied to.
+                        this.pr_meta_pending_epoch = None;
                     }
                 }
                 cx.notify();
@@ -4226,6 +4283,15 @@ impl Workspace {
             .ok();
         })
         .detach();
+    }
+
+    /// Whether an optimistic paint's background confirm is still owed for
+    /// the CURRENT source — the only way `pr_meta_pending_epoch` is ever
+    /// read (capstone P2-F): a flag set under a since-superseded
+    /// `source_epoch` reads as not-pending, so a wedged stale flag can
+    /// never dead-end [`Self::refresh_pr`] or lie to automation.
+    fn pr_meta_pending(&self) -> bool {
+        self.pr_meta_pending_epoch == Some(self.source_epoch)
     }
 
     /// Re-fetch this workspace's open PR's metadata and refresh just the
@@ -4247,7 +4313,7 @@ impl Workspace {
             // its header over the new PR's. Refresh after the open lands.
             return;
         }
-        if self.pr_meta_pending {
+        if self.pr_meta_pending() {
             // A guessed-key optimistic paint (paint-then-patch reopen,
             // docs/backlog.md "PR reopen still pays the network round-
             // trip") already has its OWN `load_pr` confirm in flight for
@@ -4749,7 +4815,7 @@ impl Workspace {
             // never blocks on this — see `automation_settled`'s doc) and
             // then poll this down to `false` before asserting on header
             // freshness.
-            "pr_meta_pending": self.pr_meta_pending,
+            "pr_meta_pending": self.pr_meta_pending(),
             "selection": self.selection.as_ref().map(|sel| {
                 let (start, end) = sel.range();
                 json!({
@@ -12349,11 +12415,11 @@ fn build_rows(
         let hidden = gap_len - revealed;
         let fully_revealed = gap_available && gap_len > 0 && hidden == 0;
 
-        // n/p target the hunk's own block, not the top of its gap — same
-        // anchor regardless of collapsed/partial/fully-revealed, since it's
-        // always the first row about to be pushed for hunk `i`.
-        hunk_rows_unified.push(unified.len());
-        hunk_rows_split.push(split.len());
+        // n/p anchor bookkeeping — the anchors themselves are pushed AFTER
+        // any revealed gap rows, below; these capture the header's position
+        // for the nothing-revealed case.
+        let header_row_unified = unified.len();
+        let header_row_split = split.len();
 
         let label: SharedString = format!(
             "@@ -{},{} +{},{} @@",
@@ -12402,6 +12468,20 @@ fn build_rows(
                 });
             }
             build_split_rows(gap, &mut split);
+        }
+
+        // n/p anchor for hunk `i` (capstone P3-1, restoring the
+        // pre-expansion behavior): with nothing revealed it's the header
+        // row (the row directly above the hunk's own lines); once any gap
+        // lines are revealed it skips past them to the hunk's OWN first
+        // line, so n/p keep targeting the change itself rather than the
+        // top of an expanded run of context.
+        if revealed > 0 {
+            hunk_rows_unified.push(unified.len());
+            hunk_rows_split.push(split.len());
+        } else {
+            hunk_rows_unified.push(header_row_unified);
+            hunk_rows_split.push(header_row_split);
         }
 
         let prepared: Vec<PreparedLine> = hunk
@@ -12656,6 +12736,20 @@ impl EventEmitter<ReviewChanged> for Workspace {}
 pub struct SummaryWidthChanged(pub f32);
 
 impl EventEmitter<SummaryWidthChanged> for Workspace {}
+
+/// Emitted when a background diff computation lands rows into `self.diffs`
+/// (stage 1 or the stage-2 recolor) — i.e. whenever this workspace's
+/// estimated rendered-diff footprint may have grown. The shell subscribes
+/// PARKED entries to this (capstone P3-8): a request dispatched while
+/// active can complete after the entity is parked, growing the LRU's real
+/// byte total past what `evict_to_budget` accounted at park time with
+/// nothing re-enforcing the budget until the next switch; the subscription
+/// re-runs eviction the moment the growth lands. The ACTIVE workspace has
+/// no such subscription — its growth is re-accounted by the
+/// `stash_active` eviction on the next switch, as always.
+pub struct DiffBytesChanged;
+
+impl EventEmitter<DiffBytesChanged> for Workspace {}
 
 impl Focusable for Workspace {
     fn focus_handle(&self, _cx: &App) -> FocusHandle {

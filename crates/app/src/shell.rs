@@ -803,6 +803,13 @@ struct CachedWorkspace {
     /// a single RAII guard, not a registry, so each parked entry needs its
     /// own). See `AppShell::on_cached_review_changed`.
     _sub: Subscription,
+    /// Re-enforces the LRU byte budget when a diff computation dispatched
+    /// before parking lands its rows on this PARKED entity (capstone P3-8:
+    /// stage-2 recolors — and stage-1 rows — arriving after `stash_active`
+    /// grew the cache past what its `evict_to_budget` accounted, with no
+    /// re-enforcement until the next switch). See
+    /// `AppShell::on_cached_diff_bytes_changed`.
+    _bytes_sub: Subscription,
 }
 
 impl WorkspaceCache {
@@ -1713,11 +1720,13 @@ impl AppShell {
         let key = ws.read(cx).review().map(|r| r.id.clone());
         if let Some(key) = key {
             let sub = cx.subscribe(&ws, Self::on_cached_review_changed);
+            let bytes_sub = cx.subscribe(&ws, Self::on_cached_diff_bytes_changed);
             self.workspace_cache.insert(
                 key,
                 CachedWorkspace {
                     entity: ws,
                     _sub: sub,
+                    _bytes_sub: bytes_sub,
                 },
             );
             self.workspace_cache.evict_to_budget(cx);
@@ -2051,6 +2060,22 @@ impl AppShell {
         // No `else` clearing `selected_review_id` here (unlike the active
         // closure) — a parked entry's review store going empty says nothing
         // about what the sidebar currently has selected.
+    }
+
+    /// A diff computation dispatched before parking just landed rows on a
+    /// PARKED entity (`Workspace::DiffBytesChanged`, subscribed per cached
+    /// entry — capstone P3-8): the LRU's real byte total may now exceed
+    /// what `stash_active`'s `evict_to_budget` accounted at park time, so
+    /// re-enforce the budget. Cheap and rare: at most one stage-1 + one
+    /// stage-2 completion per in-flight request can straggle in per park,
+    /// and `evict_to_budget` is a walk over at most six entries.
+    fn on_cached_diff_bytes_changed(
+        &mut self,
+        _ws: Entity<Workspace>,
+        _: &crate::workspace::DiffBytesChanged,
+        cx: &mut Context<Self>,
+    ) {
+        self.workspace_cache.evict_to_budget(cx);
     }
 
     /// Recompute one entry's badge off-thread (store I/O may hit WSL):

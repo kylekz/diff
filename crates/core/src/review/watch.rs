@@ -24,6 +24,15 @@ use super::io::StoreIo;
 /// Local watching (and the host-backed subscription) is event-driven.
 const POLL_INTERVAL: Duration = Duration::from_millis(1000);
 
+/// A fallback digest slower than this is suspected of having BOOTED the
+/// distro rather than merely listing a directory on a running one
+/// (`wsl.exe` against a live distro answers in well under a second; a
+/// distro boot adds multiple seconds) — see the `fallback_tick` in
+/// [`watch`] and `manager::note_boot_suspect`. A false positive (a
+/// genuinely slow digest, e.g. a host RPC riding its timeout) costs one
+/// quarantine window of paused polling, nothing more.
+const BOOT_SUSPECT_THRESHOLD: Duration = Duration::from_millis(2_000);
+
 /// Keeps the watch alive; dropping it stops callbacks (best-effort — an
 /// in-flight callback may still complete).
 pub enum ReviewWatcher {
@@ -99,18 +108,54 @@ pub(super) fn watch(
                 // The manager owns spawn pacing (cool-downs, install);
                 // returning `None` while hosts are disabled or the distro
                 // is cooling down is what keeps the supervisor's degraded
-                // loop cheap.
-                client_source: Box::new(move || {
-                    manager::client_for(&distro)
-                        .filter(|client| client.is_alive() && client.has_cap("watch"))
+                // loop cheap. Gated on `distro_running` (capstone P2-D):
+                // `client_for` can spawn a host — which BOOTS a stopped
+                // distro — and a background reacquisition retry must never
+                // resurrect a distro the user deliberately shut down. The
+                // probe is a cheap, throttled `wsl.exe --list --running`
+                // service query that itself boots nothing.
+                client_source: Box::new({
+                    let distro = distro.clone();
+                    move || {
+                        if !manager::distro_running(&distro) {
+                            return None;
+                        }
+                        manager::client_for(&distro)
+                            .filter(|client| client.is_alive() && client.has_cap("watch"))
+                    }
                 }),
                 // The pre-supervisor digest poll, now the degraded mode: a
                 // baseline on the first call, then "did the digest move"
                 // per tick. `last` persists across host sessions, so
                 // re-entering the fallback after an outage also drift-checks
-                // against the pre-outage state.
+                // against the pre-outage state. Also `distro_running`-gated
+                // (capstone P2-D): the digest shells `wsl.exe -d <distro>
+                // ls`, which boots a stopped distro within one tick of a
+                // `wsl --shutdown` — while the distro is down this reports
+                // "no change" without touching it, and `last`'s pre-outage
+                // baseline means the first post-restart digest still
+                // catches anything that changed in between.
                 fallback_tick: Some(Box::new(move || {
+                    if !manager::distro_running(&distro) {
+                        return false;
+                    }
+                    // Boot-suspicion self-correction (capstone P2-D): the
+                    // probe gate above can never fully close the race — a
+                    // `wsl --shutdown` landing in the tens of ms between
+                    // the probe's answer and this digest's `wsl.exe` spawn
+                    // makes THIS command boot the distro back up, and
+                    // without correction that latches (the accidental boot
+                    // makes every later probe honestly say "running").
+                    // A digest against a running distro is sub-second; one
+                    // that had to boot it first takes seconds — flag it so
+                    // `distro_running` quarantines the distro long enough
+                    // to idle-terminate itself. See `note_boot_suspect`.
+                    let started = std::time::Instant::now();
                     let next = digest(&io);
+                    if started.elapsed() >= BOOT_SUSPECT_THRESHOLD {
+                        manager::note_boot_suspect(&distro);
+                        return false;
+                    }
                     let changed = last.as_ref().is_some_and(|prev| *prev != next);
                     last = Some(next);
                     changed

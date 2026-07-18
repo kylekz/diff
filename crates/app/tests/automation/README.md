@@ -142,16 +142,21 @@ the `browse` key-context gate that a `ctrl-g` keystroke would require.
 
 **Ids 3-8 — the keyboard-trap guard (finding P1).** Open the theme picker
 first (a real, common prior interaction that parks focus on `AppShell`'s
-handle), then click the PR-picker hint button directly while it's open.
-Fixing the focus capture alone, without more, would have opened the PR
-picker on top of the still-open theme picker — and since closing the PR
-picker afterward re-focuses the workspace, that would strand the theme
-picker keyboard-trapped behind it (this workspace's own `escape` bindings
-outrank the shell's while focus rests here — no way out without a mouse
-click). `on_open_pr_picker` therefore declines outright while a shell
-overlay is genuinely open, so id 5's click here is a no-op and the theme
-picker stays open, escapable, and untouched — ids 7-8 confirm `escape`
-still reaches it normally afterward.
+handle), then click the PR-picker hint button's position directly while
+it's open. Fixing the focus capture alone, without more, would have opened
+the PR picker on top of the still-open theme picker — and since closing
+the PR picker afterward re-focuses the workspace, that would strand the
+theme picker keyboard-trapped behind it (this workspace's own `escape`
+bindings outrank the shell's while focus rests here — no way out without a
+mouse click). Two independent defenses now make that impossible, and id 6
+asserts the observable outcome: since the R1–R3 restyle, the theme picker
+is a true MODAL — its backdrop consumes the id-5 click and dismisses the
+picker (restoring workspace focus), so the click never even reaches the
+hint button; and `on_open_pr_picker`'s `overlay_open` decline guard (the
+original P1 fix) remains as the second line if the modal recipe ever
+changes. The assertion that matters is that the two pickers are NEVER
+open at once and focus is never stranded — ids 7-8 confirm keyboard
+handling stays live afterward.
 
 **Ids 9-12 — the actual Enter-regression discriminator (findings P2 +
 P3).** The first fix attempt gated the id-5 decline on
@@ -210,23 +215,36 @@ the slice's report):
   lands correctly, discriminating both the D0 and P3 fixes at once).
 
 The click coordinates (logical px, at the default `1440x920` automation
-window size — if the window has been resized, re-locate with a screenshot
-first per CLAUDE.md § Visual verification):
-- `1201, 51` — the "PRs · ctrl-g" header button.
-- `32, 96` — the "REVIEWS" sidebar-header label (`shell.rs`'s
-  unconditional label above the grouping/filter row); any point on that
-  row's padding works equally, since none of it is focusable.
+window size — if the window has been resized, or the layout restyled,
+re-locate with a screenshot first per CLAUDE.md § Visual verification;
+re-derived 2026-07-18 after the R1–R3 restyle moved both targets — the old
+`32, 96` now lands on the restyle's New Review button, and both points
+were re-verified against the live build via a `click`+`state` probe):
+- `1217, 53` — the "PRs · ctrl-g" header button.
+- `32, 120` — the "REVIEWS" sidebar-header label (`shell.rs`'s
+  unconditional label, now sitting BELOW the restyle's quick-open input
+  and New Review button); any point on that row's padding works equally,
+  since none of it is focusable.
+
+Ids 50/51/52 are 300ms `wait` commands before each position-sensitive
+click — CLAUDE.md § Visual verification's stale-frame note: a click
+immediately after a state-mutating command hit-tests the pre-mutation
+frame (observed directly: without the waits, the id-9/id-11 clicks
+landed on the previous frame's layout and silently missed).
 
 - id 2 (baseline): `shell.focus == "workspace"`.
 - id 4 (after `ctrl-shift-t`): `shell.theme_picker_open == true`,
   `shell.focus == "shell"`.
-- id 6 (after clicking the PR-picker hint button while the theme picker is
-  open): **the keyboard-trap guard** — `shell.workspace.pr_picker_open ==
-  false` (declined to stack) AND `shell.theme_picker_open == true`
-  (untouched) AND `shell.focus == "shell"` (untouched).
+- id 6 (after clicking the hint button's position while the theme picker
+  modal is open): **the keyboard-trap guard** — NEVER both pickers open:
+  `shell.workspace.pr_picker_open == false` AND (post-restyle) the modal
+  backdrop consumed the click, so `shell.theme_picker_open == false` and
+  `shell.focus == "workspace"` (backdrop dismiss restores focus — nothing
+  stacked, nothing stranded). A trap regression shows here as BOTH
+  `pr_picker_open == true` and `theme_picker_open == true`.
 - id 8 (after `escape`): `shell.theme_picker_open == false`,
-  `shell.focus == "workspace"` (the theme picker is still reachable and
-  closes normally — proves no trap).
+  `shell.focus == "workspace"` (keyboard handling still live — proves no
+  trap).
 - id 10 (after clicking inert sidebar chrome): **the no-overlay
   precondition** — `shell.focus == "shell"` AND
   `shell.theme_picker_open == false` AND

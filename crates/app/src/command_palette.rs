@@ -119,7 +119,8 @@ const ALLOWED_NAMESPACES: &[&str] = &["shell", "workspace"];
 /// own instruction:
 ///
 /// - The next/prev/choose/close quartet for every OTHER overlay (jump-to-
-///   file palette, PR picker, theme picker) plus this palette's own —
+///   file palette, PR picker, theme picker, the S10 find-references
+///   panel) plus this palette's own —
 ///   these only make sense while that specific overlay already has input
 ///   focus and its own keybindings scoped to it; invoking e.g.
 ///   "PrPickerNext" with no PR picker open does nothing.
@@ -148,6 +149,10 @@ const EXCLUDED_ACTIONS: &[&str] = &[
     "CommandPalettePrev",
     "CommandPaletteClose",
     "CommandPaletteChoose",
+    "ReferencesNext",
+    "ReferencesPrev",
+    "ReferencesChoose",
+    "ReferencesClose",
     "OpenCommandPalette",
     "SettingsClose",
     "OnboardingClose",

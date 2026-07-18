@@ -557,6 +557,14 @@ impl GitRepo {
                 "merge-tree",
                 "--write-tree",
                 "--name-only",
+                // NUL framing so unusual filenames (spaces/quotes/unicode)
+                // arrive unquoted — without it git C-quotes them and the
+                // parsed paths never match dv's own (capstone P3-4).
+                // Accepted alongside --write-tree/--name-only since both
+                // appeared (git 2.38); verified against git 2.53. An older
+                // git rejecting any of the three exits with a usage error,
+                // which parse_merge_tree_probe maps to Unsupported.
+                "-z",
                 base,
                 head,
             ],

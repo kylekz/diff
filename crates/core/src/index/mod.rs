@@ -21,9 +21,11 @@
 
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::{Mutex, OnceLock};
 
 use serde::{Deserialize, Serialize};
 
+use crate::conflict::ConflictInfo;
 use crate::git::{DiffSource, DiffTotals, GitRepo};
 use crate::github::{ChecksSummary, PrState, ReviewDecision};
 use crate::location::RepoLocation;
@@ -486,15 +488,13 @@ pub fn hydrate_location(location: &RepoLocation) -> HydrateOutcome {
                         // trust level as the cached PR-status badges).
                         // `apply_hydration`'s carry-forward (mirroring
                         // `diffstat`'s) keeps whatever a previous pass
-                        // found instead of blanking it.
-                        entry.conflict = repo.as_ref().and_then(|repo| {
-                            repo.conflict_probe_with_live_base(
-                                &r.source,
-                                r.live_base.iter().flat_map(|lb| lb.candidates()),
-                            )
-                            .info()
-                            .cloned()
-                        });
+                        // found instead of blanking it. Memoized so a
+                        // store-watch-triggered re-hydration doesn't re-run
+                        // identical merge-tree work per PR-shaped review —
+                        // see `memoized_conflict_probe`.
+                        entry.conflict = repo
+                            .as_ref()
+                            .and_then(|repo| memoized_conflict_probe(location, repo, r));
                         entry
                     })
                     .collect(),
@@ -502,6 +502,76 @@ pub fn hydrate_location(location: &RepoLocation) -> HydrateOutcome {
         }
         Err(_) => HydrateOutcome::Unavailable,
     }
+}
+
+/// Process-lifetime memo behind [`hydrate_location`]'s conflict probes (P3
+/// review finding: every store-watch event re-ran the merge-tree probes for
+/// every PR-shaped review at the location, though nothing they depend on
+/// had moved).
+///
+/// Key = the location plus every oid the probe's answer is a function of:
+/// the `Range` source's base and head plus each locally-resolvable
+/// live-base candidate, all resolved to oids first. `git merge-tree` over
+/// fixed oids is deterministic, so a hit can never go stale; a moved ref
+/// (a fetch advancing `origin/<branch>`, a rewritten head) resolves to a
+/// new oid, changes the key, and re-probes. Entries are immutable results —
+/// no invalidation beyond letting the map die with the process; growth is
+/// bounded by the number of distinct (range, base-movement) pairs seen in
+/// one run.
+fn conflict_probe_memo() -> &'static Mutex<HashMap<(RepoLocation, String), ConflictInfo>> {
+    static MEMO: OnceLock<Mutex<HashMap<(RepoLocation, String), ConflictInfo>>> = OnceLock::new();
+    MEMO.get_or_init(Default::default)
+}
+
+/// [`GitRepo::conflict_probe_with_live_base`] for one hydrated review, with
+/// [`conflict_probe_memo`] in front of the expensive shape. Only `Range`
+/// sources are memoized: the working-tree/staged `ls-files -u` probe is
+/// cheap and reflects *live* index state, so caching it would return stale
+/// answers after a merge starts or finishes. Only DETERMINED results are
+/// cached — an `Unsupported` (old git, transient WSL hiccup, no resolvable
+/// live base) must stay retryable on the next pass. A base/head that fails
+/// to resolve skips the memo entirely and just runs the probe (which
+/// handles the failure itself).
+fn memoized_conflict_probe(
+    location: &RepoLocation,
+    repo: &GitRepo,
+    review: &Review,
+) -> Option<ConflictInfo> {
+    let candidates = || review.live_base.iter().flat_map(|lb| lb.candidates());
+    let probe = || {
+        repo.conflict_probe_with_live_base(&review.source, candidates())
+            .info()
+            .cloned()
+    };
+    let DiffSource::Range { base, head, .. } = &review.source else {
+        return probe();
+    };
+    let (Ok(base_oid), Ok(head_oid)) = (repo.resolve(base), repo.resolve(head)) else {
+        return probe();
+    };
+    let mut oids = format!("{base_oid}..{head_oid}");
+    for candidate in candidates() {
+        if let Ok(oid) = repo.resolve(candidate) {
+            oids.push('+');
+            oids.push_str(&oid);
+        }
+    }
+    let key = (location.clone(), oids);
+    if let Some(hit) = conflict_probe_memo()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(&key)
+    {
+        return Some(hit.clone());
+    }
+    let result = probe();
+    if let Some(info) = &result {
+        conflict_probe_memo()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(key, info.clone());
+    }
+    result
 }
 
 /// Line-2 sidebar label for a review: a PR-linked review shows `PR #<n>`

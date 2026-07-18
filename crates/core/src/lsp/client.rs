@@ -116,8 +116,15 @@ pub enum SemanticWaitOutcome {
     NoSignal,
     /// A begin was seen but the load didn't finish within
     /// [`SEMANTIC_END_WAIT`] — proceed anyway (never brick code
-    /// intelligence on a wedged load); NOT latched, so a later request
-    /// re-waits for the remainder of a genuinely long project load.
+    /// intelligence on a wedged load). Latched, same as the other two
+    /// verdicts: a load whose end-notification is lost must cost the
+    /// session ONE end-wait, not a fresh [`SEMANTIC_END_WAIT`] on every
+    /// definition/hover/references for the rest of its life (P3 review
+    /// finding — the hover→definition chain could stack these to ~45s).
+    /// Latching degrades exactly to the pre-gate behavior (a possibly-
+    /// syntax-server answer, still covered by the app's empty-result
+    /// warm-up retries); a real end arriving later changes nothing the
+    /// latch hasn't already granted.
     TimedOut,
 }
 
@@ -163,9 +170,11 @@ struct SemanticState {
     seen_begin: bool,
     /// Begun-but-not-ended progress tokens.
     active: u32,
-    /// The latch: a full begin(s)→end(s) cycle completed. Never unset —
-    /// later didChange-triggered re-analysis cycles don't re-gate a warm
-    /// session (the app's empty-result retries cover those).
+    /// The latch: a full begin(s)→end(s) cycle completed — or a begun load
+    /// blew through a full [`SEMANTIC_END_WAIT`] and the timed-out waiter
+    /// latched it as done (see [`SemanticWaitOutcome::TimedOut`]). Never
+    /// unset — later didChange-triggered re-analysis cycles don't re-gate a
+    /// warm session (the app's empty-result retries cover those).
     completed: bool,
     /// [`SemanticWaitOutcome::NoSignal`] latch — the one full
     /// [`SEMANTIC_BEGIN_WAIT`] penalty is paid at most once per session.
@@ -215,9 +224,10 @@ impl SemanticReadiness {
 
     /// Block until the project-load cycle completes ([`SemanticWaitOutcome::Ready`]),
     /// or degrade: no begin within `begin_wait` → `NoSignal` (latched), or
-    /// begin seen but no completion within `end_wait` → `TimedOut`. Both
-    /// timeouts are per-call; completion is latched, so a warm session
-    /// returns `Ready` immediately.
+    /// begin seen but no completion within `end_wait` → `TimedOut` (also
+    /// latched — see its variant doc). Every verdict latches, so each
+    /// penalty is paid at most once and a warm session returns `Ready`
+    /// immediately.
     fn wait_ready(&self, begin_wait: Duration, end_wait: Duration) -> SemanticWaitOutcome {
         let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
 
@@ -247,6 +257,13 @@ impl SemanticReadiness {
             }
             let now = Instant::now();
             if now >= end_deadline {
+                // Latch the timeout as completion: a lost end-notification
+                // must not make EVERY later request re-pay the full end
+                // wait (see `SemanticWaitOutcome::TimedOut`'s doc). Wake
+                // the other waiters so they see it now instead of each
+                // sleeping out their own deadline.
+                state.completed = true;
+                self.condvar.notify_all();
                 return SemanticWaitOutcome::TimedOut;
             }
             let (next, _) = self
@@ -1081,17 +1098,33 @@ fn trace_message(direction: &str, value: &Value) {
     );
 }
 
-/// `None` when `DV_LSP_TRACE` is unset; otherwise the elapsed time since
-/// the first traced event (a process-wide clock, so all sessions in one
-/// process interleave coherently).
+/// `None` when `DV_LSP_TRACE` is unset or set to an "off" value (see
+/// [`trace_enabled_given`]); otherwise the elapsed time since the first
+/// traced event (a process-wide clock, so all sessions in one process
+/// interleave coherently).
 fn trace_clock() -> Option<Duration> {
     use std::sync::OnceLock;
     static ENABLED: OnceLock<bool> = OnceLock::new();
     static START: OnceLock<Instant> = OnceLock::new();
-    if !*ENABLED.get_or_init(|| std::env::var_os("DV_LSP_TRACE").is_some()) {
+    if !*ENABLED.get_or_init(|| trace_enabled_given(std::env::var("DV_LSP_TRACE").ok().as_deref()))
+    {
         return None;
     }
     Some(START.get_or_init(Instant::now).elapsed())
+}
+
+/// Pure core of the `DV_LSP_TRACE` gate, factored out for unit tests the
+/// same way `remote::manager::hosts_enabled_given` is (process-global env
+/// reads race under the parallel test harness). `DV_LSP_TRACE=1` enables,
+/// as every doc mention says — but so does any other set value EXCEPT the
+/// conventional "off" spellings: empty, `0`, and `false` (any case) all
+/// disable (P3 review finding: a bare `is_some()` made `DV_LSP_TRACE=0`
+/// turn the trace ON).
+fn trace_enabled_given(value: Option<&str>) -> bool {
+    match value {
+        None => false,
+        Some(v) => !(v.is_empty() || v == "0" || v.eq_ignore_ascii_case("false")),
+    }
 }
 
 fn dispatch_message(
@@ -1212,6 +1245,12 @@ mod tests {
             gate.wait_ready(Duration::from_millis(10), Duration::from_millis(30)),
             SemanticWaitOutcome::TimedOut
         );
+        // That TimedOut latched (see the dedicated latch test), so prove
+        // completion-via-ends on a FRESH gate rather than riding the latch.
+        let gate = SemanticReadiness::new();
+        gate.on_progress("begin");
+        gate.on_progress("begin");
+        gate.on_progress("end");
         gate.on_progress("end");
         // All ended — completion latched; an instant Ready from here on.
         assert_eq!(
@@ -1239,17 +1278,30 @@ mod tests {
     }
 
     #[test]
-    fn semantic_gate_begin_without_end_times_out_but_does_not_latch() {
+    fn semantic_gate_begin_without_end_times_out_and_latches() {
         // The hard-timeout fallback: a load that never finishes must not
         // brick code intelligence — the wait resolves TimedOut (proceed
-        // anyway) after the bounded end wait.
+        // anyway) after the bounded end wait, and LATCHES (P3 review
+        // finding: un-latched, a lost end-notification made every later
+        // request re-pay the full SEMANTIC_END_WAIT for the session's
+        // life).
         let gate = SemanticReadiness::new();
         gate.on_progress("begin");
         assert_eq!(
             gate.wait_ready(Duration::from_millis(10), Duration::from_millis(30)),
             SemanticWaitOutcome::TimedOut
         );
-        // NOT latched: once the load does finish, the next wait is Ready.
+        // Latched: the second wait must return immediately (Ready — the
+        // timeout was recorded as completion) rather than blocking out
+        // another LONG end wait — well under the 5s it would otherwise
+        // sleep.
+        let started = Instant::now();
+        assert_eq!(
+            gate.wait_ready(Duration::from_secs(5), Duration::from_secs(5)),
+            SemanticWaitOutcome::Ready
+        );
+        assert!(started.elapsed() < Duration::from_secs(1));
+        // A real end arriving after the latch changes nothing.
         gate.on_progress("end");
         assert_eq!(
             gate.wait_ready(Duration::from_millis(10), Duration::from_millis(10)),
@@ -1344,6 +1396,22 @@ mod tests {
             gate.wait_ready(Duration::from_millis(10), Duration::from_millis(10)),
             SemanticWaitOutcome::Ready
         );
+    }
+
+    // --- trace_enabled_given: the DV_LSP_TRACE gate -----------------------
+
+    #[test]
+    fn trace_gate_honors_off_spellings_and_on_values() {
+        // Unset, and the conventional "off" spellings, disable (P3 review
+        // finding: `is_some()` made `DV_LSP_TRACE=0` enable the trace).
+        assert!(!trace_enabled_given(None));
+        assert!(!trace_enabled_given(Some("")));
+        assert!(!trace_enabled_given(Some("0")));
+        assert!(!trace_enabled_given(Some("false")));
+        assert!(!trace_enabled_given(Some("FALSE")));
+        // The documented `=1` (and any other affirmative value) enables.
+        assert!(trace_enabled_given(Some("1")));
+        assert!(trace_enabled_given(Some("true")));
     }
 
     // --- normalize_definition_result: the three wire shapes --------------

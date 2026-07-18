@@ -178,6 +178,25 @@ fn merge_local_badge(
     }
 }
 
+/// Should the workspace's live conflict probe be stamped onto the index
+/// entry for `review_source`? Yes exactly when the workspace is displaying
+/// that review's KIND of diff (`std::mem::discriminant`), not when the two
+/// sources are structurally equal — a reopened PR workspace shows a *fresh*
+/// `DiffSource::Range` (new head/merge-base oids) while `review.source`
+/// stays frozen at draft creation, so exact equality never re-converges and
+/// hydration's older-head answer would win forever, letting the sidebar
+/// badge contradict the open workspace's own header (review finding P2-1).
+/// Same-kind with moved oids is still the same diff *kind*, and the live
+/// probe is the fresher authority on it. The guard's motivating case keeps
+/// working: a bare launch adopts a range review while the workspace shows
+/// the working-tree diff — that `ls-files -u` probe is about a different
+/// kind of diff entirely and must NOT stamp over hydration's persisted-
+/// live-base range finding. Pure so the three-case matrix is unit-testable
+/// (matches `merge_local_badge`'s pattern).
+fn should_stamp_conflict(review_source: &DiffSource, ws_source: &DiffSource) -> bool {
+    std::mem::discriminant(review_source) == std::mem::discriminant(ws_source)
+}
+
 /// `gh pr view --json state,isDraft,reviewDecision,statusCheckRollup` for a
 /// review's linked PR (docs/phase-3-github.md deliverable 3/5) — built
 /// straight from `remote`'s own `slug`/`pr` (no `GitRepo`/`origin` remote
@@ -1797,13 +1816,16 @@ impl AppShell {
                     // live-base finding (docs/backlog.md "Stored-but-
                     // never-reopened PR range reviews...") with a clean
                     // answer about a different diff. Stamp only when the
-                    // sources agree; `None` lets `upsert`'s carry-forward
+                    // workspace shows this review's kind of diff (see
+                    // `should_stamp_conflict` — kind match, not exact
+                    // equality, so a reopened PR's fresh range still
+                    // stamps); `None` lets `upsert`'s carry-forward
                     // keep whatever hydration last found (see
                     // `Workspace::source`'s doc comment).
                     let source_conflict = ws.conflict().cloned();
                     let ws_source = ws.source().clone();
                     ws.review().map(|review| {
-                        let conflict = (review.source == ws_source)
+                        let conflict = should_stamp_conflict(&review.source, &ws_source)
                             .then_some(source_conflict)
                             .flatten();
                         // Only a PR-linked review carries a `pr_status` at
@@ -2037,13 +2059,14 @@ impl AppShell {
             let ws = ws.read(cx);
             // Same reasoning as `Self::install_active`'s active closure —
             // a parked workspace's live conflict probe is just as much a
-            // real answer as an active one's, and the same source-match
-            // guard applies (don't stamp a probe about a different diff
-            // over hydration's persisted-live-base finding).
+            // real answer as an active one's, and the same source-KIND
+            // guard applies (don't stamp a probe about a different kind of
+            // diff over hydration's persisted-live-base finding; see
+            // `should_stamp_conflict`).
             let source_conflict = ws.conflict().cloned();
             let ws_source = ws.source().clone();
             ws.review().map(|review| {
-                let conflict = (review.source == ws_source)
+                let conflict = should_stamp_conflict(&review.source, &ws_source)
                     .then_some(source_conflict)
                     .flatten();
                 // Same pr_status carry-forward as `Self::install_active`'s
@@ -6781,7 +6804,10 @@ impl Render for AppShell {
 
 #[cfg(test)]
 mod tests {
-    use super::{ChecksSummary, PrBadge, PrState, ReviewBadge, merge_local_badge};
+    use super::{
+        ChecksSummary, DiffSource, PrBadge, PrState, ReviewBadge, merge_local_badge,
+        should_stamp_conflict,
+    };
 
     fn badge(open: usize, pr: Option<PrBadge>, pr_number: Option<u64>) -> ReviewBadge {
         ReviewBadge {
@@ -6799,6 +6825,51 @@ mod tests {
             decision: None,
             checks: ChecksSummary::Passing,
         }
+    }
+
+    // --- should_stamp_conflict (review finding P2-1) -----------------------
+
+    fn range(base: &str, head: &str) -> DiffSource {
+        DiffSource::Range {
+            base: base.to_string(),
+            head: head.to_string(),
+            merge_base: true,
+        }
+    }
+
+    #[test]
+    fn stamp_conflict_same_kind_same_oids_stamps() {
+        // The trivial agreement case: workspace shows exactly the review's
+        // stored range — the live probe is about this very diff.
+        assert!(should_stamp_conflict(
+            &range("aaa", "bbb"),
+            &range("aaa", "bbb")
+        ));
+    }
+
+    #[test]
+    fn stamp_conflict_same_kind_moved_oids_still_stamps() {
+        // The P2-1 case: a reopened PR workspace probes a FRESH range (new
+        // head/merge-base) while `review.source` stays frozen at draft
+        // creation. The workspace's probe is the authoritative fresh answer
+        // for this review — exact-equality gating locked it out forever and
+        // let hydration's older-head answer contradict the open header.
+        assert!(should_stamp_conflict(
+            &range("frozen-merge-base", "old-head"),
+            &range("fresh-merge-base", "new-head")
+        ));
+    }
+
+    #[test]
+    fn stamp_conflict_cross_kind_does_not_stamp() {
+        // The guard's motivating case (must keep working): a bare launch
+        // adopts a range review while the workspace shows the WORKING-TREE
+        // diff — its `ls-files -u` probe says nothing about the range and
+        // must not erase hydration's persisted-live-base finding.
+        assert!(!should_stamp_conflict(
+            &range("aaa", "bbb"),
+            &DiffSource::WorkingTree
+        ));
     }
 
     // --- merge_local_badge (review finding P3-3) ---------------------------

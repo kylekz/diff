@@ -9978,7 +9978,7 @@ impl Workspace {
                         } else {
                             // Rendered as markdown (backlog: PR descriptions
                             // showed literal `## headers`/etc as raw text).
-                            crate::markdown::view("pr-body-text", body_text)
+                            crate::markdown::view("pr-body-text", body_text, cx)
                                 .text_sm()
                                 .text_color(foreground)
                                 .into_any_element()
@@ -11227,6 +11227,7 @@ impl Workspace {
                                 crate::markdown::view(
                                     SharedString::from(format!("comment-body-{}", comment.id)),
                                     comment.body.clone(),
+                                    cx,
                                 )
                                 .text_sm()
                                 .text_color(text_secondary),
@@ -11270,6 +11271,7 @@ impl Workspace {
                                                     reply.id
                                                 )),
                                                 reply.body.clone(),
+                                                cx,
                                             )
                                             .text_sm()
                                             .text_color(text_secondary),
@@ -11493,6 +11495,7 @@ impl Workspace {
                         crate::markdown::view(
                             SharedString::from(format!("remote-body-{}-0", thread.id)),
                             opening.body.clone(),
+                            cx,
                         )
                         .text_sm()
                         .text_color(text_secondary),
@@ -11530,6 +11533,7 @@ impl Workspace {
                                                 reply_ix + 1
                                             )),
                                             reply.body.clone(),
+                                            cx,
                                         )
                                         .text_sm()
                                         .text_color(text_secondary),

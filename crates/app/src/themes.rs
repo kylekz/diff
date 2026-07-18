@@ -95,6 +95,35 @@ pub fn apply_theme(name: &str, mono_font: &str, window: Option<&mut Window>, cx:
     // switching (Phase 4) re-invokes `apply_theme` live, and `DvTheme` must
     // never go stale relative to the base theme it derives from.
     cx.set_global(DvTheme::resolve(Theme::global(cx), entry.json));
+    // Bump the epoch every apply too — this is the single funnel both the
+    // explicit picker (`Shell::apply_resolved_theme`) and follow-OS
+    // re-resolution (`Shell::resolve_follow_os`, same call) run through, so
+    // one counter covers both triggers (docs/backlog.md "Markdown code
+    // blocks may not recolor on live theme swap").
+    let next = cx.try_global::<MarkdownThemeEpoch>().map_or(0, |e| e.0) + 1;
+    cx.set_global(MarkdownThemeEpoch(next));
+}
+
+/// Bumped by every [`apply_theme`] call (startup + every live picker/
+/// follow-OS switch). `markdown::view` folds the current value into its
+/// `TextView` element id so a theme change forces a fresh `TextViewState`
+/// (and thus a fenced-code-block reparse under the new theme's
+/// `highlight_theme`) instead of leaving stale colors baked in —
+/// `TextViewState::set_text` silently no-ops when the text itself hasn't
+/// changed, so nothing else would ever repaint the syntax colors
+/// (docs/backlog.md "Markdown code blocks may not recolor on live theme
+/// swap").
+#[derive(Debug, Clone, Copy, Default)]
+struct MarkdownThemeEpoch(u64);
+
+impl Global for MarkdownThemeEpoch {}
+
+/// Current markdown theme epoch, for [`crate::markdown::view`] to fold into
+/// its element id. `0` before the first [`apply_theme`] call (never
+/// observable in practice — `apply_theme` always runs before any window
+/// exists, same contract as [`theme`]).
+pub fn markdown_theme_epoch(cx: &App) -> u64 {
+    cx.try_global::<MarkdownThemeEpoch>().map_or(0, |e| e.0)
 }
 
 /// dv-owned theme extension: tokens the R1–R3 restyle needs that

@@ -27,7 +27,7 @@
 //! while explicit spans (links, highlighted code) keep their theme-derived
 //! colors regardless.
 
-use gpui::{ElementId, SharedString};
+use gpui::{App, ElementId, SharedString};
 use gpui_component::text::{TextView, TextViewStyle};
 
 /// Build a themed Markdown [`TextView`] for `text`, keyed by `id`.
@@ -35,7 +35,18 @@ use gpui_component::text::{TextView, TextViewStyle};
 /// `id` must be stable and unique per rendered body (e.g. derived from a
 /// comment/reply id) so `TextView`'s internal per-element state — parsed AST,
 /// selection, scroll — persists correctly across re-renders instead of
-/// aliasing onto an unrelated body.
+/// aliasing onto an unrelated body. The current
+/// [`themes::markdown_theme_epoch`](crate::themes::markdown_theme_epoch) gets
+/// folded into the id on top of that: `TextView` keys its `TextViewState` off
+/// the element id (`gpui_component::text::TextView::request_layout`'s
+/// `window.use_keyed_state`), so an id that only changes on a theme swap
+/// forces a fresh state — and thus a reparse under the new theme's
+/// `highlight_theme` — instead of `TextViewState::set_text`'s same-text
+/// short-circuit leaving fenced-code syntax colors baked from the old theme
+/// (docs/backlog.md "Markdown code blocks may not recolor on live theme
+/// swap"). These bodies are short comment/PR text, so a reparse on theme
+/// swap is cheap; the id is stable across every OTHER re-render, so
+/// scroll/selection state isn't churned except on the swap itself.
 ///
 /// Every body is passed through [`sanitize_untrusted`] first (capstone
 /// P2-C): `TextView` renders `![](url)` images and raw `<img>` HTML by
@@ -47,10 +58,13 @@ use gpui_component::text::{TextView, TextViewStyle};
 /// A tighter `paragraph_gap` than the component's 1rem default keeps
 /// multi-paragraph bodies visually consistent with this app's already-compact
 /// thread cards (`gap_2`/`py_1` throughout `workspace.rs`'s card rendering).
-pub(crate) fn view(id: impl Into<ElementId>, text: impl Into<SharedString>) -> TextView {
+pub(crate) fn view(id: impl Into<ElementId>, text: impl Into<SharedString>, cx: &App) -> TextView {
     let text: SharedString = text.into();
     let sanitized: SharedString = sanitize_untrusted(text.as_ref()).into();
-    TextView::markdown(id, sanitized).style(TextViewStyle::default().paragraph_gap(gpui::rems(0.5)))
+    let epoch = crate::themes::markdown_theme_epoch(cx);
+    let keyed_id = SharedString::from(format!("{}/theme-{epoch}", id.into()));
+    TextView::markdown(keyed_id, sanitized)
+        .style(TextViewStyle::default().paragraph_gap(gpui::rems(0.5)))
 }
 
 /// Neutralize the two constructs that make `TextView` issue NETWORK

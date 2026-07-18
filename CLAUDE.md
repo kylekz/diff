@@ -1,8 +1,7 @@
 # dv — local diff viewer / PR reviewer
 
 Native GPUI (Rust) app for reviewing large diffs locally: fast diff browsing,
-line/range comments, GitHub review submission via `gh`, WSL-aware. The phased
-plan lives in `docs/` — read `docs/architecture.md` first.
+line/range comments, GitHub review submission via `gh`, WSL-aware.
 
 ## Commands
 
@@ -61,9 +60,9 @@ gpui — expect many minutes. Incremental builds are fast.
 ## Visual verification (for agents)
 
 UI/style work must be verified by looking at the running app, not by
-assuming. The primary loop is **`dv --automation`** (JSON-over-stdio; see
-docs/architecture.md § Testing): write a command script, pipe it through the
-app, then Read the PNG it produced and actually inspect the image.
+assuming. The primary loop is **`dv --automation`** (JSON-over-stdio): write
+a command script, pipe it through the app, then Read the PNG it produced and
+actually inspect the image.
 
 ```bash
 # bash (preferred — PowerShell > redirects write UTF-16); one JSON per line
@@ -156,7 +155,7 @@ problems on any failure) and emits `{"submission":{"review_id","pr",
 
 `crates/host` (`dv-host`) is a headless stdio server, spawned per WSL distro
 via `wsl.exe -d <distro> --exec`, that runs git/fs work distro-side instead
-of one `wsl.exe` per command (docs/phase-5-implementation-plan.md). Only
+of one `wsl.exe` per command. Only
 `RepoLocation::Wsl` repos ever route through it; local repos never touch
 `crates/core/src/remote/`.
 
@@ -188,113 +187,3 @@ hash, not a version string — see `crates/core/src/remote/install.rs`'s
 module doc for why), verified via a client-side sha256 + marker file. No
 sidecar next to `dv.exe` means this whole path is silently inert — today's
 per-command `wsl.exe` spawns keep working exactly as before.
-
-## Status
-
-Phases 0–1 complete: read-only diff viewer (unified + split), WSL routing,
-review-navigator shell, keyboard nav, `--automation`, acceptance validated
-on a zed-sized diff (see docs/phase-1-diff-viewer.md § Acceptance results).
-Phase 2 complete: ReviewStore + agent CLI + GUI commenting (selection,
-editor, threads with reply/edit/resolve/delete), live store watching,
-summary panel with finish-review verdicts, sidebar badges, stale-anchor
-flagging — acceptance loop verified end to end (docs/phase-2-review-layer.md
-§ Acceptance results). Phase 3 complete: GitHub via gh — `dv pr` (list/
-view/create/fetch + GUI launch), PR picker + header, validated review
-submission from both CLI and GUI (blob anchors, rename-aware paths,
-line-in-diff), sidebar PR status icons, comment author = GitHub login —
-live-accepted against kylekz/difftest (docs/phase-3-github.md § Acceptance
-results). Phase 4 complete: settings & appearance —
-JetBrains Mono bundled, four themes (Aura Dark, Dracula, Claude Dark,
-Claude Light) with ctrl-shift-t picker + follow-OS, settings.json +
-ctrl-, panel (view mode, context lines, fonts with row-height scaling),
-drag-to-resize sidebar/summary with persisted widths, thread-card/button
-polish pass (docs/phase-4-settings-and-theming.md § Acceptance results).
-Phase 5 complete (WSL host, docs/phase-5-wsl.md § Acceptance results):
-all five slices shipped per docs/phase-5-implementation-plan.md —
-protocol + HostClient (S1), transport swap with zero per-command wsl.exe
-spawns + blob/get (S2), sidecar auto-install with content-hash upgrade +
-CI musl artifact (S3), inotify store/worktree watching replacing the 1s
-digest poll — CLI comment → GUI 139ms (S4), and robustness + acceptance
-(S5): fs/* store methods off sh -c (locale-proof remote store),
-badge-walk running-host-only policy (no distro boot at launch),
-bounded install-command timeouts, host-stderr surfacing on connection
-loss. Live-verified against the real Ubuntu distro. Acceptance benchmark
-reframed the win honestly: per-file diff and cold startup are UI-bound
-(tree-sitter), NOT git-I/O-bound, so the host holds per-file parity but
-its one-time spawn makes cold startup ~175ms slower; the real win is
-capability — native live watching (worktree watch has no Stage-A
-equivalent) + zero per-command spawns. DEFERRED to backlog (P3s, not
-Phase-5 gate): resubscribe-on-respawn after a mid-session host crash and
-moving watch subscribe/unsubscribe RPCs off the GUI thread. Backlog also
-carries the deferred S3/S4 review P3s and two Phase-7 startup leads
-(host spawn on the cold-start critical path; tree-sitter startup cost).
-Phase 6 complete (review navigator, docs/phase-6-review-navigator.md §
-Acceptance results): six slices S6a–S6f — a headless cross-repo review
-index in dv-core cached in the app-data dir (S6a), shell two-phase
-WSL-gated hydration (S6b), review-centric two-line sidebar cards with
-explicit switching incl. submitted-read-only (S6c), grouping (repo/
-status/PR) + filtering persisted in settings (S6d), out-of-diff comment
-surfacing with jump-switches-source (S6e), and read-only GitHub thread
-pull via `gh api graphql` with resolved-state sync onto own submitted
-threads (S6f). Closes the "my comment vanished" priority cluster — the
-incident replay (comment on a non-default review, switch away/back)
-passes, and github.com resolve → dv-shows-resolved was live-verified
-against kylekz/difftest PR#1. A phase-boundary integration review caught
-4 cross-slice bugs (a watcher-reload wrong-review race the most serious)
-that per-slice reviews couldn't see; all fixed. DEFERRED to backlog
-(P3s): read-only thread mutation buttons render but no-op (dim/hide);
-card absolute-timestamp hover tooltip (no tooltip idiom in this crate);
-location-canonicalization double-hydrate; flaky host watch test.
-Phase 7 complete (performance, docs/phase-7-performance.md § Acceptance
-results): seven slices S7-0..S7-6 — fix-first PR-picker Enter regression
-(focus the workspace handle, not the shell; + `state.focus` + committed
-keyboard-dispatch regression scripts under crates/app/tests/automation/)
-(S7-0), perf instrumentation last_switch_ms/last_pr_list_ms/last_pr_open_ms
-(S7-1), PR-picker list cache with stale-while-revalidate (warm ctrl-g
-last_pr_list_ms=0 vs cold ~2378, no spinner) (S7-2), workspace-state LRU
-keeping Workspace entities alive — dual count(6)/byte(128MiB) cap, keyed by
-review id — for instant reactivation (last_switch_ms ~2ms vs cold rebuild)
-(S7-3), background revalidation on reactivation catching Local worktree
-edits (S7-4), content-addressed PR-reopen diff cache keyed by
-(merge_base,head_oid) (S7-5), and audit+eviction-policy docs (S7-6). Honest
-finding: the PR-reopen ROUND-TRIP stays network-bound (content-addressing
-must fetch head_oid to validate) — the win is skipping the tree-sitter diff
-recompute, not a network-free reopen. Caches wire eviction to the existing
-Phase-2 store watcher + Phase-5 worktree watcher (no polling); the LRU
-keeps a parked entity's watchers alive so Phase-2/5 live-update holds while
-parked. Capstone integration review caught 2 cross-slice bugs (stale-theme
-diff on parked-WSL-no-host reactivation; a revalidate/store-watch review-id
-race) — both fixed. DEFERRED (backlog): background the pr_meta fetch for a
-truly instant reopen; runtime-exercise the byte-triggered eviction with a
-large diff.
-Phase 8 complete (LSP, distribution, macOS; docs/phase-8-lsp-and-polish.md
-§ Acceptance results): nine slices S8a–S8i — automation gated behind a
-default-on cargo feature so shipped binaries build with `--no-default-
-features` (S8a), a gpui-free `dv-cli` crate + native Linux binary (S8b),
-the content-hash installer generalized to dv-host + dv-cli with a
-per-(component,distro) install lock (S8c), provisioning detection/consent/
-`ConsistencyReport` in dv-core, boot-storm-safe by contract (S8d), the
-first-run "Welcome to dv" onboarding page + per-launch consistency check
-with silent dv-host/dv-cli self-repair on drift and consent-gated vtsls
-install (S8e), a vtsls LSP client + ctrl-click go-to-definition + read-only
-target viewer with back/forward history, honest-view gated (S8f), hover
-popover + find-references core API + automation click modifiers/mouse_move
-(S8g), a tag-triggered release pipeline — written, deliberately never
-triggered (S8h), and macOS menu/cmd-accelerator conventions written blind
-against real gpui source, no Mac in this sandbox (S8i). Live-verified
-against real Ubuntu throughout: vtsls uninstall→consent→reinstall, cross-
-file go-to-def, hover popovers, marker-drift self-heal, and the full
-exe+sidecars bundle provisioning a distro end to end. Shipped LSP scope is
-WSL-repos-only, narrower than the phase doc's original local-first prose —
-recorded in that doc's Acceptance results rather than left implicit. The
-capstone integration review (3 rounds over the whole-phase diff) caught 10
-cross-slice findings — headline P2: a ctrl-click during the up-to-180s
-vtsls consent install latched code intelligence off permanently (S8e×S8f);
-plus consistency-check cooldowns, persisted drift dismissal, menu-dispatch
-vs target-viewer guards, and CI coverage for the shipped build shape — all
-fixed. The find-references UI and the local/Windows LSP spawn path — both
-originally deferred here — shipped in the post-Phase-8 capstone batch
-(S10/S11; the local vtsls happy path awaits a machine with node, see
-docs/backlog.md). DEFERRED (backlog): macOS runtime is
-CARRIED-FORWARD-UNVERIFIED pending a real Mac hand-run (checklist in
-docs/backlog.md); the real v* tag → Release cut is Kyle's to trigger.

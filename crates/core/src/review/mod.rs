@@ -64,6 +64,66 @@ pub struct Review {
     /// describes.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub remote: Option<RemoteRef>,
+    /// A LIVE handle to this review's real base branch, persisted alongside
+    /// the frozen merge-base sha that [`crate::DiffSource::Range`]'s `base`
+    /// deliberately collapses to (docs/backlog.md "Stored-but-never-reopened
+    /// PR range reviews show no conflict indicator"). The frozen base keeps
+    /// comment anchors stable but makes a stored PR review's conflict probe
+    /// permanently unanswerable (`GitRepo::probe_range_conflict` bails to
+    /// `Unsupported` — merging an ancestor into its descendant is always
+    /// clean); this field is the second chance
+    /// [`crate::GitRepo::conflict_probe_with_live_base`] probes against.
+    ///
+    /// Additive optional field, same forward-compat precedent as `remote`
+    /// (no `v` bump): old files without it load as `None` ("no live base
+    /// known" — no indicator), and an OLD dv binary re-saving this review
+    /// silently drops it (unknown fields aren't round-tripped) — accepted:
+    /// the indicator merely degrades until the next PR open rewrites it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub live_base: Option<LiveBase>,
+}
+
+/// A resolvable handle to a PR review's real, current base branch — see
+/// [`Review::live_base`]. Refreshed every time the PR is opened (GUI
+/// `open_pr`/`load_pr`) or submitted (`writeback_submitted_review`), both
+/// of which just fetched the base.
+///
+/// **Staleness honesty**: the conflict indicator computed from this field
+/// reflects conflicts against the base *as last seen*, not necessarily as
+/// it stands on GitHub right now — `oid` freezes at the last open/submit,
+/// and `ref_name` only advances when something fetches the base branch. A
+/// moved base can therefore make the badge wrong in either direction
+/// (stale-clean or stale-conflict) until the next open/fetch refreshes it —
+/// the same trust level as the cached PR-status badges, which also reflect
+/// last-fetch state. `ref_name` is preferred over `oid` when both resolve
+/// because it self-updates on any fetch of the base branch.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LiveBase {
+    /// A locally resolvable rev naming the base branch — spelled
+    /// `refs/remotes/origin/<branch>` (unambiguous: can't be shadowed by a
+    /// tag or local branch of the same name). May not resolve locally (the
+    /// PR-open fetch only *opportunistically* updates the remote-tracking
+    /// ref — a narrowed fetch refspec skips it) — resolution is checked at
+    /// probe time, and a non-resolving ref is skipped, never an error.
+    #[serde(default, skip_serializing_if = "Option::is_none", rename = "ref")]
+    pub ref_name: Option<String>,
+    /// The base branch's tip oid captured at the last open/submit — the
+    /// durable fallback when `ref_name` doesn't resolve (the fetched object
+    /// itself is in the local odb regardless of what refs point at it).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub oid: Option<String>,
+}
+
+impl LiveBase {
+    /// Probe candidates in preference order: the self-updating branch ref
+    /// first, then the frozen captured oid. Callers skip candidates that
+    /// don't resolve locally.
+    pub fn candidates(&self) -> impl Iterator<Item = &str> {
+        self.ref_name
+            .as_deref()
+            .into_iter()
+            .chain(self.oid.as_deref())
+    }
 }
 
 /// Where a [`Review`] came from / is headed on GitHub: which PR it's
@@ -167,6 +227,7 @@ impl Review {
             updated_ms: now,
             comments: Vec::new(),
             remote: None,
+            live_base: None,
         }
     }
 
@@ -507,6 +568,97 @@ mod tests {
         let remote = round_tripped.remote.unwrap();
         assert_eq!(remote.submitted_review_id, None);
         assert_eq!(remote.submitted_url, None);
+    }
+
+    #[test]
+    fn old_review_json_without_live_base_field_still_loads() {
+        // A review file written before `live_base` existed (or re-saved by
+        // an old dv binary, which drops unknown fields) — absence must
+        // deserialize as "no live base known", and must not grow a
+        // `"live_base"` key on the way back out.
+        let old_json = r#"{
+            "v": 1,
+            "id": "r-1700000000000-abcd",
+            "source": {"Range": {"base": "aaaa", "head": "bbbb", "merge_base": false}},
+            "state": "draft",
+            "created_ms": 1700000000000,
+            "updated_ms": 1700000000000,
+            "comments": []
+        }"#;
+        let review: Review = serde_json::from_str(old_json).unwrap();
+        assert!(review.live_base.is_none());
+        let rewritten = serde_json::to_string(&review).unwrap();
+        assert!(!rewritten.contains("\"live_base\""));
+    }
+
+    #[test]
+    fn review_with_live_base_round_trips() {
+        let mut review = draft();
+        review.live_base = Some(LiveBase {
+            ref_name: Some("refs/remotes/origin/main".to_string()),
+            oid: Some("c0ffee0000000000000000000000000000000000".to_string()),
+        });
+        let json = serde_json::to_string_pretty(&review).unwrap();
+        // The ref field serializes under the schema key `"ref"`, not the
+        // Rust field name.
+        assert!(json.contains("\"ref\": \"refs/remotes/origin/main\""));
+        assert!(!json.contains("ref_name"));
+        let round_tripped: Review = serde_json::from_str(&json).unwrap();
+        let live = round_tripped
+            .live_base
+            .expect("live_base should round-trip");
+        assert_eq!(live.ref_name.as_deref(), Some("refs/remotes/origin/main"));
+        assert_eq!(
+            live.oid.as_deref(),
+            Some("c0ffee0000000000000000000000000000000000")
+        );
+    }
+
+    #[test]
+    fn live_base_partial_fields_parse_and_candidates_prefer_ref() {
+        // Both fields optional, ref preferred, oid the fallback.
+        let both = LiveBase {
+            ref_name: Some("refs/remotes/origin/main".to_string()),
+            oid: Some("abc123".to_string()),
+        };
+        assert_eq!(
+            both.candidates().collect::<Vec<_>>(),
+            vec!["refs/remotes/origin/main", "abc123"]
+        );
+
+        let oid_only: LiveBase = serde_json::from_str(r#"{"oid": "abc123"}"#).unwrap();
+        assert_eq!(oid_only.candidates().collect::<Vec<_>>(), vec!["abc123"]);
+
+        let empty: LiveBase = serde_json::from_str("{}").unwrap();
+        assert_eq!(empty.candidates().count(), 0);
+    }
+
+    #[test]
+    fn old_binary_resave_dropping_live_base_degrades_to_none() {
+        // Simulate the documented old-binary round trip: an old dv build
+        // deserializes into a struct without `live_base` (unknown field
+        // ignored — no `deny_unknown_fields` anywhere in this model) and
+        // re-saves without it. The re-saved file must still load fine here,
+        // with absence meaning "no live base known".
+        let mut review = draft();
+        review.live_base = Some(LiveBase {
+            ref_name: Some("refs/remotes/origin/main".to_string()),
+            oid: None,
+        });
+        let json = serde_json::to_string(&review).unwrap();
+
+        // "Old binary": strip the field the way serde-without-the-field
+        // does — parse to a generic value, drop the key, re-serialize.
+        let mut value: serde_json::Value = serde_json::from_str(&json).unwrap();
+        value
+            .as_object_mut()
+            .unwrap()
+            .remove("live_base")
+            .expect("live_base should have been serialized");
+        let resaved = serde_json::to_string(&value).unwrap();
+
+        let reloaded: Review = serde_json::from_str(&resaved).unwrap();
+        assert!(reloaded.live_base.is_none());
     }
 
     #[test]

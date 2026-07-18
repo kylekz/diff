@@ -659,8 +659,22 @@ pub(super) fn cmd_review_submit(
         submitted_review_id: Some(submitted.id),
         submitted_url: Some(submitted.html_url.clone()),
     };
+    // Fresh live-base handle for the sidebar's offline conflict probe
+    // (docs/backlog.md "Stored-but-never-reopened PR range reviews...") —
+    // `prepare_pr` above just fetched `meta.base_oid`, and this is the only
+    // write path a CLI-created, never-GUI-opened review ever crosses.
+    let live_base = dv_core::LiveBase {
+        ref_name: Some(format!("refs/remotes/origin/{}", meta.base_ref)),
+        oid: Some(meta.base_oid.clone()),
+    };
     let fresh = submit::writeback_submitted_review(
-        &store, &review.id, verdict, pr_number, remote, &submitted,
+        &store,
+        &review.id,
+        verdict,
+        pr_number,
+        remote,
+        Some(live_base),
+        &submitted,
     )
     .map_err(CliError::Op)?;
 

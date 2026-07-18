@@ -505,6 +505,46 @@ impl GitRepo {
         }
     }
 
+    /// [`Self::conflict_probe`], with a second chance for the one shape it
+    /// can never answer alone: a stored PR-shaped `DiffSource::Range` whose
+    /// `base` has been collapsed to the frozen merge-base sha (docs/
+    /// backlog.md "Stored-but-never-reopened PR range reviews show no
+    /// conflict indicator"; see [`Self::probe_range_conflict`]'s doc
+    /// comment for why that bails to `Unsupported`). When the plain probe
+    /// comes back `Unsupported` for a `Range` source, each `live_base`
+    /// candidate (a review's persisted [`crate::review::LiveBase`]
+    /// candidates, preferred-first — typically `refs/remotes/origin/<br>`
+    /// then a captured base oid) is tried through
+    /// [`Self::conflict_probe_live`] until one yields a determined answer.
+    /// A candidate that doesn't resolve locally just yields `Unsupported`
+    /// from `merge-tree`'s own "not something we can merge" path and is
+    /// skipped — never an error, never a guess.
+    ///
+    /// Staleness: a persisted live base reflects the base branch *as last
+    /// seen* (see `LiveBase`'s doc comment) — the answer can be wrong in
+    /// either direction once the real base moves, same trust level as the
+    /// cached PR-status badges; a PR reopen refreshes it.
+    pub fn conflict_probe_with_live_base<'a>(
+        &self,
+        source: &DiffSource,
+        live_base: impl IntoIterator<Item = &'a str>,
+    ) -> ConflictProbe {
+        let probe = self.conflict_probe(source);
+        if !matches!(probe, ConflictProbe::Unsupported) {
+            return probe;
+        }
+        let DiffSource::Range { head, .. } = source else {
+            return probe;
+        };
+        for base in live_base {
+            let live = self.conflict_probe_live(base, head);
+            if !matches!(live, ConflictProbe::Unsupported) {
+                return live;
+            }
+        }
+        ConflictProbe::Unsupported
+    }
+
     /// **Important caveat, safe by construction**: every persisted
     /// `DiffSource::Range { merge_base: true, .. }` (a PR-shaped, "GitHub
     /// Files changed"-style range — see `crates/app/src/workspace.rs`'s
@@ -527,7 +567,9 @@ impl GitRepo {
     /// `DiffSource::Range` alone. Callers holding that live ref (a PR's
     /// freshly fetched `base_oid`, or a not-yet-resolved `--range a...b`
     /// launch argument) use [`Self::conflict_probe_live`] directly instead,
-    /// skipping this guard entirely.
+    /// skipping this guard entirely — and callers holding a review's
+    /// *persisted* live base (`Review::live_base`) get the same second
+    /// chance through [`Self::conflict_probe_with_live_base`].
     fn probe_range_conflict(&self, base: &str, head: &str) -> ConflictProbe {
         match (self.resolve(base), self.merge_base(base, head)) {
             (Ok(base_oid), Ok(merge_base_oid)) if base_oid == merge_base_oid => {

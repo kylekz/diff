@@ -981,6 +981,11 @@ struct SubmitPrep {
     review_id: String,
     pr_number: u64,
     pr_url: String,
+    /// Fresh live-base handle captured from validation's `pr_meta` fetch,
+    /// written back alongside the Submitted state so the sidebar's offline
+    /// conflict probe (docs/backlog.md "Stored-but-never-reopened PR range
+    /// reviews...") reflects the base as of this submit.
+    live_base: dv_core::LiveBase,
     submission: dv_core::ReviewSubmission,
 }
 
@@ -1058,6 +1063,10 @@ fn submit_flow_from_validation(
                 review_id,
                 pr_number: meta.number,
                 pr_url: meta.url,
+                live_base: dv_core::LiveBase {
+                    ref_name: Some(format!("refs/remotes/origin/{}", meta.base_ref)),
+                    oid: Some(meta.base_oid),
+                },
                 submission,
             },
         },
@@ -2037,6 +2046,18 @@ fn load_pr(repo: &GitRepo, number: u64, location: RepoLocation) -> anyhow::Resul
 
     let store = dv_core::ReviewStore::open(location);
     let slug = client.slug().to_string();
+    // The live base handle persisted alongside the frozen merge-base
+    // `source` above (docs/backlog.md "Stored-but-never-reopened PR range
+    // reviews show no conflict indicator"): the branch ref is the
+    // self-updating preferred handle, the just-fetched `base_oid` the
+    // durable fallback (`prepare_pr` guaranteed the object is local even
+    // if no local ref survives to name it). Refreshed on every PR open —
+    // adopted or fresh — so `hydrate_location`'s offline probe answers
+    // from the base as last seen here.
+    let live_base = dv_core::LiveBase {
+        ref_name: Some(format!("refs/remotes/origin/{}", meta.base_ref)),
+        oid: Some(meta.base_oid.clone()),
+    };
     // The whole find-or-create span runs under the store lock
     // (docs/backlog.md durable-concurrency item) — real mutual exclusion,
     // not just the re-list-before-creating belt-and-suspenders check below
@@ -2052,7 +2073,18 @@ fn load_pr(repo: &GitRepo, number: u64, location: RepoLocation) -> anyhow::Resul
             .into_iter()
             .find(|r| review_adopts_pr(r, &slug, number));
         let review = match existing {
-            Some(review) => review,
+            Some(mut review) => {
+                // Refresh the adopted draft's live base while the lock is
+                // already held — the base branch (or its tip) may have
+                // moved since the review was last opened, and this is the
+                // one moment holding the fresh fetch. Save only on actual
+                // change so a plain reopen doesn't churn the store watcher.
+                if review.live_base.as_ref() != Some(&live_base) {
+                    review.live_base = Some(live_base.clone());
+                    store.save(&review)?;
+                }
+                review
+            }
             None => {
                 // Re-list immediately before creating: closes the TOCTOU window
                 // against a concurrent creator (another `dv` process, or a CLI
@@ -2067,7 +2099,16 @@ fn load_pr(repo: &GitRepo, number: u64, location: RepoLocation) -> anyhow::Resul
                     .into_iter()
                     .find(|r| review_adopts_pr(r, &slug, number));
                 match recheck {
-                    Some(review) => review,
+                    Some(mut review) => {
+                        // Same live-base refresh as the adoption arm above
+                        // — this concurrent-creator race arm is just as
+                        // much an "open with a fresh fetch in hand" moment.
+                        if review.live_base.as_ref() != Some(&live_base) {
+                            review.live_base = Some(live_base.clone());
+                            store.save(&review)?;
+                        }
+                        review
+                    }
                     None => {
                         // A fresh draft, linked to the PR from the first click —
                         // so comments accumulate against it immediately,
@@ -2082,6 +2123,7 @@ fn load_pr(repo: &GitRepo, number: u64, location: RepoLocation) -> anyhow::Resul
                             submitted_review_id: None,
                             submitted_url: None,
                         });
+                        review.live_base = Some(live_base.clone());
                         store.save(&review)?;
                         review
                     }
@@ -2673,13 +2715,28 @@ impl Workspace {
     /// "Merge-conflict indicator..."), for `shell.rs`'s `ReviewChanged`
     /// subscription to fold into the sidebar's cached `IndexEntry` — the
     /// same "active workspace patches the index" shape `pr_status` already
-    /// uses (`AppShell::install_active`'s closure). This is how a PR
-    /// review's conflict badge ever reaches the sidebar card at all: the
-    /// headless `hydrate_location` pass can only ever answer `Unsupported`
-    /// for one (see `GitRepo::probe_range_conflict`'s doc comment) — only
-    /// the live workspace, holding the PR's freshly fetched base oid, can.
+    /// uses (`AppShell::install_active`'s closure). For an OPEN PR this is
+    /// the authoritative answer (probed against the PR's freshly fetched
+    /// base oid in `load_pr`); a stored, not-currently-open PR review's
+    /// badge comes from `hydrate_location`'s persisted-live-base probe
+    /// instead (`Review::live_base`, docs/backlog.md "Stored-but-never-
+    /// reopened PR range reviews...") — which is why the shell must only
+    /// stamp this value onto a review whose own source this workspace is
+    /// actually showing (see [`Self::source`]).
     pub(crate) fn conflict(&self) -> Option<&dv_core::ConflictInfo> {
         self.conflict.as_ref()
+    }
+
+    /// The diff source this workspace is currently showing — used by
+    /// `shell.rs`'s conflict stamping to tell whether [`Self::conflict`]
+    /// describes the adopted review's own diff at all: a plain
+    /// working-tree launch adopts the repo's latest draft *whatever its
+    /// source* (`pick_review`), and stamping the working tree's (usually
+    /// clean) `ls-files -u` probe onto a range review's card would erase
+    /// the hydration pass's real live-base finding with a clean answer
+    /// about a different diff entirely.
+    pub(crate) fn source(&self) -> &DiffSource {
+        &self.source
     }
 
     /// This workspace's repo location — normalized to the store's true
@@ -6116,6 +6173,7 @@ impl Workspace {
                         verdict,
                         prep.pr_number,
                         remote,
+                        Some(prep.live_base.clone()),
                         &submitted,
                     )?;
                     Ok((fresh, submitted.html_url))
@@ -13373,6 +13431,7 @@ mod tests {
             updated_ms: 0,
             comments: Vec::new(),
             remote,
+            live_base: None,
         }
     }
 
@@ -13879,6 +13938,15 @@ mod tests {
                 assert_eq!(prep.review_id, "r-1");
                 assert_eq!(prep.pr_number, 7);
                 assert_eq!(prep.pr_url, "https://github.com/o/r/pull/7");
+                // The live-base handle for the post-submit writeback (docs/
+                // backlog.md "Stored-but-never-reopened PR range
+                // reviews..."): the unambiguous remote-tracking spelling of
+                // `meta.base_ref`, plus the fetched base tip as fallback.
+                assert_eq!(
+                    prep.live_base.ref_name.as_deref(),
+                    Some("refs/remotes/origin/main")
+                );
+                assert_eq!(prep.live_base.oid.as_deref(), Some("a".repeat(40).as_str()));
             }
             _ => panic!("expected Confirming, got a different SubmitFlow variant"),
         }
@@ -13938,6 +14006,7 @@ mod tests {
             updated_ms: 0,
             comments: Vec::new(),
             remote: None,
+            live_base: None,
         };
         let result: Result<(Review, String), String> = Ok((
             review,
@@ -13998,6 +14067,10 @@ mod tests {
                 review_id: "r-1".to_string(),
                 pr_number: 1,
                 pr_url: "https://example.invalid/pull/1".to_string(),
+                live_base: dv_core::LiveBase {
+                    ref_name: Some("refs/remotes/origin/main".to_string()),
+                    oid: None,
+                },
                 submission: dummy_submission(dv_core::Verdict::Comment),
             },
         });

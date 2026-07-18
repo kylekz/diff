@@ -465,28 +465,36 @@ pub fn hydrate_location(location: &RepoLocation) -> HydrateOutcome {
                         let mut entry = IndexEntry::from_review(location, r);
                         entry.diffstat =
                             repo.as_ref().and_then(|repo| repo.diffstat(&r.source).ok());
-                        // Cheap (one `merge-tree`/`ls-files` subprocess) —
-                        // computed unconditionally alongside the numstat
-                        // rather than gated behind its own opt-in. `None`
+                        // Cheap (one or two `merge-tree`/`ls-files`
+                        // subprocesses) — computed unconditionally
+                        // alongside the numstat rather than gated behind
+                        // its own opt-in. `None`
                         // (`ConflictProbe::Unsupported` — no repo handle,
-                        // an old git, a transient WSL hiccup, OR (the
-                        // common case for a PR-linked review) `r.source`'s
-                        // `base` already collapsed to a frozen merge-base
-                        // sha — see `GitRepo::probe_range_conflict`'s doc
+                        // an old git, a transient WSL hiccup, or a
+                        // PR-shaped review persisted before `live_base`
+                        // existed, whose frozen merge-base `base` the
+                        // guarded probe correctly refuses to answer from —
+                        // see `GitRepo::probe_range_conflict`'s doc
                         // comment) leaves the card with no indicator.
-                        // KNOWN LIMITATION: this means the sidebar can
-                        // only ever show the conflict badge for a
-                        // PR-linked review while its workspace is actually
-                        // open — `Workspace::open_pr` probes against the
-                        // PR's live `base_oid` instead of `r.source`, which
-                        // this cheap headless pass has no way to fetch
-                        // without a `gh` network call. `apply_hydration`'s
-                        // carry-forward (mirroring `diffstat`'s) keeps
-                        // whatever a previous pass found instead of
-                        // blanking it.
-                        entry.conflict = repo
-                            .as_ref()
-                            .and_then(|repo| repo.conflict_probe(&r.source).info().cloned());
+                        // A PR-linked review's persisted `live_base`
+                        // (written by `load_pr`/submit writeback, docs/
+                        // backlog.md "Stored-but-never-reopened PR range
+                        // reviews...") gives the probe a second chance
+                        // here, entirely offline — so the badge shows for
+                        // stored PR reviews without reopening them,
+                        // reflecting the base as last fetched (the same
+                        // trust level as the cached PR-status badges).
+                        // `apply_hydration`'s carry-forward (mirroring
+                        // `diffstat`'s) keeps whatever a previous pass
+                        // found instead of blanking it.
+                        entry.conflict = repo.as_ref().and_then(|repo| {
+                            repo.conflict_probe_with_live_base(
+                                &r.source,
+                                r.live_base.iter().flat_map(|lb| lb.candidates()),
+                            )
+                            .info()
+                            .cloned()
+                        });
                         entry
                     })
                     .collect(),

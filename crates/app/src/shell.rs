@@ -1788,11 +1788,24 @@ impl AppShell {
                 let entry = {
                     let ws = ws.read(cx);
                     // Docs/backlog.md "Merge-conflict indicator...": the
-                    // only way a PR review's conflict badge reaches the
-                    // sidebar at all — see `Workspace::conflict`'s doc
-                    // comment.
-                    let conflict = ws.conflict().cloned();
+                    // live workspace's probe is authoritative for the diff
+                    // it's SHOWING — but the adopted review isn't always
+                    // that diff (a plain launch adopts the repo's latest
+                    // draft whatever its source — `pick_review`), and a
+                    // working-tree probe stamped onto a range review's
+                    // card would erase `hydrate_location`'s persisted-
+                    // live-base finding (docs/backlog.md "Stored-but-
+                    // never-reopened PR range reviews...") with a clean
+                    // answer about a different diff. Stamp only when the
+                    // sources agree; `None` lets `upsert`'s carry-forward
+                    // keep whatever hydration last found (see
+                    // `Workspace::source`'s doc comment).
+                    let source_conflict = ws.conflict().cloned();
+                    let ws_source = ws.source().clone();
                     ws.review().map(|review| {
+                        let conflict = (review.source == ws_source)
+                            .then_some(source_conflict)
+                            .flatten();
                         // Only a PR-linked review carries a `pr_status` at
                         // all (review finding P2-3) — `this.badges` is
                         // keyed by *location*, not review, and tracks
@@ -2024,9 +2037,15 @@ impl AppShell {
             let ws = ws.read(cx);
             // Same reasoning as `Self::install_active`'s active closure —
             // a parked workspace's live conflict probe is just as much a
-            // real answer as an active one's.
-            let conflict = ws.conflict().cloned();
+            // real answer as an active one's, and the same source-match
+            // guard applies (don't stamp a probe about a different diff
+            // over hydration's persisted-live-base finding).
+            let source_conflict = ws.conflict().cloned();
+            let ws_source = ws.source().clone();
             ws.review().map(|review| {
+                let conflict = (review.source == ws_source)
+                    .then_some(source_conflict)
+                    .flatten();
                 // Same pr_status carry-forward as `Self::install_active`'s
                 // active closure — see its doc comment for why this can't
                 // just adopt `this.badges[location].pr` unconditionally.

@@ -17,8 +17,9 @@ use std::collections::{BTreeMap, HashMap};
 use dv_core::diff::diff_blobs;
 use dv_core::{
     BlobSpec, ChangeStatus, ChangedFile, Comment, CommentStatus, DiffOptions, DiffSource,
-    DraftComment, GhSide, GitRepo, GithubClient, Hunk, PrMeta, PrState, RemoteRef, Review,
-    ReviewEvent, ReviewState, ReviewStore, ReviewSubmission, Side, SubmittedReview, Verdict,
+    DraftComment, GhSide, GitRepo, GithubClient, Hunk, LiveBase, PrMeta, PrState, RemoteRef,
+    Review, ReviewEvent, ReviewState, ReviewStore, ReviewSubmission, Side, SubmittedReview,
+    Verdict,
 };
 
 /// One comment that can't safely reach GitHub as submitted — produced by
@@ -505,6 +506,7 @@ pub fn writeback_submitted_review(
     verdict: Verdict,
     pr_number: u64,
     remote: RemoteRef,
+    live_base: Option<LiveBase>,
     submitted: &SubmittedReview,
 ) -> Result<Review, String> {
     store
@@ -517,6 +519,16 @@ pub fn writeback_submitted_review(
                 at_ms: dv_core::review::now_ms(),
             });
             fresh.remote = Some(remote);
+            if let Some(live_base) = live_base {
+                // Both submit paths just fetched the PR's base
+                // (`prepare_pr` during validation), so this is a fresh
+                // handle for the sidebar's offline conflict probe (docs/
+                // backlog.md "Stored-but-never-reopened PR range
+                // reviews...") — and the one chance a CLI-created,
+                // never-GUI-opened review gets one at all. `None` leaves
+                // whatever `load_pr` last wrote.
+                fresh.live_base = Some(live_base);
+            }
             store.save(&fresh)?;
             Ok(fresh)
         })
@@ -968,6 +980,7 @@ mod tests {
             updated_ms: 0,
             comments: Vec::new(),
             remote: None,
+            live_base: None,
         }
     }
 

@@ -783,6 +783,73 @@ fn t23_conflict_probe_range_with_base_resolved_to_merge_base_is_unsupported_not_
 }
 
 #[test]
+fn t24_conflict_probe_with_live_base_answers_for_frozen_merge_base_ranges() {
+    // docs/backlog.md "Stored-but-never-reopened PR range reviews show no
+    // conflict indicator": t23 proves the guarded probe correctly refuses a
+    // frozen merge-base range; this proves the persisted-live-base second
+    // chance (`Review::live_base` → `conflict_probe_with_live_base`) turns
+    // that refusal into a real answer, entirely offline.
+    let repo = TestRepo::new("t24");
+    repo.write("f.txt", b"line1\nline2\nline3\n");
+    repo.commit("base");
+    repo.git(&["checkout", "-b", "branch-a"]);
+    repo.write("f.txt", b"line1\nCHANGED-A\nline3\n");
+    repo.commit("a");
+    repo.git(&["checkout", "main"]);
+    repo.git(&["checkout", "-b", "branch-b"]);
+    repo.write("f.txt", b"line1\nCHANGED-B\nline3\n");
+    repo.commit("b");
+
+    let git_repo = open(&repo);
+    let merge_base = git_repo.merge_base("branch-a", "branch-b").unwrap();
+    let head = git_repo.resolve("branch-b").unwrap();
+    let base_oid = git_repo.resolve("branch-a").unwrap();
+    // The on-disk shape of a stored PR review's source: frozen merge-base
+    // sha, already resolved.
+    let resolved = DiffSource::Range {
+        base: merge_base,
+        head,
+        merge_base: false,
+    };
+
+    // No live base → same Unsupported as the plain probe (pre-live_base
+    // review files, or an old binary having dropped the field).
+    assert_eq!(
+        git_repo.conflict_probe_with_live_base(&resolved, []),
+        ConflictProbe::Unsupported
+    );
+
+    // A resolvable live base ref finds the real conflict.
+    let probe = git_repo.conflict_probe_with_live_base(&resolved, ["branch-a"]);
+    assert_eq!(
+        probe,
+        ConflictProbe::Determined(ConflictInfo {
+            files: vec!["f.txt".to_string()]
+        })
+    );
+
+    // A non-resolving preferred candidate is skipped (never an error),
+    // falling through to the captured-oid fallback — the exact
+    // `LiveBase::candidates()` order (`refs/remotes/origin/<br>` may not
+    // exist locally; the fetched oid still does).
+    let probe = git_repo
+        .conflict_probe_with_live_base(&resolved, ["refs/remotes/origin/nope", base_oid.as_str()]);
+    assert!(probe.is_conflicted());
+
+    // Nothing resolvable at all → Unsupported, no indicator, no error.
+    assert_eq!(
+        git_repo.conflict_probe_with_live_base(&resolved, ["refs/remotes/origin/nope"]),
+        ConflictProbe::Unsupported
+    );
+
+    // A non-Range source ignores live-base candidates entirely.
+    assert_eq!(
+        git_repo.conflict_probe_with_live_base(&DiffSource::WorkingTree, ["branch-a"]),
+        ConflictProbe::Determined(ConflictInfo::default())
+    );
+}
+
+#[test]
 fn t22_conflict_probe_commit_source_is_always_clean() {
     let repo = TestRepo::new("t22");
     repo.write("f.txt", b"hello\n");

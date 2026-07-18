@@ -28,9 +28,8 @@ jobs:
       - uses: actions/checkout@v4
       - run: cargo fmt --all --check
 
-  # NOTE (Phase 8 S8h, docs/phase-8-lsp-and-polish.md § Release pipeline):
-  # this is intentionally the release+automation BENCHMARK build the doc
-  # asks CI to keep — default cargo features, so the `automation` feature
+  # NOTE (Phase 8 S8h): this is intentionally the release+automation
+  # BENCHMARK build — default cargo features, so the `automation` feature
   # (S8a) stays compiled IN. It is NOT the distributed build: the tagged
   # release pipeline (.github/workflows/release.yml, triggers only on `v*`
   # tags) builds the actual shipped binaries with `--no-default-features`
@@ -69,7 +68,7 @@ jobs:
           if-no-files-found: error
 
   # Builds the Linux `dv-host` sidecar dv.exe/dv looks for next to itself
-  # (docs/phase-5-implementation-plan.md §5, §8 S3). musl (not the native
+  # (Phase 5, Phase 8 S3). musl (not the native
   # ubuntu-latest gnu target) for a static binary with no glibc-version
   # floor — closes the "other distros" risk without a matrix of them. Tests
   # still run against the native gnu target: real inotify coverage is S4's
@@ -95,8 +94,8 @@ jobs:
           path: target/x86_64-unknown-linux-musl/release/dv-host
           if-no-files-found: error
 
-  # Builds the native Linux `dv` CLI sidecar (docs/phase-8-lsp-and-polish.md
-  # § Distribution & first-run, Phase 8 S8b/S8c): on first use per WSL
+  # Builds the native Linux `dv` CLI sidecar (Phase 8 S8b/S8c): on first
+  # use per WSL
   # distro, dv installs this musl binary WSL-side as `~/.local/bin/dv`,
   # version-synced by content hash exactly like `dv-host` above. Same musl
   # rationale as `host-linux` (static, no glibc-version floor). The
@@ -106,8 +105,7 @@ jobs:
   # is named `dv-cli-linux-x64` but the FILE inside is `dv-cli` — the
   # release bundle step must rename it to `dv-linux-x64` (the name
   # `install.rs`'s `CLI_SPEC`/`sidecar_path()` actually looks for next to
-  # the app binary), mirroring the exact host-linux naming trap called out
-  # in docs/backlog.md.
+  # the app binary), mirroring the exact host-linux naming trap.
   cli-linux:
     runs-on: ubuntu-latest
     steps:

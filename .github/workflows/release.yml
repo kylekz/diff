@@ -1,7 +1,7 @@
 name: Release
 
-# Tag-triggered release pipeline (docs/phase-8-lsp-and-polish.md § Release
-# pipeline, Phase 8 S8h). Builds the DISTRIBUTED dv (windows-latest +
+# Tag-triggered release pipeline (Phase 8 S8h). Builds the DISTRIBUTED dv
+# (windows-latest +
 # macos-latest, `--no-default-features` — depends on S8a's cargo feature
 # gate, so `--automation` is compiled out of everything this workflow
 # ships), bundles both Linux sidecars (dv-host-linux-x64 + dv-linux-x64,
@@ -14,10 +14,10 @@ name: Release
 # ONLY fires on a `v*` tag push — never on an ordinary branch push or PR —
 # so it adds no minutes to everyday CI (see ci.yml's `build`/`host-linux`/
 # `cli-linux` jobs for the always-on builds, including the release+
-# automation benchmark build the doc asks CI to keep).
+# automation benchmark build).
 #
-# NOTE the artifact-name-vs-file-name trap (docs/backlog.md; called out
-# again in ci.yml's `cli-linux` job comment): `host-linux`/`cli-linux`
+# NOTE the artifact-name-vs-file-name trap (called out again in ci.yml's
+# `cli-linux` job comment): `host-linux`/`cli-linux`
 # below upload artifacts named `dv-host-linux-x64`/`dv-cli-linux-x64`, but
 # the FILES inside are `dv-host`/`dv-cli`. The `bundle` job below renames
 # them on download to `dv-host-linux-x64`/`dv-linux-x64` — the exact names

@@ -40,29 +40,44 @@ pub struct NodeVtsls {
     pub vtsls_version: Option<String>,
 }
 
-/// Every way [`detect_node_vtsls`] can fail to produce a [`NodeVtsls`].
+/// Every way [`detect_node_vtsls`] (WSL) or
+/// [`super::local_node::detect_node_vtsls_local`] (local/Windows) can fail
+/// to produce a [`NodeVtsls`].
 #[derive(Debug)]
 pub enum DetectError {
-    /// Reserved for a future non-WSL (local/Windows-native) node detection
-    /// path. Every caller today passes a WSL distro, so this is never
-    /// constructed yet — kept so [`super::check_node_vtsls`]'s match arms
-    /// don't need reshaping when that lands.
+    /// Reserved: would mean "a WSL-only detection path was invoked against
+    /// a non-WSL location". Never actually constructed — `consistency_check`
+    /// (the one caller of the WSL [`detect_node_vtsls`]) only ever checks
+    /// WSL distros (docs/backlog.md "Local/Windows LSP spawn path": the
+    /// onboarding/consent spine stays WSL-only even now that a local
+    /// detection path exists), and the local path
+    /// ([`super::local_node::detect_node_vtsls_local`]) is a wholly separate
+    /// function with its own `LocalNodeNotFound`/`Bounded` below, not a
+    /// caller of this one. Kept so [`super::check_node_vtsls`]'s match arms
+    /// don't need reshaping if that ever changes.
     NotWsl,
-    /// The bounded WSL round trip itself failed: a spawn failure, it hit
-    /// [`NODE_DETECT_TIMEOUT`], or the detect script's own `$HOME`-empty
-    /// guard tripped (see [`detect_script_via_tool_versions`]'s doc) — a
+    /// The bounded round trip itself failed: a spawn failure, it hit
+    /// [`NODE_DETECT_TIMEOUT`] (WSL) or the local detector's own PATH-search
+    /// timeout, or (WSL only) the detect script's own `$HOME`-empty guard
+    /// tripped (see [`detect_script_via_tool_versions`]'s doc) — a
     /// transient/environmental problem, not a verdict on whether node/vtsls
-    /// are installed. Kept distinct from [`DetectError::NoNodeFound`] so
-    /// [`super::check_node_vtsls`] maps this to
-    /// [`super::ComponentState::Failed`] (retryable) rather than
-    /// [`super::ComponentState::Missing`] (which would misleadingly tell the
-    /// user to go install node when the real problem was e.g. a wedged
-    /// distro or an unresolved `$HOME`).
+    /// are installed. Kept distinct from [`DetectError::NoNodeFound`]/
+    /// [`DetectError::LocalNodeNotFound`] so [`super::check_node_vtsls`]
+    /// maps this to [`super::ComponentState::Failed`] (retryable) rather
+    /// than [`super::ComponentState::Missing`] (which would misleadingly
+    /// tell the user to go install node when the real problem was e.g. a
+    /// wedged distro or an unresolved `$HOME`).
     Bounded(anyhow::Error),
     /// The round trip completed successfully (exit 0) but the script found
     /// no node at all via asdf's `~/.tool-versions` — a genuine "not
     /// installed" state, distinct from [`DetectError::Bounded`] above.
     NoNodeFound { distro: String },
+    /// [`super::local_node::detect_node_vtsls_local`]'s counterpart to
+    /// [`DetectError::NoNodeFound`]: no `node` executable anywhere on this
+    /// process's `PATH` — a genuine "not installed" state on the local
+    /// (non-WSL) side, which has no asdf/`~/.tool-versions` concept to
+    /// report instead.
+    LocalNodeNotFound,
 }
 
 impl std::fmt::Display for DetectError {
@@ -73,6 +88,7 @@ impl std::fmt::Display for DetectError {
             DetectError::NoNodeFound { distro } => {
                 write!(f, "no node found via asdf inside {distro}")
             }
+            DetectError::LocalNodeNotFound => write!(f, "no node found on PATH"),
         }
     }
 }

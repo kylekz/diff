@@ -663,6 +663,25 @@ fn decode_utf16le(bytes: &[u8]) -> String {
     String::from_utf16_lossy(&units)
 }
 
+/// Windows npm installs (a global `npm install -g`, or a local `--prefix`
+/// one) put a `.cmd`/`.bat` **shim** on disk for a package's bin entry
+/// (`vtsls.cmd`, `npm.cmd` itself) rather than a real PE executable —
+/// `CreateProcess` can't run one of these directly ("%1 is not a valid
+/// Win32 application"), it must go through a command interpreter. `true`
+/// only when `cfg!(windows)` AND `path`'s extension is `cmd`/`bat`
+/// (case-insensitive): a `.js` bin (the resolved real entry point), a
+/// `.exe` (`node.exe` itself), or an extensionless path (every WSL/asdf
+/// binary this crate ever spawns, which are never Windows shims) all read
+/// as `false`. Used by [`crate::provision::local_node`]'s node/vtsls
+/// detection probes and [`crate::lsp::client::LspHandle::spawn`]'s local
+/// (non-WSL) vtsls spawn to decide whether a `cmd /C` wrapper is needed.
+pub(crate) fn is_windows_shell_shim(path: &str) -> bool {
+    cfg!(windows)
+        && std::path::Path::new(path)
+            .extension()
+            .is_some_and(|ext| ext.eq_ignore_ascii_case("cmd") || ext.eq_ignore_ascii_case("bat"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -899,5 +918,30 @@ mod tests {
             elapsed < Duration::from_secs(1),
             "expected an early return near the 200ms timeout, took {elapsed:?}"
         );
+    }
+
+    // --- is_windows_shell_shim: the local-vtsls/npm `.cmd` shim detector --
+
+    #[test]
+    fn is_windows_shell_shim_flags_cmd_and_bat_case_insensitively_on_windows() {
+        if cfg!(windows) {
+            assert!(is_windows_shell_shim(r"C:\npm\vtsls.cmd"));
+            assert!(is_windows_shell_shim(r"C:\npm\vtsls.CMD"));
+            assert!(is_windows_shell_shim(r"C:\npm\npm.bat"));
+        } else {
+            // Never a shim off Windows — nothing here needs `cmd /C`.
+            assert!(!is_windows_shell_shim(r"C:\npm\vtsls.cmd"));
+        }
+    }
+
+    #[test]
+    fn is_windows_shell_shim_is_false_for_a_real_binary_or_js_entry() {
+        assert!(!is_windows_shell_shim(r"C:\node\node.exe"));
+        assert!(!is_windows_shell_shim(
+            r"C:\npm\node_modules\@vtsls\language-server\bin\vtsls.js"
+        ));
+        assert!(!is_windows_shell_shim(
+            "/home/kyle/.asdf/installs/nodejs/22.22.0/bin/vtsls"
+        ));
     }
 }

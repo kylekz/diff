@@ -42,8 +42,11 @@
 //! [`crate::remote::install::ensure_installed`]/
 //! [`crate::remote::install::ensure_cli_installed`].
 
+mod local_node;
 mod node;
 
+pub(crate) use local_node::vtsls_invocation;
+pub use local_node::{DV_VTSLS_PATH_ENV, detect_node_vtsls_local};
 pub use node::{DetectError, NodeVtsls, detect_node_vtsls, install_vtsls};
 
 use crate::github;
@@ -312,6 +315,17 @@ fn check_node_vtsls(distro: &str) -> ComponentState {
         },
         Err(DetectError::NoNodeFound { distro }) => ComponentState::Missing {
             guidance: format!("node not found via asdf (~/.tool-versions) inside {distro}"),
+        },
+        // Structurally unreachable: `detect_node_vtsls` (the WSL detector
+        // this fn calls) never constructs this variant — it's
+        // `detect_node_vtsls_local`'s own error, and this fn is never
+        // called with a local location (`consistency_check` only ever
+        // loops over WSL distros — see this module's doc comment). Kept as
+        // a real, never-fail-hard arm rather than an `unreachable!()`
+        // anyway: matching the enum exhaustively must not become a panic
+        // risk just because one caller happens not to hit this path today.
+        Err(DetectError::LocalNodeNotFound) => ComponentState::Failed {
+            error: format!("unexpected local-only detection error for WSL distro {distro}"),
         },
         Err(DetectError::Bounded(err)) => ComponentState::Failed {
             error: format!("node/vtsls detection failed inside {distro}: {err:#}"),

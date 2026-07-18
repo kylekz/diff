@@ -141,7 +141,17 @@ impl LspHandle {
         };
 
         let builder = CommandBuilder::new_spawn_only(location.clone());
-        let mut cmd = builder.command(&node.node_path, &[vtsls_path, "--stdio"]);
+        // For WSL this is always `(node.node_path, [vtsls_path, "--stdio"])`
+        // — vtsls_path is an asdf symlink, never a Windows shim, so
+        // `vtsls_invocation` always takes its direct-via-node branch there.
+        // For a `Local` repo, `vtsls_path` may instead be a `.cmd`/`.bat`
+        // npm shim (a plain PATH search's common case) — see
+        // `vtsls_invocation`'s doc comment for why that can't spawn
+        // directly and needs `cmd /C` instead.
+        let (program, args) =
+            crate::provision::vtsls_invocation(&node.node_path, vtsls_path, &["--stdio"]);
+        let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
+        let mut cmd = builder.command(&program, &arg_refs);
         cmd.stdin(Stdio::piped());
         cmd.stdout(Stdio::piped());
         cmd.stderr(Stdio::piped());

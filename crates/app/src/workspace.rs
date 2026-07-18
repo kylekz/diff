@@ -7140,17 +7140,19 @@ impl Workspace {
 
     /// Shared preamble for both go-to-definition (`Self::on_symbol_click`)
     /// and find-references (`Self::on_find_references`) — the honest-view/
-    /// WSL/selected-file/TS-file gates, the click-time position/uri/
-    /// range_head computation, the `lsp_request_epoch` bump, and the
-    /// stale-session cleanup every LSP gesture needs before it can even
-    /// consider dispatching to vtsls. Every early-out here sets
-    /// `self.lsp_status` to a short, human-readable reason rather than
-    /// silently doing nothing (docs/phase-8-lsp-and-polish.md § LSP:
-    /// "surface a gentle warning ... don't fail") — find-references is
-    /// gated IDENTICALLY to go-to-def (docs/backlog.md find-references
-    /// task: "same honest-view + WSL-repos-only gating as go-to-def").
-    /// `new_line`/`byte_col` mirror `Self::hit_test_byte_column`'s output;
-    /// `line_text` is the row's raw text (for the UTF-16 column conversion).
+    /// selected-file/TS-file gates, the click-time position/uri/range_head
+    /// computation, the `lsp_request_epoch` bump, and the stale-session
+    /// cleanup every LSP gesture needs before it can even consider
+    /// dispatching to vtsls. Every early-out here sets `self.lsp_status` to
+    /// a short, human-readable reason rather than silently doing nothing
+    /// (docs/phase-8-lsp-and-polish.md § LSP: "surface a gentle warning ...
+    /// don't fail") — find-references is gated IDENTICALLY to go-to-def
+    /// (docs/backlog.md find-references task: "same honest-view + WSL-
+    /// repos-only gating as go-to-def" — since generalized to WSL AND local
+    /// repos alike, docs/backlog.md "Local/Windows LSP spawn path"; both
+    /// kinds share this one preamble). `new_line`/`byte_col` mirror
+    /// `Self::hit_test_byte_column`'s output; `line_text` is the row's raw
+    /// text (for the UTF-16 column conversion).
     fn prepare_symbol_click(
         &mut self,
         new_line: u32,
@@ -7164,17 +7166,6 @@ impl Workspace {
             cx.notify();
             return None;
         }
-        let RepoLocation::Wsl {
-            path: root_path, ..
-        } = &self.location
-        else {
-            self.lsp_status = Some(
-                "code intelligence: WSL repos only (docs/phase-8-lsp-and-polish.md § LSP)".into(),
-            );
-            cx.notify();
-            return None;
-        };
-        let root_path = root_path.clone();
         let rel_path = self.selected_file_path()?;
         let Some(language_id) = dv_core::lsp::language_id_for_path(&rel_path) else {
             self.lsp_status = Some("code intelligence: not a TypeScript/JavaScript file".into());
@@ -7188,8 +7179,19 @@ impl Workspace {
             line: new_line.saturating_sub(1),
             character,
         };
-        let root_trimmed = root_path.trim_end_matches('/');
-        let uri = dv_core::lsp::file_uri(&format!("{root_trimmed}/{rel_path}"));
+        // Both `RepoLocation` kinds are eligible now (docs/backlog.md
+        // "Local/Windows LSP spawn path") — `file_uri_for_rel_path`
+        // dispatches on which one `self.location` actually is. `None` here
+        // means a `Local` root that isn't a well-formed absolute
+        // drive-letter path (see its doc comment) — a structural
+        // impossibility for a repo dv could ever have opened, but
+        // never-fail-hard means degrading with a banner rather than
+        // unwrapping.
+        let Some(uri) = dv_core::lsp::file_uri_for_rel_path(&self.location, &rel_path) else {
+            self.lsp_status = Some("code intelligence: unable to resolve this repo's root".into());
+            cx.notify();
+            return None;
+        };
         // `Self::lsp_view_is_honest` only compares the WHOLE view's oid
         // against the worktree HEAD; for a `Range` view that still leaves a
         // per-file gap — the displayed bytes are `head`'s committed blob,
@@ -7226,10 +7228,10 @@ impl Workspace {
 
         // An earlier attempt found vtsls missing, or the spawn/handshake
         // itself failed. Every path that can land here already cleared the
-        // WSL/TS/honest-view gates above (unlike, say, a local/Windows repo,
-        // which bails out long before ever consulting `lsp_session`), so
-        // nothing captured in this state is a permanent, structural block —
-        // it can change. The common trigger is a ctrl-click landing mid-
+        // TS/honest-view gates above (a non-TS file, or a dishonest view,
+        // bails out long before ever consulting `lsp_session`), so nothing
+        // captured in this state is a permanent, structural block — it can
+        // change. On WSL the common trigger is a ctrl-click landing mid-
         // install (S8e's up-to-180s consent-triggered `npm install -g`,
         // before the reverify flips the onboarding row to `Ok`): without
         // this reset, every later gesture kept reading the same stale
@@ -7267,12 +7269,15 @@ impl Workspace {
     /// whatever's CURRENTLY stashed" posture `lsp_pending_definition`'s doc
     /// comment describes, now shared across both request kinds.
     fn ensure_lsp_session(&mut self, cx: &mut Context<Self>) {
-        let RepoLocation::Wsl { distro, path } = self.location.clone() else {
-            // Every caller already gated on `self.location` being Wsl (via
-            // `Self::prepare_symbol_click`) before stashing a pending
-            // request — reaching here otherwise would be a caller bug, not
-            // a runtime condition worth a status banner. Never-fail-hard:
-            // bail rather than panic.
+        // `RepoLocation::Wsl` and `RepoLocation::Local` are both eligible
+        // now (docs/backlog.md "Local/Windows LSP spawn path") —
+        // `root_uri_for_location` dispatches on which one `self.location`
+        // actually is. Every caller already gated on `Self::
+        // prepare_symbol_click` succeeding (which uses the same helper)
+        // before stashing a pending request, so a `None` here would be a
+        // caller bug, not a runtime condition worth a status banner —
+        // never-fail-hard: bail rather than panic.
+        let Some(root_uri) = dv_core::lsp::root_uri_for_location(&self.location) else {
             return;
         };
         self.lsp_session = crate::lsp::LspSessionState::Spawning;
@@ -7280,13 +7285,23 @@ impl Workspace {
         cx.notify();
         self.lsp_spawn_generation += 1;
         let spawn_gen = self.lsp_spawn_generation;
-        let root_trimmed = path.trim_end_matches('/').to_string();
-        let root_uri = dv_core::lsp::file_uri(&root_trimmed);
         let location = self.location.clone();
         cx.spawn(async move |this, cx| {
             let spawned = cx
                 .background_spawn(async move {
-                    match dv_core::provision::detect_node_vtsls(&distro, None) {
+                    // WSL detection is asdf-aware (needs a distro name);
+                    // local detection is PATH-only (no asdf convention on
+                    // Windows) — see `dv_core::provision::local_node`'s
+                    // module doc. Both funnel into the same `NodeVtsls`/
+                    // `DetectError` types, so everything after this match
+                    // is location-agnostic.
+                    let detected = match &location {
+                        RepoLocation::Wsl { distro, .. } => {
+                            dv_core::provision::detect_node_vtsls(distro, None)
+                        }
+                        RepoLocation::Local(_) => dv_core::provision::detect_node_vtsls_local(),
+                    };
+                    match detected {
                         Ok(nv) if nv.vtsls_path.is_some() => {
                             dv_core::lsp::LspHandle::spawn(&location, &nv, &root_uri).map(
                                 |handle| {
@@ -7304,9 +7319,20 @@ impl Workspace {
                                 },
                             )
                         }
-                        Ok(_) => Err(dv_core::lsp::LspError::Unavailable(
-                            "node found but vtsls is not installed for this distro".to_string(),
-                        )),
+                        // Local repos get NO consent-install affordance —
+                        // deliberately, unlike WSL's `NeedsConsent` flow
+                        // (docs/backlog.md: dv never runs `npm install -g`
+                        // against the user's own global npm on its own).
+                        // The hint text is the whole degrade: an
+                        // actionable command to run themselves.
+                        Ok(_) => Err(dv_core::lsp::LspError::Unavailable(match &location {
+                            RepoLocation::Wsl { .. } => {
+                                "node found but vtsls is not installed for this distro".to_string()
+                            }
+                            RepoLocation::Local(_) => {
+                                "vtsls not found — npm i -g @vtsls/language-server".to_string()
+                            }
+                        })),
                         Err(err) => Err(dv_core::lsp::LspError::Unavailable(format!(
                             "node/vtsls detection failed: {err:#}"
                         ))),
@@ -7763,12 +7789,6 @@ impl Workspace {
         if !self.lsp_view_is_honest() {
             return;
         }
-        let RepoLocation::Wsl {
-            path: root_path, ..
-        } = self.location.clone()
-        else {
-            return;
-        };
         let Some(rel_path) = self.selected_file_path() else {
             return;
         };
@@ -7789,8 +7809,11 @@ impl Workspace {
             line: new_line.saturating_sub(1),
             character,
         };
-        let uri =
-            dv_core::lsp::file_uri(&format!("{}/{}", root_path.trim_end_matches('/'), rel_path));
+        // Both `RepoLocation` kinds — see `Self::prepare_symbol_click`'s
+        // comment on the same helper.
+        let Some(uri) = dv_core::lsp::file_uri_for_rel_path(&self.location, &rel_path) else {
+            return;
+        };
         // Same per-file re-check `Self::run_definition_request` performs
         // (P3 finding: hover captured no `range_head` at all and skipped
         // this entirely) — `Self::lsp_view_is_honest`'s whole-view gate
@@ -8195,26 +8218,23 @@ impl Workspace {
                     // `Self::open_target_at` declines for a single target)
                     // is simply dropped rather than failing the whole
                     // search over one bad location.
-                    let RepoLocation::Wsl {
-                        path: root_path, ..
-                    } = &location
-                    else {
-                        return Ok(Vec::new());
-                    };
-                    let root_prefix = format!("{}/", root_path.trim_end_matches('/'));
                     let hits: Vec<crate::lsp::ReferenceHit> = locations
                         .iter()
                         .map(crate::lsp::ReferenceHit::from_location)
                         .collect();
                     let mut groups = Vec::new();
                     for (file_uri, file_hits) in crate::lsp::group_references(hits) {
-                        let Some(posix_path) = dv_core::lsp::path_from_file_uri(&file_uri) else {
+                        // Both `RepoLocation` kinds — see
+                        // `Self::prepare_symbol_click`'s comment on the
+                        // same dispatching helper. A hit that can't be
+                        // resolved into this repo (a bundled library file,
+                        // same case `Self::open_target_at` declines for a
+                        // single target) is simply dropped.
+                        let Some(file_rel_path) =
+                            dv_core::lsp::rel_path_from_uri(&location, &file_uri)
+                        else {
                             continue;
                         };
-                        let Some(file_rel_path) = posix_path.strip_prefix(&root_prefix) else {
-                            continue;
-                        };
-                        let file_rel_path = file_rel_path.to_string();
                         let lines: Vec<String> = repo
                             .blob_bytes(&BlobSpec::Working {
                                 path: file_rel_path.clone(),
@@ -8326,8 +8346,8 @@ impl Workspace {
     /// a fresh jump's `Push`, or the `Back`/`Forward` step a `NavBack`/
     /// `NavForward` action already peeked at — and is only actually applied
     /// in the success arm below, once the viewer has really updated. Every
-    /// early-out above that (an unrecognized URI, a non-WSL location, a
-    /// target outside the repo) and the async failure arms (`Ok(None)`/
+    /// early-out above that (an unrecognized URI, a target outside the
+    /// repo) and the async failure arms (`Ok(None)`/
     /// `Err`) simply drop it, leaving `nav_stack` exactly as it was (P3
     /// finding: applying the mutation at the call site desynced history
     /// from a target read that then failed).
@@ -8346,22 +8366,17 @@ impl Workspace {
         epoch: u64,
         cx: &mut Context<Self>,
     ) {
-        let Some(posix_path) = dv_core::lsp::path_from_file_uri(&target.uri) else {
-            self.lsp_status = Some("go-to-definition: unrecognized target URI".into());
-            cx.notify();
-            return;
-        };
-        let RepoLocation::Wsl {
-            path: root_path, ..
-        } = &self.location
-        else {
-            return;
-        };
-        let root_prefix = format!("{}/", root_path.trim_end_matches('/'));
-        let Some(rel_path) = posix_path.strip_prefix(&root_prefix) else {
+        // Both `RepoLocation` kinds — see `Self::prepare_symbol_click`'s
+        // comment on the same dispatching helper. `None` covers both an
+        // unrecognized/malformed target URI and a target outside this
+        // repo's root (a bundled library file, e.g.) — those used to be
+        // distinguishable status messages, but `rel_path_from_uri` folds
+        // them into one "can't resolve" outcome for either location kind,
+        // so the message below now covers both cases generically.
+        let Some(rel_path) = dv_core::lsp::rel_path_from_uri(&self.location, &target.uri) else {
             self.lsp_status = Some(
-                "go-to-definition: target is outside this repo (e.g. a bundled library file) \
-                 — not shown"
+                "go-to-definition: target is outside this repo (e.g. a bundled library file), \
+                 or its URI couldn't be resolved — not shown"
                     .into(),
             );
             cx.notify();
@@ -8370,7 +8385,6 @@ impl Workspace {
         let Some(repo) = self.repo.clone() else {
             return;
         };
-        let rel_path = rel_path.to_string();
         let highlight_line = target.line;
 
         // Decremented at the top of the completion closure below,
@@ -8474,17 +8488,7 @@ impl Workspace {
     /// exists once a jump has actually opened the viewer.
     fn current_nav_location(&self) -> Option<crate::lsp::Location> {
         let viewer = self.target_viewer.as_ref()?;
-        let RepoLocation::Wsl {
-            path: root_path, ..
-        } = &self.location
-        else {
-            return None;
-        };
-        let uri = dv_core::lsp::file_uri(&format!(
-            "{}/{}",
-            root_path.trim_end_matches('/'),
-            viewer.path
-        ));
+        let uri = dv_core::lsp::file_uri_for_rel_path(&self.location, &viewer.path)?;
         Some(crate::lsp::Location {
             uri,
             line: viewer.highlight_line,
@@ -8624,18 +8628,11 @@ impl Workspace {
         let Some(item) = group.items.get(item_ix) else {
             return;
         };
-        let RepoLocation::Wsl {
-            path: root_path, ..
-        } = &self.location
-        else {
+        let Some(uri) = dv_core::lsp::file_uri_for_rel_path(&self.location, &group.path) else {
             return;
         };
         let target = crate::lsp::Location {
-            uri: dv_core::lsp::file_uri(&format!(
-                "{}/{}",
-                root_path.trim_end_matches('/'),
-                group.path
-            )),
+            uri,
             line: item.line,
             character: item.start_char,
         };

@@ -13,7 +13,7 @@ use std::io::{self, BufRead, BufReader, BufWriter, Read, Write};
 use std::process::{Child, ChildStderr, ChildStdin, ChildStdout, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::sync::mpsc::{self, RecvTimeoutError, SyncSender};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
 use anyhow::anyhow;
@@ -52,6 +52,23 @@ const SHUTDOWN_REQUEST_TIMEOUT: Duration = Duration::from_millis(500);
 /// best-effort shutdown handshake) before reaching for `kill` — mirrors
 /// `HostClient`'s `SHUTDOWN_GRACE`.
 const SHUTDOWN_GRACE: Duration = Duration::from_millis(1000);
+/// How long a gated request waits for the FIRST `$/progress` begin to show
+/// up before concluding no semantic-readiness signal is coming at all (an
+/// older vtsls, a server that skips progress) and proceeding ungated — see
+/// [`SemanticReadiness`]. Observed live: vtsls's first begin lands ~0.4s
+/// after the first `didOpen`, so 2s is a generous ceiling; a session that
+/// never signals pays this at most ONCE (the no-signal verdict latches).
+const SEMANTIC_BEGIN_WAIT: Duration = Duration::from_secs(2);
+/// Hard cap on how long a single gated request waits for the project load
+/// to FINISH once a begin has been seen — after this, proceed anyway
+/// (degrading to the pre-gate behavior: a possibly-syntax-server answer,
+/// still covered by the app's empty-result warm-up retries) rather than
+/// bricking code intelligence on a signal that never completes. Observed
+/// live: the scratch fixture's load finishes ~1.1s after begin; a real
+/// monorepo takes longer, and a request that starts waiting mid-load only
+/// waits for the REMAINDER (the deadline is per-call, completion is
+/// latched).
+const SEMANTIC_END_WAIT: Duration = Duration::from_secs(10);
 
 /// Every way an [`LspHandle`] operation can fail. Every variant maps to a
 /// UI-visible degrade (docs/phase-8-lsp-and-polish.md § LSP: "surface a
@@ -84,6 +101,164 @@ impl std::error::Error for LspError {}
 type Pending = Arc<Mutex<HashMap<i64, SyncSender<Result<Value, String>>>>>;
 type SharedStdin = Arc<Mutex<Option<BufWriter<ChildStdin>>>>;
 
+/// How a [`SemanticReadiness::wait_ready`] gate resolved — carried back so
+/// callers (and the `DV_LSP_TRACE` log) can tell the healthy path apart
+/// from the two degrade paths. Every variant means "go ahead and send the
+/// request now"; none is an error.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SemanticWaitOutcome {
+    /// The project-load progress cycle completed — the semantic tsserver
+    /// has the project and answers are trustworthy.
+    Ready,
+    /// No `$/progress` begin ever arrived within [`SEMANTIC_BEGIN_WAIT`]
+    /// (or the connection died) — no signal to gate on; behave exactly as
+    /// before this gate existed. Latched: later requests skip the wait.
+    NoSignal,
+    /// A begin was seen but the load didn't finish within
+    /// [`SEMANTIC_END_WAIT`] — proceed anyway (never brick code
+    /// intelligence on a wedged load); NOT latched, so a later request
+    /// re-waits for the remainder of a genuinely long project load.
+    TimedOut,
+}
+
+/// The syntax-vs-semantic warm-up gate (docs/backlog.md "vtsls
+/// syntax-vs-semantic server race at session-Ready"). vtsls forks TWO
+/// tsserver instances: a `<syntax>` one that's up almost instantly and a
+/// `<semantic>` one that takes seconds to load the project — and right
+/// after a session first reports ready, the syntax server can answer a
+/// definition/references/hover request with a fast, NON-empty, WRONG
+/// result (same-file-only definition, partial references) that the
+/// empty-result warm-up retries never re-ask.
+///
+/// **The wire signal** (observed live via `DV_LSP_TRACE` against the real
+/// Ubuntu vtsls, 2026-07-18): once the client advertises the
+/// `window.workDoneProgress` capability (see `LspHandle::initialize` — vtsls
+/// stays silent without it), the first `textDocument/didOpen` is followed
+/// ~0.4s later by `window/workDoneProgress/create` + `$/progress` begin
+/// pairs ("Analyzing 'index.ts' and its dependencies", "Initializing
+/// 'tsconfig.json'" — tsserver's `projectLoadingStart` surfaced), and all
+/// of them `end` together when the semantic server finishes loading
+/// (`projectLoadingFinish`; ~1.3s after spawn on the scratch fixture).
+/// Matching is structural — begin/end counting across ALL progress tokens,
+/// no title strings — and completion latches on the first "at least one
+/// begin seen, all begun tokens ended" instant.
+///
+/// **Why this gates per-REQUEST, not session-ready itself:** tsserver has
+/// no project until a file is opened, so the signal only starts after the
+/// first `didOpen` — holding the session's `Ready` at spawn time would
+/// wait on a signal that can never arrive. Instead
+/// `LspHandle::definition`/`hover`/`references` each call
+/// [`Self::wait_ready`] (bounded, on their own background threads) before
+/// sending — requests issued during the load "queue" by blocking, exactly
+/// the SemanticPending phase the backlog entry asks for, without any new
+/// app-side session state.
+struct SemanticReadiness {
+    state: Mutex<SemanticState>,
+    condvar: Condvar,
+}
+
+#[derive(Default)]
+struct SemanticState {
+    /// At least one `$/progress` begin has arrived.
+    seen_begin: bool,
+    /// Begun-but-not-ended progress tokens.
+    active: u32,
+    /// The latch: a full begin(s)→end(s) cycle completed. Never unset —
+    /// later didChange-triggered re-analysis cycles don't re-gate a warm
+    /// session (the app's empty-result retries cover those).
+    completed: bool,
+    /// [`SemanticWaitOutcome::NoSignal`] latch — the one full
+    /// [`SEMANTIC_BEGIN_WAIT`] penalty is paid at most once per session.
+    no_signal: bool,
+    /// The reader thread died (EOF/error) — no more signals can ever
+    /// arrive; waiters bail immediately instead of sleeping out their
+    /// timeouts against a dead child.
+    dead: bool,
+}
+
+impl SemanticReadiness {
+    fn new() -> Self {
+        SemanticReadiness {
+            state: Mutex::new(SemanticState::default()),
+            condvar: Condvar::new(),
+        }
+    }
+
+    /// Feed one `$/progress` `value.kind` observed by the reader thread.
+    /// `"report"` (and anything unrecognized) is ignored; an `end` with no
+    /// matching begin is dropped (saturating) rather than corrupting the
+    /// count.
+    fn on_progress(&self, kind: &str) {
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        match kind {
+            "begin" => {
+                state.seen_begin = true;
+                state.active += 1;
+            }
+            "end" => {
+                state.active = state.active.saturating_sub(1);
+                if state.seen_begin && state.active == 0 {
+                    state.completed = true;
+                }
+            }
+            _ => return,
+        }
+        self.condvar.notify_all();
+    }
+
+    /// The reader thread is gone — wake and release every waiter.
+    fn mark_dead(&self) {
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        state.dead = true;
+        self.condvar.notify_all();
+    }
+
+    /// Block until the project-load cycle completes ([`SemanticWaitOutcome::Ready`]),
+    /// or degrade: no begin within `begin_wait` → `NoSignal` (latched), or
+    /// begin seen but no completion within `end_wait` → `TimedOut`. Both
+    /// timeouts are per-call; completion is latched, so a warm session
+    /// returns `Ready` immediately.
+    fn wait_ready(&self, begin_wait: Duration, end_wait: Duration) -> SemanticWaitOutcome {
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+
+        // Phase 1: wait for the first begin (or the no-signal verdict).
+        let begin_deadline = Instant::now() + begin_wait;
+        while !state.completed && !state.seen_begin {
+            if state.no_signal || state.dead {
+                return SemanticWaitOutcome::NoSignal;
+            }
+            let now = Instant::now();
+            if now >= begin_deadline {
+                state.no_signal = true;
+                return SemanticWaitOutcome::NoSignal;
+            }
+            let (next, _) = self
+                .condvar
+                .wait_timeout(state, begin_deadline - now)
+                .unwrap_or_else(|e| e.into_inner());
+            state = next;
+        }
+
+        // Phase 2: a load is (or was) in flight — wait for it to finish.
+        let end_deadline = Instant::now() + end_wait;
+        while !state.completed {
+            if state.dead {
+                return SemanticWaitOutcome::NoSignal;
+            }
+            let now = Instant::now();
+            if now >= end_deadline {
+                return SemanticWaitOutcome::TimedOut;
+            }
+            let (next, _) = self
+                .condvar
+                .wait_timeout(state, end_deadline - now)
+                .unwrap_or_else(|e| e.into_inner());
+            state = next;
+        }
+        SemanticWaitOutcome::Ready
+    }
+}
+
 /// A live `vtsls --stdio` connection. Every method takes `&self` and is
 /// safe to call concurrently — mirrors [`crate::remote::client::HostClient`]'s
 /// same contract, for the same reason (dv's callers are gpui background
@@ -108,6 +283,10 @@ pub struct LspClient {
     /// whole file and bump the version even when nothing had changed,
     /// forcing vtsls to re-analyze an unchanged document on every hover).
     open_docs: Mutex<HashMap<String, (i32, u64)>>,
+    /// The syntax-vs-semantic warm-up gate — fed `$/progress` begin/end by
+    /// the reader thread, consulted (bounded) by every
+    /// definition/hover/references request. See [`SemanticReadiness`].
+    semantic: Arc<SemanticReadiness>,
 }
 
 /// Cheap-to-clone handle onto a [`LspClient`] — the only long-lived clone
@@ -176,12 +355,14 @@ impl LspHandle {
         let pending: Pending = Arc::new(Mutex::new(HashMap::new()));
         let alive = Arc::new(AtomicBool::new(true));
         let stdin: SharedStdin = Arc::new(Mutex::new(Some(BufWriter::new(stdin))));
+        let semantic = Arc::new(SemanticReadiness::new());
 
         spawn_reader_thread(
             BufReader::new(stdout),
             Arc::clone(&pending),
             Arc::clone(&alive),
             Arc::clone(&stdin),
+            Arc::clone(&semantic),
         );
 
         let handle = LspHandle(Arc::new(LspClient {
@@ -191,6 +372,7 @@ impl LspHandle {
             pending,
             alive,
             open_docs: Mutex::new(HashMap::new()),
+            semantic,
         }));
         handle.initialize(root_uri)?;
         Ok(handle)
@@ -211,6 +393,16 @@ impl LspHandle {
             "rootUri": root_uri,
             "workspaceFolders": [{ "uri": root_uri, "name": folder_name }],
             "capabilities": {
+                "window": {
+                    // Advertised so vtsls actually CREATES work-done
+                    // progress tokens (`window/workDoneProgress/create` +
+                    // `$/progress`) — without this capability it stays
+                    // silent about tsserver's project load, and the
+                    // semantic-readiness gate below has no signal to watch
+                    // (verified on the wire via `DV_LSP_TRACE`; see
+                    // `SemanticReadiness`).
+                    "workDoneProgress": true,
+                },
                 "workspace": {
                     "workspaceFolders": true,
                     "configuration": true,
@@ -320,15 +512,40 @@ impl LspHandle {
         Ok(())
     }
 
+    /// Block (bounded — see [`SEMANTIC_BEGIN_WAIT`]/[`SEMANTIC_END_WAIT`])
+    /// until vtsls's SEMANTIC tsserver has finished its first project load,
+    /// or a degrade verdict is reached — the syntax-vs-semantic warm-up
+    /// gate every definition/hover/references request runs through
+    /// automatically (see [`SemanticReadiness`]'s doc for the wire signal
+    /// and why this is per-request rather than part of session readiness).
+    /// Public so live tests can observe the gate's outcome and timing
+    /// directly; app callers never need to call it themselves.
+    pub fn wait_semantic_ready(&self) -> SemanticWaitOutcome {
+        let started = Instant::now();
+        let outcome = self
+            .0
+            .semantic
+            .wait_ready(SEMANTIC_BEGIN_WAIT, SEMANTIC_END_WAIT);
+        trace_note(&format!(
+            "semantic gate: {outcome:?} after {:.3}s",
+            started.elapsed().as_secs_f64()
+        ));
+        outcome
+    }
+
     /// `textDocument/definition`, normalized to `Vec<LocationLink>`
     /// regardless of which of the three wire shapes (`null` /
     /// `Location`/`Location[]` / `LocationLink[]`) vtsls actually answers
-    /// with — see [`normalize_definition_result`].
+    /// with — see [`normalize_definition_result`]. Gated on
+    /// [`Self::wait_semantic_ready`] so a request racing vtsls's first
+    /// project load waits for the semantic tsserver instead of accepting
+    /// the syntax server's fast-but-wrong answer.
     pub fn definition(
         &self,
         uri: &str,
         pos: lsp_types::Position,
     ) -> Result<Vec<lsp_types::LocationLink>, LspError> {
+        self.wait_semantic_ready();
         let value = self.0.request(
             "textDocument/definition",
             json!({
@@ -346,12 +563,14 @@ impl LspHandle {
     /// as `Hover` at all — never-fail-hard, same posture as
     /// [`normalize_definition_result`] (a malformed answer reads as "no
     /// hover", not an error the caller has to handle separately from the
-    /// ordinary empty case).
+    /// ordinary empty case). Same semantic warm-up gate as
+    /// [`Self::definition`].
     pub fn hover(
         &self,
         uri: &str,
         pos: lsp_types::Position,
     ) -> Result<Option<lsp_types::Hover>, LspError> {
+        self.wait_semantic_ready();
         let value = self.0.request(
             "textDocument/hover",
             json!({
@@ -367,12 +586,14 @@ impl LspHandle {
     /// `includeDeclaration: true` — the declaration site is itself a
     /// reference worth showing in a results list. Normalized the same
     /// never-a-panic way as [`normalize_definition_result`]: a malformed or
-    /// `null` result reads as "no references", never an error.
+    /// `null` result reads as "no references", never an error. Same
+    /// semantic warm-up gate as [`Self::definition`].
     pub fn references(
         &self,
         uri: &str,
         pos: lsp_types::Position,
     ) -> Result<Vec<lsp_types::Location>, LspError> {
+        self.wait_semantic_ready();
         let value = self.0.request(
             "textDocument/references",
             json!({
@@ -502,6 +723,7 @@ impl LspClient {
     }
 
     fn write_message(&self, value: &Value) -> anyhow::Result<()> {
+        trace_outgoing(value);
         let mut guard = self.stdin.lock().unwrap_or_else(|e| e.into_inner());
         let writer = guard
             .as_mut()
@@ -768,11 +990,16 @@ fn read_framed(reader: &mut BufReader<ChildStdout>) -> io::Result<Option<Value>>
 struct ReaderDeathGuard {
     pending: Pending,
     alive: Arc<AtomicBool>,
+    semantic: Arc<SemanticReadiness>,
 }
 
 impl Drop for ReaderDeathGuard {
     fn drop(&mut self) {
         self.alive.store(false, Ordering::SeqCst);
+        // Wake any request blocked in the semantic warm-up gate — no more
+        // `$/progress` can ever arrive, so sleeping out the full timeout
+        // against a dead child would only delay its "connection lost" error.
+        self.semantic.mark_dead();
         let lost: Vec<_> = self
             .pending
             .lock()
@@ -796,6 +1023,7 @@ fn spawn_reader_thread(
     pending: Pending,
     alive: Arc<AtomicBool>,
     stdin: SharedStdin,
+    semantic: Arc<SemanticReadiness>,
 ) {
     std::thread::Builder::new()
         .name("dv-lsp-reader".into())
@@ -803,15 +1031,76 @@ fn spawn_reader_thread(
             let _death_guard = ReaderDeathGuard {
                 pending: Arc::clone(&pending),
                 alive: Arc::clone(&alive),
+                semantic: Arc::clone(&semantic),
             };
             while let Ok(Some(value)) = read_framed(&mut reader) {
-                dispatch_message(value, &pending, &stdin);
+                dispatch_message(value, &pending, &stdin, &semantic);
             }
         })
         .expect("failed to spawn dv-lsp reader thread");
 }
 
-fn dispatch_message(value: Value, pending: &Pending, stdin: &SharedStdin) {
+/// Env-gated (`DV_LSP_TRACE=1`) stderr trace of every incoming message the
+/// reader thread sees, timestamped relative to the first traced message —
+/// the honest way to find out what vtsls actually puts on the wire (this is
+/// how the syntax-vs-semantic readiness signal below was discovered and
+/// verified live; see [`SemanticReadiness`]). Zero cost when the env var is
+/// unset beyond one lazy check.
+fn trace_incoming(value: &Value) {
+    trace_message("RECV", value);
+}
+
+/// The outgoing twin of [`trace_incoming`] — same `DV_LSP_TRACE` gate, same
+/// clock, so a trace interleaves client-sent requests/notifications with
+/// server messages in true wire order.
+fn trace_outgoing(value: &Value) {
+    trace_message("SEND", value);
+}
+
+/// Free-text sibling of [`trace_message`] on the same gate and clock — used
+/// for client-side events that aren't wire messages (the semantic gate's
+/// outcome and timing).
+fn trace_note(text: &str) {
+    if let Some(elapsed) = trace_clock() {
+        eprintln!("[lsp {:8.3}s NOTE] {text}", elapsed.as_secs_f64());
+    }
+}
+
+fn trace_message(direction: &str, value: &Value) {
+    let Some(elapsed) = trace_clock() else {
+        return;
+    };
+    let mut rendered = value.to_string();
+    if rendered.len() > 400 {
+        rendered.truncate(400);
+        rendered.push('…');
+    }
+    eprintln!(
+        "[lsp {:8.3}s {direction}] {rendered}",
+        elapsed.as_secs_f64()
+    );
+}
+
+/// `None` when `DV_LSP_TRACE` is unset; otherwise the elapsed time since
+/// the first traced event (a process-wide clock, so all sessions in one
+/// process interleave coherently).
+fn trace_clock() -> Option<Duration> {
+    use std::sync::OnceLock;
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    static START: OnceLock<Instant> = OnceLock::new();
+    if !*ENABLED.get_or_init(|| std::env::var_os("DV_LSP_TRACE").is_some()) {
+        return None;
+    }
+    Some(START.get_or_init(Instant::now).elapsed())
+}
+
+fn dispatch_message(
+    value: Value,
+    pending: &Pending,
+    stdin: &SharedStdin,
+    semantic: &SemanticReadiness,
+) {
+    trace_incoming(&value);
     let id = value.get("id").cloned();
     let has_method = value.get("method").is_some();
 
@@ -866,8 +1155,18 @@ fn dispatch_message(value: Value, pending: &Pending, stdin: &SharedStdin) {
             }
         }
         (None, _) => {
-            // A notification (diagnostics, log messages, progress, …) —
-            // read and discarded; go-to-definition needs none of them.
+            // A notification. `$/progress` begin/end feeds the semantic
+            // warm-up gate (see `SemanticReadiness`); everything else
+            // (diagnostics, log messages, …) is read and discarded.
+            if value.get("method").and_then(|m| m.as_str()) == Some("$/progress")
+                && let Some(kind) = value
+                    .get("params")
+                    .and_then(|p| p.get("value"))
+                    .and_then(|v| v.get("kind"))
+                    .and_then(|k| k.as_str())
+            {
+                semantic.on_progress(kind);
+            }
         }
     }
 }
@@ -895,6 +1194,157 @@ fn spawn_stderr_drain(stderr: ChildStderr) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // --- SemanticReadiness: the syntax-vs-semantic warm-up gate -----------
+    // (headless — begin/end fed directly, no live vtsls; timeouts kept
+    // tiny-but-not-flaky: the asserts are on OUTCOMES, not elapsed time,
+    // except where the latch's whole point is "returns well before the
+    // full wait")
+
+    #[test]
+    fn semantic_gate_completes_when_all_begun_progress_ends() {
+        let gate = SemanticReadiness::new();
+        gate.on_progress("begin");
+        gate.on_progress("begin");
+        gate.on_progress("end");
+        // One token still active — a bounded wait times out, not Ready.
+        assert_eq!(
+            gate.wait_ready(Duration::from_millis(10), Duration::from_millis(30)),
+            SemanticWaitOutcome::TimedOut
+        );
+        gate.on_progress("end");
+        // All ended — completion latched; an instant Ready from here on.
+        assert_eq!(
+            gate.wait_ready(Duration::from_millis(10), Duration::from_millis(10)),
+            SemanticWaitOutcome::Ready
+        );
+    }
+
+    #[test]
+    fn semantic_gate_no_begin_times_out_as_no_signal_and_latches() {
+        let gate = SemanticReadiness::new();
+        assert_eq!(
+            gate.wait_ready(Duration::from_millis(30), Duration::from_millis(30)),
+            SemanticWaitOutcome::NoSignal
+        );
+        // Latched: a second wait with a LONG begin window must return
+        // immediately rather than paying the wait again (the at-most-once
+        // penalty contract) — well under the 5s it would otherwise block.
+        let started = Instant::now();
+        assert_eq!(
+            gate.wait_ready(Duration::from_secs(5), Duration::from_secs(5)),
+            SemanticWaitOutcome::NoSignal
+        );
+        assert!(started.elapsed() < Duration::from_secs(1));
+    }
+
+    #[test]
+    fn semantic_gate_begin_without_end_times_out_but_does_not_latch() {
+        // The hard-timeout fallback: a load that never finishes must not
+        // brick code intelligence — the wait resolves TimedOut (proceed
+        // anyway) after the bounded end wait.
+        let gate = SemanticReadiness::new();
+        gate.on_progress("begin");
+        assert_eq!(
+            gate.wait_ready(Duration::from_millis(10), Duration::from_millis(30)),
+            SemanticWaitOutcome::TimedOut
+        );
+        // NOT latched: once the load does finish, the next wait is Ready.
+        gate.on_progress("end");
+        assert_eq!(
+            gate.wait_ready(Duration::from_millis(10), Duration::from_millis(10)),
+            SemanticWaitOutcome::Ready
+        );
+    }
+
+    #[test]
+    fn semantic_gate_end_without_begin_never_completes_or_underflows() {
+        let gate = SemanticReadiness::new();
+        gate.on_progress("end");
+        gate.on_progress("end");
+        assert_eq!(
+            gate.wait_ready(Duration::from_millis(20), Duration::from_millis(20)),
+            SemanticWaitOutcome::NoSignal
+        );
+        // A real begin/end cycle afterwards still completes normally — the
+        // stray ends didn't corrupt the count.
+        gate.on_progress("begin");
+        gate.on_progress("end");
+        assert_eq!(
+            gate.wait_ready(Duration::from_millis(10), Duration::from_millis(10)),
+            SemanticWaitOutcome::Ready
+        );
+    }
+
+    #[test]
+    fn semantic_gate_report_and_unknown_kinds_are_ignored() {
+        let gate = SemanticReadiness::new();
+        gate.on_progress("begin");
+        gate.on_progress("report");
+        gate.on_progress("something-new");
+        gate.on_progress("end");
+        assert_eq!(
+            gate.wait_ready(Duration::from_millis(10), Duration::from_millis(10)),
+            SemanticWaitOutcome::Ready
+        );
+    }
+
+    #[test]
+    fn semantic_gate_wakes_a_waiter_when_the_cycle_completes() {
+        // The queuing path: a request blocked in the gate mid-load is
+        // released the moment the load finishes, not at its timeout.
+        let gate = Arc::new(SemanticReadiness::new());
+        let signaller = Arc::clone(&gate);
+        let feeder = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(20));
+            signaller.on_progress("begin");
+            std::thread::sleep(Duration::from_millis(20));
+            signaller.on_progress("end");
+        });
+        let outcome = gate.wait_ready(Duration::from_secs(5), Duration::from_secs(5));
+        feeder.join().unwrap();
+        assert_eq!(outcome, SemanticWaitOutcome::Ready);
+    }
+
+    #[test]
+    fn semantic_gate_death_releases_waiters_immediately() {
+        let gate = Arc::new(SemanticReadiness::new());
+        let killer = Arc::clone(&gate);
+        let thread = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(20));
+            killer.mark_dead();
+        });
+        // Both phases: a phase-1 waiter (no begin yet) ...
+        let started = Instant::now();
+        assert_eq!(
+            gate.wait_ready(Duration::from_secs(5), Duration::from_secs(5)),
+            SemanticWaitOutcome::NoSignal
+        );
+        assert!(started.elapsed() < Duration::from_secs(1));
+        thread.join().unwrap();
+        // ... and a phase-2 waiter (begin seen, dead before end).
+        let gate = SemanticReadiness::new();
+        gate.on_progress("begin");
+        gate.mark_dead();
+        assert_eq!(
+            gate.wait_ready(Duration::from_secs(5), Duration::from_secs(5)),
+            SemanticWaitOutcome::NoSignal
+        );
+    }
+
+    #[test]
+    fn semantic_gate_completion_latch_survives_later_begin_cycles() {
+        // A didChange-triggered re-analysis after warm-up must not re-gate
+        // a warm session (see `SemanticState::completed`'s doc).
+        let gate = SemanticReadiness::new();
+        gate.on_progress("begin");
+        gate.on_progress("end");
+        gate.on_progress("begin"); // a later re-analysis starts...
+        assert_eq!(
+            gate.wait_ready(Duration::from_millis(10), Duration::from_millis(10)),
+            SemanticWaitOutcome::Ready
+        );
+    }
 
     // --- normalize_definition_result: the three wire shapes --------------
 

@@ -29,23 +29,27 @@
 //! **Scope.** This is a MINIMAL client: server-to-client requests
 //! (`client/registerCapability`, `window/workDoneProgress/create`, …) are
 //! answered with a bare `null` result just to keep the protocol moving —
-//! not actually implemented — and notifications (diagnostics, log
-//! messages, progress) are read and silently discarded. The one exception
-//! is `workspace/configuration`, which the spec requires an ARRAY reply
+//! not actually implemented — and most notifications (diagnostics, log
+//! messages) are read and silently discarded. Two exceptions:
+//! `workspace/configuration`, which the spec requires an ARRAY reply
 //! for (one entry per `params.items`) — vtsls issues it during
 //! `initialize`, and a bare `null` there is a protocol violation that can
 //! corrupt its settings handling (P2 finding: `dispatch_message` special-
 //! cases it, replying with an array of nulls sized to `params.items`
-//! instead). Go-to-definition landed in S8f; S8g adds hover and
-//! find-references ([`client::LspHandle::hover`]/
+//! instead) — and `$/progress` begin/end, which feeds the
+//! syntax-vs-semantic warm-up gate every definition/hover/references
+//! request runs through (see `client::SemanticReadiness`'s doc for the
+//! observed wire signal; docs/backlog.md "vtsls syntax-vs-semantic server
+//! race at session-Ready"). Go-to-definition landed in S8f; S8g adds hover
+//! and find-references ([`client::LspHandle::hover`]/
 //! [`client::LspHandle::references`]) reusing this exact same transport —
 //! no second `vtsls` spawn, no new client type.
 
 pub mod client;
 
 pub use client::{
-    LspClient, LspError, LspHandle, definition_covers_position, hover_contents_to_text,
-    node_modules_present,
+    LspClient, LspError, LspHandle, SemanticWaitOutcome, definition_covers_position,
+    hover_contents_to_text, node_modules_present,
 };
 
 use crate::location::RepoLocation;

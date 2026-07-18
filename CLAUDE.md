@@ -35,8 +35,7 @@ gpui — expect many minutes. Incremental builds are fast.
    interfaces so a client/server split can land without a rewrite.
 3. **GitHub goes through the `gh` CLI** (auth/SSO/enterprise for free, no token
    storage). Installed on this machine (2.96); if `gh auth status` fails, ask
-   the user to run `gh auth login`. Use `gh run list/view/watch` for CI —
-   the repo is private, so unauthenticated API polling does not work.
+   the user to run `gh auth login`. Use `gh run list/view/watch` for CI.
 
 ## GPUI / dependency policy
 

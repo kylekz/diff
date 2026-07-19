@@ -87,9 +87,9 @@ impl ComponentId {
     pub fn title(self) -> &'static str {
         match self {
             ComponentId::GhCli => "GitHub CLI (gh)",
-            ComponentId::DvOnPath => "Terminal command (dv on PATH)",
+            ComponentId::DvOnPath => "Windows CLI (dv on PATH)",
             ComponentId::DvHost => "WSL host (dv-host)",
-            ComponentId::DvCli => "Native CLI (dv)",
+            ComponentId::DvCli => "WSL CLI (dv)",
             ComponentId::NodeVtsls => "TypeScript language server (vtsls)",
         }
     }
@@ -434,7 +434,7 @@ mod tests {
     fn component_id_titles_are_stable() {
         assert_eq!(ComponentId::GhCli.title(), "GitHub CLI (gh)");
         assert_eq!(ComponentId::DvHost.title(), "WSL host (dv-host)");
-        assert_eq!(ComponentId::DvCli.title(), "Native CLI (dv)");
+        assert_eq!(ComponentId::DvCli.title(), "WSL CLI (dv)");
         assert_eq!(
             ComponentId::NodeVtsls.title(),
             "TypeScript language server (vtsls)"

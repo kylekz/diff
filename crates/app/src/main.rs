@@ -75,6 +75,24 @@ usage: dv pr <number|url> [--repo <path>|--wsl <distro>:<posix-path>]
   <number>             a bare PR number, opened against <repo-path>/cwd
   <url>                a PR URL — must match the repo's origin remote";
 
+/// Attach to the parent process's console, if any, before a print-and-exit
+/// path (usage/arg errors). The release GUI binary is `windows_subsystem =
+/// "windows"` and starts with NO console: `dv_cli::run` does this same
+/// attach for the headless subcommands, but `main`'s own arg errors used to
+/// print into the void — `dv reviews list` from a terminal exited 2 with
+/// its "unexpected extra argument" completely invisible (live-reported).
+/// Safe to call unconditionally; failure (no parent console, already
+/// attached — always true in debug builds) is the harmless no-op case, and
+/// piped/redirected stdio works regardless of any of this.
+fn attach_parent_console() {
+    #[cfg(windows)]
+    unsafe {
+        windows_sys::Win32::System::Console::AttachConsole(
+            windows_sys::Win32::System::Console::ATTACH_PARENT_PROCESS,
+        );
+    }
+}
+
 struct Cli {
     /// `None` for a bare launch — the app opens to the shell's empty state.
     seed: Option<(RepoLocation, DiffSource)>,
@@ -133,7 +151,22 @@ fn parse_args() -> Result<Cli, String> {
                 if location.is_some() {
                     return Err(format!("unexpected extra argument: {path}\n\n{USAGE}"));
                 }
-                location = Some(RepoLocation::from_path_arg(path).map_err(|e| format!("{e:#}"))?);
+                let parsed = RepoLocation::from_path_arg(path).map_err(|e| format!("{e:#}"))?;
+                // A local path that doesn't exist is almost always a typo'd
+                // subcommand (`dv reviews`), and silently LAUNCHING the GUI
+                // on it (live-reported) buries the mistake — error here
+                // instead, with a did-you-mean for the known plurals. WSL
+                // locations are exempt: existence-checking one can boot a
+                // stopped distro, the exact storm the remote layer avoids.
+                if let RepoLocation::Local(dir) = &parsed
+                    && !dir.exists()
+                {
+                    return Err(format!(
+                        "no such directory: {path}{}\n\n{USAGE}",
+                        subcommand_hint(path)
+                    ));
+                }
+                location = Some(parsed);
                 seen_repo_arg = true;
             }
         }
@@ -153,6 +186,18 @@ fn parse_args() -> Result<Cli, String> {
         automation,
         pending_pr: None,
     })
+}
+
+/// Did-you-mean line for the plural spellings of real subcommands —
+/// appended to `parse_args`'s no-such-directory error, where a typo'd
+/// subcommand otherwise reads as a bogus repo path.
+fn subcommand_hint(arg: &str) -> &'static str {
+    match arg {
+        "reviews" => "  (did you mean `dv review <list|show|create|delete>`?)",
+        "comments" => "  (did you mean `dv comment <add|reply|resolve|unresolve|list>`?)",
+        "prs" => "  (did you mean `dv pr list`?)",
+        _ => "",
+    }
 }
 
 /// The first non-flag token in `dv pr <...>` (everything after `"pr"`),
@@ -415,10 +460,12 @@ fn main() {
                     return;
                 }
                 Err(PrArgError::Parse(message)) => {
+                    attach_parent_console();
                     eprintln!("{message}\n\n{USAGE}");
                     std::process::exit(2);
                 }
                 Err(PrArgError::Mismatch(message)) => {
+                    attach_parent_console();
                     eprintln!("{message}");
                     std::process::exit(1);
                 }
@@ -429,6 +476,7 @@ fn main() {
     let cli = match parse_args() {
         Ok(parsed) => parsed,
         Err(message) => {
+            attach_parent_console();
             eprintln!("{message}");
             std::process::exit(2);
         }

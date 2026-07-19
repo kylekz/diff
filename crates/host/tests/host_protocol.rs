@@ -487,6 +487,19 @@ fn watch_worktree_ignores_dot_git_but_sees_tracked_file_edits() {
         let _ = tx.send(params);
     });
 
+    // SETTLE before the negative assertion (same posture as the
+    // post-unsubscribe settle in `watch_store_touch_...`, which cured that
+    // test's windows-latest flake): macOS FSEvents can deliver events from
+    // just BEFORE stream creation — the `git init` churn and the `a.txt`
+    // seed write above land milliseconds before `watch/subscribe`'s stream
+    // samples its "since now" event id, and fseventsd assigns/journals ids
+    // asynchronously, so those pre-subscribe writes can arrive as the
+    // stream's first delivery. Without this, `a.txt`'s own creation event
+    // leaked into the .git-silence window below (macos-latest, 2 of 3 runs
+    // on 2026-07-19). Consume until the channel stays quiet for a full
+    // second so the assertion judges ONLY the marker write.
+    while recv_watch_event(&rx, Duration::from_secs(1)).is_some() {}
+
     // An edit under `.git/` must NOT produce a worktree event.
     std::fs::write(dir.join(".git").join("dv-host-test-marker"), b"x").unwrap();
     assert!(

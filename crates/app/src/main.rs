@@ -18,6 +18,7 @@ mod mentions;
 mod menu;
 mod onboarding;
 mod recent;
+mod repos;
 mod settings;
 mod setup;
 mod shell;

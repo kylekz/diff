@@ -90,9 +90,11 @@ Notes that save debugging time:
   assert behavior there, reserve screenshots for style. `actions` lists
   every dispatchable action name. `key`/`click` exercise real input paths
   (click coords are logical px; `state` reports the scale factor).
-- The New Review folder picker is disabled under automation (a native
+- The Open Repository folder picker is disabled under automation (a native
   dialog would block the executor and wedge the channel); scripts use
-  `{"cmd":"open","path":"D:/some/repo"}` instead.
+  `{"cmd":"open","path":"D:/some/repo"}` instead. A sidebar repo row's
+  "+" (create + open a fresh draft review) is
+  `{"cmd":"new_review","path":"D:/some/repo"}`.
 - `resize` is fire-and-forget (the OS applies it async) — poll `state`
   until the size matches before asserting on it; `screenshot`'s built-in
   settle delay usually covers it.

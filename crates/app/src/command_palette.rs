@@ -124,11 +124,14 @@ const ALLOWED_NAMESPACES: &[&str] = &["shell", "workspace"];
 ///   these only make sense while that specific overlay already has input
 ///   focus and its own keybindings scoped to it; invoking e.g.
 ///   "PrPickerNext" with no PR picker open does nothing.
-/// - Context-menu-scoped actions (`ToggleArchiveReview`, `DeleteReview*`):
-///   these read `AppShell::menu_review`/`delete_confirm`, populated only by
-///   a review card's right-click, so invoked from the palette they'd
-///   silently no-op — exactly the "only makes sense with a selection
-///   context" case the task calls out.
+/// - Context-menu-scoped actions (`ToggleArchiveReview`, `DeleteReview*`,
+///   `NewReviewForRepo`, `RemoveRepoFromSidebar`): these read
+///   `AppShell::menu_review`/`delete_confirm`/`menu_repo`, populated only
+///   by a card's/row's right-click, so invoked from the palette they'd
+///   silently no-op — or worse: the `menu_repo` stash is only consumed by
+///   a chosen menu item, so after a dismissed right-click a palette
+///   invocation would act on that stale repo with zero visible connection
+///   to the gesture (post-hoc review P1).
 /// - Selection/edit-scoped workspace actions (`ClearSelection`,
 ///   `CancelComment`): only meaningful mid-selection/mid-edit, same reason.
 /// - `OpenCommandPalette` itself: redundant while already inside it.
@@ -161,6 +164,8 @@ const EXCLUDED_ACTIONS: &[&str] = &[
     "DeleteReviewPrompt",
     "DeleteReviewConfirm",
     "DeleteReviewCancel",
+    "NewReviewForRepo",
+    "RemoveRepoFromSidebar",
     "ClearSelection",
     "CancelComment",
 ];

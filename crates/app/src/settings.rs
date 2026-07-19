@@ -84,17 +84,21 @@ pub enum ViewModeSetting {
 }
 
 /// Which axis groups sidebar review cards, if any
-/// (docs/phase-6-review-navigator.md deliverable 3). `None` is a flat,
-/// last-opened-desc list — today's behavior, kept as the default so a
-/// settings.json that never sets this renders byte-identical to before
-/// grouping existed.
+/// (docs/phase-6-review-navigator.md deliverable 3). `Repo` is the
+/// default as of the repos-in-sidebar rework: the sidebar's always-
+/// visible repo rows double as the group headers there, so a fresh
+/// profile sees exactly the "repos with their reviews nested under them"
+/// model the rest of the flow (Open Repository button, per-row "+")
+/// assumes. (`None` was the default before that rework, for byte-
+/// identical back-compat with pre-grouping settings files — superseded
+/// deliberately.)
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SidebarGrouping {
-    #[default]
     None,
     /// Every review sharing a repo under one header, regardless of how
     /// many (or how few) linked PRs it spans.
+    #[default]
     Repo,
     /// One header per review-status bucket (draft / comment / approved /
     /// changes requested) — the same four buckets `SidebarFilters`'s
@@ -258,7 +262,7 @@ impl Default for Settings {
             sidebar_width: DEFAULT_SIDEBAR_WIDTH,
             sidebar_visible: true,
             summary_width: DEFAULT_SUMMARY_WIDTH,
-            sidebar_grouping: SidebarGrouping::None,
+            sidebar_grouping: SidebarGrouping::Repo,
             sidebar_filters: SidebarFilters::default(),
         }
     }
@@ -363,7 +367,7 @@ mod tests {
         assert_eq!(s.sidebar_width, 280.0);
         assert!(s.sidebar_visible);
         assert_eq!(s.summary_width, 320.0);
-        assert_eq!(s.sidebar_grouping, SidebarGrouping::None);
+        assert_eq!(s.sidebar_grouping, SidebarGrouping::Repo);
         assert_eq!(s.sidebar_filters, SidebarFilters::default());
         assert!(
             [
@@ -446,7 +450,7 @@ mod tests {
             "a settings.json predating sidebar_visible must not hide the sidebar"
         );
         assert_eq!(parsed.summary_width, DEFAULT_SUMMARY_WIDTH);
-        assert_eq!(parsed.sidebar_grouping, SidebarGrouping::None);
+        assert_eq!(parsed.sidebar_grouping, SidebarGrouping::Repo);
         assert_eq!(parsed.sidebar_filters, SidebarFilters::default());
     }
 
@@ -463,7 +467,7 @@ mod tests {
         // would silently empty an upgraded user's entire sidebar.
         let parsed: Settings =
             serde_json::from_str(r#"{"theme":"Dracula","sidebar_width":300}"#).unwrap();
-        assert_eq!(parsed.sidebar_grouping, SidebarGrouping::None);
+        assert_eq!(parsed.sidebar_grouping, SidebarGrouping::Repo);
         assert_eq!(parsed.sidebar_filters, SidebarFilters::default());
         assert!(
             [

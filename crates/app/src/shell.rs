@@ -58,6 +58,11 @@ actions!(
         DeleteReviewPrompt,
         DeleteReviewConfirm,
         DeleteReviewCancel,
+        // Repo-row context menu (the repos-in-sidebar flow): both read
+        // `AppShell::menu_repo`, stashed by the row's right-mouse-down —
+        // same mechanism as `menu_review` for review cards.
+        NewReviewForRepo,
+        RemoveRepoFromSidebar,
         // ctrl-k / cmd-k command palette (docs/backlog.md "one fuzzy
         // surface over commands AND destinations") — a fourth shell-level
         // overlay, same family as the theme picker/settings panel/
@@ -327,6 +332,13 @@ enum SidebarItem {
         key: SharedString,
         label: SharedString,
     },
+    /// An opened repository (from [`crate::repos::RepoStore`], plus any
+    /// location a visible review references that the store somehow
+    /// missed) — an interactive row: click opens the repo's working-tree
+    /// diff, its trailing "+" starts a new review there. Under
+    /// `SidebarGrouping::Repo` these double as the group headers, with
+    /// each repo's reviews nested beneath.
+    Repo(RepoLocation),
     Review(usize),
 }
 
@@ -993,6 +1005,20 @@ pub struct AppShell {
     /// (`ToggleArchiveReview`/`DeleteReviewPrompt`). Identity by id, same
     /// rationale as [`Self::selected_review_id`].
     menu_review: Option<String>,
+    /// The repo a repo-row context menu was last opened over — the repo
+    /// rows' counterpart to [`Self::menu_review`], read by
+    /// `NewReviewForRepo`/`RemoveRepoFromSidebar`.
+    menu_repo: Option<RepoLocation>,
+    /// Every repository the user has opened, persisted (`repos.json`) —
+    /// the sidebar's repo rows. Live (unlike the frozen [`Self::recent`]
+    /// seed): [`Self::open_review`] records into it, the row context
+    /// menu's remove deletes from it.
+    repos: crate::repos::RepoStore,
+    /// Count of [`Self::new_review_for_repo`] background creates still in
+    /// flight — held open in `automation_settled` so a scripted
+    /// `new_review` + `wait_ready` can't read state before the review
+    /// exists and its pinned `open_review` has run.
+    pending_review_creates: usize,
     /// The delete-review confirmation modal, when open (context menu →
     /// "Delete review…"). The modal owns the whole delete flow: it stays
     /// up while the store delete runs (`in_flight`) and shows a failure
@@ -1389,9 +1415,12 @@ impl AppShell {
         let mut this = Self {
             focus_handle: cx.focus_handle(),
             recent: RecentStore::load(),
+            repos: crate::repos::RepoStore::load(),
+            pending_review_creates: 0,
             active: None,
             selected_review_id: None,
             menu_review: None,
+            menu_repo: None,
             delete_confirm: None,
             automation,
             badges: HashMap::new(),
@@ -1443,6 +1472,32 @@ impl AppShell {
         // sequentially at startup would stack a wsl.exe boot behind each
         // one. A manual refresh (`RefreshBadges`) or simply opening that
         // review (`refresh_badge`, not WSL-skipped) still fetches it.
+        // One-time repo-list migration: a profile from before `repos.json`
+        // existed seeds its sidebar repo rows from every location the
+        // index/recent already know, so the upgrade is lossless. Runs (and
+        // persists, even when empty) exactly once — see `RepoStore::seed`.
+        // LOCAL locations whose path no longer exists are skipped: years of
+        // scratch/test repos accumulate in the index (live-observed — the
+        // unfiltered seed migrated ~20 long-deleted temp dirs into
+        // permanent repo rows), and a dead local path has nothing a repo
+        // row can ever do. Cheap sync stat per location, local only — WSL
+        // locations are kept unchecked (a stopped distro's repo is absent
+        // right now but perfectly real, and probing it could boot the
+        // distro). This filter is seed-only: a recorded repo that later
+        // loses its path stays listed (temporarily-unplugged drives must
+        // not self-evict) with the row's open simply failing until it's
+        // back or removed by hand.
+        if this.repos.needs_seed() {
+            let locations = this
+                .known_locations()
+                .into_iter()
+                .filter(|location| match location {
+                    RepoLocation::Local(path) => path.exists(),
+                    RepoLocation::Wsl { .. } => true,
+                })
+                .collect();
+            this.repos.seed(locations);
+        }
         this.refresh_all_badges(true, cx);
         // Index hydration (docs/phase-6-review-navigator.md deliverable 1,
         // S6b): same WSL-liveness gate as the badge walk above
@@ -1524,6 +1579,10 @@ impl AppShell {
         // Persist an absolute path: a relative one (`dv .`) would resolve
         // against whatever cwd the app is next launched from.
         let location = absolutize(location);
+        // Every opened repo becomes (or refreshes) a sidebar repo row —
+        // the repos-in-sidebar flow's single write path, covering the
+        // folder picker, quick-open, `dv <path>`, and automation alike.
+        self.repos.record(&location);
         // Captured BEFORE the assignment below overwrites it — the
         // self-reselect guard a few lines down needs to know whether
         // `pinned_review_id` was *already* the active review's id, not
@@ -2467,6 +2526,11 @@ impl AppShell {
         for entry in self.index.entries() {
             if !locations.contains(&entry.location) {
                 locations.push(entry.location.clone());
+            }
+        }
+        for location in self.repos.entries() {
+            if !locations.contains(location) {
+                locations.push(location.clone());
             }
         }
         for entry in self.recent.entries() {
@@ -3480,6 +3544,95 @@ impl AppShell {
         }
     }
 
+    /// The repo row's "+" (and its context menu's "New review"): create a
+    /// fresh draft review in `location`'s store, then open it pinned. The
+    /// EXPLICIT counterpart to the lazy creation paths (first comment /
+    /// PR open, `workspace.rs`) — a review made this way exists (and
+    /// shows in the sidebar) before any comment does. The create runs on
+    /// the background executor: for a Local repo it's one small JSON
+    /// write, but for a WSL repo whose distro is stopped, `StoreIo`'s
+    /// path resolution shells `wsl.exe` and rides the full distro boot —
+    /// seconds of wall clock that must not freeze the render thread
+    /// (post-hoc review P2: the sidebar deliberately keeps stopped-distro
+    /// rows, so "+ after a reboot" is a mainline gesture). The in-flight
+    /// window is tracked in [`Self::pending_review_creates`] so
+    /// `automation_settled` holds `wait_ready` open across it — without
+    /// that, a scripted `new_review` + `wait_ready` read state before the
+    /// review existed (live-hit while verifying this slice). Failure
+    /// surfaces through the quick-open error line — the sidebar's one
+    /// existing inline error surface.
+    fn new_review_for_repo(
+        &mut self,
+        location: RepoLocation,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let location = absolutize(location);
+        let store_location = location.clone();
+        self.pending_review_creates += 1;
+        cx.spawn_in(window, async move |this, cx| {
+            let created = cx
+                .background_executor()
+                .spawn(async move {
+                    dv_core::ReviewStore::open(store_location).create(DiffSource::WorkingTree)
+                })
+                .await;
+            this.update_in(cx, |this, window, cx| {
+                this.pending_review_creates = this.pending_review_creates.saturating_sub(1);
+                match created {
+                    Ok(review) => {
+                        this.open_review(
+                            location,
+                            DiffSource::WorkingTree,
+                            None,
+                            Some(review.id),
+                            window,
+                            cx,
+                        );
+                    }
+                    Err(err) => {
+                        this.set_quick_open_error(format!("couldn't create review: {err:#}"), cx);
+                    }
+                }
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// Repo-row context menu → "New review here" (see
+    /// [`Self::new_review_for_repo`]; the row stash is
+    /// [`Self::menu_repo`], same mechanism as `menu_review`).
+    fn on_new_review_for_repo(
+        &mut self,
+        _: &NewReviewForRepo,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(location) = self.menu_repo.take() else {
+            return;
+        };
+        self.new_review_for_repo(location, window, cx);
+    }
+
+    /// Repo-row context menu → "Remove from sidebar". Only drops the repo
+    /// row (`repos.json`); reviews and their on-disk store are untouched —
+    /// under `Repo` grouping a repo that still has visible reviews
+    /// resurfaces immediately via `visible_sidebar_items`' safety net,
+    /// which is the honest outcome (rows for reviews need their header).
+    fn on_remove_repo_from_sidebar(
+        &mut self,
+        _: &RemoveRepoFromSidebar,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(location) = self.menu_repo.take() else {
+            return;
+        };
+        self.repos.remove(&location);
+        cx.notify();
+    }
+
     // ---- "Open anything" quick-open (R2) -----------------------------------
 
     /// Enter in the quick-open input. Resolution is deliberately cheap and
@@ -3774,9 +3927,18 @@ impl AppShell {
             // function both this and the real `uniform_list` render from.
             "sidebar": self.visible_sidebar_items().iter().map(|item| match item {
                 SidebarItem::Header { label, .. } => json!({"header": label}),
+                SidebarItem::Repo(location) => json!({"repo": location.display_name()}),
                 SidebarItem::Review(idx) => json!({
                     "review_id": self.index.entries()[*idx].review_id,
                 }),
+            }).collect::<Vec<_>>(),
+            // The persisted repo list (`repos.json`) driving the sidebar's
+            // repo rows, in store (insertion) order — distinct from
+            // `recent` (which unions the index/recent-seed via
+            // `known_locations`) so a script can assert exactly what
+            // `open`/`new_review` recorded.
+            "repos": self.repos.entries().iter().map(|location| {
+                json!({"title": location.display_name()})
             }).collect::<Vec<_>>(),
             "workspace": self.active.as_ref().map(|ws| ws.read(cx).automation_state()),
             // Per-location badge dump (docs/phase-3-github.md deliverable
@@ -3951,6 +4113,7 @@ impl AppShell {
             .as_ref()
             .is_none_or(|page| !page.running && page.installing.is_empty());
         onboarding_settled
+            && self.pending_review_creates == 0
             && match &self.active {
                 Some(ws) => ws.read(cx).automation_settled(),
                 None => true,
@@ -3983,6 +4146,18 @@ impl AppShell {
         cx: &mut Context<Self>,
     ) {
         self.open_review(location, DiffSource::WorkingTree, None, None, window, cx);
+    }
+
+    /// `{"cmd":"new_review","path":"..."}`: the scripted stand-in for a
+    /// repo row's "+" button — same [`Self::new_review_for_repo`] path.
+    #[cfg(feature = "automation")]
+    pub(crate) fn automation_new_review(
+        &mut self,
+        location: RepoLocation,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.new_review_for_repo(location, window, cx);
     }
 
     /// `{"cmd":"select_review","review_id":"..."}`: explicit row selection by
@@ -5027,14 +5202,18 @@ impl AppShell {
         cx.notify();
     }
 
-    /// The sidebar's actual rendered row list, in order: `self.index`'s
-    /// entries filtered by `settings.sidebar_filters`
-    /// ([`entry_passes_filters`]), then — when `sidebar_grouping` isn't
-    /// `SidebarGrouping::None` — partitioned into named runs with a
-    /// [`SidebarItem::Header`] above each (deliverables 3/4). Groups appear
-    /// in first-encounter order; entries within a group, and ungrouped
-    /// entries, keep `self.index.entries()`'s own relative order —
-    /// recency-sorted at load, then stable for the whole session
+    /// The sidebar's actual rendered row list, in order. Repo rows
+    /// ([`SidebarItem::Repo`] — every persisted repo plus any location a
+    /// visible review references) always render; under
+    /// `SidebarGrouping::Repo` they double as the group headers with each
+    /// repo's reviews nested beneath, while every other grouping shows
+    /// them as a section above the review list (flat, or partitioned into
+    /// named [`SidebarItem::Header`] runs for `Status`/`Pr` —
+    /// deliverables 3/4). Reviews are `self.index`'s entries filtered by
+    /// `settings.sidebar_filters` ([`entry_passes_filters`]). Groups
+    /// appear in first-encounter order; entries within a group, and
+    /// ungrouped entries, keep `self.index.entries()`'s own relative
+    /// order — recency-sorted at load, then stable for the whole session
     /// (`apply_hydration` is order-preserving; only genuinely-new reviews
     /// insert at the front). Both [`Render::render`]'s
     /// `uniform_list` and [`Self::automation_state`]'s `"sidebar"` field are
@@ -5047,8 +5226,53 @@ impl AppShell {
             .filter(|&i| entry_passes_filters(&entries[i], filters))
             .collect();
 
+        // The repo rows (the repos-in-sidebar flow): every persisted repo
+        // in store (insertion) order, then any location a visible review
+        // references that the store somehow missed (a safety net — every
+        // open records into the store, so this is belt-and-braces for
+        // e.g. a hand-edited repos.json), deduped by `repo_group_key` so
+        // a case-variant twin can't produce two rows.
+        let mut repo_rows: Vec<RepoLocation> = Vec::new();
+        let mut repo_keys: Vec<String> = Vec::new();
+        for location in self.repos.entries().iter().cloned().chain(
+            visible
+                .iter()
+                .map(|&i| entries[i].location.clone())
+                .collect::<Vec<_>>(),
+        ) {
+            let key = repo_group_key(&location);
+            if !repo_keys.contains(&key) {
+                repo_keys.push(key);
+                repo_rows.push(location);
+            }
+        }
+
+        // Under `Repo` grouping the repo rows ARE the group headers, each
+        // followed by its own reviews — handled below. Every other
+        // grouping shows them as a plain section above the review list.
+        if self.settings.sidebar_grouping == SidebarGrouping::Repo {
+            let mut groups: HashMap<String, Vec<usize>> = HashMap::new();
+            for &i in &visible {
+                groups
+                    .entry(repo_group_key(&entries[i].location))
+                    .or_default()
+                    .push(i);
+            }
+            let mut items = Vec::with_capacity(repo_rows.len() + visible.len());
+            for (location, key) in repo_rows.into_iter().zip(repo_keys) {
+                items.push(SidebarItem::Repo(location));
+                if let Some(idxs) = groups.remove(&key) {
+                    items.extend(idxs.into_iter().map(SidebarItem::Review));
+                }
+            }
+            return items;
+        }
+
+        let mut items: Vec<SidebarItem> = repo_rows.into_iter().map(SidebarItem::Repo).collect();
+
         if self.settings.sidebar_grouping == SidebarGrouping::None {
-            return visible.into_iter().map(SidebarItem::Review).collect();
+            items.extend(visible.into_iter().map(SidebarItem::Review));
+            return items;
         }
 
         // First-encounter order for headers, preserving each group's own
@@ -5067,11 +5291,9 @@ impl AppShell {
         for i in visible {
             let entry = &entries[i];
             let (key, label) = match self.settings.sidebar_grouping {
-                SidebarGrouping::None => unreachable!("handled above"),
-                SidebarGrouping::Repo => (
-                    repo_group_key(&entry.location),
-                    dv_core::repo_label(&entry.location, None),
-                ),
+                SidebarGrouping::None | SidebarGrouping::Repo => {
+                    unreachable!("handled above")
+                }
                 SidebarGrouping::Status => {
                     let label = status_group_label(&entry.state).to_string();
                     (label.clone(), label)
@@ -5093,7 +5315,7 @@ impl AppShell {
             groups.entry(key).or_default().push(i);
         }
 
-        let mut items = Vec::with_capacity(entries.len() + order.len());
+        items.reserve(entries.len() + order.len());
         for key in order {
             let label = labels.remove(&key).unwrap_or_else(|| key.clone());
             let idxs = groups.remove(&key);
@@ -5444,6 +5666,97 @@ impl AppShell {
             .text_color(text_secondary)
             .truncate()
             .child(label)
+    }
+
+    /// One repo row (the repos-in-sidebar flow): the header-tier label on
+    /// the left, a "+" (new review) button on the right. Click anywhere
+    /// else on the row opens the repo's working-tree diff — the flow the
+    /// "New Review" button used to carry alone. Same fixed
+    /// [`SIDEBAR_ROW_HEIGHT`] as every other sidebar row (`uniform_list`
+    /// scroll math). Element ids are keyed by `repo_group_key` — the same
+    /// case-folded identity `visible_sidebar_items` dedupes rows by, so
+    /// two case-variant paths can't mint sibling ids either.
+    ///
+    /// Both the row and its "+" act on `on_click` (NOT `on_mouse_down`
+    /// like `render_review_card`'s row handler): click events bubble
+    /// child-first, so the button's handler can `stop_propagation` and
+    /// keep one press from both creating a review and opening the repo.
+    fn render_repo_row(&self, location: &RepoLocation, cx: &mut Context<Self>) -> impl IntoElement {
+        let dv = themes::dv_theme(cx);
+        let text_secondary = dv.text_secondary;
+        let surface_active = dv.surface_active;
+        let key = repo_group_key(location);
+        let label = dv_core::repo_label(location, None);
+
+        let open_location = location.clone();
+        let plus_location = location.clone();
+        let menu_location = location.clone();
+
+        let row = h_flex()
+            .id(SharedString::from(format!("repo-row-{key}")))
+            .w_full()
+            .h(px(SIDEBAR_ROW_HEIGHT))
+            .items_center()
+            .gap_1()
+            .px_2()
+            .rounded_md()
+            .cursor_pointer()
+            .hover(|el| el.bg(surface_active.opacity(0.5)))
+            .on_click(cx.listener(move |this, _, window, cx| {
+                this.open_review(
+                    open_location.clone(),
+                    DiffSource::WorkingTree,
+                    None,
+                    None,
+                    window,
+                    cx,
+                );
+            }))
+            // Stash which repo a right-click context menu is being opened
+            // over — same mechanism as `render_review_card`'s
+            // `menu_review` stash.
+            .on_mouse_down(
+                MouseButton::Right,
+                cx.listener(move |this, _, _, cx| {
+                    this.menu_repo = Some(menu_location.clone());
+                    cx.notify();
+                }),
+            )
+            .child(
+                div()
+                    .flex_1()
+                    .min_w(px(0.))
+                    .text_size(px(11.))
+                    .font_weight(gpui::FontWeight::MEDIUM)
+                    .text_color(text_secondary)
+                    .truncate()
+                    .child(label),
+            )
+            .child(
+                Button::new(SharedString::from(format!("repo-new-review-{key}")))
+                    .ghost()
+                    .xsmall()
+                    .label("+")
+                    .tooltip("New review in this repo")
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        // Keep the row's own open-repo click from also
+                        // firing off this same press.
+                        cx.stop_propagation();
+                        this.new_review_for_repo(plus_location.clone(), window, cx);
+                    })),
+            );
+
+        use gpui_component::menu::ContextMenuExt as _;
+        let menu_focus_target = match &self.active {
+            Some(ws) => ws.focus_handle(cx),
+            None => self.focus_handle.clone(),
+        };
+        row.context_menu(move |menu, _window, _cx| {
+            menu.action_context(menu_focus_target.clone())
+                .menu("New review here", Box::new(NewReviewForRepo))
+                .separator()
+                .menu("Remove from sidebar", Box::new(RemoveRepoFromSidebar))
+        })
     }
 
     /// Sidebar grouping segmented control (docs/phase-6-review-navigator.md
@@ -6619,7 +6932,7 @@ impl Render for AppShell {
                 .child(
                     div()
                         .text_color(theme.muted_foreground)
-                        .child("Create a review to start browsing a diff (Ctrl+N)."),
+                        .child("Open a repository to start browsing its diff (Ctrl+N)."),
                 )
                 .into_any_element(),
         };
@@ -6673,6 +6986,8 @@ impl Render for AppShell {
             .on_action(cx.listener(Self::on_delete_review_prompt))
             .on_action(cx.listener(Self::on_delete_review_confirm))
             .on_action(cx.listener(Self::on_delete_review_cancel))
+            .on_action(cx.listener(Self::on_new_review_for_repo))
+            .on_action(cx.listener(Self::on_remove_repo_from_sidebar))
             .on_action(cx.listener(Self::on_open_command_palette))
             .on_action(cx.listener(Self::on_command_palette_next))
             .on_action(cx.listener(Self::on_command_palette_prev))
@@ -6757,7 +7072,7 @@ impl Render for AppShell {
                                             .outline()
                                             .small()
                                             .w_full()
-                                            .label("New Review")
+                                            .label("Open Repository")
                                             .on_click(cx.listener(|this, _, window, cx| {
                                                 this.on_new_review(&NewReview, window, cx)
                                             })),
@@ -6840,6 +7155,9 @@ impl Render for AppShell {
                                                                 label.clone(),
                                                                 cx,
                                                             )
+                                                            .into_any_element(),
+                                                        SidebarItem::Repo(location) => this
+                                                            .render_repo_row(location, cx)
                                                             .into_any_element(),
                                                         SidebarItem::Review(idx) => {
                                                             let entry = &this.index.entries()[*idx];

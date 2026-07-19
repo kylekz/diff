@@ -94,10 +94,21 @@ enum Cmd {
     /// intermediate steps sidesteps both: the first step reliably crosses
     /// the threshold, and every later one lands on an `on_drag_move` frame.
     Drag { from: (f32, f32), to: (f32, f32) },
-    /// Open a working-tree review of a repo path (the scripted stand-in for
-    /// the New Review folder picker, which is disabled under automation
-    /// because the native dialog would block the foreground executor).
+    /// Open a repo path's working-tree diff (the scripted stand-in for
+    /// the Open Repository folder picker, which is disabled under
+    /// automation because the native dialog would block the foreground
+    /// executor). Also records the repo into the sidebar's persistent
+    /// repo-row list, exactly like the real picker.
     Open { path: String },
+    /// Explicitly create a fresh draft review in a repo and open it — the
+    /// scripted stand-in for a sidebar repo row's "+" button
+    /// (`AppShell::new_review_for_repo`). Replies once the create is
+    /// DISPATCHED (like `open_pr`), not once it lands: follow with
+    /// `wait_ready` (which spans the in-flight create), then assert the
+    /// outcome via `state.shell.selected_review_id`/`index` — a failed
+    /// create surfaces in `state.shell.quick_open_error`, never in this
+    /// command's own (always success-shaped) reply.
+    NewReview { path: String },
     /// Select the nth changed file in the active review.
     SelectFile { index: usize },
     /// Explicit sidebar-row selection by review id
@@ -508,6 +519,17 @@ async fn handle(
                     .map_err(|err| anyhow!("{err:#}"))?;
                 shell.update(cx, |shell, cx| shell.automation_open(location, window, cx));
                 Ok(json!({"opened": path}))
+            })?
+        }
+
+        Cmd::NewReview { path } => {
+            cx.update_window(window, |_, window, cx| -> anyhow::Result<Value> {
+                let location = dv_core::RepoLocation::from_path_arg(&path)
+                    .map_err(|err| anyhow!("{err:#}"))?;
+                shell.update(cx, |shell, cx| {
+                    shell.automation_new_review(location, window, cx)
+                });
+                Ok(json!({"new_review": path}))
             })?
         }
 

@@ -72,34 +72,31 @@ fn detect_node_vtsls_override_matches_the_tool_versions_lookup() {
     assert_eq!(via_tool_versions, via_override);
 }
 
-/// `consistency_check` over one live distro reports exactly four rows — gh
-/// (always) plus dv-host/dv-cli/node+vtsls for that one distro — in a
-/// stable order. Doesn't assert every row is `Ok`: this test binary carries
-/// no `dv-host-linux-x64`/`dv-linux-x64` sidecar next to it, so those two
+/// `consistency_check` over one live distro reports exactly the host-side
+/// rows — gh (always) plus, on Windows, dv-on-PATH — followed by
+/// dv-host/dv-cli/node+vtsls for that one distro, in a stable order.
+/// Doesn't assert every row is `Ok`: this test binary carries no
+/// `dv-host-linux-x64`/`dv-linux-x64` sidecar next to it, so those two
 /// rows are expected to read `Skipped` (no sidecar), not `Ok` — see
 /// `wsl_host_provision.rs`/`wsl_cli_provision.rs` for the tests that
 /// actually exercise the install path with a real sidecar.
 #[test]
 #[ignore = "requires WSL Ubuntu — see module docs"]
-fn consistency_check_reports_four_rows_for_one_distro() {
+fn consistency_check_reports_expected_rows_for_one_distro() {
     let report = provision::consistency_check(&[DISTRO.to_string()]);
-    assert_eq!(
-        report.components.len(),
-        4,
-        "expected gh + 3 per-distro rows, got: {:#?}",
-        report.components
-    );
+
+    let mut expected = vec![ComponentId::GhCli];
+    if cfg!(windows) {
+        expected.push(ComponentId::DvOnPath);
+    }
+    expected.extend([
+        ComponentId::DvHost,
+        ComponentId::DvCli,
+        ComponentId::NodeVtsls,
+    ]);
 
     let ids: Vec<ComponentId> = report.components.iter().map(|c| c.id).collect();
-    assert_eq!(
-        ids,
-        vec![
-            ComponentId::GhCli,
-            ComponentId::DvHost,
-            ComponentId::DvCli,
-            ComponentId::NodeVtsls,
-        ]
-    );
+    assert_eq!(ids, expected, "got: {:#?}", report.components);
 }
 
 /// The boot-storm-safety proof at the API level: an empty `distros_allowed`
@@ -107,10 +104,13 @@ fn consistency_check_reports_four_rows_for_one_distro() {
 /// WSL at all.
 #[test]
 #[ignore = "requires WSL Ubuntu to be a meaningful contrast run alongside the above — see module docs"]
-fn consistency_check_with_no_distros_only_checks_gh() {
+fn consistency_check_with_no_distros_only_checks_host_side_rows() {
     let report = provision::consistency_check(&[]);
-    assert_eq!(report.components.len(), 1);
+    assert_eq!(report.components.len(), if cfg!(windows) { 2 } else { 1 });
     assert_eq!(report.components[0].id, ComponentId::GhCli);
+    if cfg!(windows) {
+        assert_eq!(report.components[1].id, ComponentId::DvOnPath);
+    }
 }
 
 /// Live regression for the S8d review P1 fix: `install_vtsls` used to exec

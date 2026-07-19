@@ -1,9 +1,10 @@
 //! Headless provisioning model for Phase 8's onboarding spine
 //! (docs/phase-8-lsp-and-polish.md § Distribution & first-run, extended by
 //! the onboarding/consistency spine — doc-deviation 3). This module is the
-//! domain the app's onboarding PAGE (S8e) renders: four components (`gh`,
-//! `dv-host`, `dv-cli`, `node`/`vtsls`), each reduced to a [`ComponentState`],
-//! rolled up into a [`ConsistencyReport`].
+//! domain the app's onboarding PAGE (S8e) renders: host-side components
+//! (`gh`, and on Windows the `dv`-on-PATH row) plus three per-distro ones
+//! (`dv-host`, `dv-cli`, `node`/`vtsls`), each reduced to a
+//! [`ComponentState`], rolled up into a [`ConsistencyReport`].
 //!
 //! **BOOT-STORM CONTRACT — read before calling anything here.** Every fn in
 //! this module (transitively, via [`crate::remote::install`] and
@@ -44,20 +45,37 @@
 
 mod local_node;
 mod node;
+#[cfg(windows)]
+mod win_path;
 
 pub(crate) use local_node::vtsls_invocation;
 pub use local_node::{DV_VTSLS_PATH_ENV, detect_node_vtsls_local};
 pub use node::{DetectError, NodeVtsls, detect_node_vtsls, install_vtsls};
+#[cfg(windows)]
+pub use win_path::add_dv_to_path;
+
+/// Non-Windows stub for the [`ConsentAction::AddDvToPath`] executor: the
+/// variant itself is unconditional (the app's exhaustive matches must
+/// compile on every platform), but no non-Windows check ever produces it,
+/// so this is unreachable in practice. A macOS PATH story (a
+/// `/usr/local/bin` symlink) is a separate, future component.
+#[cfg(not(windows))]
+pub fn add_dv_to_path(_dir: &str) -> anyhow::Result<()> {
+    anyhow::bail!("PATH registration is only implemented on Windows")
+}
 
 use crate::github;
 use crate::remote::install::{self, HostBinarySource};
 
-/// The four components the onboarding spine tracks. `Copy` because it's
+/// The components the onboarding spine tracks. `Copy` because it's
 /// used as a cheap tag on [`ComponentReport`] and compared/matched freely by
 /// the app's rendering code.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ComponentId {
     GhCli,
+    /// Windows only: whether the running `dv.exe`'s directory is on the
+    /// user's PATH (see [`win_path`]). Never produced on other platforms.
+    DvOnPath,
     DvHost,
     DvCli,
     NodeVtsls,
@@ -69,6 +87,7 @@ impl ComponentId {
     pub fn title(self) -> &'static str {
         match self {
             ComponentId::GhCli => "GitHub CLI (gh)",
+            ComponentId::DvOnPath => "Terminal command (dv on PATH)",
             ComponentId::DvHost => "WSL host (dv-host)",
             ComponentId::DvCli => "Native CLI (dv)",
             ComponentId::NodeVtsls => "TypeScript language server (vtsls)",
@@ -85,6 +104,10 @@ pub enum ConsentAction {
     /// Invoke [`node::install_vtsls`] with these exact args once the user
     /// clicks "install" on the row.
     InstallVtsls { distro: String, node: NodeVtsls },
+    /// Invoke [`add_dv_to_path`] with this directory (the running
+    /// `dv.exe`'s own dir) once the user clicks the row's consent button.
+    /// Windows only in practice — see [`ComponentId::DvOnPath`].
+    AddDvToPath { dir: String },
 }
 
 /// The state of one provisioning component, as far as the last check could
@@ -179,8 +202,9 @@ impl ConsistencyReport {
     }
 }
 
-/// Check all four components: `gh` unconditionally (host-side, never boots
-/// anything), then `dv-host`/`dv-cli`/`node`+`vtsls` for every distro in
+/// Check every component: `gh` (and, on Windows, dv-on-PATH)
+/// unconditionally (host-side, never boots anything), then
+/// `dv-host`/`dv-cli`/`node`+`vtsls` for every distro in
 /// `distros_allowed` — and ONLY those. See the module doc's boot-storm
 /// contract: this fn will boot a stopped distro if the caller passes one in
 /// `distros_allowed`, so the caller must have already gated that list on
@@ -198,6 +222,14 @@ pub fn consistency_check(distros_allowed: &[String]) -> ConsistencyReport {
         title: ComponentId::GhCli.title().to_string(),
         state: github::gh_status(),
     }];
+    // Host-side like `gh` (registry read only — never touches a distro,
+    // never boots anything), so it's checked unconditionally too.
+    #[cfg(windows)]
+    components.push(ComponentReport {
+        id: ComponentId::DvOnPath,
+        title: ComponentId::DvOnPath.title().to_string(),
+        state: win_path::check_dv_on_path(),
+    });
 
     for distro in distros_allowed {
         components.push(ComponentReport {

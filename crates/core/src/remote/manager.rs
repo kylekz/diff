@@ -305,6 +305,63 @@ pub fn note_boot_suspect(distro: &str) {
         .insert(distro.to_string(), Instant::now() + BOOT_SUSPECT_QUARANTINE);
 }
 
+/// Every WSL distro ACTUALLY running right now, per the same shared
+/// (`RUNNING_PROBE_TTL`-cached) `wsl.exe --list --running` probe
+/// [`distro_running`] uses — never boots anything. Two filters on top of
+/// the raw probe, because callers use this to decide which distros to run
+/// per-distro provisioning checks against (the setup page's explicit-open
+/// path in `shell.rs`):
+///
+/// - distros under a [`note_boot_suspect`] quarantine are dropped (all
+///   gated activity is supposed to pause for them);
+/// - well-known utility distros ([`is_utility_distro`]) are dropped — a
+///   consistency check against a distro auto-installs dv's own sidecars
+///   into it (`crate::provision`'s check_dv_host/check_dv_cli), which is
+///   blessed for distros the user actually works in but wrong for
+///   docker-desktop et al., where it would at best fail noisily on the
+///   setup page and at worst leave stray binaries in an appliance distro.
+pub fn running_distros() -> Vec<String> {
+    let mut cache = running_probe_cache()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let fresh = cache
+        .as_ref()
+        .is_some_and(|p| p.at.elapsed() < RUNNING_PROBE_TTL);
+    if !fresh {
+        *cache = Some(RunningProbe {
+            at: Instant::now(),
+            distros: list_running_distros(),
+        });
+    }
+    let distros = cache
+        .as_ref()
+        .map(|p| p.distros.clone())
+        .unwrap_or_default();
+    drop(cache);
+    let quarantine = quarantine_map().lock().unwrap_or_else(|e| e.into_inner());
+    let now = Instant::now();
+    distros
+        .into_iter()
+        .filter(|d| !is_utility_distro(d))
+        .filter(|d| {
+            !quarantine
+                .iter()
+                .any(|(name, until)| name.eq_ignore_ascii_case(d) && now < *until)
+        })
+        .collect()
+}
+
+/// Appliance distros that back other tools (Docker Desktop, Rancher
+/// Desktop, Podman) rather than being user environments — see
+/// [`running_distros`] for why they're excluded there.
+fn is_utility_distro(name: &str) -> bool {
+    let lower = name.to_ascii_lowercase();
+    matches!(
+        lower.as_str(),
+        "docker-desktop" | "docker-desktop-data" | "rancher-desktop" | "rancher-desktop-data"
+    ) || lower.starts_with("podman-machine")
+}
+
 /// Raw `wsl.exe --list --running --quiet` (UTF-16LE-decoded), one distro
 /// name per line. Empty on failure or off Windows — see
 /// [`distro_running`]'s failure semantics.

@@ -259,6 +259,7 @@ fn index_health_word(health: dv_core::EntryHealth) -> &'static str {
 fn component_id_word(id: ComponentId) -> &'static str {
     match id {
         ComponentId::GhCli => "gh_cli",
+        ComponentId::DvOnPath => "dv_on_path",
         ComponentId::DvHost => "dv_host",
         ComponentId::DvCli => "dv_cli",
         ComponentId::NodeVtsls => "node_vtsls",
@@ -4250,6 +4251,13 @@ impl AppShell {
     /// review, P2).
     fn onboarding_titles(distros_allowed: &[String]) -> Vec<(ComponentId, String)> {
         let mut titles = vec![(ComponentId::GhCli, ComponentId::GhCli.title().to_string())];
+        // Mirrors `consistency_check`'s own unconditional, host-side
+        // Windows-only row — same order, so placeholders never reflow.
+        #[cfg(windows)]
+        titles.push((
+            ComponentId::DvOnPath,
+            ComponentId::DvOnPath.title().to_string(),
+        ));
         if distros_allowed.is_empty() {
             for id in [
                 ComponentId::DvHost,
@@ -4279,17 +4287,34 @@ impl AppShell {
     /// after the marker's already been stamped correctly shows the plain
     /// "Setup status" header, not "Welcome to dv" again.
     ///
-    /// The distro list unions [`Self::live_wsl_distros`] with the ACTIVE
-    /// workspace's own WSL distro: without a running host (e.g. a dev build
-    /// with no sidecar, where Stage-A `wsl.exe`-per-command routing carries
-    /// everything), `has_running_host` is false even while a WSL repo is
-    /// open and its git traffic is actively flowing — leaving the page
-    /// claiming "no WSL distro running" about a distro the user is looking
-    /// at right now. Opening the page is an explicit user action about that
-    /// exact environment, so the active repo's distro is live-by-implication
-    /// here for the same reason `Self::open_review`'s own per-distro check
-    /// is (the one non-`has_running_host` trigger `dv_core::provision`'s
-    /// boot-storm contract blesses).
+    /// The distro list unions three sources, most-specific first:
+    ///
+    /// - [`Self::live_wsl_distros`] (distros with a live dv-host for a
+    ///   known repo);
+    /// - every distro that is ACTUALLY running right now, per
+    ///   [`dv_core::remote::manager::running_distros`]'s non-booting
+    ///   `wsl.exe --list --running` probe — unioned in off the UI thread by
+    ///   [`Self::spawn_consistency_check_probing`], so a probed distro's
+    ///   rows appear once the check lands rather than in the placeholders.
+    ///   Without this, a user with Ubuntu visibly running but no WSL repo
+    ///   open yet saw every WSL row claim "no WSL distro running"
+    ///   (live-reported on the first production bundle). Only THIS
+    ///   explicit-open path gets the union: opening the page is a
+    ///   deliberate "show me my environment" action, and checking a
+    ///   running distro boots nothing — while the passive
+    ///   launch/open_review checks keep their conservative known-repo
+    ///   gating so background machinery never provisions into a distro the
+    ///   user hasn't connected to dv at all;
+    /// - the ACTIVE workspace's own WSL distro: without a running host
+    ///   (e.g. a dev build with no sidecar, where Stage-A
+    ///   `wsl.exe`-per-command routing carries everything),
+    ///   `has_running_host` is false even while a WSL repo is open and its
+    ///   git traffic is actively flowing. Opening the page is an explicit
+    ///   user action about that exact environment, so the active repo's
+    ///   distro is live-by-implication here for the same reason
+    ///   `Self::open_review`'s own per-distro check is (the one
+    ///   non-`has_running_host` trigger `dv_core::provision`'s boot-storm
+    ///   contract blesses).
     fn open_onboarding_page(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let first_run = SetupState::load().is_first_run();
         let mut distros_allowed = self.live_wsl_distros();
@@ -4311,8 +4336,47 @@ impl AppShell {
         // review, P2) — only a later CLOSE re-latches it.
         self.drift_page_dismissed = false;
         window.focus(&self.focus_handle, cx);
-        self.spawn_consistency_check(distros_allowed, cx);
+        self.spawn_consistency_check_probing(distros_allowed, cx);
         cx.notify();
+    }
+
+    /// Union `distros_allowed` with every distro that's actually running
+    /// right now (per [`dv_core::remote::manager::running_distros`]'s
+    /// non-booting probe), then dispatch the real consistency check. The
+    /// probe is a blocking `wsl.exe` spawn, so it runs on the background
+    /// executor — the onboarding page's placeholder rows have already
+    /// painted by the time it fires (its "first paint never waits on a WSL
+    /// round trip" contract), and any newly discovered distro's rows land
+    /// through the same suffixed-row merge that displaces the generic
+    /// "no WSL distro running" placeholders (`OnboardingPage`'s
+    /// `drop_generic_placeholder`). Only the explicit page-open path uses
+    /// this: the check auto-provisions dv's sidecars into every distro it's
+    /// allowed to touch, which is what a user deliberately looking at their
+    /// setup status wants — but not something passive launch machinery
+    /// should do to a distro that's merely running (see
+    /// [`Self::open_onboarding_page`]'s doc).
+    fn spawn_consistency_check_probing(
+        &mut self,
+        distros_allowed: Vec<String>,
+        cx: &mut Context<Self>,
+    ) {
+        cx.spawn(async move |this, cx| {
+            let unioned = cx
+                .background_executor()
+                .spawn(async move {
+                    let mut distros = distros_allowed;
+                    for distro in dv_core::remote::manager::running_distros() {
+                        if !distros.iter().any(|d| d.eq_ignore_ascii_case(&distro)) {
+                            distros.push(distro);
+                        }
+                    }
+                    distros
+                })
+                .await;
+            this.update(cx, |this, cx| this.spawn_consistency_check(unioned, cx))
+                .ok();
+        })
+        .detach();
     }
 
     fn close_onboarding_page(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -4661,17 +4725,33 @@ impl AppShell {
         if !self.onboarding_installing.insert(title.clone()) {
             anyhow::bail!("{title} already has an install in flight");
         }
-        let ConsentAction::InstallVtsls { distro, node } = action.clone();
+        // One background job + the distro list the success-arm reverify
+        // should re-check (empty for host-side actions like the PATH
+        // registration — `spawn_consistency_check(vec![])` still re-checks
+        // every unconditional host-side row, which is exactly the set such
+        // an action can have changed).
+        type ConsentJob = Box<dyn FnOnce() -> anyhow::Result<()> + Send + 'static>;
+        let (job, reverify_distros): (ConsentJob, Vec<String>) = match action.clone() {
+            ConsentAction::InstallVtsls { distro, node } => {
+                let reverify = vec![distro.clone()];
+                (
+                    Box::new(move || {
+                        dv_core::provision::install_vtsls(&distro, &node).map_err(Into::into)
+                    }),
+                    reverify,
+                )
+            }
+            ConsentAction::AddDvToPath { dir } => (
+                Box::new(move || dv_core::provision::add_dv_to_path(&dir)),
+                Vec::new(),
+            ),
+        };
         if let Some(page) = &mut self.onboarding {
             page.begin_install(idx);
         }
         cx.notify();
         cx.spawn(async move |this, cx| {
-            let distro_for_reverify = distro.clone();
-            let result = cx
-                .background_executor()
-                .spawn(async move { dv_core::provision::install_vtsls(&distro, &node) })
-                .await;
+            let result = cx.background_executor().spawn(async move { job() }).await;
             this.update(cx, |this, cx| {
                 // Clear both the page-local and shell-persisted in-flight
                 // markers BEFORE branching on the result (S8e review, P2/
@@ -4705,7 +4785,7 @@ impl AppShell {
                         if let Some(page) = &mut this.onboarding {
                             page.running = true;
                         }
-                        this.spawn_consistency_check(vec![distro_for_reverify], cx)
+                        this.spawn_consistency_check(reverify_distros, cx)
                     }
                     Err(err) => {
                         if let Some(page) = &mut this.onboarding
@@ -6381,7 +6461,13 @@ impl AppShell {
                 RowState::Failed(error) => ("\u{2715}", danger, Some(error.clone()), danger),
                 RowState::Skipped(reason) => ("\u{25cb}", muted, Some(reason.clone()), muted),
             };
-        let show_install = matches!(row.state, RowState::Consent(..));
+        // Per-action button label: "Install" fits a package install but
+        // would misdescribe the PATH registration.
+        let consent_label: Option<&'static str> = match &row.state {
+            RowState::Consent(ConsentAction::InstallVtsls { .. }, _) => Some("Install"),
+            RowState::Consent(ConsentAction::AddDvToPath { .. }, _) => Some("Add to PATH"),
+            _ => None,
+        };
 
         v_flex()
             .gap_0p5()
@@ -6397,12 +6483,12 @@ impl AppShell {
                             .child(div().text_color(glyph_color).child(glyph))
                             .child(div().text_sm().child(row.title.clone())),
                     )
-                    .when(show_install, |el| {
+                    .when_some(consent_label, |el, label| {
                         el.child(
                             Button::new(SharedString::from(format!("onboarding-install-{idx}")))
                                 .ghost()
                                 .xsmall()
-                                .label("Install")
+                                .label(label)
                                 .on_click(cx.listener(move |this, _, _, cx| {
                                     // Errors here are precondition rejections
                                     // (page closed, row no longer awaiting

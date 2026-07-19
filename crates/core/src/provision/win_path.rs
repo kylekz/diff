@@ -49,7 +49,9 @@ pub fn check_dv_on_path() -> ComponentState {
     };
     if is_cargo_target_dir(&dir) {
         return ComponentState::Skipped {
-            reason: "dev build (running from a cargo target dir)".to_string(),
+            reason: "running from a cargo target dir (transient — cargo clean deletes it); \
+                     launch the packaged dv.exe to add it to PATH"
+                .to_string(),
         };
     }
     let dir_str = dir.display().to_string();

@@ -14,7 +14,14 @@ cargo clippy -p dv --no-default-features --all-targets -- -D warnings
 #   ^ the SHIPPED build shape (automation feature off) — CI checks it and
 #     it drifts silently if only the default shape is linted locally
 cargo fmt --all                                    # also auto-runs via PostToolUse hook
+bash script/bundle-windows.sh                      # assemble dist/ (Windows bundle)
 ```
+
+The Windows bundle is TWO binaries: `dist/dv.exe` is the console launcher
+(built from `crates/cli`; runs the headless CLI in-console so the shell
+waits, forwards GUI launches to its neighbor) and `dist/dv-gui.exe` is the
+windowed app. `dv_cli::is_headless` is the single routing predicate both
+binaries share. WSL sidecars must sit in the same dir (see § WSL host).
 
 First-ever build fetches the zed monorepo as a git dependency and compiles
 gpui — expect many minutes. Incremental builds are fast.

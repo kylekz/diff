@@ -54,11 +54,49 @@ usage: dv <review|comment|pr|skill> [options]
   skill     install/show the dv-review agent skill (see `dv skill --help`)
   --version print the dv-cli version";
 
+/// Whether `args` (argv[1..]) is one of the headless invocations [`run`]
+/// handles end-to-end — the SINGLE routing predicate shared by the GUI
+/// binary's dispatch (`crates/app/src/main.rs`) and the Windows console
+/// launcher (`crates/cli/src/main.rs`), so the two can never drift.
+/// Everything else is GUI-shaped: a repo path, `dv pr <number|url>`, GUI
+/// flags. `--help`/`-h` is deliberately NOT headless — each binary owns
+/// its own usage text (the GUI's debug build documents `--automation`).
+pub fn is_headless(args: &[String]) -> bool {
+    match args.first().map(String::as_str) {
+        Some("review" | "comment" | "skill" | "--version" | "-V") => true,
+        Some("pr") => matches!(
+            pr_first_positional(&args[1..]),
+            None | Some("list" | "view" | "create" | "fetch")
+        ),
+        _ => false,
+    }
+}
+
+/// The first non-flag token in `dv pr <...>` (everything after `"pr"`),
+/// skipping `--repo <path>` / `--wsl <spec>` / `--json` exactly like the
+/// (private) `extract_location_globals` does — so `dv pr --repo X list`
+/// and `dv pr list --repo X` both see `"list"` here, matching whatever
+/// [`run`] will itself dispatch on. `None` means every token was consumed
+/// as a flag (or there were none): `dv pr` alone stays headless so [`run`]
+/// prints its own "missing subcommand" usage error.
+pub fn pr_first_positional(args: &[String]) -> Option<&str> {
+    let mut iter = args.iter();
+    while let Some(arg) = iter.next() {
+        match arg.as_str() {
+            "--repo" | "--wsl" => {
+                iter.next();
+            }
+            "--json" => {}
+            other => return Some(other),
+        }
+    }
+    None
+}
+
 /// Entry point for both `crates/app/src/main.rs`'s headless dispatch (which
-/// pre-filters `argv[1]` to `{review, comment, pr}` before ever calling
-/// this) and the native `dv-cli` binary's own `main()` (which passes
-/// `argv[1..]` straight through, unfiltered) — see the module doc. Returns
-/// the process exit code.
+/// pre-filters via [`is_headless`] before ever calling this) and the
+/// `dv-cli` binary's own `main()` — see the module doc. Returns the
+/// process exit code.
 pub fn run(args: &[String]) -> i32 {
     // SAFETY: `AttachConsole` is documented as safe to call unconditionally
     // (it merely attaches this process to its parent console if one exists
@@ -1161,6 +1199,59 @@ fn format_ms(ms: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // --- is_headless / pr_first_positional: the shared GUI-vs-CLI router
+    // (moved here from crates/app/src/main.rs when the Windows console
+    // launcher made this the predicate's single home) -------------------
+
+    fn argv(items: &[&str]) -> Vec<String> {
+        items.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn is_headless_recognizes_cli_subcommands() {
+        for first in ["review", "comment", "skill", "--version", "-V"] {
+            assert!(is_headless(&argv(&[first])), "{first} should be headless");
+        }
+        for sub in ["list", "view", "create", "fetch"] {
+            assert!(is_headless(&argv(&["pr", sub])));
+        }
+        // `dv pr` alone stays headless so `run` prints its own usage error.
+        assert!(is_headless(&argv(&["pr"])));
+        assert!(is_headless(&argv(&["pr", "--json"])));
+    }
+
+    #[test]
+    fn is_headless_routes_gui_shapes_away() {
+        for shape in [
+            vec!["D:/some/repo"],
+            vec!["pr", "123"],
+            vec!["pr", "https://github.com/o/r/pull/9"],
+            vec!["pr", "--repo", "D:/x", "123"],
+            vec!["--staged"],
+            vec!["--help"],
+            vec!["-h"],
+        ] {
+            assert!(!is_headless(&argv(&shape)), "{shape:?} should be GUI");
+        }
+        assert!(!is_headless(&argv(&[])), "bare launch is a GUI launch");
+    }
+
+    #[test]
+    fn pr_first_positional_skips_flags_and_finds_subcommand() {
+        assert_eq!(pr_first_positional(&argv(&["list"])), Some("list"));
+        assert_eq!(
+            pr_first_positional(&argv(&["--repo", "D:/x", "list"])),
+            Some("list")
+        );
+        assert_eq!(
+            pr_first_positional(&argv(&["--json", "--wsl", "Ubuntu:/x", "fetch", "5"])),
+            Some("fetch")
+        );
+        assert_eq!(pr_first_positional(&argv(&["123"])), Some("123"));
+        assert_eq!(pr_first_positional(&argv(&[])), None);
+        assert_eq!(pr_first_positional(&argv(&["--json"])), None);
+    }
 
     // --- parse_lines ---------------------------------------------------
 

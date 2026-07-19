@@ -200,28 +200,6 @@ fn subcommand_hint(arg: &str) -> &'static str {
     }
 }
 
-/// The first non-flag token in `dv pr <...>` (everything after `"pr"`),
-/// skipping `--repo <path>` / `--wsl <spec>` / `--json` exactly like
-/// `dv_cli`'s (private) `extract_location_globals` does — so `dv pr --repo X
-/// list` and `dv pr list --repo X` both see `"list"` here, matching
-/// whatever `dv_cli::run` will itself dispatch on. `None` means every token
-/// was consumed as a flag (or there were none): `dv pr` alone stays
-/// headless so `dv_cli::run` prints its own "missing subcommand" usage
-/// error.
-fn pr_first_positional(args: &[String]) -> Option<&str> {
-    let mut iter = args.iter();
-    while let Some(arg) = iter.next() {
-        match arg.as_str() {
-            "--repo" | "--wsl" => {
-                iter.next();
-            }
-            "--json" => {}
-            other => return Some(other),
-        }
-    }
-    None
-}
-
 /// `dv pr <target>`'s failure modes, split by exit code the same way
 /// `dv_cli`'s (private) `CliError` splits `Usage`/`Op`: a malformed target
 /// (not a number, not a recognizable PR URL) is a parse error (exit 2,
@@ -435,25 +413,16 @@ fn main() {
     // by `pr_first_positional` before anything commits to either path.
     let raw_args: Vec<String> = std::env::args().collect();
     if let Some(sub) = raw_args.get(1) {
-        if sub == "review"
-            || sub == "comment"
-            || sub == "skill"
-            || sub == "--version"
-            || sub == "-V"
-        {
+        // `dv_cli::is_headless` is the single shared routing predicate —
+        // the Windows console launcher (`crates/cli/src/main.rs`) makes
+        // the exact same call, so what it runs in-console and what this
+        // binary runs headlessly can never drift apart.
+        if dv_cli::is_headless(&raw_args[1..]) {
             let code = dv_cli::run(&raw_args[1..]);
             std::process::exit(code);
         }
         if sub == "pr" {
             let rest = &raw_args[2..];
-            let headless = matches!(
-                pr_first_positional(rest),
-                None | Some("list") | Some("view") | Some("create") | Some("fetch")
-            );
-            if headless {
-                let code = dv_cli::run(&raw_args[1..]);
-                std::process::exit(code);
-            }
             match parse_pr_gui_args(rest) {
                 Ok(cli) => {
                     run_gui(cli);
@@ -596,74 +565,16 @@ mod tests {
     // both a `gpui::*` glob import AND its own `#[cfg(test)] mod tests`;
     // every other module either has one or the other). Narrow, explicit
     // imports sidestep it entirely.
-    use super::{
-        PrArgError, parse_pr_gui_args, parse_pr_url, pr_first_positional, resolve_pr_target,
-    };
+    use super::{PrArgError, parse_pr_gui_args, parse_pr_url, resolve_pr_target};
     use dv_core::RepoLocation;
 
     fn args(items: &[&str]) -> Vec<String> {
         items.iter().map(|s| s.to_string()).collect()
     }
 
-    // --- pr_first_positional: the headless-vs-GUI router --------------
-
-    #[test]
-    fn pr_first_positional_finds_bare_subcommand() {
-        assert_eq!(pr_first_positional(&args(&["list"])), Some("list"));
-        assert_eq!(pr_first_positional(&args(&["view", "5"])), Some("view"));
-    }
-
-    #[test]
-    fn pr_first_positional_skips_leading_flags() {
-        let a = args(&["--repo", "D:/x", "list"]);
-        assert_eq!(pr_first_positional(&a), Some("list"));
-        let b = args(&["--json", "--wsl", "Ubuntu:/x", "fetch", "5"]);
-        assert_eq!(pr_first_positional(&b), Some("fetch"));
-    }
-
-    #[test]
-    fn pr_first_positional_sees_a_bare_number_as_not_headless() {
-        assert_eq!(pr_first_positional(&args(&["123"])), Some("123"));
-        assert_eq!(
-            pr_first_positional(&args(&["--repo", "D:/x", "123"])),
-            Some("123")
-        );
-    }
-
-    #[test]
-    fn pr_first_positional_sees_a_url_as_not_headless() {
-        let a = args(&["https://github.com/o/r/pull/9"]);
-        assert_eq!(
-            pr_first_positional(&a),
-            Some("https://github.com/o/r/pull/9")
-        );
-    }
-
-    #[test]
-    fn pr_first_positional_none_when_only_flags_or_empty() {
-        assert_eq!(pr_first_positional(&args(&[])), None);
-        assert_eq!(pr_first_positional(&args(&["--json"])), None);
-    }
-
-    #[test]
-    fn dv_pr_headless_subcommands_are_recognized() {
-        for sub in ["list", "view", "create", "fetch"] {
-            let rest = args(&[sub]);
-            let headless = matches!(
-                pr_first_positional(&rest),
-                None | Some("list") | Some("view") | Some("create") | Some("fetch")
-            );
-            assert!(headless, "{sub} should stay on the headless CLI path");
-        }
-        for target in ["123", "https://github.com/o/r/pull/9"] {
-            let rest = args(&[target]);
-            let headless = matches!(
-                pr_first_positional(&rest),
-                None | Some("list") | Some("view") | Some("create") | Some("fetch")
-            );
-            assert!(!headless, "{target} should route to the GUI launch path");
-        }
-    }
+    // The headless-vs-GUI router itself (`is_headless`/`pr_first_positional`)
+    // lives in — and is tested in — `dv_cli`, the one shared home for that
+    // predicate (see `main`'s dispatch comment).
 
     // --- parse_pr_url ---------------------------------------------------
 

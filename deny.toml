@@ -16,10 +16,13 @@ ignore = [
     # zip 8 through velopack (=1.2.161, pinned to vpk, D9): extracting an attacker's archive can
     # keep setuid bits or follow links out of the folder. Velopack extracts only the update
     # package it downloaded from dv's own release feed and checked against the feed's SHA256.
-    # Goes when velopack moves to zip 9.
+    # `ZipArchive::extract` can also abort the process on a symlink entry that declares a huge
+    # size; velopack never calls it (it reads entries with `by_index`), and the archives it opens
+    # are those same checked packages. Goes when velopack moves to zip 9.
     { id = "RUSTSEC-2026-0367", reason = "zip via velopack: extracts only dv's own checked packages" },
     { id = "RUSTSEC-2026-0368", reason = "zip via velopack: extracts only dv's own checked packages" },
     { id = "RUSTSEC-2026-0369", reason = "zip via velopack: extracts only dv's own checked packages" },
+    { id = "RUSTSEC-2026-0429", reason = "zip via velopack: never calls ZipArchive::extract" },
 ]
 
 [licenses]
@@ -31,7 +34,6 @@ allow = [
     "BSD-2-Clause",
     "BSD-3-Clause",
     "BSL-1.0",
-    "bzip2-1.0.6",
     "CC0-1.0",
     "CDLA-Permissive-2.0",
     "ISC",

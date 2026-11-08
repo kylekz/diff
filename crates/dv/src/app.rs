@@ -145,7 +145,7 @@ fn start(startup: StartOptions, cx: &mut App) -> Result<()> {
     // The settings' material and mode, before the first frame.
     dv_ui::appearance::init(MaterialSupport::probe(), cx);
 
-    set_background(background);
+    dv_ui::automation::set_background(background);
     let main = dv_ui::shell::open_main_window(
         size(px(window_size.width as f32), px(window_size.height as f32)),
         cx,
@@ -213,17 +213,6 @@ fn open_startup(open: Startup, main: &MainWindow, cx: &mut App) -> Result<()> {
         })
     })?;
     Ok(())
-}
-
-#[cfg(feature = "automation")]
-fn set_background(background: bool) {
-    gpui_automation::set_background(background);
-}
-
-#[cfg(not(feature = "automation"))]
-fn set_background(_background: bool) {
-    // `--automation-background` needs `--automation`, which `run` refuses in this build before
-    // the app starts.
 }
 
 #[cfg(feature = "automation")]

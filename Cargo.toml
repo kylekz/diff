@@ -67,7 +67,14 @@ dv_core = { path = "crates/dv_core" }
 dv_lsp = { path = "crates/dv_lsp" }
 dv_test_support = { path = "crates/dv_test_support" }
 dv_ui = { path = "crates/dv_ui" }
-gpui_automation = { path = "crates/gpui_automation" }
+
+# ---- toolbox-rs (github.com/kylekz/toolbox-rs, docs/PLAN.md §14): the shared automation crates,
+# a git dependency pinned by tag, never a branch. The in-app driver (`enabled` from `dv_ui`'s and
+# `dv`'s `automation` features, its no-op stand-ins otherwise) and the scenario runner `dv_e2e`
+# wraps. A change to either goes to toolbox-rs first, then a new tag here. toolbox-rs owns the
+# gpui pin: its tag's gpui-pre and gpui-kit versions are the ones above.
+gpui_automation = { git = "https://github.com/kylekz/toolbox-rs", tag = "v0.1.2" }
+gpui_automation_runner = { git = "https://github.com/kylekz/toolbox-rs", tag = "v0.1.2" }
 
 # ---- shared third-party
 anyhow = "1.0"
@@ -75,9 +82,6 @@ anyhow = "1.0"
 # JSON lines (PLAN §5.1).
 base64 = "0.23"
 clap = { version = "4.5", features = ["derive", "env"] }
-# macOS window screenshots for automation (`gpui_automation::capture_macos`); already in the tree
-# through gpui.
-core-graphics = "0.24"
 dirs = "6"
 # dv.exe's and dv-gui.exe's icon and version resource (`crates/dv/build.rs`); already in the
 # tree through gpui's own manifest.
@@ -104,9 +108,8 @@ markdown = "1.0.0"
 # handle's number already names another thread's directory listing the read wedges the listing
 # for good. Pinned exactly while 9 is a release candidate.
 notify = "=9.0.0-rc.6"
-# The AppKit calls gpui has no API for: the window number automation captures, and an
-# automation run's activation policy (`gpui_automation`, macOS only); already in the tree through
-# gpui.
+# The AppKit call gpui has no API for: the Dock icon of an unbundled run (`dv::dock_icon`, macOS
+# only); already in the tree through gpui.
 objc2 = "0.6"
 parking_lot = "0.12"
 png = "0.18"
@@ -131,7 +134,6 @@ ulid = "3"
 # packages it (1.2.161): Velopack's crate and CLI versions go together.
 velopack = "=1.2.161"
 windows-sys = "0.61"
-x11rb = "0.13"
 
 [profile.dev]
 debug = "limited"

@@ -208,6 +208,10 @@ impl AutomationHost for DvAutomation {
                 .is_none_or(|intel| intel.read(cx).is_settled(cx))
     }
 
+    fn commands(&self) -> &'static [&'static str] {
+        COMMANDS
+    }
+
     fn custom(
         &mut self,
         cmd: &str,
@@ -249,6 +253,30 @@ impl AutomationHost for DvAutomation {
         Some(task.unwrap_or_else(|error| Task::ready(Err(error))))
     }
 }
+
+/**
+ * Every command `custom` and `custom_task` answer, sent in the `ready` handshake so the runner
+ * rejects a scenario's misspelt command before its first step (toolbox-rs docs/automation.md
+ * "Protocol").
+ */
+const COMMANDS: &[&str] = &[
+    "set_setting",
+    "backend_block",
+    "backend_hold",
+    "wsl_distros",
+    "home_file",
+    "update_ready",
+    "seed_repo",
+    "repo_edit",
+    "open",
+    "open_review",
+    "review_op",
+    "cli",
+    "cli_spawn",
+    "cli_join",
+    "backend_kill",
+    "backend_stop",
+];
 
 /// A `set_setting` request.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

@@ -52,8 +52,9 @@ and `gpui-base =0.9.0` (gpui-kit's crates, each pinned on its own rather than th
 `gpui-kit` umbrella),
 declared once in `[workspace.dependencies]`, bumped together. The first implementation sat on zed git
 main + `gpui-component 0.5.2`, a line that is no longer maintained, and every `cargo update` was a
-big-bang risk. Same stack as the sibling app means the sibling app's `gpui_automation` crate and its lessons carry over
-directly (§14). Grep APIs under `~/.cargo/registry/src/*/gpui-pre-0.3.11/` and `gpui-component-0.9.0/`.
+big-bang risk. Same stack as the sibling apps means their shared automation crates (toolbox-rs's
+`gpui_automation`, §14.2) and their lessons carry over directly; toolbox-rs owns this pin, so a
+gpui bump starts there. Grep APIs under `~/.cargo/registry/src/*/gpui-pre-0.3.11/` and `gpui-component-0.9.0/`.
 
 ### D2. Rewrite in place, salvage deliberately
 Same repository, fresh crates (§4), with the first implementation kept read-only under `legacy/`.
@@ -459,7 +460,7 @@ bringing dv to the front on the agent's working-tree review when the agent finis
 | `dv_lsp` | lib | language servers where the repo lives: the LSP client, the language specs and their resolvers (§18.4) | never |
 | `dv_ui` | lib | views + services (§11) | yes |
 | `dv` | lib + bins `dv`, `dv-gui` | entry: GUI (the `gui` feature), CLI and `dv backend --stdio`; on Windows and macOS also the console/GUI split (`dv-gui` with `gui`) and Velopack's updates, on Windows its hooks (D9); three shapes, one of them headless (§13.1) | with `gui` |
-| `gpui_automation` | lib + bin `e2e` | ported from the sibling app (§14) | yes |
+| `dv_e2e` | bin `e2e` | the scenario runner: toolbox-rs's `gpui_automation_runner` with dv's profile and its `gh`/`lsp` fixture (§14.2) | no |
 | `mock_gh` | bin | fake `gh` for tests (§14.2) | no |
 | `mock_lsp` | bin | a scripted language server for tests (§18.7) | no |
 | `dv_test_support` | lib (dev) | fixture repo builder, shared by every crate's tests | no |
@@ -467,8 +468,10 @@ bringing dv to the front on the agent's working-tree review when the agent finis
 
 Direction: `dv` → `dv_ui` → {`dv_cli`, `dv_backend`, `dv_lsp`, `dv_core`, `gpui-component`};
 `dv_cli` → {`dv_backend`, `dv_lsp`, `dv_core`} (`dv_lsp` for the user's shell's `PATH`, §12.2); `dv_lsp` →
-`dv_core`; `dv_backend` → `dv_core`. A gpui import outside `dv_ui`, `dv`
-and `gpui_automation`, or in `dv` built without `gui`, is a build failure (`script/check` verifies
+`dv_core`; `dv_backend` → `dv_core`. The automation crates come from toolbox-rs
+(github.com/kylekz/toolbox-rs, the owner's MIT crates shared with the sibling apps), a git
+dependency pinned by tag (§14.2). A gpui import outside `dv_ui`, `dv`
+and toolbox-rs's `gpui_automation`, or in `dv` built without `gui`, is a build failure (`script/check` verifies
 it with `cargo tree`, §13.2).
 
 Rules: errors are `anyhow` in app/CLI code and `thiserror` enums in libraries; no `unwrap()`/`expect()`
@@ -2435,7 +2438,7 @@ change is committed; CI (§13.4) runs the same script on GitHub's runners once i
    every feature, and `dv` without its default features
 4. `cargo test --workspace`
 5. a plain `cargo build -p dv -p mock_gh -p mock_lsp` (step 4's test build links the binaries
-   with gpui's test support), then the e2e scenarios (`cargo run -p gpui_automation --bin e2e -- tests/e2e`),
+   with gpui's test support), then the e2e scenarios (`cargo run -p dv_e2e --bin e2e -- tests/e2e`),
    background mode; `--fast` skips this step. `--foreground` also runs `tests/e2e/foreground/`,
    the scenarios that must take the focus (screen captures of the window materials, §14.2)
 6. `--linux`: inside WSL Ubuntu with `CARGO_TARGET_DIR` on ext4, `cargo test -p dv_core -p
@@ -2451,9 +2454,9 @@ change is committed; CI (§13.4) runs the same script on GitHub's runners once i
    from Windows
 7. `--linux-gui`: the Linux app (§13.1) inside WSL Ubuntu, in a target dir of its own on ext4
    (`~/.cache/dv-target-gui`: gpui with X11 and Wayland, apart from step 6's headless one):
-   `cargo clippy -p dv -p dv_ui -p gpui_automation --all-targets -- -D warnings` and the shipped
+   `cargo clippy -p dv -p dv_ui -p dv_e2e --all-targets -- -D warnings` and the shipped
    shape's (`-p dv --no-default-features --features gui`), `cargo test -p dv -p dv_ui -p
-   gpui_automation` with no display in its environment (gpui's test platform), a plain `cargo
+   dv_e2e` with no display in its environment (gpui's test platform), a plain `cargo
    build -p dv -p mock_gh -p mock_lsp`, then every e2e scenario, which the runner starts on an
    **Xvfb display of its own** (§14.2), never WSLg's; run on a Linux host, the same right there.
    The distro needs the X11, Wayland and fontconfig development packages (`libxkbcommon-x11-dev
@@ -2739,7 +2742,13 @@ with and without its bytes, only looked at, read past what was asked, a director
   `backend_loopback` does the same against this `dv`'s own `backend --stdio` as a child of the
   app (`seed_repo` with `"backend": "loopback"`, `backend_kill`, `backend_block`,
   `backend_stop`).
-- **`gpui_automation` + `e2e` runner** — ported from the sibling app: JSONL scenarios in `tests/e2e/`, named
+- **`gpui_automation` + the `e2e` runner** — toolbox-rs's shared crates
+  (github.com/kylekz/toolbox-rs, pinned by tag in the root `Cargo.toml`; its `docs/automation.md`
+  documents the protocol, the scenario format and the runner): `gpui_automation`, the in-app
+  driver, whose `enabled` feature `dv_ui`'s and `dv`'s `automation` features turn on (without it
+  the crate is the no-op stand-ins the views call, which `dv_ui::automation` re-exports), and
+  `gpui_automation_runner`, the runner as a library, which `dv_e2e` wraps with dv's profile and
+  extensions. A change to either goes to toolbox-rs first, then a new tag here. JSONL scenarios in `tests/e2e/`, named
   targets (`.automation_target("file_list/src/routes/users.ts")`), frame-synced replies,
   `wait_for`/`assert` JSON-pointer checks, background runs that never take focus, per-scenario output
   dir with numbered screenshots and `failure.png`. dv adds custom commands `set_setting` (window
@@ -2768,11 +2777,15 @@ with and without its bytes, only looked at, read past what was asked, a director
   `wsl_distros` tells WSL's stand-in which distros there are and which run; `state.backends`
   lists the connections; `home_file` writes into the scratch home (a fake agent's folder, an
   older dv's skill) and `state.setup` is the setup screen's (§12).
-  `workflow_a_agent` runs §3 workflow A end to end that way. The runner wires `mock_gh` itself:
-  every launch gets `DV_GH` = `mock_gh` and `DV_DATA_DIR` = the scenario's data dir and no inherited
-  `DV_WSL_HOME` (only a header's `env` names one, so dv reaches WSL through its stand-in), a scenario
-  header's `gh` names the `mock_gh` scenario file (`DV_MOCK_GH`), and `{"gh_log": {}}` lines
-  assert on its call log (`DV_MOCK_GH_LOG`) (tests/e2e/README.md). On Linux the runner starts
+  `workflow_a_agent` runs §3 workflow A end to end that way. The host lists these commands in
+  the handshake, so the runner rejects a misspelt one before a scenario's first step. The
+  runner gives every launch `DV_DATA_DIR` = the scenario's data dir and no inherited `DV_`
+  variable (no `DV_WSL_HOME`: only a header's `env` names one, so dv reaches WSL through its
+  stand-in; no `DV_LSP_<ID>`). `dv_e2e`'s fixture wires `mock_gh` and `mock_lsp`: every launch
+  gets `DV_GH` = `mock_gh` and `GIT_CEILING_DIRECTORIES` = the scenario's output dir, a scenario
+  header's `gh` names the `mock_gh` scenario file (`DV_MOCK_GH`) and its `lsp` the `mock_lsp`
+  scenario for a language server (`DV_LSP_<ID>`), and `{"gh_log": {}}` and `{"lsp_log": {}}`
+  lines assert on their logs (tests/e2e/README.md). On Linux the runner starts
   an Xvfb display for the run (`Xvfb :<n> -screen 0 2560x1600x24`, the first free `n` from 90,
   ended with the run: `SIGTERM`, then `SIGKILL` after 5 s, and with the runner however it ends,
   `PR_SET_PDEATHSIG`; a lock a dead server left is no obstacle) and every app on it under X11

@@ -12,8 +12,12 @@ WSL; macOS and Linux supported. Agents read and answer reviews through the `dv` 
   never add it to the workspace. Code comes across only through the salvage list (PLAN §15): read
   it, keep what is listed, rewrite the rest.
 - Reference app for patterns: the owner's sibling GPUI app, same GPUI stack (where it lives:
-  `CLAUDE.local.md`). Its code may be copied freely (`gpui_automation` came from there); never
-  modify anything in that checkout.
+  `CLAUDE.local.md`). Its code may be copied freely; never modify anything in that checkout.
+- Shared crates: toolbox-rs (`~/code/toolbox-rs`, github.com/kylekz/toolbox-rs, MIT, the owner's
+  own), a git dependency pinned by tag in the root `Cargo.toml`. It holds the automation crates
+  dv, slide and fc share (its `docs/automation.md`). A change to them goes to toolbox-rs first
+  (its own `script/check`, then a new tag), then the tag here; never a branch, never a committed
+  `[patch]`.
 - Machine-specific notes (the sibling app's path, the Mac's ssh destination for `DV_MAC_HOST`)
   live in the git-ignored `CLAUDE.local.md` beside this file, never in the repository:
   @CLAUDE.local.md
@@ -36,7 +40,7 @@ WSL; macOS and Linux supported. Agents read and answer reviews through the `dv` 
 | `dv_backend` | the stdio protocol (`proto`: JSON lines, bytes base64, `WireError` for every `BackendError`), the `dv backend --stdio` server loop (`server`), how a server starts (`launch`: `Launcher::Command` a child process such as a loopback `dv backend --stdio`, `Launcher::Wsl` a distro's through `wsl.exe`, `Launcher::InProcess` a thread over in-memory pipes for tests), `RemoteBackend` over a `Connection` with its lifecycle (`client`: state and `subscribe`, reconnect with backoff 1/2/5 s then `Failed` until `retry`, worktrees re-opened and watches resubscribed with a synthetic rescan, remote processes ended by a death, `kill` as a test seam) and the app's `Connections` registry, build hashes (`build`), WSL (`wsl`: the distros, the `/bin/sh` scripts run through `wsl.exe` as a `Shell`, the launch with its markers) and this app's Linux builds and their install, prune and check in a distro (`install`) (PLAN §5); a test helper bin, never shipped: `dv_test_child`, the process the conformance suite spawns and its child-process loopback server | never |
 | `dv_cli` | the headless commands (`args`, clap) and what they run with (`Context`: the command line, cwd, env, streams, git env, so tests run them in-process), the repository and which review a command means (PLAN §10.2), a WSL repository's command run inside its distro on Windows (`reexec`, PLAN §10.4), who it acts as, thread placement, JSON DTOs (`dto`), exit and error codes (`error`), the `dv-review` agent skill (`skill/SKILL.md`, PLAN §10.5), the setup checks of every environment (`checks`: dv in a distro, the CLI on PATH with the user `Path` behind a seam, `user_path`, the agents' skills, git identity, `gh`; a distro's run as its own Linux dv, `checks::distro`) behind `dv doctor` and `dv setup [agents | path | wsl | all]` (PLAN §10, §12) | never |
 | `dv_lsp` | language servers where the repo lives (PLAN §18.4): the LSP client (`client`: `LspClient` over a `Backend::spawn_stdio` process, Content-Length framing (`framing`), requests with timeouts and `$/cancelRequest` on drop, the server's own requests answered, progress, registered file watchers, UTF-8 columns with UTF-16 converted (`text`), worktree paths and `file:` URIs (`paths`)), `LanguageServerSpec` as data (`spec`) and the registry (`languages`: `typescript`, TypeScript 7's native `tsc --lsp --stdio`; `tailwindcss` and `css`, JavaScript servers), the `Resolver` (`resolve`: the `DV_LSP_<ID>` override, the project's own copy by Node's resolution through the backend, above the worktree root and through links that leave it (`resolve::node`, `Backend::probe_path`; npm, pnpm and bun layouts), the native CPU first (`resolve::platform`), `settings.json`'s `lsp.<id>.command` and `lsp.runtime` (`settings`), `PATH` and the home (`resolve::host`; a distro's read from its user's interactive login shell through `spawn_stdio`, `resolve::shell`), JavaScript servers' entry scripts, bun's global folder and the runtime, bun then node (`resolve::js`), `files_changed` / `resolve_fresh` for installs), the restart schedule (`restarts`) | never |
-| `gpui_automation` | JSONL automation over stdio + the `e2e` runner bin (PLAN §14) | yes |
+| `dv_e2e` | bin `e2e`: the scenario runner, toolbox-rs's `gpui_automation_runner` with dv's profile (`DV_` variables, `DV_DATA_DIR`, Windows, Linux and macOS) and its extensions (`fixture`: the header's `gh` and `lsp` played by `mock_gh` and `mock_lsp`, the `gh_log` and `lsp_log` actions, `GIT_CEILING_DIRECTORIES`), tests/e2e/README.md (PLAN §14) | never |
 | `mock_gh` | bin: fake `gh` for tests (PLAN §14.2) | never |
 | `mock_lsp` | bin: a scripted language server for tests and scenarios (`DV_LSP_<ID>` names it; scenario `--scenario` / `DV_MOCK_LSP`, log `--log` / `DV_MOCK_LSP_LOG`, PLAN §18.7) | never |
 | `dv_test_support` | dev-only lib: `FixtureRepo` and shared test helpers (PLAN §14.2) | never |
@@ -44,24 +48,31 @@ WSL; macOS and Linux supported. Agents read and answer reviews through the `dv` 
 
 Direction: `dv` → {`dv_ui`, `dv_cli`, `dv_core`}; `dv_ui` → {`dv_cli`, `dv_backend`, `dv_lsp`,
 `dv_core`, `gpui-component`}; `dv_cli` → {`dv_backend`, `dv_lsp`, `dv_core`}; `dv_lsp` → `dv_core`; `dv_backend` →
-`dv_core`. `dv` and
-`dv_ui` reach `gpui_automation` only through their `automation` features; `dv`'s also brings
+`dv_core`; `dv_e2e` → toolbox-rs's `gpui_automation_runner`. `dv_ui` depends on toolbox-rs's
+`gpui_automation` always: without its `enabled` feature it is only the no-op stand-ins the views
+call (`automation_target`, `open_window`, …), re-exported by `dv_ui::automation`. `dv_ui`'s and
+`dv`'s `automation` features turn on `gpui_automation/enabled`, the driver; `dv` depends on it only
+with `automation`, so its headless build stays gpui-free. `dv`'s `automation` also brings
 `dv_test_support` (gpui-free) for the scenario repos it seeds and `dv_backend` for their
 loopback, never in the shipped build. A gpui
 dependency in a "never" crate, or in `dv` built without `gui`, fails `script/check` (step 3,
 `cargo tree`), because those run headless: in the CLI, as the static musl backend inside WSL, and
 in fast tests.
 
-GPUI naming: `gpui` = crates.io `gpui-pre =0.3.11`, `gpui_platform` = `gpui-pre-platform =0.3.11`,
-components = `gpui-component =0.9.0` and its base `gpui-base =0.9.0` (gpui-kit's crates) (the window's text
-selection, which `dv_ui` copies through the clipboard seam) (PLAN D1). Don't guess APIs: grep the sources under
+GPUI naming (PLAN D1): `gpui` = crates.io `gpui-pre =0.3.11`, `gpui_platform` =
+`gpui-pre-platform =0.3.11`, components = gpui-kit's `gpui-component =0.9.0` and its base
+`gpui-base =0.9.0` (the window's text selection, which `dv_ui` copies through the clipboard
+seam). toolbox-rs owns this pin: its tag's gpui-pre and gpui-kit versions are the ones dv uses,
+and a gpui bump starts there. Don't guess APIs: grep the sources under
 `~/.cargo/registry/src/index.crates.io-*/gpui-pre-0.3.11/` and `gpui-component-0.9.0/`.
 
 ## Rules
 
 - **Dependencies.** Declare every dependency once in the root `[workspace.dependencies]` (keep it
-  alphabetical) and use `foo.workspace = true` in crates. Exact pins for the gpui family; bump them
-  together, then build and run the e2e scenarios before keeping the new `Cargo.lock`.
+  alphabetical) and use `foo.workspace = true` in crates. crates.io only (`deny.toml`), with one
+  exception: toolbox-rs, a git dependency pinned by tag. Exact pins for the gpui family, the
+  versions toolbox-rs's tag pins; bump them together with a toolbox-rs tag that has them, then
+  build and run the e2e scenarios before keeping the new `Cargo.lock`.
 - **Licensing.** `gpui` and `gpui-component` are Apache-2.0; learn from and build on them freely.
   Most other Zed crates (editor, project, worktree, …) are GPL/AGPL: read them for architecture,
   never copy their code here.
@@ -142,7 +153,7 @@ script/check --foreground    # also tests/e2e/foreground: takes the focus for a 
 script/check --linux         # also step 6: the headless crates and dv tested and linted in WSL
                              # Ubuntu, script/build-linux --debug-only, the real WSL sandboxed under /tmp
 script/check --linux-gui     # also step 7: the Linux app in WSL Ubuntu (~/.cache/dv-target-gui):
-                             # clippy in its GUI shapes, dv/dv_ui/gpui_automation tests, e2e on Xvfb
+                             # clippy in its GUI shapes, dv/dv_ui/dv_e2e tests, e2e on Xvfb
 script/check-mac [--sync-only] [-- <check args>]  # the Mac ($DV_MAC_HOST, ~/code/dv) made this working
                              # tree, then script/check run there; its exit code (macOS below)
 script/build-linux [--aarch64] [--debug-only]   # the static musl dv for WSL:
@@ -175,9 +186,7 @@ cargo test -p dv --test backend_loopback # the built `dv backend --stdio` as a c
                              # handshake, a kill and the reconnect, Failed and retry, no leaked server
 cargo fmt --all
 cargo build -p dv -p mock_gh -p mock_lsp                           # the runner starts these; it doesn't build them
-cargo run -p gpui_automation --bin e2e -- tests/e2e    # background run; output in target/e2e/<scenario>/
-cargo test -p gpui_automation --test harness_e2e -- --ignored
-                             # the automation library's own e2e proof against its example harness
+cargo run -p dv_e2e --bin e2e -- tests/e2e    # background run; output in target/e2e/<scenario>/
 DV_TEST_TSC=<TypeScript 7's lib/tsc> cargo test -p dv_lsp --test real_tsc
                              # the real TypeScript check (PLAN §18.7): read-only, a temp fixture;
                              # in WSL, a project's node_modules/.bun/@typescript+typescript-linux-x64@*/…/lib/tsc
@@ -264,7 +273,7 @@ App windows open on the owner's real desktop.
   Windows desktop. The e2e runner on Linux starts an Xvfb display of its own for the run and
   starts the app there under X11 alone (PLAN §14.2); run the Linux app only through it (from
   the Linux GUI target dir: `CARGO_TARGET_DIR=$HOME/.cache/dv-target-gui cargo run -p
-  gpui_automation --bin e2e -- tests/e2e`, or `script/check --linux-gui`). Its `--host-display`
+  dv_e2e --bin e2e -- tests/e2e`, or `script/check --linux-gui`). Its `--host-display`
   (WSLg's display) is for an explicit exploratory look the owner asked for: a short scenario
   under `target/tmp/` that quits. `script/check --linux-gui` runs the Linux `cargo test`
   with `DISPLAY` and `WAYLAND_DISPLAY` removed (gpui's test platform needs neither); do the
@@ -287,7 +296,8 @@ App windows open on the owner's real desktop.
   screenshots are physical pixels (a 1440×900 window captures as ~2160×1350).
 - Exploratory runs (looking at something no scenario covers yet) are scratch scenarios outside
   `tests/e2e`, e.g. `target/tmp/explore.jsonl`, run with the runner and their own `--out`.
-  `tests/e2e/README.md` documents the protocol, the scenario format, the runner and dv's `state`.
+  toolbox-rs's `docs/automation.md` documents the protocol, the scenario format and the runner;
+  `tests/e2e/README.md` dv's own extensions, commands and `state`.
   The connection states (reconnecting, failed, the banner) are the loopback's in a scenario
   (`seed_repo` with `"backend": "loopback"`, `backend_kill`, `backend_block`); a real WSL repo
   only in an exploratory run (WSL below).

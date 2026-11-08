@@ -1,9 +1,0 @@
-{"scenario": {"window_size": "1000x700", "app_args": ["--maximized"], "description": "Background runs only: a window asked for maximized bounds opens windowed at its restore bounds and inactive, since gpui's SW_MAXIMIZE would activate and raise it"}}
-{"cmd": "wait_ready", "timeout_ms": 10000}
-// gpui maximizes with a posted ShowWindowAsync, so give it frames to land before looking.
-{"cmd": "wait_frames", "n": 10}
-{"cmd": "state", "expect_result": [{"pointer": "/window/background", "equals": true}, {"pointer": "/window/maximized", "equals": false}, {"pointer": "/window/active", "equals": false}, {"pointer": "/window/w", "equals": 1000}, {"pointer": "/window/h", "equals": 700}]}
-{"cmd": "click", "target": "counter/increment", "expect": [{"pointer": "/counter", "equals": 1}, {"pointer": "/window/active", "equals": false}]}
-{"cmd": "screenshot", "name": "windowed", "expect_result": [{"pointer": "/logical/w", "equals": 1000}, {"pointer": "/logical/h", "equals": 700}, {"pointer": "/source", "equals": "window"}]}
-// A screen capture would copy whatever covers the window, so background mode refuses it.
-{"cmd": "screenshot", "path": "${out_dir}/never-written.png", "source": "screen", "expect_error": "\"foreground\": true"}

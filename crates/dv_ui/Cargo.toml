@@ -11,9 +11,10 @@ path = "src/lib.rs"
 doctest = false
 
 [features]
-# Named automation targets and the automation host's hooks for gpui_automation (docs/PLAN.md §14).
-# The dv binary enables it through its own `automation` feature.
-automation = ["dep:gpui_automation"]
+# The automation seam re-exports toolbox-rs's `gpui_automation` (docs/PLAN.md §14), whose driver
+# this turns on; without it the seam is the crate's no-op stand-ins. The dv binary enables it
+# through its own `automation` feature.
+automation = ["gpui_automation/enabled"]
 
 [dependencies]
 anyhow.workspace = true
@@ -25,7 +26,7 @@ futures.workspace = true
 gpui.workspace = true
 gpui-base.workspace = true
 gpui-component.workspace = true
-gpui_automation = { workspace = true, optional = true }
+gpui_automation.workspace = true
 log.workspace = true
 markdown.workspace = true
 parking_lot.workspace = true

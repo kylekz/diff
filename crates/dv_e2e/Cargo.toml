@@ -1,0 +1,22 @@
+[package]
+name = "dv_e2e"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+description = "dv's e2e scenario runner: toolbox-rs's runner with dv's profile and its gh/lsp fixture (docs/PLAN.md §14)"
+
+[[bin]]
+name = "e2e"
+path = "src/main.rs"
+
+# gpui: never (`script/check` step 3). It drives `dv` over its stdio.
+[dependencies]
+anyhow.workspace = true
+gpui_automation_runner.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+
+[dev-dependencies]
+pretty_assertions.workspace = true
+tempfile.workspace = true

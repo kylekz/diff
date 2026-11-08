@@ -1661,6 +1661,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "dv_e2e"
+version = "0.4.0"
+dependencies = [
+ "anyhow",
+ "gpui_automation_runner",
+ "pretty_assertions",
+ "serde",
+ "serde_json",
+ "tempfile",
+]
+
+[[package]]
 name = "dv_lsp"
 version = "0.4.0"
 dependencies = [
@@ -3109,25 +3121,45 @@ checksum = "99b18b06f5026b3d312488eacfdddbe78f82b4bf32bb2d2bc3186e31e552b797"
 
 [[package]]
 name = "gpui_automation"
-version = "0.4.0"
+version = "0.1.2"
+source = "git+https://github.com/kylekz/toolbox-rs?tag=v0.1.2#620b141408773025bfabc435891ed9e1418ecec3"
 dependencies = [
  "anyhow",
  "core-graphics 0.24.0",
  "futures",
- "gpui-component",
  "gpui-pre",
- "gpui-pre-platform",
- "libc",
+ "gpui_automation_protocol",
  "log",
  "objc2 0.6.4",
  "png 0.18.1",
- "pretty_assertions",
  "raw-window-handle",
  "serde",
  "serde_json",
- "tempfile",
  "windows-sys 0.61.2",
  "x11rb",
+]
+
+[[package]]
+name = "gpui_automation_protocol"
+version = "0.1.2"
+source = "git+https://github.com/kylekz/toolbox-rs?tag=v0.1.2#620b141408773025bfabc435891ed9e1418ecec3"
+dependencies = [
+ "anyhow",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "gpui_automation_runner"
+version = "0.1.2"
+source = "git+https://github.com/kylekz/toolbox-rs?tag=v0.1.2#620b141408773025bfabc435891ed9e1418ecec3"
+dependencies = [
+ "anyhow",
+ "gpui_automation_protocol",
+ "libc",
+ "serde",
+ "serde_json",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

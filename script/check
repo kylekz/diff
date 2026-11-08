@@ -10,7 +10,7 @@
 #                              the app's connection, `dv setup wsl` and the CLI run inside it;
 #                              run inside a distro, the first two there and no real-WSL step
 #   script/check --linux-gui   also step 7: the Linux app (dv's GUI shapes, dv_ui and
-#                              gpui_automation) linted and tested inside WSL Ubuntu, and the e2e
+#                              dv_e2e) linted and tested inside WSL Ubuntu, and the e2e
 #                              scenarios there on an Xvfb display the runner starts (never
 #                              WSLg's); run on a Linux host, right there
 set -euo pipefail
@@ -24,7 +24,7 @@ usage: script/check [--fast] [--foreground] [--linux] [--linux-gui]
      (-p dv --no-default-features --features gui), headless (-p dv --no-default-features)
   3. gpui boundary: no gpui in the headless crates' or the headless dv's dependency trees
   4. cargo test --workspace
-  5. e2e scenarios in tests/e2e (background windows)          skipped with --fast
+  5. e2e scenarios in tests/e2e through dv_e2e (background)   skipped with --fast
      and tests/e2e/foreground (takes the focus; hands off)    only with --foreground
   6. the headless crates and the headless dv tested and linted inside WSL Ubuntu,
      script/build-linux, then the real WSL (sandboxed under /tmp)  only with --linux
@@ -69,7 +69,7 @@ step() {
 }
 
 # The crates that must never depend on gpui, even transitively (PLAN §4).
-headless_crates=(dv_core dv_backend dv_cli dv_lsp mock_gh mock_lsp dv_test_support dv_package)
+headless_crates=(dv_core dv_backend dv_cli dv_lsp mock_gh mock_lsp dv_test_support dv_package dv_e2e)
 
 step 1 "cargo fmt --all --check"
 cargo fmt --all --check
@@ -92,7 +92,9 @@ check_boundary() {
     shift
     local tree offenders
     tree="$(cargo tree "$@" -e normal --target all --prefix none)"
-    offenders="$(printf '%s\n' "$tree" | grep -E '^gpui' | sed 's/ (\*)$//' | sort -u || true)"
+    # gpui's own crates (gpui-pre*, gpui-component, gpui-base, gpui-kit-assets) are hyphenated;
+    # toolbox-rs's gpui-free automation crates (gpui_automation_runner, …_protocol) are not.
+    offenders="$(printf '%s\n' "$tree" | grep -E '^gpui-' | sed 's/ (\*)$//' | sort -u || true)"
     if [[ -n "$offenders" ]]; then
         boundary_ok=0
         echo "error: $name depends on gpui:" >&2
@@ -129,16 +131,16 @@ else
         # runner itself never builds anything.
         step 5 "cargo build -p dv -p mock_gh -p mock_lsp  (plain binaries for the runner)"
         cargo build -p dv -p mock_gh -p mock_lsp
-        step 5 "e2e scenarios: cargo run -p gpui_automation --bin e2e -- tests/e2e"
-        cargo run -p gpui_automation --bin e2e -- tests/e2e
+        step 5 "e2e scenarios: cargo run -p dv_e2e --bin e2e -- tests/e2e"
+        cargo run -p dv_e2e --bin e2e -- tests/e2e
     fi
     if [[ "$foreground" -eq 1 ]]; then
         # These take the foreground for a few seconds each (tests/e2e/README.md, "Screenshots
         # and window materials"), so only an explicit flag runs them.
         step 5 "cargo build -p dv -p mock_gh -p mock_lsp  (plain binaries for the runner)"
         cargo build -p dv -p mock_gh -p mock_lsp
-        step 5 "foreground e2e scenarios: cargo run -p gpui_automation --bin e2e -- tests/e2e/foreground"
-        cargo run -p gpui_automation --bin e2e -- tests/e2e/foreground
+        step 5 "foreground e2e scenarios: cargo run -p dv_e2e --bin e2e -- tests/e2e/foreground"
+        cargo run -p dv_e2e --bin e2e -- tests/e2e/foreground
     fi
 fi
 
@@ -225,15 +227,15 @@ if [[ "$linux_gui" -eq 1 ]]; then
     # scenarios run on an Xvfb display the e2e runner starts and ends, never the desktop's
     # (CLAUDE.md, "GUI runs"); their screenshots land in <that target dir>/e2e.
     linux_gui_steps=(
-        "cargo clippy -p dv -p dv_ui -p gpui_automation --all-targets -- -D warnings"
+        "cargo clippy -p dv -p dv_ui -p dv_e2e --all-targets -- -D warnings"
         "cargo clippy -p dv --no-default-features --features gui --all-targets -- -D warnings"
-        "env -u DISPLAY -u WAYLAND_DISPLAY cargo test -p dv -p dv_ui -p gpui_automation"
+        "env -u DISPLAY -u WAYLAND_DISPLAY cargo test -p dv -p dv_ui -p dv_e2e"
     )
     # The scenarios, as step 5 runs them; --fast skips them here too.
     if [[ "$fast" -eq 0 ]]; then
         linux_gui_steps+=(
             "cargo build -p dv -p mock_gh -p mock_lsp"
-            "cargo run -p gpui_automation --bin e2e -- tests/e2e"
+            "cargo run -p dv_e2e --bin e2e -- tests/e2e"
         )
     fi
     case "$(uname -s)" in

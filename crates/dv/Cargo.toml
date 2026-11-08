@@ -55,12 +55,13 @@ gui = [
 # are built without it (PLAN D9).
 # It also seeds fixture repos for scenarios (`seed_repo`, PLAN §14.2) with `dv_test_support`,
 # which, like `dv_core`, never depends on gpui, and reaches them through a loopback
-# `dv backend --stdio` it can kill and block (`dv_backend`, PLAN §5.2).
+# `dv backend --stdio` it can kill and block (`dv_backend`, PLAN §5.2). `gpui_automation`
+# (toolbox-rs) stays optional here, unlike in `dv_ui`: the headless build must not reach gpui.
 automation = [
     "gui",
     "dep:dv_backend",
     "dep:dv_test_support",
-    "dep:gpui_automation",
+    "gpui_automation/enabled",
     "dep:serde",
     "dep:serde_json",
     "dv_ui/automation",
@@ -110,7 +111,7 @@ libc = { workspace = true, optional = true }
 
 # A Linux desktop's window system: X11, and Wayland where the session has it (gpui prefers it
 # when `WAYLAND_DISPLAY` is set). Automation runs under X11 alone, on an Xvfb display
-# (`gpui_automation`'s X11 captures, PLAN §14.2).
+# (toolbox-rs `gpui_automation`'s X11 captures, PLAN §14.2).
 [target.'cfg(target_os = "linux")'.dependencies]
 gpui_platform = { workspace = true, optional = true, features = ["wayland", "x11"] }
 

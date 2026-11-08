@@ -1,7 +1,7 @@
-# cargo-deny, CI's dependencies job (docs/PLAN.md §13.4): every crate comes from crates.io,
-# carries a license on the list below, and has no open security advisory. A change to
-# Cargo.lock that brings in a crate from anywhere else, or a crate RustSec flags, fails CI and so
-# can't reach a release.
+# cargo-deny, CI's dependencies job (docs/PLAN.md §13.4): every crate comes from crates.io or the
+# owner's toolbox-rs, carries a license on the list below, and has no open security advisory. A
+# change to Cargo.lock that brings in a crate from anywhere else, or a crate RustSec flags, fails
+# CI and so can't reach a release.
 
 [graph]
 all-features = true
@@ -57,4 +57,7 @@ allow-wildcard-paths = true
 unknown-registry = "deny"
 unknown-git = "deny"
 allow-registry = ["https://github.com/rust-lang/crates.io-index"]
-allow-git = []
+# toolbox-rs, the owner's shared automation crates (docs/PLAN.md §14), pinned by tag in
+# Cargo.toml: the one source besides crates.io. A change to it goes to toolbox-rs first, then a
+# new tag here.
+allow-git = ["https://github.com/kylekz/toolbox-rs"]

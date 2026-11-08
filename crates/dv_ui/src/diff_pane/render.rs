@@ -13,7 +13,7 @@ use dv_core::review::AnchorSide;
 use gpui::{
     AnyElement, Context, DispatchPhase, FontWeight, InteractiveElement as _, IntoElement,
     MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, ParentElement as _, Render,
-    ScrollWheelEvent, StatefulInteractiveElement as _, Styled as _, Window, canvas, div,
+    ScrollEvent, StatefulInteractiveElement as _, Styled as _, Window, canvas, div,
     prelude::FluentBuilder as _, px,
 };
 use std::rc::Rc;
@@ -130,7 +130,7 @@ impl Render for DiffPane {
                     this.pointer_left_pane(cx);
                 }
             }))
-            .on_scroll_wheel(cx.listener(|this, event: &ScrollWheelEvent, _, cx| {
+            .on_scroll(cx.listener(|this, event: &ScrollEvent, _, cx| {
                 let delta = event.delta.pixel_delta(px(heights::CODE));
                 if delta.x != px(0.) {
                     this.scroll_sideways(-f32::from(delta.x), cx);

@@ -655,7 +655,7 @@ fn ready_banner(
                     .max_h(px(READY_NOTE_MAX_HEIGHT))
                     .overflow_y_scroll()
                     .track_scroll(scroll)
-                    .on_scroll_wheel(cx.listener(|_, _, _, cx| cx.notify()))
+                    .on_scroll(cx.listener(|_, _, _, cx| cx.notify()))
                     .px(theme.spacing.lg)
                     .pl(px(43.))
                     .child(

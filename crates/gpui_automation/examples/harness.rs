@@ -336,7 +336,7 @@ impl Harness {
 }
 
 impl Render for Harness {
-    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let dropped = if self.dropped.is_empty() {
             SharedString::from("Drop files here")
         } else {
@@ -543,7 +543,6 @@ impl Render for Harness {
                     .children((0..ROWS).map(|index| self.render_row(index, cx)))
                     .automation_target("list"),
             )
-            .children(Root::render_dialog_layer(window, cx))
     }
 }
 

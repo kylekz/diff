@@ -12,17 +12,17 @@ rust-version = "1.98"
 publish = false
 
 [workspace.dependencies]
-# ---- UI stack (docs/PLAN.md D1): gpui-pre snapshot + gpui-component 0.6, the same pins as the sibling app.
+# ---- UI stack (docs/PLAN.md D1): gpui-pre snapshot + gpui-component 0.9 (gpui-kit), the same pins as the sibling apps.
 # Pinned exactly; bump all of these together.
-gpui = { package = "gpui-pre", version = "=0.3.6" }
-gpui_platform = { package = "gpui-pre-platform", version = "=0.3.6" }
+gpui = { package = "gpui-pre", version = "=0.3.11" }
+gpui_platform = { package = "gpui-pre-platform", version = "=0.3.11" }
 # gpui-component's base: its window-wide text selection (`TextSelection`), which the hover
 # card's selectable Markdown copies through the clipboard seam (`dv_ui::shell`).
-gpui-base = "=0.6.6"
+gpui-base = "=0.9.0"
 # The tree-sitter grammars `dv_ui::syntax` highlights diffs with (PLAN §6 step 4): every one of
 # gpui-component's `tree-sitter-languages`. SQL's grammar crate (tree-sitter-sequel) wants `cc`
 # ~1.2, which every other build dependency accepts, so the lock keeps `cc` at the newest 1.2.
-gpui-component = { version = "=0.6.6", features = [
+gpui-component = { version = "=0.9.0", features = [
     "tree-sitter-astro",
     "tree-sitter-bash",
     "tree-sitter-c",

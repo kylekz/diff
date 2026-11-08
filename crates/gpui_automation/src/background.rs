@@ -78,9 +78,11 @@ pub fn window_options(options: WindowOptions) -> WindowOptions {
     }
 }
 
-/// `options` for a background window: unfocused and unthrottled, and
-/// windowed at the restore bounds of maximized bounds, since gpui maximizes
-/// with `ShowWindow(SW_MAXIMIZE)`, which activates the window.
+/// `options` for a background window: unfocused and unthrottled (none of
+/// gpui's caps while inactive, in Low Power Mode or under thermal pressure, so
+/// a run on battery steps as fast as one on the desk), and windowed at the
+/// restore bounds of maximized bounds, since gpui maximizes with
+/// `ShowWindow(SW_MAXIMIZE)`, which activates the window.
 fn background_options(options: WindowOptions) -> WindowOptions {
     let window_bounds = match options.window_bounds {
         Some(WindowBounds::Maximized(bounds)) => Some(WindowBounds::Windowed(bounds)),
@@ -89,6 +91,8 @@ fn background_options(options: WindowOptions) -> WindowOptions {
     WindowOptions {
         focus: false,
         inactive_frame_interval: None,
+        low_power_frame_interval: None,
+        thermal_frame_interval: None,
         window_bounds,
         ..options
     }
@@ -183,6 +187,8 @@ mod tests {
             "the window stays visible so it keeps rendering"
         );
         assert_eq!(background.inactive_frame_interval, None);
+        assert_eq!(background.low_power_frame_interval, None);
+        assert_eq!(background.thermal_frame_interval, None);
         assert_eq!(background.window_bounds, None);
     }
 

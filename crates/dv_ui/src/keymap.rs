@@ -13,9 +13,7 @@
 //! `secondary` is gpui's platform modifier: `Ctrl` on Windows and Linux, `Cmd` on macOS
 //! (DESIGN §5: "macOS uses Cmd for every Ctrl").
 
-use gpui::{
-    Action, App, DummyKeyboardMapper, KeyBinding, KeyBindingContextPredicate, SharedString,
-};
+use gpui::{Action, App, KeyBinding, KeyBindingContextPredicate, SharedString};
 
 use crate::actions::{
     app, composer, diff_pane, field, file_finder, file_list, find, first_run, palette, settings,
@@ -98,8 +96,8 @@ impl Shortcut {
         }
     }
 
-    /// The gpui binding for this row.
-    pub fn key_binding(&self) -> anyhow::Result<KeyBinding> {
+    /// The gpui binding for this row, its keys parsed for the app's OS and keyboard.
+    pub fn key_binding(&self, cx: &App) -> anyhow::Result<KeyBinding> {
         let predicate = KeyBindingContextPredicate::parse(&self.predicate())?;
         Ok(KeyBinding::load(
             self.keys,
@@ -107,7 +105,7 @@ impl Shortcut {
             Some(predicate.into()),
             false,
             None,
-            &DummyKeyboardMapper,
+            cx,
         )?)
     }
 
@@ -306,7 +304,7 @@ pub fn platform_shortcuts() -> impl Iterator<Item = &'static Shortcut> {
 /// last and win within a context depth.
 pub fn init(cx: &mut App) -> anyhow::Result<()> {
     let bindings = platform_shortcuts()
-        .map(Shortcut::key_binding)
+        .map(|shortcut| shortcut.key_binding(cx))
         .collect::<anyhow::Result<Vec<_>>>()?;
     cx.bind_keys(bindings);
     Ok(())
@@ -419,12 +417,13 @@ mod tests {
 
     use super::*;
 
-    #[test]
-    fn every_row_binds_and_no_keystroke_is_bound_twice_under_one_predicate() {
+    #[gpui::test]
+    fn every_row_binds_and_no_keystroke_is_bound_twice_under_one_predicate(
+        cx: &mut gpui::TestAppContext,
+    ) {
         let mut seen = HashSet::new();
         for shortcut in SHORTCUTS.iter().chain(MACOS_SHORTCUTS) {
-            shortcut
-                .key_binding()
+            cx.update(|cx| shortcut.key_binding(cx))
                 .unwrap_or_else(|error| panic!("{shortcut:?}: {error}"));
             assert!(
                 seen.insert((shortcut.keys, shortcut.predicate())),

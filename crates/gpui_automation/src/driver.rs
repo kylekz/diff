@@ -15,8 +15,7 @@ use futures::future::Either;
 use gpui::{
     AnyWindowHandle, App, AppContext as _, AsyncApp, Entity, ExternalPaths, FileDropEvent,
     KeyUpEvent, Keystroke, Modifiers, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent,
-    Pixels, PlatformInput, Point, ScrollDelta, ScrollWheelEvent, Task, TouchPhase, Window, point,
-    px,
+    Pixels, PlatformInput, Point, ScrollDelta, ScrollEvent, Task, TouchPhase, Window, point, px,
 };
 use serde_json::{Map, Value, json};
 
@@ -162,6 +161,7 @@ impl<H: AutomationHost> Driver<H> {
             Builtin::Action(args) => self.action(args, window, cx).await,
             Builtin::Key(args) => {
                 let keystroke = keys::parse_keystroke(&args.keystroke)?;
+                let keystroke = cx.update(|cx| keys::as_typed(keystroke, cx));
                 let window = self.current_window(window, cx)?;
                 let handled = cx.update_window(window.handle, |_, window, cx| {
                     window.dispatch_keystroke(keystroke.clone(), cx)
@@ -172,6 +172,12 @@ impl<H: AutomationHost> Driver<H> {
             }
             Builtin::Keys(args) => {
                 let keystrokes = keys::parse_keystroke_sequence(&args.keys.joined())?;
+                let keystrokes: Vec<Keystroke> = cx.update(|cx| {
+                    keystrokes
+                        .into_iter()
+                        .map(|keystroke| keys::as_typed(keystroke, cx))
+                        .collect()
+                });
                 let window = self.current_window(window, cx)?;
                 let mut handled = Vec::with_capacity(keystrokes.len());
                 for keystroke in keystrokes {
@@ -663,7 +669,7 @@ impl<H: AutomationHost> Driver<H> {
                     pointer.position = e.position;
                     pointer.pressed = None;
                 }
-                PlatformInput::ScrollWheel(e) => pointer.position = e.position,
+                PlatformInput::Scroll(e) => pointer.position = e.position,
                 PlatformInput::FileDrop(
                     FileDropEvent::Entered { position, .. }
                     | FileDropEvent::Pending { position }
@@ -905,11 +911,12 @@ impl<H: AutomationHost> Driver<H> {
         }
         self.dispatch(
             &window,
-            vec![PlatformInput::ScrollWheel(ScrollWheelEvent {
+            vec![PlatformInput::Scroll(ScrollEvent {
                 position: at,
                 delta,
                 modifiers,
                 touch_phase: TouchPhase::Moved,
+                source: gpui::ScrollSource::Pointer,
             })],
             cx,
         )?;

@@ -46,12 +46,14 @@ beyond what `gh` gives for free, merge-conflict badges.
 
 ## 1. Decisions
 
-### D1. UI stack: `gpui-pre` + `gpui-component` 0.6, exact pins (same as the sibling app)
-`gpui = { package = "gpui-pre", version = "=0.3.6" }` (+ `gpui-pre-platform`), `gpui-component =0.6.6`,
+### D1. UI stack: `gpui-pre` + `gpui-component` 0.9 (gpui-kit), exact pins (same as the sibling apps)
+`gpui = { package = "gpui-pre", version = "=0.3.11" }` (+ `gpui-pre-platform`), `gpui-component =0.9.0`
+and `gpui-base =0.9.0` (gpui-kit's crates, each pinned on its own rather than through the
+`gpui-kit` umbrella),
 declared once in `[workspace.dependencies]`, bumped together. The first implementation sat on zed git
 main + `gpui-component 0.5.2`, a line that is no longer maintained, and every `cargo update` was a
 big-bang risk. Same stack as the sibling app means the sibling app's `gpui_automation` crate and its lessons carry over
-directly (§14). Grep APIs under `~/.cargo/registry/src/*/gpui-pre-0.3.6/` and `gpui-component-0.6.6/`.
+directly (§14). Grep APIs under `~/.cargo/registry/src/*/gpui-pre-0.3.11/` and `gpui-component-0.9.0/`.
 
 ### D2. Rewrite in place, salvage deliberately
 Same repository, fresh crates (§4), with the first implementation kept read-only under `legacy/`.
@@ -2891,7 +2893,7 @@ Each phase ends with its e2e scenarios green and a screenshot review against DES
   `settings.json` and `known_repos.json`, each written atomically, the last write winning.
 - **macOS is verified on one Mac**, the owner's (§13.2: `script/check-mac`); keep platform code
   behind small modules so a gap there stays contained.
-- Window material (D8) is available: `gpui-pre` 0.3.6 has `WindowBackgroundAppearance::{Blurred,
+- Window material (D8) is available: `gpui-pre` 0.3.11 has `WindowBackgroundAppearance::{Blurred,
   MicaBackdrop, MicaAltBackdrop}` (`gpui-pre-windows/src/window.rs`), checked 2026-10-04.
 
 ---

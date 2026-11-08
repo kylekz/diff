@@ -292,7 +292,7 @@ fn ctrl_click_puts_the_cursor_on_its_line_which_alt_left_comes_back_to(cx: &mut 
             pane.char_point_for_tests("src/a.ts", AnchorSide::New, 2, at.range.start + 1)
         })
         .expect("line 2 drew");
-    let modifiers = Modifiers::secondary_key();
+    let modifiers = cx.update(|_, cx| Modifiers::secondary_key(cx));
     cx.simulate_event(MouseDownEvent {
         button: MouseButton::Left,
         position: point,

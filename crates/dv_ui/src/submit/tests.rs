@@ -331,7 +331,10 @@ fn no_other_review_opens_while_a_round_is_finished(cx: &mut TestAppContext) {
     let location = Location::Local(repo.path().to_path_buf());
     // The round starts and another review is asked for before the write can run.
     let (submitting, opening, refused) = cx.update(|window, cx| {
-        window.dispatch_keystroke(gpui::Keystroke::parse("secondary-enter").unwrap(), cx);
+        window.dispatch_keystroke(
+            gpui::Keystroke::parse_with_os("secondary-enter", cx.platform_info().os).unwrap(),
+            cx,
+        );
         let opening = shell.update(cx, |shell, cx| {
             shell.open(location, OpenRequest::Target(Target::Staged), window, cx)
         });

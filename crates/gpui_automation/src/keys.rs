@@ -2,7 +2,19 @@
 //! commands.
 
 use anyhow::{Context as _, Result, bail};
-use gpui::{Keystroke, Modifiers};
+use gpui::{App, Keystroke, Modifiers, OperatingSystem};
+
+/**
+ * The OS that `secondary-` resolves for: gpui-pre 0.3.11 parses a keystroke for a named OS (cmd on
+ * the Mac, ctrl elsewhere), and scenarios run on the machine the app runs on.
+ */
+const HOST_OS: OperatingSystem = if cfg!(target_os = "macos") {
+    OperatingSystem::Mac
+} else if cfg!(target_os = "linux") {
+    OperatingSystem::Linux
+} else {
+    OperatingSystem::Windows
+};
 
 /// Parse one keystroke in gpui's keymap syntax (`"ctrl-shift-k"`, `"enter"`,
 /// `"A"` which means shift-a).
@@ -11,7 +23,25 @@ pub fn parse_keystroke(source: &str) -> Result<Keystroke> {
     if source.is_empty() {
         bail!("empty keystroke");
     }
-    Keystroke::parse(source).map_err(|err| anyhow::anyhow!("bad keystroke {source:?}: {err}"))
+    Keystroke::parse_with_os(source, HOST_OS)
+        .map_err(|err| anyhow::anyhow!("bad keystroke {source:?}: {err}"))
+}
+
+/// `keystroke` as the OS's own key event would carry it. On Windows a shifted
+/// digit or punctuation key arrives as its shifted character without shift
+/// (`shift-[` is `{` on a US layout), and gpui maps key bindings the same way
+/// through the keyboard mapper, so the keystroke goes through that mapper with
+/// the current layout too; gpui then gives it its `key_char`. The Mac's key
+/// events keep the unshifted key and shift, as parsed.
+pub fn as_typed(keystroke: Keystroke, cx: &App) -> Keystroke {
+    if HOST_OS == OperatingSystem::Windows {
+        cx.keyboard_mapper()
+            .map_key_equivalent(keystroke, false)
+            .inner()
+            .clone()
+    } else {
+        keystroke
+    }
 }
 
 /// Parse a whitespace-separated keystroke sequence such as
@@ -99,7 +129,7 @@ mod tests {
     #[test]
     fn sequence_splits_on_whitespace() {
         let keys = parse_keystroke_sequence("ctrl-k  down\tenter").unwrap();
-        let unparsed: Vec<String> = keys.iter().map(Keystroke::unparse).collect();
+        let unparsed: Vec<String> = keys.iter().map(|key| key.unparse(HOST_OS)).collect();
         assert_eq!(unparsed, ["ctrl-k", "down", "enter"]);
         assert!(keys[0].modifiers.control);
         assert_eq!(keys[0].key, "k");
@@ -175,7 +205,12 @@ mod tests {
             parse_modifiers("secondary").unwrap(),
             parse_keystroke("secondary-k").unwrap().modifiers
         );
-        assert!(parse_modifiers("secondary").unwrap().secondary());
+        let secondary = parse_modifiers("secondary").unwrap();
+        assert!(if HOST_OS == OperatingSystem::Mac {
+            secondary.platform
+        } else {
+            secondary.control
+        });
         let err = parse_modifiers("meta").unwrap_err().to_string();
         assert!(err.contains("unknown modifier"), "{err}");
     }

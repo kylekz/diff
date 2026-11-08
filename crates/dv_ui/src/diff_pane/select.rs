@@ -357,7 +357,9 @@ impl DiffPane {
         };
         let text = &diff_line.text;
         // `Ctrl`+click: go to definition, the press selecting nothing (PLAN §18.1).
-        if event.modifiers.secondary() && event.click_count == 1 && self.definition_click(event, cx)
+        if event.modifiers.secondary(cx)
+            && event.click_count == 1
+            && self.definition_click(event, cx)
         {
             return;
         }

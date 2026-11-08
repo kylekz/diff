@@ -14,8 +14,8 @@ use std::cell::Cell;
 
 use gpui::{
     AnyElement, App, DispatchPhase, Empty, IntoElement, MouseDownEvent, MouseEvent, MouseExitEvent,
-    MouseMoveEvent, MouseUpEvent, ParentElement as _, ScrollWheelEvent, Styled as _, Window,
-    canvas, div,
+    MouseMoveEvent, MouseUpEvent, ParentElement as _, ScrollEvent, Styled as _, Window, canvas,
+    div,
 };
 
 thread_local! {
@@ -69,7 +69,7 @@ fn guard_element() -> AnyElement {
                 block_real::<MouseDownEvent>(window);
                 block_real::<MouseUpEvent>(window);
                 block_real::<MouseExitEvent>(window);
-                block_real::<ScrollWheelEvent>(window);
+                block_real::<ScrollEvent>(window);
             },
         ))
         .into_any_element()
@@ -110,7 +110,7 @@ mod tests {
                     .size_full()
                     .on_mouse_move(move |_, _, _| moves.set(moves.get() + 1))
                     .on_mouse_down(MouseButton::Left, move |_, _, _| downs.set(downs.get() + 1))
-                    .on_scroll_wheel(move |_, _, _| wheels.set(wheels.get() + 1)),
+                    .on_scroll(move |_, _, _| wheels.set(wheels.get() + 1)),
             )
         }
     }
@@ -131,7 +131,7 @@ mod tests {
         cx.simulate_mouse_move(at, None, Modifiers::none());
         cx.simulate_mouse_down(at, MouseButton::Left, Modifiers::none());
         cx.simulate_mouse_up(at, MouseButton::Left, Modifiers::none());
-        cx.simulate_event(ScrollWheelEvent {
+        cx.simulate_event(ScrollEvent {
             position: at,
             ..Default::default()
         });

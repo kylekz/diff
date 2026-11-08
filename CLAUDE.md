@@ -52,10 +52,10 @@ dependency in a "never" crate, or in `dv` built without `gui`, fails `script/che
 `cargo tree`), because those run headless: in the CLI, as the static musl backend inside WSL, and
 in fast tests.
 
-GPUI naming: `gpui` = crates.io `gpui-pre =0.3.6`, `gpui_platform` = `gpui-pre-platform =0.3.6`,
-components = `gpui-component =0.6.6` and its base `gpui-base =0.6.6` (the window's text
+GPUI naming: `gpui` = crates.io `gpui-pre =0.3.11`, `gpui_platform` = `gpui-pre-platform =0.3.11`,
+components = `gpui-component =0.9.0` and its base `gpui-base =0.9.0` (gpui-kit's crates) (the window's text
 selection, which `dv_ui` copies through the clipboard seam) (PLAN D1). Don't guess APIs: grep the sources under
-`~/.cargo/registry/src/index.crates.io-*/gpui-pre-0.3.6/` and `gpui-component-0.6.6/`.
+`~/.cargo/registry/src/index.crates.io-*/gpui-pre-0.3.11/` and `gpui-component-0.9.0/`.
 
 ## Rules
 

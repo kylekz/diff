@@ -1580,7 +1580,7 @@ checksum = "92773504d58c093f6de2459af4af33faa518c13451eb8f2b5698ed3d36e7c813"
 
 [[package]]
 name = "dv"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -1612,7 +1612,7 @@ dependencies = [
 
 [[package]]
 name = "dv_backend"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "base64 0.23.1",
  "dv_core",
@@ -1630,7 +1630,7 @@ dependencies = [
 
 [[package]]
 name = "dv_cli"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "clap",
  "dv_backend",
@@ -1648,7 +1648,7 @@ dependencies = [
 
 [[package]]
 name = "dv_core"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "dv_test_support",
  "ignore",
@@ -1665,7 +1665,7 @@ dependencies = [
 
 [[package]]
 name = "dv_e2e"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "anyhow",
  "gpui_automation_runner",
@@ -1677,7 +1677,7 @@ dependencies = [
 
 [[package]]
 name = "dv_lsp"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "dv_backend",
  "dv_core",
@@ -1696,7 +1696,7 @@ dependencies = [
 
 [[package]]
 name = "dv_package"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "pretty_assertions",
  "semver",
@@ -1706,14 +1706,14 @@ dependencies = [
 
 [[package]]
 name = "dv_test_support"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "tempfile",
 ]
 
 [[package]]
 name = "dv_ui"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "anyhow",
  "dv_backend",
@@ -4336,7 +4336,7 @@ dependencies = [
 
 [[package]]
 name = "mock_gh"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "anyhow",
  "pretty_assertions",
@@ -4347,7 +4347,7 @@ dependencies = [
 
 [[package]]
 name = "mock_lsp"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "anyhow",
  "dv_core",

@@ -2449,7 +2449,8 @@ change is committed; CI (§13.4) runs the same script on GitHub's runners once i
 4. `cargo test --workspace`
 5. a plain `cargo build -p dv -p mock_gh -p mock_lsp` (step 4's test build links the binaries
    with gpui's test support), then the e2e scenarios (`cargo run -p dv_e2e --bin e2e -- tests/e2e`),
-   background mode; `--fast` skips this step. `--foreground` also runs `tests/e2e/foreground/`,
+   background mode; `--fast` skips this step, and `--e2e-only` runs it alone (CI's second job
+   beside `--fast`, §13.4). `--foreground` also runs `tests/e2e/foreground/`,
    the scenarios that must take the focus (screen captures of the window materials, §14.2)
 6. `--linux`: inside WSL Ubuntu with `CARGO_TARGET_DIR` on ext4, `cargo test -p dv_core -p
    dv_backend -p dv_cli -p dv_lsp -p dv_test_support -p mock_gh -p mock_lsp`, `cargo test -p dv
@@ -2600,30 +2601,36 @@ owns `~/.local/bin/dv` (§5.2's link rule).
 ### 13.4 CI and releases (GitHub Actions)
 The repository is public, so GitHub's hosted runners cost nothing. Two workflows:
 
-- **`.github/workflows/ci.yml`**, on every push to main, every pull request, and for every
-  release tag (`release.yml` calls it): `script/check` on Windows (`windows-2025`),
-  `script/check --fast` on macOS (`macos-15`, Apple silicon: its runner's 1024×768 screen is too
-  small for the scenarios' 1440×900 windows, which `script/check-mac` runs on the owner's Mac),
-  `script/check --linux` on Ubuntu 24.04 (the gates, the e2e
-  scenarios on the runner's own Xvfb with Mesa's software Vulkan, the headless crates and the
-  static musl build; the real-WSL step needs Windows with WSL and is skipped), the workflows
-  themselves (actionlint, and zizmor's security audits, pedantic; locally
+- **`.github/workflows/ci.yml`**, on every push to main, every pull request, and for a release
+  tag whose commit has no passing run on main (`release.yml` calls it): `script/check` on
+  Windows (`windows-2025`), `script/check --fast` on macOS (`macos-15`, Apple silicon: its
+  runner's 1024×768 screen is too small for the scenarios' 1440×900 windows, which
+  `script/check-mac` runs on the owner's Mac), `script/check --linux` on Ubuntu 24.04 (the
+  gates, the e2e scenarios on the runner's own Xvfb with Mesa's software Vulkan, the headless
+  crates and the static musl build; the real-WSL step needs Windows with WSL and is skipped).
+  On Windows and Linux each runs as two jobs side by side, `--fast` (with `--linux` on Linux)
+  and `--e2e-only`, which together are every step (the scenarios take about as long as the
+  tests, so the two halves run at once). Beside them, the workflows themselves (actionlint, and zizmor's security audits, pedantic; locally
   `script/check-workflows`), and the dependencies (cargo-deny, `deny.toml`: every crate from
   crates.io with a license on its list, no yanked crate, no open RustSec vulnerability; one that
   doesn't apply is ignored there with why). A failure keeps the e2e screenshots and logs as the
   run's artifact for a week. The caches (Cargo's registry and the target dirs) are saved only
-  by a push to main.
+  by a push to main. A push or pull request that changes only documentation (`docs/`, the
+  Markdown at the root, `tests/e2e/README.md`) runs nothing, since no gate reads it.
 - **`.github/workflows/release.yml`**, on pushing a tag `v*`:
   1. **the tag** (`script/release-check`): an annotated `v<semver>` (a prerelease such as
      `v0.2.0-rc.1` too) whose version without the prerelease is the tagged commit's workspace
      version, on a commit on main; the tag's message is the release notes;
-  2. **CI** in full on that commit (ci.yml), alongside
+  2. **CI** on that commit, alongside the builds: the push to main that brought the commit ran
+     ci.yml on it, and when that run passes (the release waits for it) it stands for this one;
+     with no such run, or one that doesn't pass (failed, cancelled, superseded in the queue),
+     the release runs ci.yml in full itself, without caches;
   3. **the builds**, with no cache: the static musl `dv-linux-x86_64` (`script/build-linux
-     --profile dist`) and the AppImage (`script/package --linux-app`, `vpk pack` on the runner),
-     then the Windows release (`vpk download github` fetches the latest release's full
-     package, from which `vpk pack` makes the delta and against which `dv_package` checks the
-     version newer, then `script/package --version <v> --feed https://github.com/<repo>
-     --linux-dir … --out …`), and the macOS release on `macos-15` the same way (its channel
+     --profile dist`, a job of its own) and the AppImage (`script/package --linux-app`, `vpk
+     pack` on the runner), and once the musl build is done the Windows release (`vpk download
+     github` fetches the latest release's full package, from which `vpk pack` makes the delta
+     and against which `dv_package` checks the version newer, then `script/package --version
+     <v> --feed https://github.com/<repo> --linux-dir … --out …`), and the macOS release on `macos-15` the same way (its channel
      `osx`, `script/package --version <v> --feed … --out …`);
   4. **publish**, in the `release` environment, which waits for the owner's approval: the
      files' `SHA256SUMS`, their build provenance (`actions/attest-build-provenance`), then the

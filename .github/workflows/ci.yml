@@ -1,6 +1,8 @@
 # Every gate of script/check on GitHub's own runners (docs/PLAN.md §13.4): Windows, Linux and
 # macOS, plus the workflows' and the dependencies' own checks. It runs on pushes to main, on
-# pull requests, and for every release tag before anything is published (release.yml calls it).
+# pull requests, and for a release tag whose commit has no passing run on main (release.yml
+# calls it). On Windows and Linux, script/check runs as two jobs side by side, `--fast` (steps
+# 1-4, and step 6 on Linux) and `--e2e-only` (step 5), which together are its every step.
 #
 # Security: the token is read-only in every job, no job has a secret, checkouts keep no
 # credentials, every action is pinned to a commit, and nothing runs on pull_request_target. The
@@ -10,10 +12,23 @@
 
 name: CI
 
+# A change to the documentation alone (docs/, the Markdown at the root, the e2e README) runs
+# nothing: no gate reads them. crates/dv_cli/skill/SKILL.md is code (dv_cli embeds and tests it),
+# and a release's call (workflow_call) has no path filter.
 on:
   push:
     branches: [main]
+    paths:
+      - "**"
+      - "!docs/**"
+      - "!*.md"
+      - "!tests/e2e/README.md"
   pull_request:
+    paths:
+      - "**"
+      - "!docs/**"
+      - "!*.md"
+      - "!tests/e2e/README.md"
   workflow_call:
 
 permissions: {}
@@ -69,11 +84,15 @@ jobs:
           arguments: --all-features --locked
 
   windows:
-    name: Windows (script/check)
+    name: Windows (script/check ${{ matrix.check }})
     runs-on: windows-2025
     timeout-minutes: 75
     permissions:
       contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        check: [--fast, --e2e-only]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -95,6 +114,7 @@ jobs:
           restore-keys: windows-
       # The runner's desktop is 1024x768, too small for the scenarios' 1440x900 windows.
       - name: A 1920x1080 desktop for the e2e scenarios
+        if: ${{ matrix.check == '--e2e-only' }}
         shell: pwsh
         run: |
           Set-DisplayResolution -Width 1920 -Height 1080 -Force
@@ -103,24 +123,27 @@ jobs:
       # The runner's own temp dir, whose name is long: the default one is spelled with an 8.3
       # short name (C:\Users\RUNNER~1\…), which git and the file system report long, so tests
       # that compare a fixture's path with what came back would see two spellings of one folder.
-      - name: script/check
+      - name: script/check ${{ matrix.check }}
         shell: bash
+        env:
+          CHECK: ${{ matrix.check }}
         run: |
           export TMP="$RUNNER_TEMP" TEMP="$RUNNER_TEMP"
-          bash script/check
+          bash script/check "$CHECK"
       - name: The e2e scenarios' screenshots and logs
-        if: ${{ failure() }}
+        if: ${{ failure() && matrix.check == '--e2e-only' }}
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: e2e-windows
           path: target/e2e
           retention-days: 7
           if-no-files-found: ignore
+      # The --fast half's target dir, whose dependencies the --e2e-only half's build reuses.
       - name: Save the cache (main, once per Cargo.lock)
-        if: ${{ !cancelled() && github.event_name == 'push' && github.ref == 'refs/heads/main' && steps.cache.outputs.cache-hit != 'true' }}
+        if: ${{ !cancelled() && matrix.check == '--fast' && github.event_name == 'push' && github.ref == 'refs/heads/main' && steps.cache.outputs.cache-hit != 'true' }}
         shell: bash
         run: rm -rf target/debug/incremental target/e2e target/tmp
-      - if: ${{ !cancelled() && github.event_name == 'push' && github.ref == 'refs/heads/main' && steps.cache.outputs.cache-hit != 'true' }}
+      - if: ${{ !cancelled() && matrix.check == '--fast' && github.event_name == 'push' && github.ref == 'refs/heads/main' && steps.cache.outputs.cache-hit != 'true' }}
         uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: |
@@ -131,11 +154,15 @@ jobs:
           key: windows-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}
 
   linux:
-    name: Linux (script/check --linux)
+    name: Linux (script/check ${{ matrix.check }})
     runs-on: ubuntu-24.04
     timeout-minutes: 75
     permissions:
       contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        check: [--fast --linux, --e2e-only]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -167,20 +194,26 @@ jobs:
             target
           key: linux-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}
           restore-keys: linux-
-      - name: script/check --linux
-        run: bash script/check --linux
+      - name: script/check ${{ matrix.check }}
+        env:
+          CHECK: ${{ matrix.check }}
+        run: |
+          read -ra args <<< "$CHECK"
+          bash script/check "${args[@]}"
       - name: The e2e scenarios' screenshots and logs
-        if: ${{ failure() }}
+        if: ${{ failure() && matrix.check == '--e2e-only' }}
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: e2e-linux
           path: target/e2e
           retention-days: 7
           if-no-files-found: ignore
+      # The --fast --linux half's target dirs, whose dependencies the --e2e-only half's build
+      # reuses, and the musl build's.
       - name: Save the cache (main, once per Cargo.lock)
-        if: ${{ !cancelled() && github.event_name == 'push' && github.ref == 'refs/heads/main' && env.ACT != 'true' && steps.cache.outputs.cache-hit != 'true' }}
+        if: ${{ !cancelled() && matrix.check != '--e2e-only' && github.event_name == 'push' && github.ref == 'refs/heads/main' && env.ACT != 'true' && steps.cache.outputs.cache-hit != 'true' }}
         run: rm -rf target/debug/incremental target/e2e target/tmp
-      - if: ${{ !cancelled() && github.event_name == 'push' && github.ref == 'refs/heads/main' && env.ACT != 'true' && steps.cache.outputs.cache-hit != 'true' }}
+      - if: ${{ !cancelled() && matrix.check != '--e2e-only' && github.event_name == 'push' && github.ref == 'refs/heads/main' && env.ACT != 'true' && steps.cache.outputs.cache-hit != 'true' }}
         uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: |

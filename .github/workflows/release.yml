@@ -1,8 +1,9 @@
 # A release (docs/PLAN.md §13.4): pushing an annotated tag `v<version>` on a commit on main
 # builds the Windows and macOS releases (Setup.exe, the .pkg, and the Velopack update feed the
-# installed app reads) and the Linux AppImage on GitHub's runners, runs every CI gate on that commit, and then waits for
-# the owner to approve the `release` environment before anything is published to GitHub
-# Releases.
+# installed app reads) and the Linux AppImage on GitHub's runners, makes sure every CI gate
+# passed on that commit (main's own CI run for it when that one passes, else a run of ci.yml
+# here), and then waits for the owner to approve the `release` environment before anything is
+# published to GitHub Releases.
 #
 # Security, beyond ci.yml's:
 # - only the owner can create `v*` tags, and no tag can be moved or deleted (a repository
@@ -66,9 +67,56 @@ jobs:
           if-no-files-found: error
           retention-days: 7
 
+  # The tag's commit is on main, whose push ran ci.yml on it moments before the tag: when that
+  # run passes, it is this commit's CI, and the release doesn't run the same gates a second
+  # time, cold, on the slowest path (PLAN §13.4). No run, or one that doesn't pass (failed,
+  # cancelled, superseded while it waited), and the `ci` job below runs them here instead.
+  main-ci:
+    name: CI on main for this commit
+    needs: verify
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    permissions:
+      actions: read
+    outputs:
+      passed: ${{ steps.main.outputs.passed }}
+    steps:
+      - name: Wait for main's CI run of this commit
+        id: main
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          # The push to main comes first, but its run can take a few seconds to be listed.
+          id=""
+          for _ in 1 2 3 4 5 6; do
+            id="$(gh run list --repo "$GITHUB_REPOSITORY" --workflow ci.yml --branch main \
+              --event push --commit "$SHA" --limit 1 --json databaseId --jq '.[0].databaseId // ""')"
+            if [[ -n "$id" ]]; then break; fi
+            sleep 10
+          done
+          if [[ -z "$id" ]]; then
+            echo "No CI run on main for $SHA: this release runs ci.yml itself"
+            echo "passed=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          echo "main's CI run for $SHA: $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$id"
+          gh run watch "$id" --repo "$GITHUB_REPOSITORY" --interval 60 > /dev/null
+          conclusion="$(gh run view "$id" --repo "$GITHUB_REPOSITORY" --json conclusion --jq .conclusion)"
+          echo "conclusion: $conclusion"
+          if [[ "$conclusion" == success ]]; then
+            echo "passed=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "It didn't pass: this release runs ci.yml itself"
+            echo "passed=false" >> "$GITHUB_OUTPUT"
+          fi
+
   ci:
     name: CI
-    needs: verify
+    needs: [verify, main-ci]
+    # main-ci failing to answer counts as no answer: the gates run here.
+    if: ${{ !cancelled() && needs.verify.result == 'success' && needs.main-ci.outputs.passed != 'true' }}
     # A job-level call resolves from this same commit before anything runs, so the runtime
     # checkout the self-repository form (`$/`) guards against can't reach it; actionlint doesn't
     # read `$/` yet.
@@ -76,8 +124,43 @@ jobs:
     permissions:
       contents: read
 
+  # The static dv WSL distros run, which the Windows release ships beside dv.exe: a job of its
+  # own, so the Windows release starts once it is built rather than after the AppImage.
+  linux-dv:
+    name: Linux dv (WSL)
+    needs: verify
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    permissions:
+      contents: read
+    env:
+      VERSION: ${{ needs.verify.outputs.version }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: rustup (act's runner image has none; GitHub's has)
+        if: ${{ env.ACT == 'true' }}
+        run: |
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs |
+            sh -s -- -y --profile minimal --default-toolchain none
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+      - name: Rust toolchain (rust-toolchain.toml)
+        run: rustup toolchain install && rustc --version
+      - name: The static Linux dv WSL distros run (script/build-linux)
+        env:
+          DV_CHANNEL: release
+          DV_VERSION: ${{ env.VERSION }}
+        run: bash script/build-linux --profile dist --out target/package/linux
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: linux-builds
+          path: target/package/linux/dv-linux-x86_64
+          if-no-files-found: error
+          retention-days: 7
+
   linux:
-    name: Linux builds
+    name: Linux AppImage
     needs: verify
     runs-on: ubuntu-24.04
     timeout-minutes: 120
@@ -107,23 +190,12 @@ jobs:
           dotnet-version: 8.0.x
       - name: vpk 1.2.161 (the velopack crate's version)
         run: dotnet tool install -g vpk --version 1.2.161
-      - name: The static Linux dv WSL distros run (script/build-linux)
-        env:
-          DV_CHANNEL: release
-          DV_VERSION: ${{ env.VERSION }}
-        run: bash script/build-linux --profile dist --out target/package/linux
       - name: The Linux app's AppImage (script/package --linux-app)
         run: |
           set -euo pipefail
           bash script/package --linux-app --version "$VERSION" --out target/package/linux-release
           mkdir -p target/package/upload
           cp target/package/linux-release/dv.AppImage target/package/upload/dv-linux-x86_64.AppImage
-      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
-        with:
-          name: linux-builds
-          path: target/package/linux/dv-linux-x86_64
-          if-no-files-found: error
-          retention-days: 7
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: release-linux
@@ -133,7 +205,7 @@ jobs:
 
   windows:
     name: Windows release
-    needs: [verify, linux]
+    needs: [verify, linux-dv]
     runs-on: windows-2025
     timeout-minutes: 120
     permissions:
@@ -263,7 +335,12 @@ jobs:
 
   publish:
     name: Publish (after the owner approves)
-    needs: [verify, ci, linux, windows, macos]
+    needs: [verify, main-ci, ci, linux-dv, linux, windows, macos]
+    # Every build, and the gates either on main or here (`ci` is skipped when main's run passed).
+    if: >-
+      ${{ !cancelled() && needs.verify.result == 'success' && needs.linux.result == 'success'
+      && needs.windows.result == 'success' && needs.macos.result == 'success'
+      && (needs.main-ci.outputs.passed == 'true' || needs.ci.result == 'success') }}
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     environment:

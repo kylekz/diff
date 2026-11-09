@@ -17,7 +17,8 @@ use serde_json::{Value, json};
 pub fn settings(cx: &App) -> Value {
     let settings = cx.services().settings.read(cx);
     let resolved = dv_ui::appearance::resolved(cx);
-    let available: Vec<&str> = dv_ui::appearance::support(cx)
+    let available: Vec<&str> = gpui_appearance::state(cx)
+        .support()
         .available()
         .into_iter()
         .map(Material::key)
@@ -35,14 +36,32 @@ pub fn settings(cx: &App) -> Value {
     })
 }
 
-/// `state.shell`.
-pub fn shell(shell: &Shell, cx: &App) -> Value {
+/// What AppKit reports for `window` (macOS; `null` elsewhere): its own appearance (`null`
+/// follows the system's), `isOpaque`, and `gpui_appearance`'s vibrancy view with its style.
+fn window_native(window: &Window) -> Value {
+    gpui_appearance::native(window).map_or(Value::Null, |native| {
+        json!({
+            "forced": native.forced.map(|appearance| appearance.key()),
+            "opaque": native.opaque,
+            "vibrancy_view": native.vibrancy_view,
+            "vibrancy": native.vibrancy.map(|vibrancy| json!({
+                "material": vibrancy.material.key(),
+                "blending": vibrancy.blending.key(),
+                "state": vibrancy.state.key(),
+            })),
+        })
+    })
+}
+
+/// `state.shell`, `window` its window.
+pub fn shell(shell: &Shell, window: &Window, cx: &App) -> Value {
     let status = shell.status_line(cx);
     json!({
         "panel_visible": shell.panel_visible(),
         "panel_width": cx.services().settings.read(cx).panel_width(),
         "empty_state": shell.empty_state(cx).map(|empty| empty.key()),
         "window_material": shell.applied_material().key(),
+        "window_native": window_native(window),
         "opening": shell.opening().is_some(),
         "pending": shell.pending_pick().map(|pending| json!({
             "repo": pending.location.display_name(),

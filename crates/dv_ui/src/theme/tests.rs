@@ -186,7 +186,7 @@ fn the_opaque_themes_force_opaque_and_dracula_is_dark_only() {
 }
 
 #[test]
-fn materials_round_trip_their_keys_and_map_to_gpui() {
+fn materials_spell_their_keys_in_settings() {
     for material in Material::ALL {
         assert_eq!(Material::from_key(material.key()), Some(material));
         assert_eq!(
@@ -195,18 +195,19 @@ fn materials_round_trip_their_keys_and_map_to_gpui() {
         );
     }
     assert_eq!(Material::from_key("Mica"), None);
-    assert_eq!(
-        Material::Mica.window_background(),
-        WindowBackgroundAppearance::MicaBackdrop
-    );
-    assert_eq!(
-        Material::Acrylic.window_background(),
-        WindowBackgroundAppearance::Blurred
-    );
-    assert_eq!(
-        Material::Opaque.window_background(),
-        WindowBackgroundAppearance::Opaque
-    );
+}
+
+#[test]
+fn vibrancy_takes_acrylics_surfaces() {
+    for palette in Palette::ALL {
+        for appearance in Appearance::ALL {
+            let acrylic = DvColors::new(palette, appearance, Material::Acrylic);
+            let vibrancy = DvColors::new(palette, appearance, Material::Vibrancy);
+            assert_eq!(vibrancy.chrome, acrylic.chrome);
+            assert_eq!(vibrancy.panel, acrylic.panel);
+            assert_eq!(vibrancy.window_background, gpui::transparent_black());
+        }
+    }
 }
 
 #[test]

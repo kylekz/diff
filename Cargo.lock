@@ -1594,6 +1594,7 @@ dependencies = [
  "env_logger",
  "gpui-pre",
  "gpui-pre-platform",
+ "gpui_appearance",
  "gpui_automation",
  "libc",
  "log",
@@ -1604,6 +1605,7 @@ dependencies = [
  "serde",
  "serde_json",
  "tempfile",
+ "toolbox_process",
  "velopack",
  "windows-sys 0.61.2",
 ]
@@ -1623,6 +1625,7 @@ dependencies = [
  "sha2 0.11.0",
  "tempfile",
  "thiserror 2.0.21",
+ "toolbox_process",
 ]
 
 [[package]]
@@ -1639,6 +1642,7 @@ dependencies = [
  "serde",
  "serde_json",
  "tempfile",
+ "toolbox_process",
  "windows-sys 0.61.2",
 ]
 
@@ -1649,15 +1653,14 @@ dependencies = [
  "dv_test_support",
  "ignore",
  "imara-diff",
- "libc",
  "log",
  "notify 9.0.0-rc.6",
  "serde",
  "serde_json",
  "tempfile",
  "thiserror 2.0.21",
+ "toolbox_process",
  "ulid",
- "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -1722,17 +1725,16 @@ dependencies = [
  "gpui-base",
  "gpui-component",
  "gpui-pre",
+ "gpui_appearance",
  "gpui_automation",
  "log",
  "markdown",
  "parking_lot",
  "pretty_assertions",
- "raw-window-handle",
  "serde",
  "serde_json",
  "tempfile",
  "tree-sitter",
- "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -1910,7 +1912,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -2452,7 +2454,7 @@ dependencies = [
  "log",
  "presser",
  "thiserror 2.0.21",
- "windows 0.62.2",
+ "windows 0.58.0",
 ]
 
 [[package]]
@@ -3120,9 +3122,24 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "99b18b06f5026b3d312488eacfdddbe78f82b4bf32bb2d2bc3186e31e552b797"
 
 [[package]]
+name = "gpui_appearance"
+version = "0.5.0"
+source = "git+https://github.com/kylekz/toolbox-rs?tag=v0.5.0#f497006c938e9a10c99c81403128aa95b93aaa2e"
+dependencies = [
+ "gpui-pre",
+ "log",
+ "objc2 0.6.4",
+ "objc2-app-kit 0.3.2",
+ "objc2-foundation 0.3.2",
+ "raw-window-handle",
+ "serde",
+ "windows-sys 0.61.2",
+]
+
+[[package]]
 name = "gpui_automation"
-version = "0.1.2"
-source = "git+https://github.com/kylekz/toolbox-rs?tag=v0.1.2#620b141408773025bfabc435891ed9e1418ecec3"
+version = "0.5.0"
+source = "git+https://github.com/kylekz/toolbox-rs?tag=v0.5.0#f497006c938e9a10c99c81403128aa95b93aaa2e"
 dependencies = [
  "anyhow",
  "core-graphics 0.24.0",
@@ -3141,8 +3158,8 @@ dependencies = [
 
 [[package]]
 name = "gpui_automation_protocol"
-version = "0.1.2"
-source = "git+https://github.com/kylekz/toolbox-rs?tag=v0.1.2#620b141408773025bfabc435891ed9e1418ecec3"
+version = "0.5.0"
+source = "git+https://github.com/kylekz/toolbox-rs?tag=v0.5.0#f497006c938e9a10c99c81403128aa95b93aaa2e"
 dependencies = [
  "anyhow",
  "serde",
@@ -3151,8 +3168,8 @@ dependencies = [
 
 [[package]]
 name = "gpui_automation_runner"
-version = "0.1.2"
-source = "git+https://github.com/kylekz/toolbox-rs?tag=v0.1.2#620b141408773025bfabc435891ed9e1418ecec3"
+version = "0.5.0"
+source = "git+https://github.com/kylekz/toolbox-rs?tag=v0.5.0#f497006c938e9a10c99c81403128aa95b93aaa2e"
 dependencies = [
  "anyhow",
  "gpui_automation_protocol",
@@ -3444,7 +3461,7 @@ dependencies = [
  "js-sys",
  "log",
  "wasm-bindgen",
- "windows-core 0.62.2",
+ "windows-core 0.58.0",
 ]
 
 [[package]]
@@ -5700,7 +5717,7 @@ dependencies = [
  "once_cell",
  "socket2",
  "tracing",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -6243,7 +6260,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -7075,7 +7092,7 @@ dependencies = [
  "getrandom 0.4.3",
  "once_cell",
  "rustix",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -7374,6 +7391,17 @@ name = "toml_writer"
 version = "1.1.2+spec-1.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7d56353a2a665ad0f41a421187180aab746c8c325620617ad883a99a1cbe66d2"
+
+[[package]]
+name = "toolbox_process"
+version = "0.5.0"
+source = "git+https://github.com/kylekz/toolbox-rs?tag=v0.5.0#f497006c938e9a10c99c81403128aa95b93aaa2e"
+dependencies = [
+ "libc",
+ "thiserror 2.0.21",
+ "which",
+ "windows-sys 0.61.2",
+]
 
 [[package]]
 name = "tower"
@@ -8627,7 +8655,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.48.0",
 ]
 
 [[package]]

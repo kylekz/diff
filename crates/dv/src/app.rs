@@ -5,7 +5,7 @@
 use std::{cell::Cell, path::PathBuf, process::ExitCode, rc::Rc};
 
 use anyhow::{Result, bail};
-use dv_ui::platform::MaterialSupport;
+use dv_ui::appearance::MaterialSupport;
 use dv_ui::services::reviews::OpenRequest;
 use dv_ui::services::{ServicesConfig, SetupConfig, WslAccess};
 use dv_ui::shell::{IfNotOpened, MainWindow};

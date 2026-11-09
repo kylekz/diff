@@ -1,4 +1,4 @@
-{"scenario": {"window_size": "1440x900", "description": "The themes (DESIGN §1.3): Settings › Appearance's Theme row (palette) picks Aura, Claude or Dracula; Claude and Dracula are opaque, their Mica and Acrylic disabled with the note keeping the material for Aura, and Dracula is dark whatever the mode, the mode row saying so; a review with an annotation, a reply and a selected line in Claude Dark, Claude Light and Dracula, and Settings in Claude Light and Dracula; back to Aura, the material and mode are as they were."}}
+{"scenario": {"window_size": "1440x900", "description": "The themes (DESIGN §1.3): Settings › Appearance's Theme row (palette) picks Aura, Claude or Dracula; Claude and Dracula are opaque, their translucent materials (Mica and Acrylic; Vibrancy on macOS) disabled with the note keeping the material for Aura, and Dracula is dark whatever the mode, the mode row saying so; a review with an annotation, a reply and a selected line in Claude Dark, Claude Light and Dracula, and Settings in Claude Light and Dracula; back to Aura, the material and mode are as they were."}}
 {"cmd": "wait_ready", "timeout_ms": 20000}
 {"cmd": "set_setting", "key": "mode", "value": "dark"}
 {"cmd": "set_setting", "key": "material", "value": "mica"}
@@ -16,7 +16,9 @@
 {"cmd": "click", "target": "settings/palette/claude"}
 {"cmd": "settle", "expect": [{"pointer": "/settings/palette", "equals": "claude"}, {"pointer": "/settings/material", "equals": "mica"}, {"pointer": "/settings/resolved_material", "equals": "opaque"}, {"pointer": "/settings/resolved_mode", "equals": "dark"}, {"pointer": "/shell/window_material", "equals": "opaque"}]}
 {"cmd": "screenshot", "name": "settings-claude-dark"}
-{"cmd": "click", "target": "settings/material/acrylic", "expect": {"pointer": "/settings/material", "equals": "mica"}}
+// A translucent material takes no click under Claude: Acrylic elsewhere, Vibrancy (macOS's only one) on a Mac.
+{"cmd": "click", "target": "settings/material/acrylic", "platforms": ["windows", "linux"], "expect": {"pointer": "/settings/material", "equals": "mica"}}
+{"cmd": "click", "target": "settings/material/vibrancy", "platforms": ["macos"], "expect": {"pointer": "/settings/material", "equals": "mica"}}
 {"cmd": "click", "target": "settings/mode/light"}
 {"cmd": "settle", "expect": [{"pointer": "/settings/resolved_mode", "equals": "light"}]}
 {"cmd": "screenshot", "name": "settings-claude-light"}

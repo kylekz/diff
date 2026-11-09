@@ -19,20 +19,8 @@ serde.workspace = true
 serde_json.workspace = true
 tempfile.workspace = true
 thiserror.workspace = true
+toolbox_process.workspace = true
 ulid.workspace = true
-
-# A spawned process's group, and its exit seen before it is reaped (`backend::process`).
-[target.'cfg(unix)'.dependencies]
-libc.workspace = true
-
-# Children that die with this process, and a spawned process's job (`job`).
-[target.'cfg(windows)'.dependencies]
-windows-sys = { workspace = true, features = [
-    "Win32_Foundation",
-    "Win32_Security",
-    "Win32_System_JobObjects",
-    "Win32_System_Threading",
-] }
 
 [dev-dependencies]
 dv_test_support.workspace = true

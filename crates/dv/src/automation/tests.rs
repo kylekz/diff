@@ -3,7 +3,7 @@ use std::path::PathBuf;
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 
-use dv_ui::platform::MaterialSupport;
+use dv_ui::appearance::MaterialSupport;
 use dv_ui::services::{ServicesConfig, WslAccess};
 use dv_ui::system::SystemShell;
 use gpui::{TestAppContext, VisualTestContext};
@@ -225,7 +225,8 @@ fn state_describes_the_empty_shell(cx: &mut TestAppContext) {
             "panel_visible": true,
             "panel_width": 280.0,
             "empty_state": "no_review",
-            "window_material": Material::platform_default().key(),
+            "window_material": dv_ui::appearance::default_material().key(),
+            "window_native": null,
             "opening": false,
             "pending": null,
             "banner": null,
@@ -249,7 +250,7 @@ fn state_describes_the_empty_shell(cx: &mut TestAppContext) {
     assert_eq!(state["settings"]["mode"], "system");
     assert_eq!(
         state["settings"]["available_materials"],
-        json!(["mica", "acrylic", "opaque"])
+        json!(["mica", "acrylic", "vibrancy", "opaque"])
     );
     assert_eq!(state["system"], json!({"requests": [], "answers_left": 0}));
     assert_eq!(state["repos"], json!([]));
@@ -274,7 +275,6 @@ fn set_setting_changes_the_theme_and_saves(cx: &mut TestAppContext) {
     });
     let reply = reply.expect("a dv command").unwrap();
     assert_eq!(reply["settings"]["material"], "acrylic");
-    assert_eq!(reply["settings"]["resolved_material"], "acrylic");
     cx.update(|window, cx| {
         host.update(cx, |host, cx| {
             host.custom(
@@ -291,6 +291,8 @@ fn set_setting_changes_the_theme_and_saves(cx: &mut TestAppContext) {
 
     let state = state(&host, cx);
     assert_eq!(state["settings"]["resolved_mode"], "light");
+    // Resolved once the change has reached `gpui_appearance`, as the window shows it.
+    assert_eq!(state["settings"]["resolved_material"], "acrylic");
     assert_eq!(state["shell"]["window_material"], "acrylic");
     assert!(settled(&host, cx));
     let saved: Value =

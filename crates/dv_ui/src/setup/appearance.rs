@@ -1,10 +1,11 @@
 //! Settings › Appearance (DESIGN §4.3): the theme's palette, the light/dark mode and the window
 //! material, each a segmented control that changes the setting at once (`services::Settings`,
-//! which `crate::appearance` follows). A material the platform or the palette can't show
-//! (Claude and Dracula are opaque, DESIGN §1.3) is drawn disabled, and a line under the control
-//! says why; a setting it can't show (Mica with transparency effects since turned off, or with
-//! Claude chosen) stays chosen, the window showing Opaque meanwhile (DESIGN §3). With Dracula,
-//! which has no light palette, the mode row says so.
+//! which `crate::appearance` follows). The material row offers the platform's own: Vibrancy and
+//! Opaque on macOS, Mica, Acrylic and Opaque elsewhere. One the platform or the palette can't
+//! show (Claude and Dracula are opaque, DESIGN §1.3) is drawn disabled, and a line under the
+//! control says why; a setting it can't show (Mica with transparency effects since turned off,
+//! with Claude chosen, or made on another platform) stays chosen, the window showing Opaque
+//! meanwhile (DESIGN §3). With Dracula, which has no light palette, the mode row says so.
 //!
 //! Automation targets: `settings/appearance`, `settings/palette/<key>`, `settings/mode/<key>`
 //! and `settings/material/<key>` (the settings' keys, `aura`, `system`, `mica`, …).
@@ -17,16 +18,27 @@ use gpui::{
 
 use crate::automation::AutomationTargetExt as _;
 use crate::components::{segment, segmented};
-use crate::platform::MaterialSupport;
+use gpui_appearance::MaterialSupport;
+
 use crate::services::{ActiveServices as _, Mode};
 use crate::theme::{DvTheme, Material, Palette, StyledText as _};
+
+/// The modes in the order the row shows them (DESIGN §4.3).
+const MODES: [Mode; 3] = [Mode::System, Mode::Dark, Mode::Light];
+
+/// The materials the row offers on this platform (module docs).
+const MATERIALS: &[Material] = if cfg!(target_os = "macos") {
+    &[Material::Vibrancy, Material::Opaque]
+} else {
+    &[Material::Mica, Material::Acrylic, Material::Opaque]
+};
 
 /// The page: its heading over one card with a row per setting.
 pub fn page(theme: &DvTheme, cx: &App) -> AnyElement {
     let c = &theme.colors;
     let settings = cx.services().settings.read(cx);
     let (palette, mode, material) = (settings.palette(), settings.mode(), settings.material());
-    let support = crate::appearance::support(cx);
+    let support = gpui_appearance::state(cx).support();
 
     let palettes = Palette::ALL
         .into_iter()
@@ -51,30 +63,29 @@ pub fn page(theme: &DvTheme, cx: &App) -> AnyElement {
             )
         });
 
-    let modes = Mode::ALL
-        .into_iter()
-        .fold(segmented(theme), |control, each| {
-            let on = each == mode;
-            control.child(
-                segment(
-                    SharedString::from(format!("settings-mode-{}", each.key())),
-                    on,
-                    true,
-                    theme,
-                )
-                .debug_selector(move || format!("settings-mode-{}", each.key()))
-                .child(mode_label(each))
-                .when(!on, |this| {
-                    this.on_click(move |_, _, cx| {
-                        let settings = cx.services().settings.clone();
-                        settings.update(cx, |settings, cx| settings.set_mode(each, cx));
-                    })
-                })
-                .automation_target(format!("settings/mode/{}", each.key())),
+    let modes = MODES.into_iter().fold(segmented(theme), |control, each| {
+        let on = each == mode;
+        control.child(
+            segment(
+                SharedString::from(format!("settings-mode-{}", each.key())),
+                on,
+                true,
+                theme,
             )
-        });
-    let materials = Material::ALL
-        .into_iter()
+            .debug_selector(move || format!("settings-mode-{}", each.key()))
+            .child(mode_label(each))
+            .when(!on, |this| {
+                this.on_click(move |_, _, cx| {
+                    let settings = cx.services().settings.clone();
+                    settings.update(cx, |settings, cx| settings.set_mode(each, cx));
+                })
+            })
+            .automation_target(format!("settings/mode/{}", each.key())),
+        )
+    });
+    let materials = MATERIALS
+        .iter()
+        .copied()
         .fold(segmented(theme), |control, each| {
             let on = each == material;
             let enabled = palette.material(each) == each && support.supports(each);
@@ -125,17 +136,13 @@ pub fn page(theme: &DvTheme, cx: &App) -> AnyElement {
             modes.into_any_element(),
             theme,
         )))
-        .child(
-            div().border_t_1().border_color(c.line).child(row(
-                "Material",
-                "What shows through behind dv's surfaces: Mica tints them with the wallpaper, \
-                 Acrylic blurs the windows behind dv."
-                    .into(),
-                material_note(support, palette, material),
-                materials.into_any_element(),
-                theme,
-            )),
-        );
+        .child(div().border_t_1().border_color(c.line).child(row(
+            "Material",
+            material_detail().into(),
+            material_note(support, palette, material),
+            materials.into_any_element(),
+            theme,
+        )));
     div()
         .flex()
         .flex_col()
@@ -212,6 +219,17 @@ fn mode_detail() -> &'static str {
     }
 }
 
+/// What the material row says, naming the platform's own materials.
+fn material_detail() -> &'static str {
+    if cfg!(target_os = "macos") {
+        "What shows through behind dv's surfaces: Vibrancy blurs the desktop and the windows \
+         behind dv."
+    } else {
+        "What shows through behind dv's surfaces: Mica tints them with the wallpaper, Acrylic \
+         blurs the windows behind dv."
+    }
+}
+
 /// Why a material can't be chosen here, and what the window shows when the setting is one of
 /// those (`platform`'s rules, PLAN D8; an opaque palette's, DESIGN §1.3).
 fn material_note(
@@ -219,6 +237,11 @@ fn material_note(
     palette: Palette,
     chosen: Material,
 ) -> Option<SharedString> {
+    let translucent = if cfg!(target_os = "macos") {
+        "Vibrancy is"
+    } else {
+        "Mica and Acrylic are"
+    };
     if !palette.is_glass() {
         let keeping = if chosen == Material::Opaque {
             String::new()
@@ -227,8 +250,23 @@ fn material_note(
         };
         return Some(
             format!(
-                "Mica and Acrylic are Aura's: {} is opaque{keeping}.",
+                "{translucent} Aura's: {} is opaque{keeping}.",
                 palette.label()
+            )
+            .into(),
+        );
+    }
+    if !MATERIALS.contains(&chosen) {
+        // A setting made on another platform: Mica on a Mac, Vibrancy on Windows.
+        let home = if chosen == Material::Vibrancy {
+            "macOS"
+        } else {
+            "Windows 11"
+        };
+        return Some(
+            format!(
+                "{} is {home}'s: dv shows Opaque here, keeping it for {home}.",
+                chosen.label()
             )
             .into(),
         );
@@ -239,18 +277,16 @@ fn material_note(
             chosen.label()
         )
     });
-    let why = if !cfg!(windows) {
+    let why = if cfg!(target_os = "macos") {
+        if support.vibrancy {
+            return None;
+        }
+        "Vibrancy needs Reduce transparency off (System Settings › Accessibility › Display)."
+    } else if !cfg!(windows) {
         if support.acrylic || support.mica {
             return None;
         }
-        let platform = if cfg!(target_os = "macos") {
-            "macOS"
-        } else {
-            "Linux"
-        };
-        return Some(
-            format!("Mica and Acrylic are Windows 11's: on {platform}, dv is Opaque.").into(),
-        );
+        return Some("Mica and Acrylic are Windows 11's: on Linux, dv is Opaque.".into());
     } else if !support.acrylic {
         "Mica and Acrylic need Windows 11 with Transparency effects on (Windows Settings › \
          Personalization › Colors)."
@@ -266,22 +302,46 @@ fn material_note(
 mod tests {
     use super::*;
 
+    /// The platform's first translucent material, which [`MaterialSupport::ALL`] can show.
+    fn translucent() -> Material {
+        MATERIALS[0]
+    }
+
     #[test]
     fn an_opaque_palette_says_so_keeping_the_material_for_aura() {
+        let (are, kept) = if cfg!(target_os = "macos") {
+            ("Vibrancy is", "Vibrancy")
+        } else {
+            ("Mica and Acrylic are", "Mica")
+        };
         assert_eq!(
-            material_note(MaterialSupport::ALL, Palette::Claude, Material::Mica).as_deref(),
-            Some("Mica and Acrylic are Aura's: Claude is opaque, keeping Mica for Aura.")
+            material_note(MaterialSupport::ALL, Palette::Claude, translucent()).as_deref(),
+            Some(format!("{are} Aura's: Claude is opaque, keeping {kept} for Aura.").as_str())
         );
         assert_eq!(
             material_note(MaterialSupport::ALL, Palette::Dracula, Material::Opaque).as_deref(),
-            Some("Mica and Acrylic are Aura's: Dracula is opaque.")
+            Some(format!("{are} Aura's: Dracula is opaque.").as_str())
+        );
+    }
+
+    #[test]
+    fn a_setting_from_another_platform_is_kept_for_it() {
+        let elsewhere = if cfg!(target_os = "macos") {
+            Material::Mica
+        } else {
+            Material::Vibrancy
+        };
+        let note = material_note(MaterialSupport::ALL, Palette::Aura, elsewhere).unwrap();
+        assert!(
+            note.contains("dv shows Opaque here, keeping it for"),
+            "{note}"
         );
     }
 
     #[test]
     fn the_note_says_why_a_material_is_missing() {
         assert_eq!(
-            material_note(MaterialSupport::ALL, Palette::Aura, Material::Mica),
+            material_note(MaterialSupport::ALL, Palette::Aura, translucent()),
             None
         );
         if cfg!(windows) {
@@ -293,16 +353,23 @@ mod tests {
             .unwrap();
             assert!(off.contains("Transparency effects"), "{off}");
             assert!(off.contains("keeping Acrylic"), "{off}");
-            let no_mica = MaterialSupport {
-                mica: false,
-                acrylic: true,
-            };
+            // Windows 11 before 22H2: Acrylic, but no Mica.
+            let no_mica = MaterialSupport::for_windows(Some(22000), true);
             assert_eq!(
                 material_note(no_mica, Palette::Aura, Material::Acrylic).as_deref(),
                 Some("Mica needs Windows 11 22H2 or later.")
             );
             let showing = material_note(no_mica, Palette::Aura, Material::Mica).unwrap();
             assert!(showing.contains("keeping Mica"), "{showing}");
+        } else if cfg!(target_os = "macos") {
+            let reduced = material_note(
+                MaterialSupport::for_macos(true),
+                Palette::Aura,
+                Material::Vibrancy,
+            )
+            .unwrap();
+            assert!(reduced.contains("Reduce transparency"), "{reduced}");
+            assert!(reduced.contains("keeping Vibrancy"), "{reduced}");
         } else {
             let note = material_note(
                 MaterialSupport::OPAQUE_ONLY,

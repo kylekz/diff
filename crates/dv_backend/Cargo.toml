@@ -31,6 +31,7 @@ serde.workspace = true
 serde_json = { workspace = true, features = ["raw_value"] }
 sha2.workspace = true
 thiserror.workspace = true
+toolbox_process.workspace = true
 
 [dev-dependencies]
 dv_test_support.workspace = true

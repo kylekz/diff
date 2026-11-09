@@ -26,6 +26,7 @@ futures.workspace = true
 gpui.workspace = true
 gpui-base.workspace = true
 gpui-component.workspace = true
+gpui_appearance.workspace = true
 gpui_automation.workspace = true
 log.workspace = true
 markdown.workspace = true
@@ -33,18 +34,6 @@ parking_lot.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 tree-sitter.workspace = true
-
-[target.'cfg(windows)'.dependencies]
-# The window material: the native handle for DWM, the Windows build and the "Transparency
-# effects" switch (`platform`, PLAN D8).
-raw-window-handle.workspace = true
-windows-sys = { workspace = true, features = [
-    "Wdk_System_SystemServices",
-    "Win32_Foundation",
-    "Win32_Graphics_Dwm",
-    "Win32_System_Registry",
-    "Win32_System_SystemInformation",
-] }
 
 [dev-dependencies]
 dv_test_support.workspace = true

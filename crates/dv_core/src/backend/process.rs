@@ -11,7 +11,8 @@
 //! A process takes everything it starts with it: it runs in a process group of its own on Unix
 //! (a job of its own on Windows), which is killed when the process is killed, when its handle
 //! is dropped, and when the process itself exits, so a language server's children never
-//! outlive it. The job also dies with dv however dv ends (`crate::job`).
+//! outlive it. The job also dies with dv however dv ends. `toolbox_process` does all of this
+//! (`local`).
 
 mod local;
 

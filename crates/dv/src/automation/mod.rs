@@ -172,7 +172,7 @@ impl AutomationHost for DvAutomation {
             "app": "dv",
             "data_dir": cx.services().data_dir().display().to_string(),
             "settings": state::settings(cx),
-            "shell": state::shell(self.shell.read(cx), cx),
+            "shell": state::shell(self.shell.read(cx), window, cx),
             "system": state::system(cx),
             "repos": state::repos(cx),
             "switcher": state::switcher(self.shell.read(cx), cx),
@@ -303,7 +303,10 @@ impl SettingChange {
             "material" => Material::from_key(value)
                 .map(Self::Material)
                 .ok_or_else(|| {
-                    anyhow!("material must be \"mica\", \"acrylic\" or \"opaque\", not {value:?}")
+                    anyhow!(
+                        "material must be \"mica\", \"acrylic\", \"vibrancy\" or \"opaque\", \
+                         not {value:?}"
+                    )
                 }),
             "mode" => Mode::from_key(value).map(Self::Mode).ok_or_else(|| {
                 anyhow!("mode must be \"system\", \"dark\" or \"light\", not {value:?}")

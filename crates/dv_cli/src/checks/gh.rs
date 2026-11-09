@@ -3,8 +3,9 @@
 //! never signs in itself: the fix is `gh auth login`. Inside a WSL distro this is the distro's
 //! own `gh`, a separate sign-in.
 
-use std::process::Command;
 use std::time::Duration;
+
+use toolbox_process::Command;
 
 use super::process::{self, apply_env};
 use super::{Check, Fix, Seams, State, id};
@@ -15,12 +16,13 @@ const TITLE: &str = "GitHub CLI";
 const TIMEOUT: Duration = Duration::from_secs(15);
 
 pub(super) fn check(seams: &Seams) -> Check {
-    let mut command = Command::new(&seams.gh);
-    command.args(["auth", "status"]);
-    apply_env(&mut command, &seams.child_env);
-    command.env("GH_PROMPT_DISABLED", "1");
+    let command = apply_env(
+        Command::new(&seams.gh).args(["auth", "status"]),
+        &seams.child_env,
+    )
+    .env("GH_PROMPT_DISABLED", "1");
     match process::run(command, TIMEOUT) {
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Check::new(
+        Err(error) if process::not_found(&error) => Check::new(
             id::GH,
             TITLE,
             State::Missing,

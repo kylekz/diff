@@ -295,14 +295,15 @@ fn a_process_printing_faster_than_the_client_reads_waits_for_it() {
             .unwrap_or(0)
     };
     // It has stalled once its count holds still between two looks; one that never stalls
-    // passes the bound below on the way.
+    // passes the bound below on the way. The bound is what may wait unread: the local queue's
+    // 256 chunks of 64 KiB (`toolbox_process`), the 1 MiB budget, and the pipes.
     let deadline = Instant::now() + WITHIN;
     let mut stalled = flooded();
     loop {
         std::thread::sleep(Duration::from_millis(300));
         let now = flooded();
         assert!(
-            now < 16 * 1024 * 1024,
+            now < 24 * 1024 * 1024,
             "the process printed {now} bytes nobody read"
         );
         if now > 0 && now == stalled {

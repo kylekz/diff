@@ -234,10 +234,10 @@ fn codex_and_cursor_share_one_install(cx: &mut TestAppContext) {
 
 #[gpui::test]
 fn settings_appearance_changes_the_mode_and_the_material(cx: &mut TestAppContext) {
-    use crate::platform::MaterialSupport;
     use crate::services::Mode;
     use crate::test_support::bounds;
     use crate::theme::{ActiveTheme as _, Appearance, Material};
+    use gpui_appearance::MaterialSupport;
 
     let (_dir, shell, cx) = open_shell(cx);
     cx.simulate_keystrokes("secondary-,");
@@ -256,22 +256,38 @@ fn settings_appearance_changes_the_mode_and_the_material(cx: &mut TestAppContext
         })
     };
 
+    // The platform's own translucent materials (Vibrancy alone on macOS).
+    let (first, first_name, second_name) = if cfg!(target_os = "macos") {
+        (
+            Material::Vibrancy,
+            "settings-material-vibrancy",
+            "settings-material-vibrancy",
+        )
+    } else {
+        (
+            Material::Acrylic,
+            "settings-material-acrylic",
+            "settings-material-mica",
+        )
+    };
     click("settings-mode-light", cx);
-    click("settings-material-acrylic", cx);
-    assert_eq!(chosen(cx), (Mode::Light, Material::Acrylic));
+    click(first_name, cx);
+    assert_eq!(chosen(cx), (Mode::Light, first));
     cx.update(|_, cx| {
         let theme = cx.dv_theme();
         assert_eq!(
             (theme.appearance, theme.material),
-            (Appearance::Light, Material::Acrylic)
+            (Appearance::Light, first)
         );
     });
 
-    // A material the platform can't show takes no click; the one chosen stays, shown Opaque.
-    cx.update(|_, cx| crate::appearance::set_support(MaterialSupport::OPAQUE_ONLY, cx));
-    click("settings-material-mica", cx);
-    assert_eq!(chosen(cx), (Mode::Light, Material::Acrylic));
+    // A material the platform can't show is shown Opaque, keeping the setting, and takes no
+    // click.
+    cx.update(|_, cx| gpui_appearance::set_support(MaterialSupport::OPAQUE_ONLY, cx));
+    assert_eq!(chosen(cx), (Mode::Light, first));
     assert_eq!(cx.update(|_, cx| cx.dv_theme().material), Material::Opaque);
     click("settings-material-opaque", cx);
+    assert_eq!(chosen(cx), (Mode::Light, Material::Opaque));
+    click(second_name, cx);
     assert_eq!(chosen(cx), (Mode::Light, Material::Opaque));
 }

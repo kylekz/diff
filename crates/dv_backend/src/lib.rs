@@ -16,7 +16,7 @@
 //! - [`build`]: build hashes, which `hello` compares (PLAN §5.2).
 //!
 //! Every child it starts (servers, `wsl.exe`) dies with this process, however it ends
-//! (`dv_core::job`).
+//! (`dv_core::job`), and gets no console window on Windows (`toolbox_process`).
 //!
 //! gpui: **never**. The Linux build of this crate is the WSL backend, a static musl binary
 //! without a window system; `script/check` fails when gpui appears in its dependency tree

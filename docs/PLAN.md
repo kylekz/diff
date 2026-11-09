@@ -108,16 +108,22 @@ Every list is paginated.
 
 ### D8. Window material: Mica by default
 Windows 11: `MicaBackdrop` by default, `Blurred` (Acrylic) as a setting, `Opaque` automatically on
-Windows 10, when "transparency effects" is off, on Linux, and as a setting. **macOS: Opaque.**
-gpui's `Blurred` there (an `NSVisualEffectView` with its tint and saturation layers stripped)
-leaves the window clear with no blur at all on macOS 27 (the wallpaper sharp behind dv's
-translucent tints, active and inactive alike), which reads worse
-than Opaque; vibrancy via `Blurred` comes back when gpui's blur works again (a Mica or Acrylic
-setting made elsewhere is kept and resolves to Opaque meanwhile). GPUI only blurs what is *behind* the window; in-app overlays are opaque tinted layers over a
-scrim (DESIGN §3). Acrylic uses the undocumented composition API and can lag while dragging on some
-Windows builds — hence Mica as the default. gpui sets Mica through `DWMWA_SYSTEMBACKDROP_TYPE`, which
-only build 22621+ has, so earlier Windows 11 builds (22000–22620) resolve Mica to Opaque too; a
-material the platform can't show always resolves to Opaque (`dv_ui::platform`).
+Windows 10, when "transparency effects" is off, on Linux, and as a setting. **macOS: Opaque by
+default, Vibrancy as a setting.** gpui's own `Blurred` there is an `NSVisualEffectView` with its
+tint and saturation layers stripped: untinted, and with no blur at all up to gpui-pre 0.3.6 on
+macOS 27. Vibrancy is toolbox-rs's `gpui_appearance` instead, which puts a plain
+`NSVisualEffectView` of its own behind gpui's content: tinted for light or dark, flat while the
+window is inactive, as any macOS window. Its surfaces take Acrylic's values (DESIGN §3) until
+DESIGN tunes a set of its own; until then Opaque stays the default. "Reduce transparency" on
+resolves it to Opaque, and a Mica or Acrylic setting made elsewhere is kept and resolves to Opaque
+meanwhile (as Vibrancy does on Windows). GPUI only blurs what is *behind* the window; in-app
+overlays are opaque tinted layers over a scrim (DESIGN §3). Acrylic uses the undocumented
+composition API and can lag while dragging on some Windows builds — hence Mica as the default.
+gpui sets Mica through `DWMWA_SYSTEMBACKDROP_TYPE`, which only build 22621+ has, so earlier
+Windows 11 builds (22000–22620) resolve Mica to Opaque too; a material the platform can't show
+always resolves to Opaque. `gpui_appearance` holds these rules, follows the OS's light/dark
+setting and applies both to the window (`dv_ui::appearance` narrows the settings by the palette
+first, DESIGN §1.3).
 
 ### D9. Packaging and updates: Velopack
 - **Packages:** `vpk pack` produces a one-click per-user `Setup.exe` on Windows (no wizard, no
@@ -470,8 +476,10 @@ Direction: `dv` → `dv_ui` → {`dv_cli`, `dv_backend`, `dv_lsp`, `dv_core`, `g
 `dv_cli` → {`dv_backend`, `dv_lsp`, `dv_core`} (`dv_lsp` for the user's shell's `PATH`, §12.2); `dv_lsp` →
 `dv_core`; `dv_backend` → `dv_core`. The automation crates come from toolbox-rs
 (github.com/kylekz/toolbox-rs, the owner's MIT crates shared with the sibling apps), a git
-dependency pinned by tag (§14.2). A gpui import outside `dv_ui`, `dv`
-and toolbox-rs's `gpui_automation`, or in `dv` built without `gui`, is a build failure (`script/check` verifies
+dependency pinned by tag (§14.2), and so do `toolbox_process` (every program dv runs on this
+machine, in a process tree of its own: `dv_core`, `dv_backend`, `dv_cli`; gpui-free, §18.3) and
+`gpui_appearance` (light/dark and the window materials, D8: `dv_ui`). A gpui import outside
+`dv_ui`, `dv` and toolbox-rs's `gpui_automation` and `gpui_appearance`, or in `dv` built without `gui`, is a build failure (`script/check` verifies
 it with `cargo tree`, §13.2).
 
 Rules: errors are `anyhow` in app/CLI code and `thiserror` enums in libraries; no `unwrap()`/`expect()`
@@ -536,8 +544,10 @@ of the index this way (§2.3), so the user's index is never written.
   `-c core.quotepath=off -c color.ui=never -c color.diff=never -c diff.algorithm=myers
   -c diff.autoRefreshIndex=false`, the inherited variables that point git elsewhere or change how
   pathspecs and diffs are read (`GIT_DIR`, `GIT_INDEX_FILE`, `GIT_CONFIG_PARAMETERS`,
-  `GIT_LITERAL_PATHSPECS`, `GIT_DIFF_OPTS`, `GIT_ATTR_SOURCE`, …) removed, and `CREATE_NO_WINDOW` on
-  Windows. `color.diff` needs its own override because a configured `color.diff=always` beats
+  `GIT_LITERAL_PATHSPECS`, `GIT_DIFF_OPTS`, `GIT_ATTR_SOURCE`, …) removed. It runs through
+  toolbox-rs's `toolbox_process` (no console window on Windows, a process tree of its own), so a
+  timeout kills git with everything it started (hooks, `ssh`, credential helpers), and what git
+  leaves running when it exits is killed then. `color.diff` needs its own override because a configured `color.diff=always` beats
   `color.ui`. A driver's `diff.<driver>.algorithm` beats `-c diff.algorithm`, and only flags beat a
   `.gitmodules` `ignore` setting, so the diff commands also pin git's diff presentation with flags
   (D4). `diff.autoRefreshIndex=false` because the worktree forms of `git diff` rewrite the index
@@ -592,15 +602,15 @@ in git: that is how a server dies with its client.
 **The client** (`dv_backend::client`): a `Connection` (one per distro, or a named loopback) starts
 its server through its `Launcher` (`dv_backend::launch`) on the first call and shakes hands; every
 `RemoteBackend` of that server shares it, each call blocking its thread until its reply comes.
-`Launcher::Command` runs a child process with piped stdio (`CREATE_NO_WINDOW` on Windows, where the
-detached app has no console), such as a loopback `dv backend --stdio`, and may name the build hash
+`Launcher::Command` runs a child process with piped stdio (no console window on Windows, where the
+detached app has no console: `toolbox_process::Command::to_std`), such as a loopback `dv backend --stdio`, and may name the build hash
 `hello` checks; `Launcher::InProcess` serves on a thread over in-memory pipes; `Launcher::Wsl`
 starts a distro's server through `wsl.exe`, installing this app's Linux build there first when it is
 missing (§5.2). A launcher also answers whether its host runs (`host_running`: a distro's state,
 listed afresh; `None` for this machine), which every automatic start asks first (§5.2's connecting
 rule). Every process a launcher starts, and every `wsl.exe` dv runs, joins a job object this process
-holds with `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE` (`dv_core::job`), so it dies with dv however dv
-ends. A reader thread routes replies by id and watch batches to their watch's channel, which
+holds with `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE` (`dv_core::job`, over
+`toolbox_process::tie_to_this_process`), so it dies with dv however dv ends. A reader thread routes replies by id and watch batches to their watch's channel, which
 delivers to the sink on a thread of the watch's own, so the `WatchHandle` contract (§5.3) holds over
 the wire. Before the first reply, lines that aren't the protocol are kept as diagnostics (`wsl.exe`
 can print warnings on stdout first); after it, such a line, or a reply nobody asked for, is a
@@ -747,7 +757,7 @@ the same cases against both implementations.
   (UTF-16LE), never the localised `--verbose` table, reused for 2 s, everyone asking while a
   listing runs sharing it (`wsl::running_now` lists afresh); a `--running` that fails counts as
   none running. Listing boots no distro. Every
-  `wsl.exe` dv starts is made without a console window (`CREATE_NO_WINDOW`, one builder,
+  `wsl.exe` dv starts is made without a console window (`CREATE_NO_WINDOW` through `toolbox_process`, one builder,
   `wsl::wsl_exe`), the CLI's crossing alone sharing its caller's console (§10.4). `dv setup wsl
   <distro>` does the install ahead of time (§10.1).
 - Death (§5.1): in-flight requests fail with `BackendError::Disconnected`, the connection is
@@ -3118,7 +3128,8 @@ fn spawn_stdio(&self, spec: &ProcessSpec, sink: ProcessSink) -> Result<ProcessHa
 // the process's own, in order, the exit last.
 ```
 
-- **What runs.** Nothing runs through a shell: `Command::new(program).args(args)`, the executable
+- **What runs.** Nothing runs through a shell: `toolbox_process::Command::new(program).args(args)`
+  (toolbox-rs's crate, `spawn_streaming`), the executable
   one a resolver found and its arguments the language's spec's. A program that isn't an absolute
   path, NUL in an argument or the environment, and on Windows a batch file (`.bat`, `.cmd`, which
   only `cmd.exe` runs) are refused before anything starts (`BackendError::InvalidProcess`); the
@@ -3132,23 +3143,21 @@ fn spawn_stdio(&self, spec: &ProcessSpec, sink: ProcessSink) -> Result<ProcessHa
   The exit comes after both pipes end, or 1 s after the process exited when something it
   started still holds one: something that escaped its tree (it made itself a session or a job
   of its own), whose pipe's reader thread then stays blocked until it closes the pipe or exits.
-  Two reader threads feed the delivery thread through a queue of 64 chunks or lines, so a sink
-  that falls behind makes the process wait on its pipes rather than dv buffer without end.
+  Two reader threads feed the delivery thread through a queue of 256 chunks (64 KiB each) or
+  lines, so a sink that falls behind makes the process wait on its pipes rather than dv buffer
+  without end. A stderr line longer than 1 MiB arrives as several lines, each cut at 8 KiB.
   Dropping the handle stops the delivery: once `drop` returns the sink is never called again
   and has been dropped (from inside the sink, after it returns), as for a watch (§5.3). A write
   to a process that has ended fails as `io` "writing to <program> failed: the process has
   ended", locally and through the wire alike.
 - **Its tree.** A process takes everything it starts with it: on Unix it leads a process group of
   its own (`process_group(0)`), on Windows it is alone in a job object of its own with the
-  kill-on-close limit (`dv_core::job::Job`), which also kills it when dv ends however it ends.
+  kill-on-close limit, which also kills it when dv ends however it ends.
   A kill, a dropped handle, and the process's own exit each kill the group or the job: its exit
   is seen before it is reaped (`waitid` with `WNOWAIT`), so the group's id is still its own then;
   a wait that fails (the process reaped elsewhere) kills nothing. So a language server's
-  children never outlive it. On Windows a process joins its job right after it starts, so a
-  child it starts in that instant stays outside: closing the window needs the process created
-  suspended and its first thread resumed once in the job, and `std::process::Command` keeps
-  that thread's handle to itself. A language server starts its children only after it has read
-  a request.
+  children never outlive it. On Windows the process is created suspended and resumed only
+  once it is in its job, so not even a child it starts at once escapes the job.
 - **On the wire** (`PROTO = 2`, §5.1): `spawn {repo, spec}` → `{proc, pid}` (the pid where it
   runs: inside the distro), `proc_write {proc, bytes}`, `proc_kill {proc}`, and `{"proc": n,
   "out": <base64>}`, `{"proc": n, "err": <line>}`, `{"proc": n, "exit": <code or null>}`

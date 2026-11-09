@@ -45,6 +45,7 @@ gui = [
     "dep:dirs",
     "dep:dv_ui",
     "dep:gpui",
+    "dep:gpui_appearance",
     "dep:gpui_platform",
     "dep:libc",
     "dep:objc2",
@@ -64,6 +65,7 @@ automation = [
     "gpui_automation/enabled",
     "dep:serde",
     "dep:serde_json",
+    "dep:toolbox_process",
     "dv_ui/automation",
 ]
 
@@ -79,11 +81,15 @@ dv_test_support = { workspace = true, optional = true }
 dv_ui = { workspace = true, optional = true }
 env_logger.workspace = true
 gpui = { workspace = true, optional = true }
+# What the platform can show, probed at startup, and automation's `state` of it (`app`).
+gpui_appearance = { workspace = true, optional = true }
 gpui_automation = { workspace = true, optional = true }
 gpui_platform = { workspace = true, optional = true }
 log.workspace = true
 serde = { workspace = true, optional = true }
 serde_json = { workspace = true, optional = true }
+# The agent's `dv` commands a scenario plays (`automation::agent_cli`), with no console window.
+toolbox_process = { workspace = true, optional = true }
 
 # Velopack (PLAN D9): on Windows its install, update and uninstall hooks, and on Windows and
 # macOS an installed copy's updates (`installer`, `updates`): the app's, never the headless

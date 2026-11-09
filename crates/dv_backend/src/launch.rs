@@ -6,8 +6,8 @@
 //!   the protocol and `RemoteBackend` without a process (the conformance suite).
 //! - [`Launcher::Command`]: a child process, typically a dv executable's `backend --stdio` on
 //!   this machine (a loopback, PLAN §14.2). Its stdin, stdout and stderr are piped and, on
-//!   Windows, it is created with `CREATE_NO_WINDOW`: the detached app has no console, and a
-//!   console child would flash a window.
+//!   Windows, it is created with no console window (`toolbox_process::Command::to_std`): the
+//!   detached app has no console, and a console child would flash a window.
 //! - [`Launcher::Wsl`]: a distro's `dv backend --stdio` through `wsl.exe` (`crate::wsl`), this
 //!   app's Linux build installed there first when it is missing (`crate::install`); the
 //!   connection's state says `Installing` meanwhile.
@@ -30,7 +30,7 @@ use std::ffi::{OsStr, OsString};
 use std::fmt;
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, Stdio};
 use std::sync::Arc;
 
 use crate::install::{self, LINUX_DIR_VAR, LinuxBuilds};
@@ -381,20 +381,19 @@ fn spawn(
     env: &[(OsString, Option<OsString>)],
     build: Option<String>,
 ) -> io::Result<Transport> {
-    let mut command = Command::new(program);
-    command
-        .args(args)
+    let mut child = env
+        .iter()
+        .fold(
+            toolbox_process::Command::new(program).args(args),
+            |command, (name, value)| match value {
+                Some(value) => command.env(name, value),
+                None => command.env_remove(name),
+            },
+        )
+        .to_std()
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    for (name, value) in env {
-        match value {
-            Some(value) => command.env(name, value),
-            None => command.env_remove(name),
-        };
-    }
-    no_window(&mut command);
-    let mut child = command
+        .stderr(Stdio::piped())
         .spawn()
         .map_err(|error| io::Error::new(error.kind(), format!("{}: {error}", program.display())))?;
     dv_core::job::tie_to_this_process(&child);
@@ -419,18 +418,6 @@ fn spawn(
         notes: Vec::new(),
     })
 }
-
-/// The process gets no console window (module docs).
-#[cfg(windows)]
-pub(crate) fn no_window(command: &mut Command) {
-    use std::os::windows::process::CommandExt as _;
-    /// `CREATE_NO_WINDOW` from the Win32 process creation flags.
-    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-    command.creation_flags(CREATE_NO_WINDOW);
-}
-
-#[cfg(not(windows))]
-pub(crate) fn no_window(_command: &mut Command) {}
 
 /// `program args…` as one line to read, an argument quoted when it is empty or has a space.
 fn command_line(program: &OsStr, args: &[OsString]) -> String {

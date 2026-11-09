@@ -10,10 +10,10 @@ use gpui::{AppContext as _, Bounds, Entity, Pixels, TestAppContext, VisualTestCo
 use gpui_component::Root;
 
 use crate::ActiveServices as _;
-use crate::platform::MaterialSupport;
 use crate::services::ServicesConfig;
 use crate::shell::Shell;
 use crate::system::SystemShell;
+use gpui_appearance::MaterialSupport;
 
 /// A 1440x900 main window around a [`Shell`], over services in a temporary data dir, with the
 /// system seam scripted (nothing reaches the real clipboard or opens a picker).

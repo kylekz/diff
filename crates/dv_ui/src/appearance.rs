@@ -1,29 +1,23 @@
-//! Which theme is on screen: the settings' palette, material and mode (PLAN D8, DESIGN §1, §3),
-//! narrowed by what the platform can show, what the palette has (DESIGN §1.3: Claude and
-//! Dracula are opaque, Dracula dark) and, for `Mode::System`, the OS's light/dark setting.
+//! Which theme is on screen: the settings' palette, material and mode (PLAN D8, DESIGN §1, §3).
+//!
+//! toolbox-rs's `gpui_appearance` holds the rest: the OS's light/dark setting, followed live,
+//! and what the platform can show (Mica and Acrylic on Windows 11 with Transparency effects on,
+//! vibrancy on macOS without Reduce transparency), and it applies what they resolve to to each
+//! window the shell tracks (`gpui_appearance::track_window`). dv narrows its settings by the
+//! palette before handing them over (DESIGN §1.3: Claude and Dracula are opaque, Dracula dark).
 //!
 //! [`init`] runs after [`crate::services::init`] and before the first window, so the first frame
-//! already uses the resolved theme, and from then on follows every settings change. The shell
-//! reports the OS appearance as it changes ([`system_changed`]) and re-probes the platform when
-//! the window is activated ([`refresh_support`]: the transparency switch may have flipped while
-//! dv was in the background). Each change installs the theme ([`crate::theme::install`]), which
-//! redraws every window; the shell then applies the material to its window.
+//! already uses the resolved theme, and from then on follows every settings change and every
+//! change the crate sees. Each change installs the theme ([`crate::theme::install`]), which
+//! redraws every window.
 
-use gpui::{App, Global, Subscription, WindowAppearance};
+use gpui::App;
+/// What the platform can show, which [`init`] starts from (`MaterialSupport::probe`).
+pub use gpui_appearance::MaterialSupport;
+use gpui_appearance::{AppearanceState, Mode, Preferences, Setup, Vibrancy};
 
-use crate::platform::MaterialSupport;
 use crate::services::{ActiveServices as _, SettingsEvent};
 use crate::theme::{self, Appearance, Material, Palette};
-
-struct AppearanceState {
-    /// The OS's light/dark setting.
-    system: Appearance,
-    /// What the platform can show.
-    support: MaterialSupport,
-    _settings: Subscription,
-}
-
-impl Global for AppearanceState {}
 
 /// The settings resolved against the platform and the OS.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -33,82 +27,65 @@ pub struct Resolved {
     pub material: Material,
 }
 
+/// The material setting's default (PLAN D8): Mica on Windows, Opaque elsewhere. On macOS too,
+/// where vibrancy is a setting until DESIGN §3 has tokens tuned for it, so dv keeps Opaque rather
+/// than `gpui_appearance`'s platform default.
+pub fn default_material() -> Material {
+    if cfg!(windows) {
+        Material::Mica
+    } else {
+        Material::Opaque
+    }
+}
+
 /// Starts following the settings with `support` as the platform's abilities (from
 /// [`MaterialSupport::probe`]) and installs the resolved theme.
 pub fn init(support: MaterialSupport, cx: &mut App) {
+    gpui_appearance::init(
+        Setup {
+            support,
+            preferences: preferences(cx),
+            vibrancy: Vibrancy::default(),
+        },
+        cx,
+    );
     let settings = cx.services().settings.clone();
-    let subscription = cx.subscribe(&settings, |_, event: &SettingsEvent, cx| match event {
-        SettingsEvent::Changed => sync(cx),
-    });
-    log::info!("window materials available: {}", describe(support));
-    cx.set_global(AppearanceState {
-        system: Appearance::of_window(cx.window_appearance()),
-        support,
-        _settings: subscription,
-    });
+    cx.subscribe(&settings, |_, event: &SettingsEvent, cx| match event {
+        SettingsEvent::Changed => {
+            gpui_appearance::set_preferences(preferences(cx), cx);
+            // A palette change alone may leave the crate's state as it was.
+            sync(cx);
+        }
+    })
+    .detach();
+    cx.observe_global::<AppearanceState>(sync).detach();
     sync(cx);
 }
 
-/// `"mica, acrylic, opaque"`, for the log.
-fn describe(support: MaterialSupport) -> String {
-    support
-        .available()
-        .iter()
-        .map(|material| material.key())
-        .collect::<Vec<_>>()
-        .join(", ")
-}
-
-/// The OS's appearance changed (the main window's appearance observer).
-pub fn system_changed(appearance: WindowAppearance, cx: &mut App) {
-    let system = Appearance::of_window(appearance);
-    let Some(state) = cx.try_global::<AppearanceState>() else {
-        return;
-    };
-    if state.system != system {
-        cx.global_mut::<AppearanceState>().system = system;
-        sync(cx);
+/// What dv asks the crate for: the settings' mode and material, as far as the palette has them.
+fn preferences(cx: &App) -> Preferences {
+    let settings = cx.services().settings.read(cx);
+    let palette = settings.palette();
+    Preferences {
+        mode: if palette.has_light() {
+            settings.mode()
+        } else {
+            Mode::Dark
+        },
+        material: palette.material(settings.material()),
     }
-}
-
-/// Re-reads what the platform can show (the transparency switch).
-pub fn refresh_support(cx: &mut App) {
-    set_support(MaterialSupport::probe(), cx);
-}
-
-/// Replaces what the platform can show: [`refresh_support`], and tests.
-pub fn set_support(support: MaterialSupport, cx: &mut App) {
-    let Some(state) = cx.try_global::<AppearanceState>() else {
-        return;
-    };
-    if state.support != support {
-        log::info!("window materials available now: {}", describe(support));
-        cx.global_mut::<AppearanceState>().support = support;
-        sync(cx);
-    }
-}
-
-/// What the platform can show, as last probed.
-pub fn support(cx: &App) -> MaterialSupport {
-    cx.try_global::<AppearanceState>()
-        .map_or(MaterialSupport::OPAQUE_ONLY, |state| state.support)
-}
-
-/// The OS's light/dark setting, as last reported.
-pub fn system(cx: &App) -> Appearance {
-    cx.try_global::<AppearanceState>()
-        .map(|state| state.system)
-        .unwrap_or_default()
 }
 
 /// The settings resolved now.
 pub fn resolved(cx: &App) -> Resolved {
-    let settings = cx.services().settings.read(cx);
-    let palette = settings.palette();
+    let gpui_appearance::Resolved {
+        appearance,
+        material,
+    } = gpui_appearance::resolved(cx);
     Resolved {
-        palette,
-        appearance: palette.appearance(settings.mode().resolve(system(cx))),
-        material: palette.material(support(cx).resolve(settings.material())),
+        palette: cx.services().settings.read(cx).palette(),
+        appearance,
+        material,
     }
 }
 
@@ -127,7 +104,7 @@ mod tests {
 
     use super::*;
     use crate::ActiveTheme as _;
-    use crate::services::{Mode, ServicesConfig};
+    use crate::services::ServicesConfig;
 
     fn setup(cx: &mut TestAppContext, support: MaterialSupport) -> tempfile::TempDir {
         let dir = tempfile::tempdir().unwrap();
@@ -169,9 +146,9 @@ mod tests {
         assert_eq!(on_screen(cx), (Appearance::Light, Material::Acrylic));
         settings.update(cx, |settings, cx| {
             settings.set_mode(Mode::Dark, cx);
-            settings.set_material(Material::Mica, cx);
+            settings.set_material(Material::Vibrancy, cx);
         });
-        assert_eq!(on_screen(cx), (Appearance::Dark, Material::Mica));
+        assert_eq!(on_screen(cx), (Appearance::Dark, Material::Vibrancy));
         cx.run_until_parked();
     }
 
@@ -180,14 +157,29 @@ mod tests {
         let _dir = setup(cx, MaterialSupport::ALL);
         let settings = cx.update(|cx| cx.services().settings.clone());
         settings.update(cx, |settings, cx| settings.set_mode(Mode::System, cx));
-        cx.update(|cx| system_changed(WindowAppearance::Light, cx));
+        cx.update(|cx| gpui_appearance::set_system(Appearance::Light, cx));
         assert_eq!(on_screen(cx).0, Appearance::Light);
-        cx.update(|cx| system_changed(WindowAppearance::VibrantDark, cx));
+        cx.update(|cx| gpui_appearance::set_system(Appearance::Dark, cx));
         assert_eq!(on_screen(cx).0, Appearance::Dark);
         // An explicit mode ignores the OS.
         settings.update(cx, |settings, cx| settings.set_mode(Mode::Light, cx));
-        cx.update(|cx| system_changed(WindowAppearance::Dark, cx));
+        cx.update(|cx| gpui_appearance::set_system(Appearance::Dark, cx));
         assert_eq!(on_screen(cx).0, Appearance::Light);
+        cx.run_until_parked();
+    }
+
+    #[gpui::test]
+    fn the_palette_narrows_the_mode_and_the_material(cx: &mut TestAppContext) {
+        let _dir = setup(cx, MaterialSupport::ALL);
+        let settings = cx.update(|cx| cx.services().settings.clone());
+        settings.update(cx, |settings, cx| {
+            settings.set_mode(Mode::Light, cx);
+            settings.set_material(Material::Mica, cx);
+            settings.set_palette(Palette::Dracula, cx);
+        });
+        assert_eq!(on_screen(cx), (Appearance::Dark, Material::Opaque));
+        settings.update(cx, |settings, cx| settings.set_palette(Palette::Aura, cx));
+        assert_eq!(on_screen(cx), (Appearance::Light, Material::Mica));
         cx.run_until_parked();
     }
 
@@ -198,7 +190,7 @@ mod tests {
         settings.update(cx, |settings, cx| settings.set_material(Material::Mica, cx));
         assert_eq!(on_screen(cx).1, Material::Opaque, "transparency off");
         // Transparency switched back on.
-        cx.update(|cx| set_support(MaterialSupport::ALL, cx));
+        cx.update(|cx| gpui_appearance::set_support(MaterialSupport::ALL, cx));
         assert_eq!(on_screen(cx).1, Material::Mica);
         assert_eq!(
             cx.update(|cx| resolved(cx).material),

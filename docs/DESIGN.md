@@ -150,9 +150,9 @@ lines) and on light and dark taskbars alike. The source is `crates/dv/resources/
 
 ## 3. Materials
 
-| Surface | Acrylic / Mica | Opaque |
+| Surface | Acrylic / Mica / Vibrancy | Opaque |
 |---|---|---|
-| Window background | OS material (`Blurred` / `MicaBackdrop`) | `chrome` solid |
+| Window background | OS material (`Blurred` / `MicaBackdrop`; macOS's `NSVisualEffectView`) | `chrome` solid |
 | Title bar, status bar, PR strip | `chrome` translucent | solid |
 | Panel | `panel` translucent | solid |
 | Diff surface, thread cards | near-opaque (`code` ≥ 94%, `thread` ≥ 98%) | solid |
@@ -160,9 +160,11 @@ lines) and on light and dark taskbars alike. The source is `crates/dv/resources/
 | Popovers with no scrim (hover card, menus, find bar, a server's details) | `popover`: solid, so the code under them never shows through | solid |
 
 GPUI blurs only what is behind the window, so in-app overlays never "frost" app content (PLAN D8).
+Vibrancy (macOS, PLAN D8) takes Acrylic's surface values: both blur what is behind the window,
+and Vibrancy has no tuned set of its own yet, which is why Opaque stays macOS's default.
 Opaque is chosen automatically on Windows 10, with system transparency off, on Linux, on macOS
-(gpui's vibrancy there shows no blur on macOS 27, PLAN D8) and for non-Aura themes; it must look
-finished in its own right, not like a degraded mode. Window
+with Reduce transparency on, and for non-Aura themes; it must look finished in its own right, not
+like a degraded mode. Window
 inactive: material falls back to its inactive appearance (OS-managed); dv dims nothing itself.
 
 ---
@@ -754,14 +756,16 @@ Setup unchanged.
   **Appearance**, one card with a row per setting (its name in 600, what it does in `fg2`
   secondary, its control on the right, a header-style segmented control): **Theme** Aura |
   Claude | Dracula (§1.3), **Mode** System | Dark | Light and **Material** Mica | Acrylic |
-  Opaque, each applied as it is clicked. With Dracula the mode row's `yellow` line says
+  Opaque (on macOS Vibrancy | Opaque), each applied as it is clicked. With Dracula the mode row's `yellow` line says
   "Dracula has no light palette: dv shows it dark, keeping the mode for the other themes". With
-  Claude or Dracula Mica and Acrylic are disabled segments and the material row's line says
-  "Mica and Acrylic are Aura's: Claude is opaque" (Dracula likewise), keeping the setting for
-  Aura. A
+  Claude or Dracula the translucent materials are disabled segments and the material row's line
+  says "Mica and Acrylic are Aura's: Claude is opaque" ("Vibrancy is Aura's" on macOS; Dracula
+  likewise), keeping the setting for Aura. A setting made on another platform (Mica on a Mac)
+  shows Opaque, the line saying so ("Mica is Windows 11's: dv shows Opaque here, keeping it for
+  Windows 11"). A
   material the platform can't show is a disabled segment in `fg3`, and a `yellow` line under
-  the row says why ("Mica and Acrylic need Windows 11 with Transparency effects on…"; on macOS
-  and Linux, that dv is Opaque there) and, when the setting is one of them, that dv shows
+  the row says why ("Mica and Acrylic need Windows 11 with Transparency effects on…"; "Vibrancy needs Reduce
+  transparency off…" on macOS; on Linux, that dv is Opaque there) and, when the setting is one of them, that dv shows
   Opaque meanwhile, keeping the setting. Then **Setup**, the cards above with Check again. Opening it checks everything again; `Esc`, the close button or a click on the scrim
   closes it, the keyboard back where it was.
 - **The out-of-date notice** sits at the status bar's right: the warning triangle and

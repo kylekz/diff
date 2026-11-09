@@ -411,31 +411,22 @@ fn a_timeout_kills_git() {
 }
 
 #[test]
-fn a_timeout_also_bounds_a_process_git_leaves_holding_its_output() {
-    // git exits at once, but the backgrounded `sleep` inherited its stdout and stderr, so the
-    // pipes stay open for twenty seconds.
+fn what_git_leaves_running_ends_with_it() {
+    // git exits at once, but the backgrounded `sleep` inherited its stdout and stderr: it is in
+    // git's process tree, so it is killed when git exits, which closes the pipes.
     let repo = committed_repo();
     let backend = open(&repo);
     let started = Instant::now();
-    let err = backend
+    let output = backend
         .git(
             &["-c", "alias.bg=!sleep 20 &", "bg"],
-            &GitOpts::new().with_timeout(Duration::from_millis(300)),
+            &GitOpts::new().with_timeout(Duration::from_secs(10)),
         )
-        .unwrap_err();
+        .unwrap();
+    assert_eq!(output.code, 0);
+    // Far sooner than the sleep: its end closed the pipes.
     assert!(
-        matches!(
-            err,
-            BackendError::Timeout {
-                timeout_ms: 300,
-                ..
-            }
-        ),
-        "{err:?}"
-    );
-    // Far sooner than the sleep: the timeout ended the wait for the pipes.
-    assert!(
-        started.elapsed() < Duration::from_secs(8),
+        started.elapsed() < Duration::from_secs(5),
         "{:?}",
         started.elapsed()
     );

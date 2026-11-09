@@ -1,12 +1,11 @@
 //! The root view (PLAN §11 `shell`, DESIGN §2): the title bar, the panel, the main area and the
 //! status bar, over the window material (DESIGN §3).
 //!
-//! The shell keeps its window in step with the theme: whenever [`crate::theme::install`] puts a
-//! new [`DvTheme`] in place it applies that theme's material and light/dark appearance to the
-//! window ([`crate::platform::apply_window_material`],
-//! [`crate::platform::apply_window_appearance`]) and repaints. It also reports the OS's
-//! light/dark changes to [`crate::appearance`] and has it re-probe the platform when the window
-//! is activated.
+//! The shell keeps its window in step with [`crate::appearance`]: it tracks it with
+//! `gpui_appearance`, which applies the resolved material and light/dark appearance to the
+//! window, reports the OS's light/dark changes and re-probes the platform when the window is
+//! activated; and it repaints whenever [`crate::theme::install`] puts a new [`DvTheme`] in
+//! place.
 //!
 //! **Reviews.** The shell owns the open review's [`ReviewSession`] and hands it to the panel's
 //! [`FileList`] and [`CommentsList`] and to the [`DiffPane`]; opening another review swaps it
@@ -94,7 +93,6 @@ use crate::file_finder::FileFinder;
 use crate::file_list::{FileList, FileListEvent};
 use crate::history::History;
 use crate::palette::Palette;
-use crate::platform;
 use crate::services::ActiveServices as _;
 use crate::services::LocationsEvent;
 use crate::services::reviews::OpenRequest;
@@ -102,7 +100,8 @@ use crate::session::{Comparison, ReviewSession, SessionEvent};
 use crate::submit::{FinishSheet, SheetEvent};
 use crate::switcher::source::{SourcePicker, SourcePickerEvent};
 use crate::switcher::{Switcher, SwitcherEvent};
-use crate::theme::{ActiveTheme as _, Appearance, DvTheme, Material};
+use crate::theme::{ActiveTheme as _, DvTheme, Material};
+use gpui_appearance::Backing;
 
 pub use pending::PendingPick;
 
@@ -242,8 +241,9 @@ struct Overlay<V> {
 
 /// The root view of the main window.
 pub struct Shell {
-    /// The material last applied to the window, for `state.shell`.
-    applied: Material,
+    /// Keeps the window's material and light/dark in step (module docs); what it applied is
+    /// `state.shell`'s.
+    appearance: gpui_appearance::WindowTracker,
     /// The open review, if any.
     session: Option<Entity<ReviewSession>>,
     file_list: Entity<FileList>,
@@ -335,21 +335,9 @@ impl Shell {
                     LocationsEvent::ConnectionChanged { up: false, .. } => {}
                 },
             ),
-            cx.observe_global_in::<DvTheme>(window, |this, window, cx| {
-                this.apply_window_theme(window, cx);
-                cx.notify();
-            }),
-            cx.observe_window_appearance(window, |_, window, cx| {
-                crate::appearance::system_changed(window.appearance(), cx);
-                // gpui sets the window's light/dark to the OS's right after this observer runs;
-                // dv's mode may differ, so it is put back on the next frame.
-                window.on_next_frame(|window, cx| {
-                    platform::apply_window_appearance(window, cx.dv_theme().appearance);
-                });
-            }),
+            cx.observe_global_in::<DvTheme>(window, |_, _, cx| cx.notify()),
             cx.observe_window_activation(window, |this, window, cx| {
                 if window.is_window_active() {
-                    crate::appearance::refresh_support(cx);
                     // `settings.json`'s `lsp` edited by hand meanwhile, a review open or not.
                     crate::intel::reload_lsp_settings(cx);
                     if let Some(session) = &this.session {
@@ -394,14 +382,8 @@ impl Shell {
                 target.focus(window, cx);
             }),
         ];
-        let (appearance, material) = {
-            let theme = cx.dv_theme();
-            (theme.appearance, theme.material)
-        };
         // gpui opened the window light or dark as the OS is; dv's mode may say otherwise.
-        if appearance != Appearance::of_window(window.appearance()) {
-            platform::apply_window_appearance(window, appearance);
-        }
+        let appearance = gpui_appearance::track_window(Backing::Solid, window, cx);
         // The main area always renders, inside the shell's key context, so the shell's keys
         // (`Ctrl O`) work at once and the stream's as soon as a review shows.
         diff_pane.read(cx).focus_handle(cx).focus(window, cx);
@@ -412,8 +394,7 @@ impl Shell {
             first_run_focus.focus(window, cx);
         }
         Self {
-            // The window opened with the theme's material ([`window_options`]).
-            applied: material,
+            appearance,
             session: None,
             file_list,
             comments_list,
@@ -689,7 +670,7 @@ impl Shell {
 
     /// The material applied to the window.
     pub fn applied_material(&self) -> Material {
-        self.applied
+        self.appearance.applied().material
     }
 
     /// Nothing is opening or being picked, and no round is being finished: automation's
@@ -1217,15 +1198,6 @@ impl Shell {
         }
         self.set_panel_visible(!self.panel_visible, cx);
     }
-
-    fn apply_window_theme(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let theme = cx.dv_theme();
-        platform::apply_window_appearance(window, theme.appearance);
-        if theme.material != self.applied {
-            platform::apply_window_material(window, theme.material);
-            self.applied = theme.material;
-        }
-    }
 }
 
 impl Focusable for Shell {
@@ -1263,7 +1235,7 @@ pub fn window_options(window_size: Size<gpui::Pixels>, cx: &App) -> WindowOption
             traffic_light_position: Some(point(px(12.), px(12.))),
         }),
         window_min_size: Some(min_size),
-        window_background: theme.material.window_background(),
+        window_background: gpui_appearance::window_background(Backing::Solid, cx),
         // Linux: dv's title bar is the window's, and its frame gpui-component's `Root`
         // (`frame`); the platform keeps its own where it can't do without (X11 with no
         // compositor). Windows and macOS take their frame from `titlebar` above.

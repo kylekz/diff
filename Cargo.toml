@@ -68,13 +68,20 @@ dv_lsp = { path = "crates/dv_lsp" }
 dv_test_support = { path = "crates/dv_test_support" }
 dv_ui = { path = "crates/dv_ui" }
 
-# ---- toolbox-rs (github.com/kylekz/toolbox-rs, docs/PLAN.md §14): the shared automation crates,
-# a git dependency pinned by tag, never a branch. The in-app driver (`enabled` from `dv_ui`'s and
-# `dv`'s `automation` features, its no-op stand-ins otherwise) and the scenario runner `dv_e2e`
-# wraps. A change to either goes to toolbox-rs first, then a new tag here. toolbox-rs owns the
-# gpui pin: its tag's gpui-pre and gpui-kit versions are the ones above.
-gpui_automation = { git = "https://github.com/kylekz/toolbox-rs", tag = "v0.1.2" }
-gpui_automation_runner = { git = "https://github.com/kylekz/toolbox-rs", tag = "v0.1.2" }
+# ---- toolbox-rs (github.com/kylekz/toolbox-rs, docs/PLAN.md §14): the shared crates, a git
+# dependency pinned by tag, never a branch. A change to any goes to toolbox-rs first, then a new
+# tag here. toolbox-rs owns the gpui pin: its tag's gpui-pre and gpui-kit versions are the ones
+# above.
+# Light/dark and the window materials (`dv_ui::appearance`, PLAN D8). `serde`: `settings.json`
+# holds its `Mode` and `Material` by their keys.
+gpui_appearance = { git = "https://github.com/kylekz/toolbox-rs", tag = "v0.5.0", features = ["serde"] }
+# The in-app driver (`enabled` from `dv_ui`'s and `dv`'s `automation` features, its no-op
+# stand-ins otherwise) and the scenario runner `dv_e2e` wraps.
+gpui_automation = { git = "https://github.com/kylekz/toolbox-rs", tag = "v0.5.0" }
+gpui_automation_runner = { git = "https://github.com/kylekz/toolbox-rs", tag = "v0.5.0" }
+# Every other program dv runs on this machine: git, a backend's processes, the setup checks, in
+# a process tree of their own with no console window (PLAN §18.3). gpui-free.
+toolbox_process = { git = "https://github.com/kylekz/toolbox-rs", tag = "v0.5.0" }
 
 # ---- shared third-party
 anyhow = "1.0"
@@ -114,7 +121,6 @@ objc2 = "0.6"
 parking_lot = "0.12"
 png = "0.18"
 pretty_assertions = "1.4"
-raw-window-handle = "0.6"
 # The app icon's test renders `crates/dv/resources/windows/dv.svg` (`crates/dv/tests/app_icon.rs`);
 # already in the tree through gpui.
 resvg = { version = "0.46", default-features = false }

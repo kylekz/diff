@@ -45,7 +45,7 @@ use std::time::{Duration, Instant};
 use parking_lot::Mutex;
 
 use crate::install::{self, LinuxBuilds};
-use crate::launch::{Transport, no_window};
+use crate::launch::Transport;
 
 /// The program every WSL command runs through.
 pub const WSL_EXE: &str = "wsl.exe";
@@ -305,9 +305,7 @@ fn run_wsl(args: &[&str]) -> Result<Output, WslError> {
 /// `wsl.exe` as the app starts it, with no console window (module docs). Every `wsl.exe` dv
 /// starts is built here, but the CLI's run inside a distro ([`Shell::console_command`]).
 fn wsl_exe() -> Command {
-    let mut command = Command::new(WSL_EXE);
-    no_window(&mut command);
-    command
+    toolbox_process::Command::new(WSL_EXE).to_std()
 }
 
 /// The distro names `wsl.exe --list --quiet` printed: one per line, UTF-16LE (with or without

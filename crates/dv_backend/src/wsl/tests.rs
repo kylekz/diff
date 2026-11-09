@@ -474,7 +474,8 @@ mod local {
 
 /// Every `wsl.exe` dv starts is made without a console window but the CLI's run inside a
 /// distro (module docs). `Command` can't be asked for its creation flags, so the sources are:
-/// `wsl.exe` is made in [`wsl_exe`], which adds `CREATE_NO_WINDOW`, and in
+/// `wsl.exe` is made in [`wsl_exe`], through `toolbox_process::Command::to_std` (which adds
+/// `CREATE_NO_WINDOW`), and in
 /// `Shell::console_command`, and nowhere else.
 #[test]
 fn every_wsl_exe_but_the_clis_run_starts_without_a_console_window() {
@@ -509,5 +510,5 @@ fn every_wsl_exe_but_the_clis_run_starts_without_a_console_window() {
     let wsl = include_str!("../wsl.rs");
     let builder = &wsl[wsl.find("fn wsl_exe() -> Command {").unwrap()..];
     let body = &builder[..builder.find("\n}").unwrap()];
-    assert!(body.contains("no_window(&mut command);"), "{body}");
+    assert!(body.contains(".to_std()"), "{body}");
 }

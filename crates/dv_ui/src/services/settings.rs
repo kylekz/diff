@@ -27,11 +27,11 @@
 use std::path::{Path, PathBuf};
 
 use gpui::{AppContext as _, Context, EventEmitter, Subscription, Task};
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 use serde_json::{Map, Value};
 
 use super::persist::Writer;
-use crate::theme::{Appearance, Material, Palette};
+use crate::theme::{Material, Palette};
 
 /// The settings file in the data dir.
 pub const SETTINGS_FILE: &str = "settings.json";
@@ -51,43 +51,9 @@ pub fn clamp_panel_width(width: f32) -> f32 {
     }
 }
 
-/// Light or dark (DESIGN §1.1, §1.2), or whichever the OS uses.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum Mode {
-    /// Follow the OS's light/dark setting, live.
-    #[default]
-    System,
-    Dark,
-    Light,
-}
-
-impl Mode {
-    pub const ALL: [Mode; 3] = [Self::System, Self::Dark, Self::Light];
-
-    /// `"system"`, `"dark"` or `"light"`, as settings and automation state spell it.
-    pub fn key(self) -> &'static str {
-        match self {
-            Self::System => "system",
-            Self::Dark => "dark",
-            Self::Light => "light",
-        }
-    }
-
-    /// The mode a [`key`](Self::key) names.
-    pub fn from_key(key: &str) -> Option<Self> {
-        Self::ALL.into_iter().find(|mode| mode.key() == key)
-    }
-
-    /// The palette this mode shows while the OS uses `system`.
-    pub fn resolve(self, system: Appearance) -> Appearance {
-        match self {
-            Self::System => system,
-            Self::Dark => Appearance::Dark,
-            Self::Light => Appearance::Light,
-        }
-    }
-}
+/// Light or dark (DESIGN §1.1, §1.2), or whichever the OS uses: `gpui_appearance`'s, spelled
+/// `"system"`, `"dark"` or `"light"` in the file.
+pub use gpui_appearance::Mode;
 
 /// The settings file's contents.
 #[derive(Clone, Debug, PartialEq)]
@@ -112,7 +78,7 @@ impl Default for SettingsFile {
     fn default() -> Self {
         Self {
             palette: None,
-            material: Material::platform_default(),
+            material: crate::appearance::default_material(),
             mode: Mode::default(),
             panel_width: None,
             lsp: None,
@@ -546,7 +512,7 @@ mod tests {
         assert_eq!(file, SettingsFile::default());
         assert!(problems.is_empty());
         assert_eq!(file.mode, Mode::System);
-        assert_eq!(file.material, Material::platform_default());
+        assert_eq!(file.material, crate::appearance::default_material());
     }
 
     #[test]
@@ -607,7 +573,7 @@ mod tests {
     fn bad_values_fall_back_one_by_one() {
         let (file, problems) =
             SettingsFile::parse(r#"{"v": 1, "material": "glass", "mode": "light"}"#);
-        assert_eq!(file.material, Material::platform_default());
+        assert_eq!(file.material, crate::appearance::default_material());
         assert_eq!(file.mode, Mode::Light);
         assert_eq!(problems.len(), 1);
         assert!(
@@ -714,18 +680,6 @@ mod tests {
         assert_eq!(clamp_panel_width(f32::NAN), PANEL_WIDTH_DEFAULT);
     }
 
-    #[test]
-    fn modes_resolve_against_the_system() {
-        assert_eq!(Mode::System.resolve(Appearance::Light), Appearance::Light);
-        assert_eq!(Mode::System.resolve(Appearance::Dark), Appearance::Dark);
-        assert_eq!(Mode::Dark.resolve(Appearance::Light), Appearance::Dark);
-        assert_eq!(Mode::Light.resolve(Appearance::Dark), Appearance::Light);
-        for mode in Mode::ALL {
-            assert_eq!(Mode::from_key(mode.key()), Some(mode));
-        }
-        assert_eq!(Mode::from_key("auto"), None);
-    }
-
     #[gpui::test]
     fn changes_are_saved_in_the_background(cx: &mut TestAppContext) {
         let dir = tempfile::tempdir().unwrap();
@@ -745,7 +699,7 @@ mod tests {
             })
         });
         // A material other than the platform's default, which the file leaves in place.
-        let other = if Material::platform_default() == Material::Opaque {
+        let other = if crate::appearance::default_material() == Material::Opaque {
             Material::Acrylic
         } else {
             Material::Opaque
@@ -825,7 +779,7 @@ mod tests {
             saved,
             serde_json::json!({
                 "v": 1,
-                "material": Material::platform_default().key(),
+                "material": crate::appearance::default_material().key(),
                 "mode": "light",
                 "lsp": {"typescript": {"command": ["/x/tsc", "--lsp"]}},
                 "theirs": 1

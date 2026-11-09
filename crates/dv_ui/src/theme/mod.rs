@@ -3,12 +3,12 @@
 //!
 //! [`DvTheme`] is a gpui global holding every DESIGN token resolved for one [`Palette`]
 //! (Aura/Claude/Dracula), one [`Appearance`] (dark/light) and one [`Material`]
-//! (Mica/Acrylic/Opaque). Views read it through
+//! (Mica/Acrylic/Vibrancy/Opaque; both `gpui_appearance`'s). Views read it through
 //! [`ActiveTheme::dv_theme`] and never hard-code colours. [`apply`] installs a first theme at
 //! startup and [`install`] switches it (`crate::appearance` follows the settings and the OS);
 //! both map the tokens onto gpui-component's [`Theme`] so stock components match, including
-//! `Root`'s background, which is the window background of DESIGN §3: transparent over Mica and
-//! Acrylic so the OS material shows, `chrome` solid over Opaque.
+//! `Root`'s background, which is the window background of DESIGN §3: transparent over a material
+//! so the OS material shows, `chrome` solid over Opaque.
 
 pub mod tokens;
 
@@ -16,8 +16,7 @@ pub mod tokens;
 mod tests;
 
 use gpui::{
-    App, BoxShadow, FontWeight, Global, Hsla, Pixels, Rgba, SharedString, Styled, WindowAppearance,
-    WindowBackgroundAppearance, point, px,
+    App, BoxShadow, FontWeight, Global, Hsla, Pixels, Rgba, SharedString, Styled, point, px,
 };
 use gpui_component::highlighter::HighlightTheme;
 use gpui_component::{Theme, ThemeMode, ThemeTokens};
@@ -28,35 +27,9 @@ use std::sync::Arc;
 use crate::assets::fonts;
 use tokens::{Surface, TokenSet};
 
-/// Dark or light (DESIGN §1.1, §1.2).
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
-pub enum Appearance {
-    #[default]
-    Dark,
-    Light,
-}
-
-impl Appearance {
-    /// `"dark"` or `"light"`, as settings and automation state spell it.
-    pub fn key(self) -> &'static str {
-        match self {
-            Self::Dark => "dark",
-            Self::Light => "light",
-        }
-    }
-
-    pub fn is_light(self) -> bool {
-        self == Self::Light
-    }
-
-    /// The palette a window appearance stands for.
-    pub fn of_window(appearance: WindowAppearance) -> Self {
-        match appearance {
-            WindowAppearance::Light | WindowAppearance::VibrantLight => Self::Light,
-            WindowAppearance::Dark | WindowAppearance::VibrantDark => Self::Dark,
-        }
-    }
-}
+/// Dark or light (DESIGN §1.1, §1.2), and the window material (PLAN D8, DESIGN §3): the
+/// toolbox's, whose keys (`"dark"`, `"mica"`, …) settings and automation state spell.
+pub use gpui_appearance::{Appearance, Material};
 
 /// A theme's family (DESIGN §1.3): Aura (dark and light, on every material), Claude (dark and
 /// light, opaque) or Dracula (dark, opaque).
@@ -130,78 +103,6 @@ impl Palette {
             (Self::Claude, Appearance::Dark) => &tokens::CLAUDE_DARK,
             (Self::Claude, Appearance::Light) => &tokens::CLAUDE_LIGHT,
             (Self::Dracula, _) => &tokens::DRACULA,
-        }
-    }
-}
-
-/// The window material (PLAN D8, DESIGN §3).
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum Material {
-    /// Windows 11's Mica backdrop: samples only the wallpaper; the Windows default.
-    Mica,
-    /// Blur of whatever is behind the window (Windows' acrylic).
-    Acrylic,
-    /// No material: solid surfaces. Windows 10, transparency effects off, Linux, macOS.
-    Opaque,
-}
-
-impl Material {
-    pub const ALL: [Material; 3] = [Self::Mica, Self::Acrylic, Self::Opaque];
-
-    /// `"mica"`, `"acrylic"` or `"opaque"`, as settings and automation state spell it.
-    pub fn key(self) -> &'static str {
-        match self {
-            Self::Mica => "mica",
-            Self::Acrylic => "acrylic",
-            Self::Opaque => "opaque",
-        }
-    }
-
-    /// The name the UI shows.
-    pub fn label(self) -> &'static str {
-        match self {
-            Self::Mica => "Mica",
-            Self::Acrylic => "Acrylic",
-            Self::Opaque => "Opaque",
-        }
-    }
-
-    /// The material a [`key`](Self::key) names.
-    pub fn from_key(key: &str) -> Option<Self> {
-        Self::ALL.into_iter().find(|material| material.key() == key)
-    }
-
-    /// Whether the OS material shows through the window background.
-    pub fn is_translucent(self) -> bool {
-        self != Self::Opaque
-    }
-
-    /// What gpui asks the window manager for (PLAN D8).
-    pub fn window_background(self) -> WindowBackgroundAppearance {
-        match self {
-            Self::Mica => WindowBackgroundAppearance::MicaBackdrop,
-            Self::Acrylic => WindowBackgroundAppearance::Blurred,
-            Self::Opaque => WindowBackgroundAppearance::Opaque,
-        }
-    }
-
-    /// The setting's default on this platform (PLAN D8): Mica on Windows, Opaque elsewhere (on
-    /// macOS too: `crate::platform` says why). What the platform can show narrows it further
-    /// (`crate::platform::MaterialSupport`).
-    pub fn platform_default() -> Self {
-        if cfg!(windows) {
-            Self::Mica
-        } else {
-            Self::Opaque
-        }
-    }
-
-    fn pick(self, surface: &Surface) -> Rgba {
-        match self {
-            Self::Mica => surface.mica,
-            Self::Acrylic => surface.acrylic,
-            Self::Opaque => surface.opaque,
         }
     }
 }
@@ -302,7 +203,7 @@ impl DvColors {
             solid: t,
             syntax: x,
         } = palette.tokens(appearance);
-        let m = |surface: &Surface| -> Hsla { material.pick(surface).into() };
+        let m = |surface: &Surface| -> Hsla { surface.on(material).into() };
         let c = |value: Rgba| -> Hsla { value.into() };
         let chrome = m(&s.chrome);
         Self {
@@ -315,7 +216,7 @@ impl DvColors {
             layer_strong: m(&s.layer_strong),
             thread: m(&s.thread),
             overlay: m(&s.overlay),
-            popover: Material::Opaque.pick(&s.overlay).into(),
+            popover: s.overlay.on(Material::Opaque).into(),
             ctrl: m(&s.ctrl),
             input_bg: m(&s.input_bg),
             fg: c(t.fg),
@@ -914,7 +815,7 @@ fn highlight_theme(dv: &DvTheme) -> HighlightTheme {
         .collect();
     let theme = json!({
         "name": "dv",
-        "appearance": if dv.appearance.is_light() { "light" } else { "dark" },
+        "appearance": dv.appearance.key(),
         "style": {
             "editor.background": hex(dv.colors.code),
             "editor.foreground": hex(syntax.plain),
@@ -923,10 +824,10 @@ fn highlight_theme(dv: &DvTheme) -> HighlightTheme {
     });
     serde_json::from_value(theme).unwrap_or_else(|error| {
         log::warn!("dv's highlight theme didn't build ({error}); using gpui-component's");
-        let fallback = if dv.appearance.is_light() {
-            HighlightTheme::default_light()
-        } else {
+        let fallback = if dv.appearance.is_dark() {
             HighlightTheme::default_dark()
+        } else {
+            HighlightTheme::default_light()
         };
         (*fallback).clone()
     })

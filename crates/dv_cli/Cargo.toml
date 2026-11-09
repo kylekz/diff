@@ -21,6 +21,7 @@ dv_lsp.workspace = true
 log.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+toolbox_process.workspace = true
 
 # The user `Path` in the registry and the broadcast that tells running programs it changed
 # (`checks::user_path`, PLAN §12.2).

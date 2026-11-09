@@ -1,15 +1,33 @@
-{"scenario": {"window_size": "1440x900", "platforms": ["macos"], "description": "The empty shell on macOS (PLAN D8, DESIGN §3): Opaque is its only material, the default; a Mica or Acrylic setting (one made on Windows, say) is kept and resolves to Opaque. Dark and light, each also as the screen shows it (`source: screen`; a background window stays in front on macOS), to look at beside the window's own image (nothing compares them)"}}
+{"scenario": {"window_size": "1440x900", "platforms": ["macos"], "description": "The empty shell on macOS (PLAN D8, DESIGN §3): Opaque by default, Vibrancy as a setting (gpui_appearance's own NSVisualEffectView behind the window's content, there while it shows and gone otherwise, as AppKit reports it: shell.window_native); a Mica or Acrylic setting (one made on Windows, say) is kept and resolves to Opaque. Needs Reduce transparency off; its first assertion says so when it is on. Dark and light, each also as the screen shows it (`source: screen`; a background window stays in front on macOS, inactive, so vibrancy shows flat there: the foreground scenario shows its blur)"}}
 {"cmd": "wait_ready", "timeout_ms": 20000}
-{"cmd": "settle", "expect": [{"pointer": "/settings/available_materials", "equals": ["opaque"]}, {"pointer": "/settings/material", "equals": "opaque"}, {"pointer": "/shell/window_material", "equals": "opaque"}]}
+{"cmd": "settle", "expect": [{"pointer": "/settings/available_materials", "equals": ["vibrancy", "opaque"]}, {"pointer": "/settings/material", "equals": "opaque"}, {"pointer": "/shell/window_material", "equals": "opaque"}, {"pointer": "/shell/window_native/opaque", "equals": true}, {"pointer": "/shell/window_native/vibrancy_view", "equals": false}, {"pointer": "/shell/window_native/forced", "equals": null}]}
 
-// A translucent setting is kept but shows Opaque.
+// A Windows material is kept but shows Opaque.
 {"cmd": "set_setting", "key": "material", "value": "acrylic", "expect_result": {"pointer": "/settings/material", "equals": "acrylic"}}
-{"cmd": "settle", "expect": [{"pointer": "/settings/resolved_material", "equals": "opaque"}, {"pointer": "/shell/window_material", "equals": "opaque"}, {"pointer": "/settings/save_error", "equals": null}]}
+{"cmd": "settle", "expect": [{"pointer": "/settings/resolved_material", "equals": "opaque"}, {"pointer": "/shell/window_material", "equals": "opaque"}, {"pointer": "/shell/window_native/vibrancy_view", "equals": false}, {"pointer": "/settings/save_error", "equals": null}]}
 {"cmd": "set_setting", "key": "material", "value": "mica", "expect_result": {"pointer": "/settings/material", "equals": "mica"}}
 {"cmd": "settle", "expect": [{"pointer": "/settings/resolved_material", "equals": "opaque"}, {"pointer": "/shell/window_material", "equals": "opaque"}]}
 
+// Vibrancy: the effect view goes in behind gpui's content, the window no longer opaque.
+{"cmd": "set_setting", "key": "material", "value": "vibrancy", "expect_result": {"pointer": "/settings/material", "equals": "vibrancy"}}
 {"cmd": "set_setting", "key": "mode", "value": "dark", "expect_result": {"pointer": "/settings/mode", "equals": "dark"}}
-{"cmd": "settle", "expect": [{"pointer": "/settings/resolved_mode", "equals": "dark"}]}
+{"cmd": "settle", "expect": [{"pointer": "/settings/resolved_material", "equals": "vibrancy"}, {"pointer": "/settings/resolved_mode", "equals": "dark"}, {"pointer": "/shell/window_material", "equals": "vibrancy"}, {"pointer": "/shell/window_native/opaque", "equals": false}, {"pointer": "/shell/window_native/vibrancy_view", "equals": true}, {"pointer": "/shell/window_native/vibrancy", "equals": {"material": "under-window-background", "blending": "behind-window", "state": "follows-window"}}, {"pointer": "/shell/window_native/forced", "equals": "dark"}]}
+{"cmd": "screenshot", "name": "shell-vibrancy-dark"}
+{"cmd": "screenshot", "name": "shell-vibrancy-dark-screen", "source": "screen"}
+
+{"cmd": "set_setting", "key": "mode", "value": "light", "expect_result": {"pointer": "/settings/mode", "equals": "light"}}
+{"cmd": "settle", "expect": [{"pointer": "/settings/resolved_mode", "equals": "light"}, {"pointer": "/shell/window_native/forced", "equals": "light"}, {"pointer": "/shell/window_native/vibrancy_view", "equals": true}]}
+{"cmd": "screenshot", "name": "shell-vibrancy-light"}
+{"cmd": "screenshot", "name": "shell-vibrancy-light-screen", "source": "screen"}
+
+// System mode lets the window follow macOS's own setting: no appearance of its own.
+{"cmd": "set_setting", "key": "mode", "value": "system", "expect_result": {"pointer": "/settings/mode", "equals": "system"}}
+{"cmd": "settle", "expect": [{"pointer": "/shell/window_native/forced", "equals": null}]}
+
+// Back to Opaque: the effect view is taken out.
+{"cmd": "set_setting", "key": "material", "value": "opaque", "expect_result": {"pointer": "/settings/material", "equals": "opaque"}}
+{"cmd": "set_setting", "key": "mode", "value": "dark", "expect_result": {"pointer": "/settings/mode", "equals": "dark"}}
+{"cmd": "settle", "expect": [{"pointer": "/settings/resolved_material", "equals": "opaque"}, {"pointer": "/settings/resolved_mode", "equals": "dark"}, {"pointer": "/shell/window_material", "equals": "opaque"}, {"pointer": "/shell/window_native/opaque", "equals": true}, {"pointer": "/shell/window_native/vibrancy_view", "equals": false}]}
 {"cmd": "screenshot", "name": "shell-dark"}
 {"cmd": "screenshot", "name": "shell-dark-screen", "source": "screen"}
 
@@ -18,5 +36,7 @@
 {"cmd": "screenshot", "name": "shell-light"}
 {"cmd": "screenshot", "name": "shell-light-screen", "source": "screen"}
 
-// The last choice was saved to settings.json: a restart comes back in it.
-{"restart": {}, "expect": [{"pointer": "/settings/material", "equals": "mica"}, {"pointer": "/settings/mode", "equals": "light"}, {"pointer": "/shell/window_material", "equals": "opaque"}]}
+// The last choice was saved to settings.json: a restart comes back in it, and Vibrancy comes back with its view.
+{"cmd": "set_setting", "key": "material", "value": "vibrancy", "expect_result": {"pointer": "/settings/material", "equals": "vibrancy"}}
+{"cmd": "settle", "expect": [{"pointer": "/shell/window_native/vibrancy_view", "equals": true}]}
+{"restart": {}, "expect": [{"pointer": "/settings/material", "equals": "vibrancy"}, {"pointer": "/settings/mode", "equals": "light"}, {"pointer": "/shell/window_material", "equals": "vibrancy"}, {"pointer": "/shell/window_native/vibrancy_view", "equals": true}, {"pointer": "/shell/window_native/forced", "equals": "light"}]}

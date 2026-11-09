@@ -1,0 +1,26 @@
+{"scenario": {"window_size": "1440x900", "platforms": ["macos"], "foreground": true, "description": "The empty shell over Vibrancy and Opaque, dark and light, captured from the screen as it is shown: vibrancy blurs only behind an active window, so this takes the focus for a few seconds. Run on demand or with script/check --foreground (tests/e2e/README.md, Screenshots and window materials)"}}
+{"cmd": "wait_ready", "timeout_ms": 20000}
+{"cmd": "settle", "expect": [{"pointer": "/window/active", "equals": true}, {"pointer": "/window/background", "equals": false}, {"pointer": "/settings/available_materials", "equals": ["vibrancy", "opaque"]}]}
+
+{"cmd": "set_setting", "key": "material", "value": "vibrancy"}
+{"cmd": "set_setting", "key": "mode", "value": "dark"}
+{"cmd": "settle", "expect": [{"pointer": "/settings/resolved_material", "equals": "vibrancy"}, {"pointer": "/settings/resolved_mode", "equals": "dark"}, {"pointer": "/shell/window_material", "equals": "vibrancy"}, {"pointer": "/shell/window_native/vibrancy_view", "equals": true}, {"pointer": "/window/active", "equals": true}]}
+// AppKit animates the material in; give it time to finish before copying the screen.
+{"cmd": "wait", "ms": 500}
+{"cmd": "screenshot", "name": "shell-vibrancy-dark-screen", "source": "screen", "expect_result": {"pointer": "/source", "equals": "screen"}}
+
+{"cmd": "set_setting", "key": "mode", "value": "light"}
+{"cmd": "settle", "expect": [{"pointer": "/settings/resolved_mode", "equals": "light"}, {"pointer": "/shell/window_native/forced", "equals": "light"}, {"pointer": "/shell/window_native/vibrancy_view", "equals": true}]}
+{"cmd": "wait", "ms": 500}
+{"cmd": "screenshot", "name": "shell-vibrancy-light-screen", "source": "screen", "expect_result": {"pointer": "/source", "equals": "screen"}}
+
+{"cmd": "set_setting", "key": "material", "value": "opaque"}
+{"cmd": "set_setting", "key": "mode", "value": "dark"}
+{"cmd": "settle", "expect": [{"pointer": "/settings/resolved_material", "equals": "opaque"}, {"pointer": "/settings/resolved_mode", "equals": "dark"}, {"pointer": "/shell/window_native/vibrancy_view", "equals": false}]}
+{"cmd": "wait", "ms": 500}
+{"cmd": "screenshot", "name": "shell-opaque-dark-screen", "source": "screen", "expect_result": {"pointer": "/source", "equals": "screen"}}
+
+{"cmd": "set_setting", "key": "mode", "value": "light"}
+{"cmd": "settle", "expect": [{"pointer": "/settings/resolved_mode", "equals": "light"}]}
+{"cmd": "wait", "ms": 500}
+{"cmd": "screenshot", "name": "shell-opaque-light-screen", "source": "screen", "expect_result": {"pointer": "/source", "equals": "screen"}}

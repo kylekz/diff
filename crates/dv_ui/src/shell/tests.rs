@@ -23,7 +23,10 @@ fn the_empty_shell_shows_the_no_review_state(cx: &mut TestAppContext) {
         let view = shell.read(cx);
         assert!(view.panel_visible());
         assert_eq!(view.empty_state(cx), Some(EmptyState::NoReview));
-        assert_eq!(view.applied_material(), Material::platform_default());
+        assert_eq!(
+            view.applied_material(),
+            crate::appearance::default_material()
+        );
         let status = view.status_line(cx);
         assert_eq!(status.health, Health::Idle);
         assert_eq!(status.location, "No repo");
@@ -39,7 +42,12 @@ fn the_empty_shell_shows_the_no_review_state(cx: &mut TestAppContext) {
 fn a_material_change_reaches_the_window(cx: &mut TestAppContext) {
     let (_dir, shell, cx) = open_shell(cx);
     let settings = cx.update(|_, cx| cx.services().settings.clone());
-    for material in [Material::Acrylic, Material::Opaque, Material::Mica] {
+    for material in [
+        Material::Acrylic,
+        Material::Opaque,
+        Material::Vibrancy,
+        Material::Mica,
+    ] {
         settings.update(cx, |settings, cx| settings.set_material(material, cx));
         cx.run_until_parked();
         shell.read_with(cx, |shell, _| {
@@ -57,7 +65,7 @@ fn the_window_opens_at_its_size_with_the_material(cx: &mut TestAppContext) {
     let options = cx.update(|_, cx| window_options(size(px(1440.), px(900.)), cx));
     assert_eq!(
         options.window_background,
-        Material::platform_default().window_background()
+        crate::appearance::default_material().window_background(gpui_appearance::Backing::Solid)
     );
     assert_eq!(options.window_min_size, Some(size(px(1100.), px(700.))));
     let Some(WindowBounds::Windowed(bounds)) = options.window_bounds else {

@@ -42,7 +42,7 @@
 use std::ffi::OsString;
 use std::io::{Read, Write as _};
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, ExitStatus, Stdio};
+use std::process::{Child, ExitStatus, Stdio};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
 use std::sync::{Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
@@ -343,10 +343,21 @@ impl Running {
     /// Starts `exe` with the request's arguments, working directory and stdin, and `env` laid
     /// over this process's environment.
     pub fn start(exe: &Path, request: &Request, env: &EnvOverlay) -> Result<Self> {
-        let mut command = Command::new(exe);
+        // `dv.exe` is a console program (PLAN §13.1): `toolbox_process` creates it with no
+        // console window, which an app that has no console of its own would give each child.
+        let mut command = env
+            .iter()
+            .fold(
+                toolbox_process::Command::new(exe)
+                    .args(&request.args)
+                    .current_dir(&request.cwd),
+                |command, (name, value)| match value {
+                    Some(value) => command.env(name, value),
+                    None => command.env_remove(name),
+                },
+            )
+            .to_std();
         command
-            .args(&request.args)
-            .current_dir(&request.cwd)
             .stdin(if request.stdin.is_some() {
                 Stdio::piped()
             } else {
@@ -354,19 +365,6 @@ impl Running {
             })
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
-        for (name, value) in env {
-            match value {
-                Some(value) => command.env(name, value),
-                None => command.env_remove(name),
-            };
-        }
-        #[cfg(windows)]
-        {
-            use std::os::windows::process::CommandExt as _;
-            // `dv.exe` is a console program (PLAN §13.1): without this, an app that has no
-            // console of its own would give each child a console window.
-            command.creation_flags(windows_sys::Win32::System::Threading::CREATE_NO_WINDOW);
-        }
         let mut child = command.spawn().with_context(|| {
             format!(
                 "couldn't start `{}` ({}) in {}",

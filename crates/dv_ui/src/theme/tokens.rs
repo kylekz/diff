@@ -9,6 +9,8 @@
 
 use gpui::Rgba;
 
+use super::Material;
+
 /// `#rrggbb`.
 pub const fn hex(rgb: u32) -> Rgba {
     rgba(
@@ -42,6 +44,18 @@ const fn surface(acrylic: Rgba, mica: Rgba, opaque: Rgba) -> Surface {
         acrylic,
         mica,
         opaque,
+    }
+}
+
+impl Surface {
+    /// Its value over `material`. Vibrancy (macOS) takes Acrylic's: both blur whatever is behind
+    /// the window, and DESIGN §3 has no values of its own for it yet.
+    pub fn on(&self, material: Material) -> Rgba {
+        match material {
+            Material::Mica => self.mica,
+            Material::Acrylic | Material::Vibrancy => self.acrylic,
+            Material::Opaque => self.opaque,
+        }
     }
 }
 

@@ -3,8 +3,9 @@
 //! `GIT_CONFIG_NOSYSTEM` is set for the checks, as a test's and an automation run's is), which
 //! dv's comments are signed with. dv never changes git's configuration: the fix is the command to run.
 
-use std::process::Command;
 use std::time::Duration;
+
+use toolbox_process::Command;
 
 use super::process::{self, apply_env};
 use super::{Check, Fix, Seams, State, id};
@@ -67,18 +68,24 @@ pub(super) fn check(seams: &Seams) -> Check {
 
 /// `user.name` and `user.email` in one configuration scope.
 fn read(seams: &Seams, scope: &str) -> Result<(Option<String>, Option<String>), String> {
-    let mut command = Command::new("git");
-    command.args(["config", scope]);
-    if scope == "--global" {
+    let command = Command::new("git").args(["config", scope]);
+    let command = if scope == "--global" {
         // `[include]`d files hold an identity as often as the file itself.
-        command.arg("--includes");
-    }
-    command.args(["--get-regexp", r"^user\.(name|email)$"]);
-    apply_env(&mut command, &seams.child_env);
-    command.env("LC_ALL", "C");
-    let ran = process::run(command, TIMEOUT).map_err(|error| match error.kind() {
-        std::io::ErrorKind::NotFound => "git isn't installed, or isn't on PATH".to_string(),
-        _ => format!("git config failed: {error}"),
+        command.arg("--includes")
+    } else {
+        command
+    };
+    let command = apply_env(
+        command.args(["--get-regexp", r"^user\.(name|email)$"]),
+        &seams.child_env,
+    )
+    .env("LC_ALL", "C");
+    let ran = process::run(command, TIMEOUT).map_err(|error| {
+        if process::not_found(&error) {
+            "git isn't installed, or isn't on PATH".to_string()
+        } else {
+            format!("git config failed: {error}")
+        }
     })?;
     match ran.code {
         // 1: none set.

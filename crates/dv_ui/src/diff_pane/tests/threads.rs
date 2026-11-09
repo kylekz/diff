@@ -704,3 +704,32 @@ fn a_reply_opened_near_the_bottom_comes_wholly_into_view(cx: &mut TestAppContext
         "the card ends at {bottom}, past the viewport's {height}"
     );
 }
+
+/// A post's answer can reach the pane after the review's reload has already drawn the new
+/// card (a loaded machine): the card is revealed then, and nothing is left waiting to scroll
+/// the stream back to it on a later change.
+#[gpui::test]
+fn a_post_answered_after_its_card_is_drawn_leaves_nothing_to_reveal_later(cx: &mut TestAppContext) {
+    let repo = stream_fixture(80);
+    let (_dir, shell, cx) = open(&repo, cx);
+    let pane = pane(&shell, cx);
+    let thread = add_thread(&shell, "b.txt", AnchorSide::New, (2, 2), "Why a digit?", cx);
+    let target = ComposerTarget {
+        path: "b.txt".to_string(),
+        side: AnchorSide::New,
+        start_line: 2,
+        end_line: 2,
+        reply_to: None,
+    };
+    pane.update_in(cx, |pane, window, cx| {
+        pane.posted(target, Ok(thread.clone()), window, cx);
+    });
+    settle_drawn(cx, &shell, "the answer", |_, _| true);
+    assert_eq!(focused(&pane, cx), Some(thread));
+
+    // The reader moves on to c.txt; a later change to the rows (`S`) leaves them there.
+    press(cx, &shell, "j j");
+    pane.read_with(cx, |pane, _| assert_eq!(pane.top_file(), Some("c.txt")));
+    press(cx, &shell, "s");
+    pane.read_with(cx, |pane, _| assert_eq!(pane.top_file(), Some("c.txt")));
+}

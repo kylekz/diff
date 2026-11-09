@@ -802,7 +802,7 @@ impl DiffPane {
         cx.notify();
     }
 
-    fn posted(
+    pub(super) fn posted(
         &mut self,
         target: ComposerTarget,
         result: Result<ThreadId, Failure>,
@@ -824,6 +824,11 @@ impl DiffPane {
                 }
                 self.focused_thread = Some(thread.clone());
                 self.pending_thread = Some(thread);
+                // The review's reload can draw the card before this answer comes (a loaded
+                // machine), leaving no change to its rows to reveal it on: it is revealed now
+                // if it is there, else once it is drawn.
+                self.reveal_pending_thread();
+                self.viewport_changed(cx);
                 if let Some(path) = self.target_block_path(&target, cx) {
                     self.refresh_path(&path, cx);
                 }

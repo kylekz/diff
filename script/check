@@ -4,6 +4,8 @@
 #
 #   script/check               steps 1-5
 #   script/check --fast        steps 1-4 (skips the e2e scenarios)
+#   script/check --e2e-only    step 5 alone: CI runs it as a job of its own beside --fast, so
+#                              the two together are steps 1-5 (PLAN §13.4)
 #   script/check --foreground  also the foreground scenarios in tests/e2e/foreground (step 5)
 #   script/check --linux       also step 6: the headless crates and dv inside WSL Ubuntu, the
 #                              Linux build (script/build-linux) and the real WSL from Windows:
@@ -17,7 +19,7 @@ set -euo pipefail
 
 usage() {
     cat <<'EOF'
-usage: script/check [--fast] [--foreground] [--linux] [--linux-gui]
+usage: script/check [--fast | --e2e-only] [--foreground] [--linux] [--linux-gui]
 
   1. cargo fmt --all --check
   2. cargo clippy in dv's three shapes: default (gui + automation), the shipped app
@@ -26,6 +28,7 @@ usage: script/check [--fast] [--foreground] [--linux] [--linux-gui]
   4. cargo test --workspace
   5. e2e scenarios in tests/e2e through dv_e2e (background)   skipped with --fast
      and tests/e2e/foreground (takes the focus; hands off)    only with --foreground
+     (--e2e-only: this step alone)
   6. the headless crates and the headless dv tested and linted inside WSL Ubuntu,
      script/build-linux, then the real WSL (sandboxed under /tmp)  only with --linux
   7. the Linux app inside WSL Ubuntu: clippy in its GUI shapes, the gpui crates' tests and
@@ -35,12 +38,14 @@ EOF
 }
 
 fast=0
+e2e_only=0
 foreground=0
 linux=0
 linux_gui=0
 for arg in "$@"; do
     case "$arg" in
         --fast) fast=1 ;;
+        --e2e-only) e2e_only=1 ;;
         --foreground) foreground=1 ;;
         --linux) linux=1 ;;
         --linux-gui) linux_gui=1 ;;
@@ -60,6 +65,10 @@ if [[ "$fast" -eq 1 && "$foreground" -eq 1 ]]; then
     echo "script/check: --fast skips the e2e step that --foreground adds to" >&2
     exit 2
 fi
+if [[ "$e2e_only" -eq 1 && ("$fast" -eq 1 || "$linux" -eq 1 || "$linux_gui" -eq 1) ]]; then
+    echo "script/check: --e2e-only is step 5 alone, without --fast, --linux or --linux-gui" >&2
+    exit 2
+fi
 
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$root"
@@ -71,50 +80,52 @@ step() {
 # The crates that must never depend on gpui, even transitively (PLAN §4).
 headless_crates=(dv_core dv_backend dv_cli dv_lsp mock_gh mock_lsp dv_test_support dv_package dv_e2e)
 
-step 1 "cargo fmt --all --check"
-cargo fmt --all --check
+if [[ "$e2e_only" -eq 0 ]]; then
+    step 1 "cargo fmt --all --check"
+    cargo fmt --all --check
 
-# dv's three shapes (PLAN §13.1): each drifts silently unless it is linted on its own.
-step 2 "cargo clippy --workspace --all-targets -- -D warnings  (dv: gui + automation)"
-cargo clippy --workspace --all-targets -- -D warnings
-step 2 "cargo clippy -p dv --no-default-features --features gui --all-targets -- -D warnings  (the shipped app)"
-cargo clippy -p dv --no-default-features --features gui --all-targets -- -D warnings
-step 2 "cargo clippy -p dv --no-default-features --all-targets -- -D warnings  (headless: the WSL build)"
-cargo clippy -p dv --no-default-features --all-targets -- -D warnings
+    # dv's three shapes (PLAN §13.1): each drifts silently unless it is linted on its own.
+    step 2 "cargo clippy --workspace --all-targets -- -D warnings  (dv: gui + automation)"
+    cargo clippy --workspace --all-targets -- -D warnings
+    step 2 "cargo clippy -p dv --no-default-features --features gui --all-targets -- -D warnings  (the shipped app)"
+    cargo clippy -p dv --no-default-features --features gui --all-targets -- -D warnings
+    step 2 "cargo clippy -p dv --no-default-features --all-targets -- -D warnings  (headless: the WSL build)"
+    cargo clippy -p dv --no-default-features --all-targets -- -D warnings
 
-step 3 "gpui boundary: ${headless_crates[*]} and the headless dv"
-boundary_ok=1
-# Normal dependencies only (dev-dependencies may use gpui's test support), every target
-# platform, one crate per line without tree drawing. `$1` names the check, the rest are
-# `cargo tree`'s package and feature arguments.
-check_boundary() {
-    local name="$1"
-    shift
-    local tree offenders
-    tree="$(cargo tree "$@" -e normal --target all --prefix none)"
-    # gpui's own crates (gpui-pre*, gpui-component, gpui-base, gpui-kit-assets) are hyphenated;
-    # toolbox-rs's gpui-free automation crates (gpui_automation_runner, …_protocol) are not.
-    offenders="$(printf '%s\n' "$tree" | grep -E '^gpui-' | sed 's/ (\*)$//' | sort -u || true)"
-    if [[ -n "$offenders" ]]; then
-        boundary_ok=0
-        echo "error: $name depends on gpui:" >&2
-        printf '%s\n' "$offenders" | sed 's/^/  /' >&2
-        echo "  (cargo tree $* -e normal --target all -i <name> shows the path to one)" >&2
-    else
-        echo "ok: $name"
+    step 3 "gpui boundary: ${headless_crates[*]} and the headless dv"
+    boundary_ok=1
+    # Normal dependencies only (dev-dependencies may use gpui's test support), every target
+    # platform, one crate per line without tree drawing. `$1` names the check, the rest are
+    # `cargo tree`'s package and feature arguments.
+    check_boundary() {
+        local name="$1"
+        shift
+        local tree offenders
+        tree="$(cargo tree "$@" -e normal --target all --prefix none)"
+        # gpui's own crates (gpui-pre*, gpui-component, gpui-base, gpui-kit-assets) are hyphenated;
+        # toolbox-rs's gpui-free automation crates (gpui_automation_runner, …_protocol) are not.
+        offenders="$(printf '%s\n' "$tree" | grep -E '^gpui-' | sed 's/ (\*)$//' | sort -u || true)"
+        if [[ -n "$offenders" ]]; then
+            boundary_ok=0
+            echo "error: $name depends on gpui:" >&2
+            printf '%s\n' "$offenders" | sed 's/^/  /' >&2
+            echo "  (cargo tree $* -e normal --target all -i <name> shows the path to one)" >&2
+        else
+            echo "ok: $name"
+        fi
+    }
+    for crate in "${headless_crates[@]}"; do
+        check_boundary "$crate" -p "$crate" --all-features
+    done
+    # The static musl build installed into WSL distros: the CLI and `dv backend --stdio`.
+    check_boundary "dv --no-default-features" -p dv --no-default-features
+    if [[ "$boundary_ok" -ne 1 ]]; then
+        exit 1
     fi
-}
-for crate in "${headless_crates[@]}"; do
-    check_boundary "$crate" -p "$crate" --all-features
-done
-# The static musl build installed into WSL distros: the CLI and `dv backend --stdio`.
-check_boundary "dv --no-default-features" -p dv --no-default-features
-if [[ "$boundary_ok" -ne 1 ]]; then
-    exit 1
-fi
 
-step 4 "cargo test --workspace"
-cargo test --workspace
+    step 4 "cargo test --workspace"
+    cargo test --workspace
+fi
 
 if [[ "$fast" -eq 1 ]]; then
     step 5 "e2e scenarios: skipped (--fast)"

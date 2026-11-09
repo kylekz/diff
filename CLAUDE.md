@@ -153,6 +153,7 @@ and a gpui bump starts there. Don't guess APIs: grep the sources under
 ```bash
 script/check                 # every gate (PLAN §13.2): fmt, clippy x3, gpui boundary, tests, e2e
 script/check --fast          # the same without the e2e scenarios
+script/check --e2e-only      # the e2e scenarios alone (step 5; CI's job beside --fast)
 script/check --foreground    # also tests/e2e/foreground: takes the focus for a few seconds
 script/check --linux         # also step 6: the headless crates and dv tested and linted in WSL
                              # Ubuntu, script/build-linux --debug-only, the real WSL sandboxed under /tmp

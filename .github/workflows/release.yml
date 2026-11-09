@@ -77,7 +77,7 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 120
     permissions:
-      actions: read
+      actions: read # lists and watches main's CI runs
     outputs:
       passed: ${{ steps.main.outputs.passed }}
     steps:

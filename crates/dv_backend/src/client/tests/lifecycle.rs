@@ -310,10 +310,13 @@ fn each_respawn_waits_its_own_backoff() {
             },
         ]
     );
+    // A state reaches the test through the notifier thread, a moment after the reconnect
+    // thread set it and began its wait, so a gap may read that moment short of the wait.
+    let delivery = Duration::from_millis(20);
     for (i, wait) in backoff.iter().enumerate() {
         let gap = states[i + 1].0 - states[i].0;
         assert!(
-            gap >= *wait,
+            gap + delivery >= *wait,
             "attempt {} came {gap:?} after its state",
             i + 1
         );

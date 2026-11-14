@@ -7,7 +7,7 @@
 //!
 //! Every server is a child of this test process and none may outlive its test: each test
 //! checks that every server it met (by the pid its `hello` answered with) is gone at the end.
-//! Children get none of this process's `CLAUDECODE`, `DV_AUTHOR`, `DV_REVIEW` or `RUST_LOG`.
+//! Children get none of this process's `CLAUDECODE`, `DV_AUTHOR`, `DV_MODEL`, `DV_REVIEW` or `RUST_LOG`.
 
 use std::io;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -32,10 +32,16 @@ fn launcher(build: Option<String>) -> Launcher {
     Launcher::Command {
         program: env!("CARGO_BIN_EXE_dv").into(),
         args: vec!["backend".into(), "--stdio".into()],
-        env: ["CLAUDECODE", "DV_AUTHOR", "DV_REVIEW", "RUST_LOG"]
-            .into_iter()
-            .map(|name| (name.into(), None))
-            .collect(),
+        env: [
+            "CLAUDECODE",
+            "DV_AUTHOR",
+            "DV_MODEL",
+            "DV_REVIEW",
+            "RUST_LOG",
+        ]
+        .into_iter()
+        .map(|name| (name.into(), None))
+        .collect(),
         build,
     }
 }
@@ -439,12 +445,18 @@ fn a_process_runs_through_the_server_and_ends_with_its_connection() {
     let server = server_pid(&connection);
     // `dv` itself is the process, headless subcommands only, as no one in particular.
     let dv = |args: &[&str]| {
-        ["CLAUDECODE", "DV_AUTHOR", "DV_REVIEW", "RUST_LOG"]
-            .into_iter()
-            .fold(
-                ProcessSpec::new(env!("CARGO_BIN_EXE_dv")).args(args.iter().copied()),
-                |spec, name| spec.env(name, None),
-            )
+        [
+            "CLAUDECODE",
+            "DV_AUTHOR",
+            "DV_MODEL",
+            "DV_REVIEW",
+            "RUST_LOG",
+        ]
+        .into_iter()
+        .fold(
+            ProcessSpec::new(env!("CARGO_BIN_EXE_dv")).args(args.iter().copied()),
+            |spec, name| spec.env(name, None),
+        )
     };
 
     // A usage error: its stderr, and its exit code.

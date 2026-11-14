@@ -11,10 +11,10 @@ use gpui_component::input::Input;
 
 use super::branches::Mode;
 use super::items::{Entry, Item, ItemKind, RepoHeader, RepoSummary, TargetKind};
-use super::{RepoMenu, SWITCHER_WIDTH, Switcher};
+use super::{MenuTarget, SWITCHER_WIDTH, Switcher, SwitcherMenu};
 
-/// The header menu's layer: above the switcher, itself at the shell's menu priority (4).
-const REPO_MENU_PRIORITY: usize = 5;
+/// The menus' layer: above the switcher, itself at the shell's menu priority (4).
+const MENU_PRIORITY: usize = 5;
 use crate::automation::AutomationTargetExt as _;
 use crate::components::{
     count_badge, icon, kbd, location_chip, menu_item, menu_panel, skeleton, status_chip, totals,
@@ -36,6 +36,7 @@ impl Render for Switcher {
             .on_action(cx.listener(Self::confirm))
             .on_action(cx.listener(Self::dismiss))
             .on_action(cx.listener(Self::remove_selected))
+            .on_action(cx.listener(Self::ask_close))
             .w(SWITCHER_WIDTH)
             .max_h(max_height)
             .flex()
@@ -191,7 +192,16 @@ impl Switcher {
             ItemKind::CompareBranches => DvIcon::ArrowLeftRight,
             ItemKind::Branch { .. } | ItemKind::Base { .. } => DvIcon::GitBranch,
         };
+        // Asked to close its review (`Ctrl Shift W`): the row says so instead of its badge.
+        let asking = self.closing() == Some(item.key.as_str());
         let right: Option<AnyElement> = match item.review() {
+            Some(_) if asking => Some(
+                div()
+                    .flex_none()
+                    .font_weight(FontWeight::MEDIUM)
+                    .child("Close this review?")
+                    .into_any_element(),
+            ),
             Some(badge) => Some(
                 div()
                     .flex()
@@ -236,8 +246,42 @@ impl Switcher {
             (false, true) => c.fg,
             (false, false) => c.fg2,
         };
+        // A row beside an open review has a menu (module docs): a right-click, or its `⋯`.
+        let group = SharedString::from(format!("switcher-item-{}", item.key));
+        let more = item.review().is_some().then(|| {
+            let key = item.key.clone();
+            more_button(
+                ElementId::Name(format!("switcher-item-more-{}", item.key).into()),
+                group.clone(),
+                self.row_menu_is(&item.key),
+                theme,
+            )
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(move |this, event: &MouseDownEvent, _, cx| {
+                    cx.stop_propagation();
+                    if this.row_menu_is(&key) {
+                        this.close_menu(cx);
+                    } else {
+                        this.open_row_menu(&key, event.position, cx);
+                    }
+                }),
+            )
+            .automation_target(format!("switcher/{}/more", item.key))
+        });
         div()
             .id(ElementId::NamedInteger("switcher-item".into(), ix as u64))
+            .group(group)
+            .when(item.review().is_some(), |this| {
+                let key = item.key.clone();
+                this.on_mouse_down(
+                    MouseButton::Right,
+                    cx.listener(move |this, event: &MouseDownEvent, _, cx| {
+                        cx.stop_propagation();
+                        this.open_row_menu(&key, event.position, cx);
+                    }),
+                )
+            })
             .flex()
             .items_center()
             .gap(theme.spacing.md)
@@ -274,6 +318,7 @@ impl Switcher {
             }))
             .child(div().flex_1())
             .children(right)
+            .children(more)
             .automation_target(format!("switcher/{}", item.key))
     }
 
@@ -296,6 +341,44 @@ impl Switcher {
                 .children(keys.into_iter().map(|key| kbd(keymap::label(key), theme)))
                 .child(what)
         };
+        let hints = div()
+            .flex()
+            .items_center()
+            .gap(theme.spacing.lg)
+            .pr(theme.spacing.sm)
+            .text_spec(&theme.text.secondary)
+            .text_color(c.fg3);
+        // A row asked to close its review: only its two answers.
+        let hints = if self.closing().is_some() {
+            hints
+                .child(hint(vec!["enter"], "close review"))
+                .child(hint(vec!["escape"], "keep"))
+        } else {
+            hints
+                .when(self.closable(), |this| {
+                    this.child(hint(vec!["secondary-shift-w"], "close review"))
+                })
+                .when(self.removable().is_some(), |this| {
+                    this.child(hint(vec!["secondary-shift-backspace"], "remove"))
+                })
+                .child(hint(vec!["up", "down"], "move"))
+                .child(hint(
+                    vec!["enter"],
+                    if matches!(self.mode, Mode::Branches { .. }) {
+                        "next"
+                    } else {
+                        "open"
+                    },
+                ))
+                .child(hint(
+                    vec!["escape"],
+                    match self.mode {
+                        Mode::Repos => "close",
+                        Mode::Branches { .. } if !self.back_to_repos => "close",
+                        _ => "back",
+                    },
+                ))
+        };
         div()
             .flex_none()
             .flex()
@@ -307,44 +390,53 @@ impl Switcher {
             .border_color(c.line)
             .children(open_folder)
             .child(div().flex_1())
-            .child(
-                div()
-                    .flex()
-                    .items_center()
-                    .gap(theme.spacing.lg)
+            // Why the last close failed stands in for the keys until the selection moves.
+            .child(match self.close_failure() {
+                Some(why) => div()
+                    .min_w_0()
                     .pr(theme.spacing.sm)
                     .text_spec(&theme.text.secondary)
-                    .text_color(c.fg3)
-                    .when(self.removable().is_some(), |this| {
-                        this.child(hint(vec!["secondary-shift-backspace"], "remove"))
-                    })
-                    .child(hint(vec!["up", "down"], "move"))
-                    .child(hint(
-                        vec!["enter"],
-                        if matches!(self.mode, Mode::Branches { .. }) {
-                            "next"
-                        } else {
-                            "open"
-                        },
+                    .child(problem(
+                        &format!("Couldn't close the review: {why}"),
+                        c.red,
+                        theme,
                     ))
-                    .child(hint(
-                        vec!["escape"],
-                        match self.mode {
-                            Mode::Repos => "close",
-                            Mode::Branches { .. } if !self.back_to_repos => "close",
-                            _ => "back",
-                        },
-                    )),
-            )
+                    .automation_target("switcher/close_failure"),
+                None => hints.into_any_element(),
+            })
             .into_any_element()
     }
 
-    /// A repository header's menu at the pointer: **Remove from list**, disabled for the open
-    /// review's repository with the reason under it.
-    fn render_menu(&self, menu: RepoMenu, theme: &DvTheme, cx: &mut Context<Self>) -> AnyElement {
+    /// The open menu at the pointer: a repository header's **Remove from list**, disabled for
+    /// the open review's repository with the reason under it, or a review row's **Close
+    /// review**.
+    fn render_menu(
+        &self,
+        menu: SwitcherMenu,
+        theme: &DvTheme,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
         let c = &theme.colors;
-        let removable = self.can_remove(&menu.location);
-        let location = menu.location.clone();
+        let location = match menu.target {
+            MenuTarget::Repo(location) => location,
+            MenuTarget::Review { row } => {
+                let close = menu_item(
+                    "switcher-menu-close",
+                    "Close review",
+                    DvIcon::X,
+                    true,
+                    theme,
+                )
+                .on_click(cx.listener(move |this, _, _, cx| this.close_review(&row, cx)))
+                .automation_target("switcher/menu/close");
+                let panel = menu_panel("switcher-menu", theme)
+                    .on_mouse_down_out(cx.listener(|this, _, _, cx| this.close_menu(cx)))
+                    .child(close)
+                    .automation_target("switcher/menu");
+                return menu_layer(menu.position, panel);
+            }
+        };
+        let removable = self.can_remove(&location);
         let remove = menu_item(
             "switcher-menu-remove",
             "Remove from list",
@@ -370,14 +462,7 @@ impl Switcher {
                 )
             })
             .automation_target("switcher/menu");
-        deferred(
-            anchored()
-                .position(menu.position)
-                .snap_to_window_with_margin(px(8.))
-                .child(panel),
-        )
-        .with_priority(REPO_MENU_PRIORITY)
-        .into_any_element()
+        menu_layer(menu.position, panel)
     }
 
     /// A repository's header: its name, its path dimmed, its location chip, and a line on its
@@ -394,46 +479,24 @@ impl Switcher {
             return repo_header(header, first, None, theme);
         }
         let group = SharedString::from(format!("switcher-repo-{}", header.key));
-        let menu_open = self
-            .menu
-            .as_ref()
-            .is_some_and(|menu| menu.location == header.location);
-        let c = &theme.colors;
-        let hover = c.control_hover;
-        let more = div()
-            .id(ElementId::Name(
-                format!("switcher-more-{}", header.key).into(),
-            ))
-            .flex_none()
-            .size(px(22.))
-            .flex()
-            .items_center()
-            .justify_center()
-            .rounded(theme.radii.control)
-            .cursor_pointer()
-            .hover(move |style| style.bg(hover))
-            .when(!menu_open, |this| {
-                this.opacity(0.)
-                    .group_hover(group.clone(), |style| style.opacity(1.))
+        let more = more_button(
+            ElementId::Name(format!("switcher-more-{}", header.key).into()),
+            group.clone(),
+            self.repo_menu_is(&header.location),
+            theme,
+        )
+        .on_mouse_down(MouseButton::Left, {
+            let location = header.location.clone();
+            cx.listener(move |this, event: &MouseDownEvent, _, cx| {
+                cx.stop_propagation();
+                if this.repo_menu_is(&location) {
+                    this.close_menu(cx);
+                } else {
+                    this.open_menu(location.clone(), event.position, cx);
+                }
             })
-            .when(menu_open, |this| this.bg(hover))
-            .child(icon(DvIcon::Ellipsis, px(14.), c.fg2))
-            .on_mouse_down(MouseButton::Left, {
-                let location = header.location.clone();
-                cx.listener(move |this, event: &MouseDownEvent, _, cx| {
-                    cx.stop_propagation();
-                    if this
-                        .menu
-                        .as_ref()
-                        .is_some_and(|menu| menu.location == location)
-                    {
-                        this.close_menu(cx);
-                    } else {
-                        this.open_menu(location.clone(), event.position, cx);
-                    }
-                })
-            })
-            .automation_target(format!("switcher/repo/{}/more", header.key));
+        })
+        .automation_target(format!("switcher/repo/{}/more", header.key));
         let location = header.location.clone();
         div()
             .id(ElementId::Name(group.clone()))
@@ -453,6 +516,46 @@ impl Switcher {
             )
             .into_any_element()
     }
+}
+
+/// A menu's `panel` at `position` (the pointer), kept inside the window, above the switcher.
+fn menu_layer(position: gpui::Point<gpui::Pixels>, panel: impl IntoElement) -> AnyElement {
+    deferred(
+        anchored()
+            .position(position)
+            .snap_to_window_with_margin(px(8.))
+            .child(panel),
+    )
+    .with_priority(MENU_PRIORITY)
+    .into_any_element()
+}
+
+/// A `⋯` that opens a menu: a 22-square ghost button shown under the pointer of `group` (its
+/// header or row) and while its menu is `open` (DESIGN §4.1).
+fn more_button(
+    id: ElementId,
+    group: SharedString,
+    open: bool,
+    theme: &DvTheme,
+) -> gpui::Stateful<gpui::Div> {
+    let c = &theme.colors;
+    let hover = c.control_hover;
+    div()
+        .id(id)
+        .flex_none()
+        .size(px(22.))
+        .flex()
+        .items_center()
+        .justify_center()
+        .rounded(theme.radii.control)
+        .cursor_pointer()
+        .hover(move |style| style.bg(hover))
+        .when(!open, |this| {
+            this.opacity(0.)
+                .group_hover(group, |style| style.opacity(1.))
+        })
+        .when(open, |this| this.bg(hover))
+        .child(icon(DvIcon::Ellipsis, px(14.), c.fg2))
 }
 
 /// A repository's header: its name, its path dimmed, its location chip, `more` at the end of

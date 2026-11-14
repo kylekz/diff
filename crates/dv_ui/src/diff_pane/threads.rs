@@ -664,7 +664,7 @@ impl DiffPane {
                 .review()
                 .thread(thread)
                 .filter(|thread| thread.state == ThreadState::Annotation)
-                .map(|thread| thread.author.name.clone())
+                .map(|thread| crate::agents::shown_name(&thread.author).to_string())
         });
         let (rows, placeholder) = match (&target.reply_to, asking) {
             (Some(_), Some(agent)) => (REPLY_ROWS, format!("Ask {agent} about this…")),

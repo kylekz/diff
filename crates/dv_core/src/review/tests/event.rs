@@ -225,6 +225,37 @@ fn newer_events_are_counted_not_reported() {
 }
 
 #[test]
+fn an_agents_model_rides_with_its_name_and_is_left_out_without_one() {
+    let thread = ThreadId::parse("t-01j9z3k4m5n6p7q8r9s0t1v2w3").unwrap();
+    let line = r#"{"v":1,"eid":"e-01j9z3k4m5n6p7q8r9s0t1v2w4","at":6,"kind":"reply_added","thread":"t-01j9z3k4m5n6p7q8r9s0t1v2w3","id":"c-01j9z3k4m5n6p7q8r9s0t1v2w3","body":"Done.","author":{"kind":"agent","name":"claude-code","model":"Claude Fable 5.2"}}"#;
+    let parsed = parse_log(line.as_bytes());
+    assert!(parsed.warnings.is_empty(), "{:?}", parsed.warnings);
+    let EventBody::ReplyAdded {
+        author, thread: t, ..
+    } = &parsed.events[0].body
+    else {
+        panic!("a reply: {:?}", parsed.events[0].body);
+    };
+    assert_eq!(*t, thread);
+    assert_eq!(author, &agent().with_model("Claude Fable 5.2"));
+    assert_eq!(
+        String::from_utf8(parsed.events[0].to_line().unwrap()).unwrap(),
+        line
+    );
+
+    // Who wrote it is the kind and the name: the model only says what it ran on.
+    assert!(author.is(&agent()));
+    assert!(author.is(&agent().with_model("Claude Opus 5.5")));
+    assert!(!author.is(&Author::agent("codex").with_model("Claude Fable 5.2")));
+    assert!(!author.is(&Author::reviewer("claude-code")));
+    let plain = serde_json::to_value(agent()).unwrap();
+    assert_eq!(
+        plain,
+        serde_json::json!({"kind": "agent", "name": "claude-code"})
+    );
+}
+
+#[test]
 fn optional_anchors_notes_and_authors_are_left_out_when_absent_and_read_when_missing() {
     // As written before replies, state changes and statuses carried them: optional fields
     // need no version bump (PLAN §7).

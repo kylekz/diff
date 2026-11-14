@@ -337,6 +337,7 @@ fn who_the_command_acts_as_crosses_through_wslenv() {
         [
             change("CLAUDECODE", None),
             change("DV_AUTHOR", None),
+            change("DV_MODEL", None),
             change("DV_REVIEW", None),
             change("WSLENV", None),
         ]
@@ -346,9 +347,19 @@ fn who_the_command_acts_as_crosses_through_wslenv() {
         [
             change("CLAUDECODE", Some("1")),
             change("DV_AUTHOR", None),
+            change("DV_MODEL", None),
             change("DV_REVIEW", Some("r-1")),
             change("WSLENV", Some("CLAUDECODE/u:DV_REVIEW/u")),
         ]
+    );
+    // The model an agent names crosses with its name.
+    assert_eq!(
+        environment(&vars(&[
+            ("DV_AUTHOR", "codex"),
+            ("DV_MODEL", "GPT 6.1 Sol")
+        ]))
+        .last(),
+        Some(&change("WSLENV", Some("DV_AUTHOR/u:DV_MODEL/u")))
     );
     // After what it lists already, which keeps its order; an entry for a name that crosses, in
     // any case and with any flags, gives way to `NAME/u`, so the value crosses verbatim under
@@ -737,7 +748,7 @@ git commit -qm base
         assert_eq!(json["repo"]["branch"], "main");
         assert_eq!(
             json["author"],
-            serde_json::json!({"kind": "reviewer", "name": "dv fixture"})
+            serde_json::json!({"kind": "reviewer", "name": "dv fixture", "model": null})
         );
 
         // Installed now; and who the command acts as crosses with it.
@@ -746,7 +757,7 @@ git commit -qm base
         assert_eq!(second.stderr, "");
         assert_eq!(
             second.ok_json()["author"],
-            serde_json::json!({"kind": "agent", "name": "claude-code"})
+            serde_json::json!({"kind": "agent", "name": "claude-code", "model": null})
         );
     }
 }

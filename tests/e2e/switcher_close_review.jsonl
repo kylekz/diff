@@ -1,0 +1,47 @@
+{"scenario": {"window_size": "1440x900", "description": "Close review (DESIGN §4.1): a switcher row beside an open review has a menu (its `⋯`, or a right-click) whose Close review closes that review for good, the row then offering a new one; Ctrl Shift W asks the same of the selected row (\"Close this review?\"), Esc keeps it and Enter closes it, the open review included, which the window then shows closed; a row without a review has neither. Screenshots of the menu and the asking row."}}
+{"cmd": "wait_ready", "timeout_ms": 20000}
+{"cmd": "set_setting", "key": "mode", "value": "dark"}
+{"cmd": "settle"}
+{"cmd": "seed_repo", "name": "api", "steps": [{"write": "app.ts", "text": "export const app = 1;\n"}, {"commit": "base"}, {"write": "app.ts", "text": "export const app = 2;\n"}], "save": {"repo": "/path"}}
+{"cmd": "open_review", "path": "${repo}", "target": "staged", "save": {"staged": "/review_id"}}
+{"cmd": "settle"}
+{"cmd": "open_review", "path": "${repo}", "save": {"working": "/review_id"}}
+{"cmd": "settle", "expect": [{"pointer": "/session/total", "equals": 1}, {"pointer": "/session/review_id", "equals": "${working}"}, {"pointer": "/session/status", "equals": "open"}]}
+
+// The switcher: the staged row's `⋯` opens its menu without opening the review; Esc closes
+// the menu alone.
+{"cmd": "key", "keystroke": "secondary-o"}
+{"cmd": "settle", "expect": [{"pointer": "/switcher/open", "equals": true}, {"pointer": "/switcher/selected", "equals": "api/working"}, {"pointer": "/switcher/menu", "equals": null}, {"pointer": "/switcher/closing", "equals": null}]}
+{"cmd": "click", "target": "switcher/api/staged/more"}
+{"cmd": "settle", "expect": [{"pointer": "/switcher/open", "equals": true}, {"pointer": "/switcher/menu", "equals": {"row": "api/staged"}}, {"pointer": "/switcher/selected", "equals": "api/staged"}, {"pointer": "/session/review_id", "equals": "${working}"}]}
+{"cmd": "screenshot", "name": "menu"}
+{"cmd": "key", "keystroke": "escape"}
+{"cmd": "settle", "expect": [{"pointer": "/switcher/menu", "equals": null}, {"pointer": "/switcher/open", "equals": true}]}
+// A right-click opens it too, and Close review closes the staged review: its row stays,
+// with no review.
+{"cmd": "click", "target": "switcher/api/staged", "button": "right"}
+{"cmd": "settle", "expect": [{"pointer": "/switcher/menu", "equals": {"row": "api/staged"}}]}
+{"cmd": "click", "target": "switcher/menu/close"}
+{"cmd": "wait_for", "pointer": "/switcher/items/1/review", "equals": null}
+{"cmd": "settle", "expect": [{"pointer": "/switcher/open", "equals": true}, {"pointer": "/switcher/menu", "equals": null}, {"pointer": "/switcher/items/1/key", "equals": "api/staged"}, {"pointer": "/switcher/selected", "equals": "api/staged"}, {"pointer": "/switcher/close_failure", "equals": null}, {"pointer": "/session/status", "equals": "open"}]}
+{"cmd": "cli", "args": ["review", "show", "${staged}", "--json"], "cwd": "repos/api", "expect_result": [{"pointer": "/exit", "equals": 0}, {"pointer": "/json/review/status", "equals": "closed"}]}
+// Without a review the row has nothing to close: the key asks nothing.
+{"cmd": "key", "keystroke": "secondary-shift-w"}
+{"cmd": "settle", "expect": [{"pointer": "/switcher/closing", "equals": null}]}
+
+// The open review's row: Ctrl Shift W asks, Esc keeps it (and the switcher), and Enter after
+// asking again closes it; the window shows it closed.
+{"cmd": "key", "keystroke": "up"}
+{"cmd": "settle", "expect": [{"pointer": "/switcher/selected", "equals": "api/working"}]}
+{"cmd": "key", "keystroke": "secondary-shift-w"}
+{"cmd": "settle", "expect": [{"pointer": "/switcher/closing", "equals": "api/working"}]}
+{"cmd": "screenshot", "name": "asking"}
+{"cmd": "key", "keystroke": "escape"}
+{"cmd": "settle", "expect": [{"pointer": "/switcher/closing", "equals": null}, {"pointer": "/switcher/open", "equals": true}, {"pointer": "/session/status", "equals": "open"}]}
+{"cmd": "key", "keystroke": "secondary-shift-w"}
+{"cmd": "key", "keystroke": "enter"}
+{"cmd": "wait_for", "pointer": "/session/status", "equals": "closed"}
+{"cmd": "settle", "expect": [{"pointer": "/switcher/open", "equals": true}, {"pointer": "/switcher/closing", "equals": null}, {"pointer": "/switcher/items/0/key", "equals": "api/working"}, {"pointer": "/switcher/items/0/review", "equals": null}]}
+{"cmd": "key", "keystroke": "escape"}
+{"cmd": "settle", "expect": [{"pointer": "/switcher/open", "equals": false}, {"pointer": "/session/status", "equals": "closed"}]}
+{"cmd": "screenshot", "name": "closed"}

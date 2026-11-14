@@ -63,8 +63,9 @@
 //! it, `code` those lines now and `excerpt` the diff around them, as `excerpt` is for a found
 //! thread — or `removed` — nothing replaced it; it stood just before line `before_line` of
 //! `path` now, one past the last line at its end, `code` and `excerpt` `null`; else `null`),
-//! `body` (Markdown), `author: {kind, name}`, `created_at`, `note` (the last state change's
-//! note), `replies: [{id, author, body, created_at}]`. Act on `anchor.current`, never on the
+//! `body` (Markdown), `author: {kind, name, model}` (`model`: the one an agent said it runs
+//! on, else `null`), `created_at`, `note` (the last state change's note),
+//! `replies: [{id, author, body, created_at}]`. Act on `anchor.current`, never on the
 //! original line numbers.
 //!
 //! Within a schema a document only grows: readers ignore keys they don't know; a key removed,
@@ -106,6 +107,8 @@ pub struct AuthorDto {
     /// `reviewer`, `agent` or `github`.
     pub kind: &'static str,
     pub name: String,
+    /// The model an agent said it runs on ("Claude Fable 5.2"), or `null`.
+    pub model: Option<String>,
 }
 
 impl From<&Author> for AuthorDto {
@@ -113,6 +116,7 @@ impl From<&Author> for AuthorDto {
         Self {
             kind: author.kind.as_str(),
             name: author.name.clone(),
+            model: author.model.clone(),
         }
     }
 }

@@ -378,6 +378,10 @@ A round is the target as it stood when the reviewer last handed the review over.
   (`closed`). A PR review is the reviewer's alone: an agent reads it but never writes to it
   (§9.10). While its pending review on GitHub holds posted comments (§9.8) those threads are
   frozen until it is submitted or discarded.
+- **Closing** is the reviewer's, from either side: `dv review close <id>`, or **Close review**
+  on the review's row in the switcher (DESIGN §4.1; `Reviews::close_review`, the same
+  `ops::set_status`), whichever review it is, the open one included, which follows its log as
+  it does any write from outside. The switcher's key only asks first, since `closed` is final.
 - `approved`, `closed` and `submitted` are final; every other status counts as open. A finished
   local review is read-only for everyone, the CLI included: `review::ops` refuses a new thread,
   a reply, a thread state change, an edit, a deletion or a viewed mark on an `approved` or
@@ -413,6 +417,13 @@ A round is the target as it stood when the reviewer last handed the review over.
 - **Authors:** `reviewer` (git identity), `agent` (`--author`, default from the skill: `claude-code`,
   `codex`, …), `github` (GitHub's threads on a PR: shown from the PR's mirror, never written to a
   review's log, read-only; their state is GitHub's, §9.6).
+- **An agent's model:** an agent says which model it runs on, in the model's own words
+  (`--model 'Claude Fable 5.2'`, else `$DV_MODEL`, §10.1), and every event it writes carries
+  it beside its name (`author.model`, optional, §7). It is what the app shows for the agent,
+  with the model family's mark (DESIGN §1.6, §4.1), and no part of who the agent is
+  (`Author::is`: kind and name): an agent that changes models still edits and deletes what it
+  wrote. dv stores the name as given and reads the family from it only to draw
+  (`dv_ui::agents`), so a family it learns later shows for old reviews too.
 - **Annotations** (§19): an agent's explanation of its own change, anchored as a comment is,
   in state `annotation`: waiting on no one, counted apart from the threads. The reviewer's reply
   turns one into an open thread, the agent's question as §10.5 treats it.
@@ -918,7 +929,8 @@ so the UI falls back to refreshing those itself instead of also losing review up
 - **Location:** `<git-common-dir>/dv/reviews/<id>.jsonl` (resolved with `git rev-parse
   --git-common-dir`, never by hand), shared by every worktree of the repo. The `created` event records
   the worktree root it was made in (`worktree`), which is what a `working` or `staged` target means.
-- **Events (v1):** `created{target, author, worktree}`, `round_closed{n, new_oid, old_oid, verdict?,
+- **Events (v1):** `created{target, author, worktree}` (an `author` is `{kind, name, model?}`
+  everywhere, `model` the one an agent named, §2.5), `round_closed{n, new_oid, old_oid, verdict?,
   body?}` (`body`: the round's summary, Markdown),
   `viewed{round, path, on}`, `thread_added{id, anchor, body, author, github_thread?, annotation?}`, `reply_added{thread, id, body,
   author, anchor?}`, `thread_state{thread, state, note?, author, anchor?}`, `body_edited{target_id,
@@ -1606,7 +1618,7 @@ dv backend --stdio                         (every build; started by the app, §5
 ```
 
 Global flags: `--repo <path>` (also `\\wsl.localhost\<distro>\<path>`), `--wsl <distro>:<path>`,
-`--review <id>`, `--json`, `--author <name>`; they go anywhere on the line.
+`--review <id>`, `--json`, `--author <name>`, `--model <model>`; they go anywhere on the line.
 
 - **One clap tree.** `dv_cli::args` holds the global flags and the headless commands; the `dv`
   binary keeps the GUI's options (`--data-dir`, `--automation…`, `--window-size`, the hidden
@@ -1614,7 +1626,7 @@ Global flags: `--repo <path>` (also `\\wsl.localhost\<distro>\<path>`), `--wsl <
   --help` lists every command. A headless command goes to `dv_cli::run(&global, command, &mut
   Context)` before any gpui code runs. `Context` carries the command line (without the app's
   options: what a command run inside a WSL distro passes on, §10.4), the working directory, the
-  environment (`dv_cli::Env`: `$DV_REVIEW`, `$DV_AUTHOR` and `CLAUDECODE` are read through it,
+  environment (`dv_cli::Env`: `$DV_REVIEW`, `$DV_AUTHOR`, `$DV_MODEL` and `CLAUDECODE` are read through it,
   never by clap), stdin, stdout, stderr, whether they are the process's own (a child then
   shares them) and whether they are terminals, and the environment overlay every git the
   command spawns gets (`LocalBackendOptions::env`), so tests run commands in-process and
@@ -1638,7 +1650,11 @@ Global flags: `--repo <path>` (also `\\wsl.localhost\<distro>\<path>`), `--wsl <
 - **Identity (§2.5):** an agent named by `--author <name>`, else `$DV_AUTHOR`, else
   `claude-code` when `CLAUDECODE` is set (Claude Code exports it to the commands it runs);
   otherwise the reviewer, by the repo's `user.name` (`review::reviewer_identity`, as the GUI).
-  What each may do is `review::ops`'s rule. `dv status` says who a command acts as.
+  What each may do is `review::ops`'s rule. `dv status` says who a command acts as. An agent's
+  model (§2.5) is `--model <model>`, else `$DV_MODEL`: one line of text, trimmed, stored as
+  given. `--model` without an agent identity, or empty, is exit 2 (`usage`); `$DV_MODEL` is
+  read only when the command acts as an agent, and empty it counts as unset, as `$DV_AUTHOR`
+  does.
 - **Placement:** `comment list` and `comment show` place every thread with
   `review::place_thread` (§8) against the review's target resolved now (all changes, never an
   interdiff) in its home worktree (§2.2: a `working` or `staged` review's own worktree, a
@@ -1848,7 +1864,7 @@ doesn't. A deleted thread is not found.
   lines `start_line..end_line` of `path` replaced it, `code` those lines now and `excerpt` the
   diff around them as `excerpt` is for a found thread — or `removed`, standing before
   `before_line` now, `code` and `excerpt` `null`; else `null`; `placement` stays `outdated`),
-  `body`, `author: {kind, name}`, `created_at`, `note` (the last state change's), `replies: [{id,
+  `body`, `author: {kind, name, model}` (`model` the one an agent named, else `null`, §2.5), `created_at`, `note` (the last state change's), `replies: [{id,
   author, body, created_at}]`. The writes print: `review new` `{created, review}`; `review done` and `close`
   `{changed, review}`; `review submit` `{review, round}`; `review delete` `{deleted}`; `comment
   add`, `comment annotate` and `comment edit` `{thread}` (an edited reply: `{reply, thread}`);
@@ -1969,7 +1985,7 @@ per-git-command spawns (D6), and the app's `Connections` play no part.
   works; a file must be UTF-8, checked here so the error names it) and handed to the child's
   stdin as `-`, which also lets the second run after an install lose nothing; otherwise the
   child's stdin is empty.
-- **Who it acts as** crosses too: `CLAUDECODE`, `DV_AUTHOR` and `DV_REVIEW`, those set, join
+- **Who it acts as** crosses too: `CLAUDECODE`, `DV_AUTHOR`, `DV_MODEL` and `DV_REVIEW`, those set, join
   `WSLENV` as `NAME/u` after whatever else it lists, in its order. An entry it already has for
   one of them, in any case or with any flags, gives way to that `NAME/u` (`/w` wouldn't pass the
   value in, `/p` would translate it as a path, `dv_author` would export another name), so each
@@ -2021,7 +2037,8 @@ add`), and a `commit` or `range` one fixed history (tell the user rather than ha
 rules: threads read as dv prints them, `--json` when parsing (`status`, `review show`,
 `review wait`, whose ids and round numbers the agent keeps), `--author <agent>` on every write, `<agent>` being the agent's own
 name, which every example writes as that placeholder (Claude Code is recognised by `CLAUDECODE`
-anyway), never `resolve` or `reopen`, no `dv review new` unless the
+anyway), and `--model '<model>'` beside it, the model the agent runs on by the name its own
+instructions give it (§2.5), left out rather than guessed when nothing tells it, never `resolve` or `reopen`, no `dv review new` unless the
 user asks (handing work over, below, is the user asking), text through `--body-file -` / `--note-file -` and a short note inline only in single
 quotes (double quotes run backticks in a POSIX shell, and a backtick is PowerShell's escape), a
 disagreement is a reply with reasons and still an address with a note saying so;
@@ -2126,7 +2143,8 @@ material), `switcher` (repos + reviews, `Ctrl O`), `palette` (`Ctrl K`: reviews,
 `comments_list`, `diff_pane` (the stream, and the file view in a one-file scope), `thread` +
 `composer`, `intel` (code intelligence: the hover card, the `references` panel tab, §18.6),
 `submit` (sheet), `onboarding`, `settings`, `banner` (errors and backend state, inline, never
-over content).
+over content). `agents` is how every one of them shows an agent (§2.5): its model's name, and
+the model family's mark read from that name.
 
 **Review session:** `ReviewSession` entity (`dv_ui::session`) = one review, its target fixed for
 life: the repo and its store, the folded review, the comparison (§2.3: the interdiff since a
@@ -2740,7 +2758,7 @@ with and without its bytes, only looked at, read past what was asked, a director
   this build in the scratch home, then `--wsl`, the share's spelling and a working directory
   inside the distro naming the repository, an exit code passed through (`review wait --timeout
   1` → 3, an error's 1 with its JSON), `--body-file -` over a pipe, `CLAUDECODE`, `DV_AUTHOR` and
-  `DV_REVIEW` crossing through `WSLENV`, a `dv` killed during `review wait` taking the distro's
+  `DV_REVIEW` crossing through `WSLENV` (`DV_MODEL` with them, `dv_cli`'s `reexec` tests), a `dv` killed during `review wait` taking the distro's
   `dv` with it (the kill-on-close job), stdout and stderr sent to one file coming out whole, a
   `~/.local/bin` dv can't write leaving the crossing working, and a distro that isn't there as
   exit 4 with its error document alone on stdout. Without a
@@ -2785,7 +2803,7 @@ with and without its bytes, only looked at, read past what was asked, a director
   (`DV_USER_PATH_FILE` = `<data_dir>/user-path.txt`: `dv setup path` never writes the
   registry), `DV_ONLY_DISTROS` (the sandbox's distro, else none: `dv doctor` and `dv setup`
   reach no other), and without the
-  inherited `CLAUDECODE`, `DV_AUTHOR` and `DV_REVIEW` (a scenario sets them on purpose); `cli`
+  inherited `CLAUDECODE`, `DV_AUTHOR`, `DV_MODEL` and `DV_REVIEW` (a scenario sets them on purpose); `cli`
   runs one to its end and replies `{exit, stdout, stderr, json}`, `cli_spawn` starts one that
   blocks (`dv review wait`) and `cli_join` collects it, and a child still running when the app
   quits is killed. `seed_repo` with `"backend": "loopback"` reaches its repo through a loopback
@@ -2831,7 +2849,7 @@ with and without its bytes, only looked at, read past what was asked, a director
   streams, an explicit environment and the fixture's git environment) against fixture repos and
   `mock_gh`, from the agent's point of view; a few binary tests run the built `dv`
   (`CARGO_BIN_EXE_dv`) for dispatch, exit codes and real pipes. Neither ever starts the GUI, and
-  every one removes `CLAUDECODE`, `DV_AUTHOR` and `DV_REVIEW` (which Claude Code's environment
+  every one removes `CLAUDECODE`, `DV_AUTHOR`, `DV_MODEL` and `DV_REVIEW` (which Claude Code's environment
   may carry) unless it sets them on purpose.
 
 ### 14.3 Owner-only live checks
@@ -3702,7 +3720,8 @@ nothing waits on it.
   work up for review in dv or the project's instructions say to, once the code is final:
   annotations are written last, because one whose code the agent then rewrites goes outdated
   and is never drawn (§19.3). As the skill writes it (every write with `--author <agent>`,
-  which also makes `review new` open the review as the agent rather than the reviewer):
+  which also makes `review new` open the review as the agent rather than the reviewer, and
+  with `--model '<model>'` beside it, §2.5, left out below):
   1. `dv review new --author <agent> --json` (the working tree's review; `--branch` when the
      work is committed on the branch checked out, whose working tree is then clean) opens the
      review, or resumes the target's open one (§2.4); keep `review.id`. A resumed review that

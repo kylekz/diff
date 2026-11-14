@@ -51,8 +51,8 @@ use dv_core::diff::file_list;
 use dv_core::git::branches::Branch;
 use dv_core::label::{LabelContext, Labels};
 use dv_core::review::{
-    Author, Home, HomeError, ListEntry, LoadedReview, ReviewId, ReviewStore, ReviewSummary, home,
-    ops, reviewer_identity,
+    Author, Home, HomeError, ListEntry, LoadedReview, ReviewId, ReviewStatus, ReviewStore,
+    ReviewSummary, home, ops, reviewer_identity,
 };
 use dv_core::{Backend, BackendError, GitRepo, Location, Target};
 use futures::channel::oneshot;
@@ -769,6 +769,43 @@ impl Reviews {
         cx.emit(ReviewsEvent::Changed);
         cx.notify();
         true
+    }
+
+    /// Closes the open review `review` of the repository at `location` as the reviewer
+    /// (`ops::set_status`, PLAN §2.4: `closed` is final), from the switcher's row. The
+    /// repository is reached as an open reaches it, and every row is listed again whether or
+    /// not it closed, since another worktree's row may list the same review: a review that
+    /// was finished meanwhile leaves its row either way.
+    pub fn close_review(
+        &mut self,
+        location: Location,
+        review: ReviewId,
+        cx: &mut Context<Self>,
+    ) -> Task<Result<(), Failure>> {
+        let open = self
+            .locations
+            .update(cx, |locations, cx| locations.open(location, cx));
+        detached(cx, async move |this, cx| {
+            let closed = match open.await {
+                Ok(backend) => {
+                    cx.background_spawn(async move {
+                        ops::set_status(
+                            &ReviewStore::new(backend.clone()),
+                            &review,
+                            ReviewStatus::Closed,
+                            &reviewer_identity(backend.as_ref()),
+                            None,
+                        )
+                        .map(|_| ())
+                        .map_err(|error| Failure::from(&error))
+                    })
+                    .await
+                }
+                Err(error) => Err(Failure::from(&*error)),
+            };
+            this.update(cx, |this, cx| this.refresh_all(cx)).ok();
+            closed
+        })
     }
 
     /// A listing or an open of `given` reached the repository whose worktree root is `root`

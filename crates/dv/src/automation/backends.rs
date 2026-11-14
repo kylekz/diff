@@ -152,13 +152,13 @@ impl DvAutomation {
 }
 
 /// `program backend --stdio`, the loopback's server in the app. The child gets none of this
-/// process's agent identity (`CLAUDECODE`, `DV_AUTHOR`, `DV_REVIEW`): it serves the app, which
+/// process's agent identity (`CLAUDECODE`, `DV_AUTHOR`, `DV_MODEL`, `DV_REVIEW`): it serves the app, which
 /// acts as the reviewer.
 fn server(program: PathBuf) -> Launcher {
     Launcher::Command {
         program,
         args: vec!["backend".into(), "--stdio".into()],
-        env: ["CLAUDECODE", "DV_AUTHOR", "DV_REVIEW"]
+        env: ["CLAUDECODE", "DV_AUTHOR", "DV_MODEL", "DV_REVIEW"]
             .into_iter()
             .map(|name| (name.into(), None))
             .collect(),

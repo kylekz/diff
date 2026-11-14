@@ -156,6 +156,12 @@ pub const SHORTCUTS: &[Shortcut] = &[
         switcher::RemoveRepo,
         AheadOfInputs
     ),
+    shortcut!(
+        "secondary-shift-w",
+        SWITCHER,
+        switcher::CloseReview,
+        AheadOfInputs
+    ),
     shortcut!("escape", SWITCHER, switcher::Dismiss),
     // The file finder: as the switcher, its filter field has the keyboard.
     shortcut!("down", FILE_FINDER, file_finder::SelectNext, AheadOfInputs),

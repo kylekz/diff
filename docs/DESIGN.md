@@ -98,6 +98,17 @@ over code with no scrim under it, the find bar or the hover card, doesn't sit in
 Inline stroke icons at 14–16px, 1.5–1.6 stroke, `currentColor`, from one set (Lucide-compatible
 geometry, bundled as SVG paths). No emoji anywhere.
 
+**Model marks.** An agent that names its model (PLAN §2.5) shows with its model family's mark:
+Claude, OpenAI (GPT), Gemini, Kimi, DeepSeek, Z.ai (GLM) and Qwen, each one colour like every
+icon (the makers' logos as filled shapes, from lobe-icons; `assets/icons/README.md`). The family
+is read from the model's name (`dv_ui::agents`: "Claude Fable 5.2", "gpt-6.1-sol", "Opus 5.5",
+"o4-mini"), else, for an agent that names none, from its own (`claude-code`, `codex`,
+`gemini-cli`); a name that tells no family keeps the bot glyph. A mark is drawn in its family's
+colour, the same in every palette, a lighter step in dark where the brand's own is too deep
+for dark surfaces: Claude `#d97757` in both; Gemini `#3478f6` light, `#8ab4f8` dark; DeepSeek
+`#4d6bfe`, `#7c93ff`; Qwen `#615ced`, `#9a96f8`; OpenAI, Kimi and Z.ai, whose marks are black
+or white, in `fg`. As an avatar it sits on a soft fill of that colour at 14%.
+
 ### 1.7 App icon
 dv's icon (the executables, the window and the taskbar, the Start menu's shortcut, the installer)
 is a split diff on an accent tile: a 224/256 square with radius 52 filled with the accent
@@ -229,6 +240,21 @@ inactive: material falls back to its inactive appearance (OS-managed); dv dims n
   the footer's hints start with it ("remove") while the selected row's repo can be removed. `Esc`
   closes an open menu before the switcher. The branch picker's header has
   no menu, and `Ctrl Shift Backspace` removes nothing there.
+  A row beside an open review (a target's, another target's review, the branch picker's rows)
+  has a menu of its own, opened the same two ways (its `⋯` at the row's end, after the
+  badge; the row takes the selection): **Close review** (x glyph) closes that review for good
+  (PLAN §2.4: `closed` is final, as `dv review close`), whichever it is — the open review
+  too, which the window then shows closed (§4.4). A target's row stays, without a review
+  ("New review" when selected); a row that stood for the review alone goes, the selection
+  moving to the row after it, else the one before. `Ctrl Shift W` asks the same of the
+  selected row, from the filter field too: the row reads "Close this review?" (at 500) in
+  place of its badge and the footer's hints become `Enter` "close review" and `Esc` "keep";
+  `Enter` closes it, `Esc` keeps it (the switcher staying open), and so does moving the
+  selection, typing in the filter or picking a row. The key alone never closes a review,
+  since nothing reopens one. While the selected row has a review the footer's hints start
+  with it ("close review"). A close that fails (the connection lost under it) leaves the
+  review as it was and says why in the footer in place of the hints, a triangle in `red`,
+  until the selection moves.
   **Compare branches…** turns the switcher into the branch picker for that repo, in the same panel:
   the field cleared, its placeholder "Pick a branch to review", the repo's header over one row per
   local branch but the default one (branch glyph, the most recently committed first): the name, then
@@ -501,7 +527,11 @@ inactive: material falls back to its inactive appearance (OS-managed); dv dims n
   review's changes: one that left them is in the "Not in the diff" section), aren't drawn in
   the stream (`]`/`[` pass over them) and carry the comments list's "all changes" tag, named
   where they stand in all changes.
-- **Thread card:** avatar (reviewer round, agent square with the agent's icon), name, agent tag, time,
+- **Thread card:** avatar (reviewer round; agent square with its model family's mark in the
+  family's colour on a soft fill of it, §1.6, else the bot glyph in `blue` on `blueSoft`), name
+  (an agent that named its model shows by it, "Claude Fable 5.2", wherever dv names the agent:
+  here, the state chip, an annotation's header and its Ask, the handoff), agent tag (`agent`;
+  the agent's own name, `claude-code`, beside a model's), time,
   anchor (`new · line 31`: where the thread shows now; "`new · lines 34–36 · moved`" while
   those are other lines than the ones it was written on, found there by relocation or recorded
   there by an event — never for code edited where it stands, PLAN §8), rendered
@@ -512,11 +542,11 @@ inactive: material falls back to its inactive appearance (OS-managed); dv dims n
   thread's outline `accentRing`) sits under the last line of its range on its side: in split
   view in that side's half over the line's tint, 62 in from the half's edge, the other half
   `recess`; in unified view past both line numbers. Its 32-high header holds the state chip
-  ("Open", "Addressed by claude-code", "Resolved"), "Outdated" when it is, the anchor in `fg3` ("file" for a comment on the whole file)
+  ("Open", "Addressed by Claude Fable 5.2" — the agent as it shows, its own name when it named no model — "Resolved"), "Outdated" when it is, the anchor in `fg3` ("file" for a comment on the whole file)
   and the reviewer's actions as small buttons (Resolve on an open thread, Resolve and Reopen on
   an addressed one, Reopen and a chevron on a resolved one; in a narrow card the anchor, then the
   chip's agent name, truncate, never the actions); an addressed thread's note follows
-  on `blueSoft` with the agent's glyph. A resolved thread collapses to that header with its
+  on `blueSoft` with the agent's glyph (its family's mark, else the bot). A resolved thread collapses to that header with its
   comment's first line until its chevron opens it (or while a reply to it is being written). A
   thread whose code moved (lines inserted above it, its block moved, a small edit) follows it to
   its new lines. An outdated thread (relocation can't find its code at all, PLAN §8) has no line
@@ -548,7 +578,7 @@ inactive: material falls back to its inactive appearance (OS-managed); dv dims n
   in the order they were added. `code` fill (the diff's own surface, so it reads as part of the
   code rather than over it, whatever the line's tint), `line` outline, radius 10, no shadow, a
   2px `blue` rule down its left edge inside the radius; the focused one's outline `accentRing`.
-  A 28-high header: the agent's square avatar at 16 with its icon, the agent's name at 600 in
+  A 28-high header: the agent's square avatar at 16 with its mark, the agent's name (its model's, when it named one) at 600 in
   `fg2`, "Annotation" in `fg3`, the anchor in `fg3` (`new · lines 12–14`, "file", "· moved" as
   a thread's), and at the right a small **Ask** (with its `R` keycap while focused). The body:
   Markdown at 13 in `fg2`, in full (the skill keeps an annotation to one to three sentences);
@@ -809,7 +839,9 @@ Setup unchanged.
   banner on `blueSoft` over `code` made opaque (on Mica and Acrylic the material doesn't show
   through it, so its note's fade ends in exactly its colour), with a `blue` outline at 35%,
   radius 6, 12 in from the region's edges —
-  the agent's glyph in `blue`, "`claude-code` marked round 2 ready" (the name at 600; a long
+  the agent's glyph (its model family's mark in the family's colour, §1.6, else the bot in
+  `blue`), "`Claude Fable 5.2` marked round 2 ready" (the agent as it shows: its model, else
+  its own name, at 600; a long
   name truncates, "marked round n ready" and the disclosure never do), "· 5 annotations" in
   `fg2` when the review holds annotations written in that round (PLAN §19), the first line of its
   note (`dv review done --note`, PLAN §7) as plain text in `fg2`, and a **Show note** disclosure
@@ -911,6 +943,7 @@ Setup unchanged.
 | `Ctrl K` | the palette: commands, reviews and, as you type, the review's files (§4.1; again, or `Esc`, closes it) |
 | `Ctrl O` | switch repo / review (the switcher; again, or `Esc`, closes it) |
 | `Ctrl Shift Backspace` | in the switcher: remove the selected row's repo from the list (not the open review's, §4.1) |
+| `Ctrl Shift W` | in the switcher: ask to close the selected row's review; `Enter` then closes it for good, `Esc` keeps it (§4.1) |
 | `Ctrl G` | the PR picker (§4.5) |
 | `Ctrl R` | on a PR review: refresh it from GitHub (fetch, threads, checks, Viewed; PLAN §9.4) |
 | `Ctrl B` | toggle panel |

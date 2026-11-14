@@ -22,7 +22,7 @@ fn status_names_the_repo_and_the_current_review() {
     );
     assert_eq!(
         json["author"],
-        json!({"kind": "reviewer", "name": "dv fixture"})
+        json!({"kind": "reviewer", "name": "dv fixture", "model": null})
     );
     assert_eq!(json["current"], json!(null));
     assert_eq!(json["reviews"], json!([]));
@@ -78,23 +78,23 @@ fn the_author_is_an_agent_when_named_or_under_claude_code() {
     };
     assert_eq!(
         author(&fixture, &[]),
-        json!({"kind": "reviewer", "name": "dv fixture"})
+        json!({"kind": "reviewer", "name": "dv fixture", "model": null})
     );
 
     fixture.env.insert("CLAUDECODE".into(), "1".into());
     assert_eq!(
         author(&fixture, &[]),
-        json!({"kind": "agent", "name": "claude-code"})
+        json!({"kind": "agent", "name": "claude-code", "model": null})
     );
 
     fixture.env.insert("DV_AUTHOR".into(), "codex".into());
     assert_eq!(
         author(&fixture, &[]),
-        json!({"kind": "agent", "name": "codex"})
+        json!({"kind": "agent", "name": "codex", "model": null})
     );
     assert_eq!(
         author(&fixture, &["--author", "cursor"]),
-        json!({"kind": "agent", "name": "cursor"})
+        json!({"kind": "agent", "name": "cursor", "model": null})
     );
 
     // An empty variable counts as unset; an empty flag is a mistake.
@@ -102,12 +102,83 @@ fn the_author_is_an_agent_when_named_or_under_claude_code() {
     fixture.env.insert("CLAUDECODE".into(), String::new());
     assert_eq!(
         author(&fixture, &[]),
-        json!({"kind": "reviewer", "name": "dv fixture"})
+        json!({"kind": "reviewer", "name": "dv fixture", "model": null})
     );
     let error = fixture
         .run(&["status", "--json", "--author", ""])
         .error(Exit::Usage, "usage");
     assert_eq!(error["message"], "--author needs an agent name");
+}
+
+#[test]
+fn an_agent_names_its_model() {
+    let mut fixture = Fixture::new();
+    let author = |fixture: &Fixture, args: &[&str]| {
+        let mut line = vec!["status", "--json"];
+        line.extend_from_slice(args);
+        fixture.run(&line).ok_json()["author"].clone()
+    };
+    let claude = |model: &str| json!({"kind": "agent", "name": "claude-code", "model": model});
+
+    // The flag, with whoever the agent is.
+    fixture.env.insert("CLAUDECODE".into(), "1".into());
+    assert_eq!(
+        author(&fixture, &["--model", " Claude Fable 5.2 "]),
+        claude("Claude Fable 5.2")
+    );
+    assert_eq!(
+        author(&fixture, &["--author", "codex", "--model", "GPT 6.1 Sol"]),
+        json!({"kind": "agent", "name": "codex", "model": "GPT 6.1 Sol"})
+    );
+
+    // The variable, which the flag overrides; empty, it counts as unset.
+    fixture
+        .env
+        .insert("DV_MODEL".into(), "Claude Opus 5.5".into());
+    assert_eq!(author(&fixture, &[]), claude("Claude Opus 5.5"));
+    assert_eq!(
+        author(&fixture, &["--model", "Claude Fable 5.2"]),
+        claude("Claude Fable 5.2")
+    );
+    let ran = fixture.run(&["status"]);
+    assert_eq!(
+        ran.lines()[1],
+        "acting as: agent claude-code (Claude Opus 5.5)"
+    );
+    fixture.env.insert("DV_MODEL".into(), " ".into());
+    assert_eq!(
+        author(&fixture, &[]),
+        json!({"kind": "agent", "name": "claude-code", "model": null})
+    );
+
+    // The reviewer has no model: the variable is ignored, the flag is a mistake, as an empty
+    // one or one of several lines is.
+    fixture.env.insert("CLAUDECODE".into(), String::new());
+    fixture
+        .env
+        .insert("DV_MODEL".into(), "Claude Opus 5.5".into());
+    assert_eq!(
+        author(&fixture, &[]),
+        json!({"kind": "reviewer", "name": "dv fixture", "model": null})
+    );
+    let error = fixture
+        .run(&["status", "--json", "--model", "Claude Fable 5.2"])
+        .error(Exit::Usage, "usage");
+    assert_eq!(
+        error["message"],
+        "--model names the model an agent runs on: pass --author <agent name> with it"
+    );
+    let error = fixture
+        .run(&["status", "--json", "--author", "codex", "--model", ""])
+        .error(Exit::Usage, "usage");
+    assert_eq!(error["message"], "--model needs a model name");
+    let error = fixture
+        .run(&["status", "--json", "--author", "codex", "--model", "a\nb"])
+        .error(Exit::Usage, "usage");
+    assert_eq!(
+        error["message"],
+        "--model: a model name is one line of text"
+    );
 }
 
 #[test]
@@ -130,7 +201,7 @@ fn status_shows_the_handoff_note() {
     assert_eq!(note["note"], "Renamed the cache.\n\nAlso added a test.");
     assert_eq!(
         note["author"],
-        json!({"kind": "agent", "name": "claude-code"})
+        json!({"kind": "agent", "name": "claude-code", "model": null})
     );
     assert!(note["at"].as_u64().unwrap() > 0);
 

@@ -21,6 +21,7 @@
 //! and Settings › Setup over the setup checks (PLAN §12).
 
 pub mod actions;
+pub mod agents;
 pub mod app_menu;
 pub mod appearance;
 pub mod assets;

@@ -274,6 +274,7 @@ fn the_child_environment_is_the_fixtures_without_the_agents_variables() {
             ),
             unset("CLAUDECODE"),
             unset("DV_AUTHOR"),
+            unset("DV_MODEL"),
             unset("DV_REVIEW"),
             // No Linux build to run inside a distro: a WSL repository is exit 4.
             set(

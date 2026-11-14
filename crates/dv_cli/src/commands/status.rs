@@ -79,7 +79,10 @@ fn text(doc: &StatusDoc) -> Vec<String> {
     lines
 }
 
-/// `agent claude-code`, `reviewer Kyle`.
+/// `agent claude-code`, `agent claude-code (Claude Fable 5.2)`, `reviewer Kyle`.
 pub(crate) fn author(author: &AuthorDto) -> String {
-    format!("{} {}", author.kind, author.name)
+    match &author.model {
+        Some(model) => format!("{} {} ({model})", author.kind, author.name),
+        None => format!("{} {}", author.kind, author.name),
+    }
 }

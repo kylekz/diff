@@ -135,7 +135,7 @@ fn live_wsl_install_open_watch_and_the_cli() {
     // The dv on the distro's PATH reads the same repository.
     let listed = sh(
         &shell,
-        r#"cd "$1" && env -u CLAUDECODE -u DV_AUTHOR -u DV_REVIEW "$HOME/.local/bin/dv" review list --json"#,
+        r#"cd "$1" && env -u CLAUDECODE -u DV_AUTHOR -u DV_MODEL -u DV_REVIEW "$HOME/.local/bin/dv" review list --json"#,
         &[&repo],
     );
     let listed: serde_json::Value = serde_json::from_str(&listed).unwrap();
@@ -146,6 +146,7 @@ fn live_wsl_install_open_watch_and_the_cli() {
         .args(["--wsl", &format!("{distro}:{repo}"), "status", "--json"])
         .env_remove("CLAUDECODE")
         .env_remove("DV_AUTHOR")
+        .env_remove("DV_MODEL")
         .env_remove("DV_REVIEW")
         .env_remove("DV_WSL_HOME")
         .stdin(Stdio::null())

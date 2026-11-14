@@ -193,6 +193,16 @@ pub fn role_word(author: &Author) -> &'static str {
     author.kind.as_str()
 }
 
+/// The tag beside an author's name on a comment: an agent shown by its model
+/// ([`crate::agents::shown_name`]) is tagged with its own name (`claude-code`), anyone else
+/// with their role.
+pub fn role_tag(author: &Author) -> &str {
+    match author.model {
+        Some(_) => &author.name,
+        None => role_word(author),
+    }
+}
+
 /// What one-line rows show of a Markdown body: its first line as plain text
 /// ([`crate::markdown::first_line_plain`]), so `**cap**` reads as `cap` there as it does,
 /// bold, on the card.
@@ -200,13 +210,14 @@ pub fn first_line(body: &str) -> String {
     crate::markdown::first_line_plain(body)
 }
 
-/// A thread's state chip text: "Open", "Addressed by claude-code", "Resolved".
+/// A thread's state chip text: "Open", "Addressed by Claude Fable 5.2" (the agent as it
+/// shows, [`crate::agents::shown_name`]), "Resolved".
 pub fn state_label(thread: &Thread) -> String {
     match thread.state {
         ThreadState::Open => "Open".to_string(),
         ThreadState::Addressed => match &thread.last_change {
             Some(change) if change.author.kind == AuthorKind::Agent => {
-                format!("Addressed by {}", change.author.name)
+                format!("Addressed by {}", crate::agents::shown_name(&change.author))
             }
             Some(change) if change.author.kind == AuthorKind::Reviewer => "Addressed".to_string(),
             _ => "Addressed by agent".to_string(),

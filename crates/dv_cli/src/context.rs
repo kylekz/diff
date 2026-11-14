@@ -12,7 +12,7 @@ use std::io::{self, IsTerminal as _, Read, Write};
 use std::path::PathBuf;
 
 /// The environment a command reads its variables from (`$DV_REVIEW`, `$DV_AUTHOR`,
-/// `CLAUDECODE`, PLAN §10.2, §2.5).
+/// `$DV_MODEL`, `CLAUDECODE`, PLAN §10.2, §2.5).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Env {
     /// The process's own environment.

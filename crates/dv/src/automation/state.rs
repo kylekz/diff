@@ -7,6 +7,7 @@ use dv_ui::diff_pane::PlaceRef;
 use dv_ui::services::reviews::{OpenRequest, RepoRow, ReviewRow};
 use dv_ui::session::{Comparison, FileState, ReviewSession, diff_kind};
 use dv_ui::submit::SummaryTab;
+use dv_ui::switcher::MenuTarget;
 use dv_ui::switcher::items::{ItemKind, ReviewBadge};
 use dv_ui::system::SystemRequest;
 use dv_ui::{ActiveServices as _, Failure, Material, Shell};
@@ -105,7 +106,16 @@ fn badge(badge: Option<&ReviewBadge>) -> Value {
 /// `state.switcher`.
 pub fn switcher(shell: &Shell, cx: &App) -> Value {
     let Some(switcher) = shell.switcher() else {
-        return json!({"open": false, "mode": null, "query": null, "selected": null, "items": [], "menu": null});
+        return json!({
+            "open": false,
+            "mode": null,
+            "query": null,
+            "selected": null,
+            "items": [],
+            "menu": null,
+            "closing": null,
+            "close_failure": null,
+        });
     };
     let switcher = switcher.read(cx);
     let listing = switcher.listing();
@@ -129,11 +139,13 @@ pub fn switcher(shell: &Shell, cx: &App) -> Value {
             })
         })
         .collect();
-    let menu = switcher.menu().map(|menu| {
-        json!({
-            "repo": menu.location.display_name(),
-            "removable": switcher.can_remove(&menu.location),
-        })
+    // A repository header's menu (`repo`, `removable`) or a review row's (`row`, its key).
+    let menu = switcher.menu().map(|menu| match &menu.target {
+        MenuTarget::Repo(location) => json!({
+            "repo": location.display_name(),
+            "removable": switcher.can_remove(location),
+        }),
+        MenuTarget::Review { row } => json!({"row": row}),
     });
     json!({
         "open": true,
@@ -142,6 +154,9 @@ pub fn switcher(shell: &Shell, cx: &App) -> Value {
         "selected": switcher.selected_key(),
         "items": items,
         "menu": menu,
+        // The row asked to close its review (`Ctrl Shift W`), and why the last close failed.
+        "closing": switcher.closing(),
+        "close_failure": switcher.close_failure(),
     })
 }
 
@@ -810,8 +825,15 @@ fn file(session: &ReviewSession, entry: &FileEntry) -> Value {
     })
 }
 
+/// An author: `model` the one an agent said it runs on and `family` the model family whose
+/// mark it shows (`dv_ui::agents`), each `null` without one.
 fn author(author: &Author) -> Value {
-    json!({"kind": author.kind.as_str(), "name": author.name})
+    json!({
+        "kind": author.kind.as_str(),
+        "name": author.name,
+        "model": author.model,
+        "family": dv_ui::agents::family(author).map(dv_ui::agents::ModelFamily::key),
+    })
 }
 
 fn thread_state(session: &ReviewSession, thread: &Thread) -> Value {

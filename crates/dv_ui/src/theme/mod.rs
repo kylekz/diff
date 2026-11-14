@@ -533,6 +533,31 @@ fn shadow(color: Rgba, y: f32, blur: f32, inset: bool) -> BoxShadow {
     }
 }
 
+/// The model families' colours (DESIGN §1.6) for one appearance; the black-or-white marks
+/// take [`DvColors::fg`].
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ModelColors {
+    pub claude: Hsla,
+    pub gemini: Hsla,
+    pub deepseek: Hsla,
+    pub qwen: Hsla,
+}
+
+impl ModelColors {
+    fn new(appearance: Appearance) -> Self {
+        let t = match appearance {
+            Appearance::Dark => tokens::MODELS_DARK,
+            Appearance::Light => tokens::MODELS_LIGHT,
+        };
+        Self {
+            claude: t.claude.into(),
+            gemini: t.gemini.into(),
+            deepseek: t.deepseek.into(),
+            qwen: t.qwen.into(),
+        }
+    }
+}
+
 /// Every DESIGN token for one palette, appearance and material.
 #[derive(Clone, Debug)]
 pub struct DvTheme {
@@ -540,6 +565,7 @@ pub struct DvTheme {
     pub appearance: Appearance,
     pub material: Material,
     pub colors: DvColors,
+    pub models: ModelColors,
     pub fonts: Fonts,
     pub text: TypeScale,
     pub sizes: Sizes,
@@ -562,6 +588,7 @@ impl DvTheme {
             appearance,
             material,
             colors: DvColors::new(palette, appearance, material),
+            models: ModelColors::new(appearance),
             text: TypeScale::new(&fonts),
             fonts,
             sizes: Sizes::default(),

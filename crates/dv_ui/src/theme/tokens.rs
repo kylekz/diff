@@ -169,6 +169,33 @@ pub struct SyntaxTokens {
     pub plain: Rgba,
 }
 
+/// The model families' own colours (DESIGN §1.6), for the marks beside what an agent wrote:
+/// the brand's colour where it reads on the appearance's surfaces, a lighter step of it in
+/// dark. The families whose mark is black or white (OpenAI, Kimi, Z.ai) take `fg`.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ModelTokens {
+    pub claude: Rgba,
+    pub gemini: Rgba,
+    pub deepseek: Rgba,
+    pub qwen: Rgba,
+}
+
+/// The model marks' colours in dark themes.
+pub const MODELS_DARK: ModelTokens = ModelTokens {
+    claude: hex(0xd97757),
+    gemini: hex(0x8ab4f8),
+    deepseek: hex(0x7c93ff),
+    qwen: hex(0x9a96f8),
+};
+
+/// The model marks' colours in light themes.
+pub const MODELS_LIGHT: ModelTokens = ModelTokens {
+    claude: hex(0xd97757),
+    gemini: hex(0x3478f6),
+    deepseek: hex(0x4d6bfe),
+    qwen: hex(0x615ced),
+};
+
 /// One appearance's full token set.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct TokenSet {

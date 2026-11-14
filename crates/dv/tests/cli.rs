@@ -5,7 +5,7 @@
 //! Only headless commands (and `--help`, `--version`) are run here: `dv` alone or `dv open`
 //! would start the app on the owner's desktop, except in the headless build
 //! (`--no-default-features`), which has no window to open. These tests run in every shape. Every child gets the fixture's git environment
-//! and none of this process's `CLAUDECODE`, `DV_AUTHOR` or `DV_REVIEW` (Claude Code exports
+//! and none of this process's `CLAUDECODE`, `DV_AUTHOR`, `DV_MODEL` or `DV_REVIEW` (Claude Code exports
 //! `CLAUDECODE` to the commands it runs). None crosses into a WSL distro: each child's
 //! `DV_LINUX_DIR` names a folder without a Linux build, so a WSL repository stops at exit 4
 //! before any `wsl.exe` starts (`tests/wsl_cli.rs` crosses for real, sandboxed).
@@ -47,6 +47,7 @@ fn command(repo: &FixtureRepo, cwd: &Path, args: &[&str], env: &[(&str, &str)]) 
         .current_dir(cwd)
         .env_remove("CLAUDECODE")
         .env_remove("DV_AUTHOR")
+        .env_remove("DV_MODEL")
         .env_remove("DV_REVIEW")
         .env_remove("DV_WSL_HOME")
         .env("DV_LINUX_DIR", no_linux_build())

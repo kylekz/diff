@@ -1184,3 +1184,142 @@ fn a_repo_is_removed_by_key_or_menu_but_not_the_open_reviews(cx: &mut TestAppCon
     settle(cx, &shell, "the removal", |_, _| true);
     assert_eq!(known(&shell, cx), ["api-server"]);
 }
+
+#[gpui::test]
+fn a_review_is_closed_from_its_rows_menu_or_by_key_once_asked(cx: &mut TestAppContext) {
+    let (_dir, shell, cx) = open_shell(cx);
+    let repos = tempfile::tempdir().unwrap();
+    let api = stacked_fixture(&repos.path().join("api-server"));
+    add_repo(&api, &shell, cx);
+    let location = Location::Local(api.path().to_path_buf());
+    // Three open reviews: of another branch (a row of its own), of the staged changes, and
+    // of the working tree, which is the one left open in the window.
+    for target in [
+        Target::Branch {
+            branch: "feat-a".into(),
+            base: None,
+        },
+        Target::Staged,
+        Target::Working,
+    ] {
+        let task = cx.update(|window, cx| {
+            shell.update(cx, |shell, cx| {
+                shell.open(location.clone(), OpenRequest::Target(target), window, cx)
+            })
+        });
+        cx.run_until_parked();
+        settle(cx, &shell, "the review", |shell, _| {
+            shell.session().is_some()
+        });
+        cx.foreground_executor().block_test(task).unwrap();
+    }
+    let review_of = |shell: &Entity<Shell>, cx: &mut VisualTestContext, key: &str| {
+        let view = switcher(shell, cx).unwrap();
+        view.read_with(cx, |view, _| {
+            let listing = view.listing();
+            listing
+                .position(key)
+                .and_then(|ix| listing.items[ix].review().cloned())
+        })
+    };
+
+    cx.simulate_keystrokes("secondary-o");
+    settle(cx, &shell, "the rows", |_, _| true);
+    let view = switcher(&shell, cx).expect("Ctrl O opens the switcher");
+    let other = view.read_with(cx, |view, _| {
+        keys(view.listing())
+            .into_iter()
+            .find(|key| key.starts_with("api-server/review/"))
+            .expect("the other branch's review has a row")
+            .to_string()
+    });
+
+    // Ctrl Shift W only asks: Esc keeps the review and the switcher, and so does moving on.
+    assert!(view.update(cx, |view, cx| view.select_key("api-server/staged", cx)));
+    assert!(view.read_with(cx, |view, _| view.closable()));
+    cx.simulate_keystrokes("secondary-shift-w");
+    assert_eq!(
+        view.read_with(cx, |view, _| view.closing().map(str::to_string)),
+        Some("api-server/staged".to_string())
+    );
+    cx.simulate_keystrokes("escape");
+    assert_eq!(
+        view.read_with(cx, |view, _| view.closing().is_some()),
+        false
+    );
+    assert!(switcher(&shell, cx).is_some(), "Esc kept the switcher");
+    cx.simulate_keystrokes("secondary-shift-w down");
+    assert_eq!(
+        view.read_with(cx, |view, _| view.closing().is_some()),
+        false
+    );
+    settle(cx, &shell, "nothing", |_, _| true);
+    assert!(review_of(&shell, cx, "api-server/staged").is_some());
+
+    // Asked, Enter closes it: the row stays, selected, and offers a new review.
+    assert!(view.update(cx, |view, cx| view.select_key("api-server/staged", cx)));
+    cx.simulate_keystrokes("secondary-shift-w enter");
+    settle(cx, &shell, "the close", |shell, cx| {
+        shell.switcher().is_some_and(|view| {
+            let view = view.read(cx);
+            view.listing()
+                .position("api-server/staged")
+                .is_some_and(|ix| view.listing().items[ix].review().is_none())
+        })
+    });
+    assert_eq!(selected(&shell, cx).as_deref(), Some("api-server/staged"));
+    assert!(shell.read_with(cx, |shell, _| shell.session().is_some()));
+
+    // A row without a review has nothing to close: the key does nothing there, nor a menu.
+    cx.simulate_keystrokes("secondary-shift-w");
+    view.update(cx, |view, cx| {
+        assert!(!view.closable());
+        assert_eq!(view.closing(), None);
+        view.open_row_menu(
+            "api-server/staged",
+            gpui::point(gpui::px(10.), gpui::px(10.)),
+            cx,
+        );
+        assert!(view.menu().is_none());
+    });
+
+    // Another target's review, from its row's menu (Esc closes the menu first): its row
+    // goes, and the selection moves to the next one.
+    view.update(cx, |view, cx| {
+        view.open_row_menu(&other, gpui::point(gpui::px(10.), gpui::px(10.)), cx);
+        assert_eq!(
+            view.menu().map(|menu| menu.target.clone()),
+            Some(MenuTarget::Review { row: other.clone() })
+        );
+    });
+    assert_eq!(selected(&shell, cx), Some(other.clone()));
+    cx.simulate_keystrokes("escape");
+    assert!(view.read_with(cx, |view, _| view.menu().is_none()));
+    assert!(switcher(&shell, cx).is_some(), "Esc closed the menu only");
+    let next = view.read_with(cx, |view, _| {
+        let listing = view.listing();
+        listing.items[listing.position(&other).unwrap() + 1]
+            .key
+            .clone()
+    });
+    view.update(cx, |view, cx| view.close_review(&other, cx));
+    settle(cx, &shell, "the close", |shell, cx| {
+        shell
+            .switcher()
+            .is_some_and(|view| view.read(cx).listing().position(&other).is_none())
+    });
+    assert_eq!(selected(&shell, cx), Some(next));
+
+    // The open review closes the same way; the window shows it closed.
+    view.update(cx, |view, cx| view.close_review("api-server/working", cx));
+    settle(cx, &shell, "the open review closed", |shell, cx| {
+        shell
+            .session()
+            .is_some_and(|session| session.read(cx).review().status == ReviewStatus::Closed)
+    });
+    assert!(review_of(&shell, cx, "api-server/working").is_none());
+    assert_eq!(
+        view.read_with(cx, |view, _| view.close_failure().is_some()),
+        false
+    );
+}

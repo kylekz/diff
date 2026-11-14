@@ -530,7 +530,8 @@ const READY_NOTE_MAX_HEIGHT: f32 = 240.;
 const READY_NOTE_FADE: f32 = 28.;
 
 /// The agent's handoff over a `ready` review (DESIGN §4.4): on `blueSoft` with a `blue` outline
-/// at 35%, the agent's glyph, "claude-code marked round 2 ready", the note's first line as
+/// at 35%, the agent's glyph, "Claude Fable 5.2 marked round 2 ready" (the agent as it shows,
+/// `crate::agents::shown_name`), the note's first line as
 /// plain text and "Show note", which opens the whole note as Markdown under it, scrolling
 /// (`scroll`) past READY_NOTE_MAX_HEIGHT with a fade at its foot while more lies below.
 fn ready_banner(
@@ -541,10 +542,10 @@ fn ready_banner(
     cx: &mut Context<Shell>,
 ) -> AnyElement {
     let c = &theme.colors;
-    let who = ready
-        .author
-        .as_ref()
-        .map_or_else(|| "The agent".to_string(), |author| author.name.clone());
+    let who = ready.author.as_ref().map_or_else(
+        || "The agent".to_string(),
+        |author| crate::agents::shown_name(author).to_string(),
+    );
     // The first line stands in for the note while it is closed.
     let first = ready
         .note
@@ -589,7 +590,8 @@ fn ready_banner(
         .py(theme.spacing.sm)
         .pl(theme.spacing.lg)
         .pr(theme.spacing.md)
-        .child(icon(DvIcon::Bot, px(15.), c.blue))
+        // Its model family's mark, when it named a model dv knows (`crate::agents`).
+        .child(crate::agents::glyph(ready.author.as_ref(), px(15.), theme))
         // The agent's name truncates before anything else does; "marked round n ready" and
         // the disclosure always show (DESIGN §4.4).
         .child(

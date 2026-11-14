@@ -1,5 +1,5 @@
-//! dv's icons (DESIGN §1.6): the few Lucide glyphs the views use, the Windows caption glyphs and
-//! dv's mark, embedded from `assets/icons/` (its README names each file's source and licence).
+//! dv's icons (DESIGN §1.6): the few Lucide glyphs the views use, the Windows caption glyphs,
+//! the model families' marks and dv's mark, embedded from `assets/icons/` (its README names each file's source and licence).
 //!
 //! gpui paints `svg()` as a mask tinted with the text colour, so every icon is single-colour; an
 //! SVG's own `opacity` shades the mask (the mark's dimmed half). Draw one with
@@ -81,6 +81,14 @@ dv_icons! {
     Terminal => "square-terminal",
     TriangleAlert => "triangle-alert",
     X => "x",
+    // The model families' marks, beside what an agent wrote (`crate::agents`).
+    ModelClaude => "model-claude",
+    ModelDeepSeek => "model-deepseek",
+    ModelGemini => "model-gemini",
+    ModelKimi => "model-kimi",
+    ModelOpenAi => "model-openai",
+    ModelQwen => "model-qwen",
+    ModelZai => "model-zai",
 }
 
 #[cfg(test)]

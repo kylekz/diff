@@ -185,7 +185,7 @@ impl DiffPane {
             .review()
             .thread(thread)
             .filter(|thread| thread.state == dv_core::review::ThreadState::Annotation)
-            .map(|thread| thread.author.name.clone())
+            .map(|thread| crate::agents::shown_name(&thread.author).to_string())
     }
 
     /// Lays `element` out under the line `at` names: in split view in its side's half, over

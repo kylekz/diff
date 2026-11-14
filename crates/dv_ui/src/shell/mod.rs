@@ -1130,7 +1130,7 @@ impl Shell {
 
     fn on_switcher_event(
         &mut self,
-        _: &Entity<Switcher>,
+        switcher: &Entity<Switcher>,
         event: &SwitcherEvent,
         window: &mut Window,
         cx: &mut Context<Self>,
@@ -1150,6 +1150,23 @@ impl Shell {
             SwitcherEvent::Remove { location } => {
                 let reviews = cx.services().reviews.clone();
                 reviews.update(cx, |reviews, cx| reviews.remove_repo(location, cx));
+            }
+            // The open review, when it is the one closed, follows its log like any write
+            // from outside (the session's watch); a close that fails is the switcher's to say.
+            SwitcherEvent::Close { location, review } => {
+                let reviews = cx.services().reviews.clone();
+                let close = reviews.update(cx, |reviews, cx| {
+                    reviews.close_review(location.clone(), review.clone(), cx)
+                });
+                let switcher = switcher.downgrade();
+                cx.spawn(async move |_, cx| {
+                    if let Err(failure) = close.await {
+                        switcher
+                            .update(cx, |switcher, cx| switcher.close_failed(&failure, cx))
+                            .ok();
+                    }
+                })
+                .detach();
             }
             SwitcherEvent::Dismiss => {
                 self.close_menu(window, cx);

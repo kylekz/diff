@@ -23,7 +23,7 @@
 //! own `HOME`),
 //! `DV_DATA_DIR` set to the app's data dir, `DV_USER_PATH_FILE` to the app's stand-in for the
 //! user `Path` (`<data dir>/user-path.txt`, so `dv setup path` never writes the registry),
-//! `CLAUDECODE`, `DV_AUTHOR` and `DV_REVIEW` removed
+//! `CLAUDECODE`, `DV_AUTHOR`, `DV_MODEL` and `DV_REVIEW` removed
 //! (Claude Code exports `CLAUDECODE` to what it runs, and the CLI takes it for the agent's
 //! identity, PLAN §2.5), `DV_LINUX_DIR` naming a folder without a Linux build unless the app
 //! itself runs sandboxed (`DV_WSL_HOME` naming a scratch home, as `dv_backend::wsl::sandbox`
@@ -72,9 +72,10 @@ const WSL_VARS: &[&str] = &["DV_LINUX_DIR", "DV_WSL_HOME", ONLY_DISTROS_VAR];
 /// The variable naming the only distros a child's setup checks reach (`dv_cli::checks`).
 const ONLY_DISTROS_VAR: &str = dv_cli::checks::ONLY_DISTROS_VAR;
 
-/// The variables that make the CLI an agent or pick its review (PLAN §2.5, §10.2): never
+/// The variables that make the CLI an agent, name its model or pick its review (PLAN §2.5,
+/// §10.2): never
 /// inherited, set through `env` when a scenario means them.
-const AGENT_VARS: &[&str] = &["CLAUDECODE", "DV_AUTHOR", "DV_REVIEW"];
+const AGENT_VARS: &[&str] = &["CLAUDECODE", "DV_AUTHOR", "DV_MODEL", "DV_REVIEW"];
 
 /// Where a child finds its home directory: `<data dir>/home` for every child (the app's own
 /// setup checks' home too, `crate::app::AUTOMATION_HOME`), so nothing a scenario runs (`dv

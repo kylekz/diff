@@ -18,7 +18,7 @@
 //! it runs gets that home as `DV_WSL_HOME`, so nothing reaches the distro user's own home
 //! (CLAUDE.md). `dv` finds the Linux build beside itself in `target/debug`, where
 //! `script/build-linux` puts it (or in `DV_LINUX_DIR`). Every child runs without this process's
-//! `CLAUDECODE`, `DV_AUTHOR`, `DV_REVIEW` and `WSLENV`, set only on purpose.
+//! `CLAUDECODE`, `DV_AUTHOR`, `DV_MODEL`, `DV_REVIEW` and `WSLENV`, set only on purpose.
 
 #![cfg(windows)]
 
@@ -116,6 +116,7 @@ mkdir sub
             .args(args)
             .env_remove("CLAUDECODE")
             .env_remove("DV_AUTHOR")
+            .env_remove("DV_MODEL")
             .env_remove("DV_REVIEW")
             .env_remove("WSLENV")
             .env_remove("RUST_LOG")
@@ -249,7 +250,7 @@ fn a_command_runs_inside_the_distro_after_installing_dv_there() {
     assert_eq!(doc["repo"]["branch"], "main");
     assert_eq!(
         doc["author"],
-        json!({"kind": "reviewer", "name": "dv fixture"})
+        json!({"kind": "reviewer", "name": "dv fixture", "model": null})
     );
 
     // Installed now: nothing but the command's own output.
@@ -368,29 +369,29 @@ fn who_the_command_acts_as_and_its_review_cross_with_it() {
     };
     assert_eq!(
         status(&[("CLAUDECODE", "1")])["author"],
-        json!({"kind": "agent", "name": "claude-code"})
+        json!({"kind": "agent", "name": "claude-code", "model": null})
     );
     // After what `WSLENV` lists already.
     assert_eq!(
         status(&[("DV_AUTHOR", "codex"), ("WSLENV", "USERPROFILE/p")])["author"],
-        json!({"kind": "agent", "name": "codex"})
+        json!({"kind": "agent", "name": "codex", "model": null})
     );
     // An entry `WSLENV` has for the same name, with other flags or in another case, doesn't
     // keep it from crossing verbatim.
     assert_eq!(
         status(&[("CLAUDECODE", "1"), ("WSLENV", "CLAUDECODE/w")])["author"],
-        json!({"kind": "agent", "name": "claude-code"})
+        json!({"kind": "agent", "name": "claude-code", "model": null})
     );
     for listed in ["DV_AUTHOR/p", "dv_author"] {
         assert_eq!(
             status(&[("DV_AUTHOR", "codex"), ("WSLENV", listed)])["author"],
-            json!({"kind": "agent", "name": "codex"}),
+            json!({"kind": "agent", "name": "codex", "model": null}),
             "{listed}"
         );
     }
     assert_eq!(
         status(&[])["author"],
-        json!({"kind": "reviewer", "name": "dv fixture"})
+        json!({"kind": "reviewer", "name": "dv fixture", "model": null})
     );
 
     let review = json(

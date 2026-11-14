@@ -40,5 +40,8 @@ The first build compiles GPUI and takes several minutes; incremental builds are 
 
 Bundled in the binary from `assets/`: the [Geist](https://github.com/vercel/geist-font) and
 [JetBrains Mono](https://github.com/JetBrains/JetBrainsMono) fonts (SIL Open Font License 1.1,
-`assets/fonts/*/OFL.txt`) and a few [Lucide](https://lucide.dev) icons (ISC,
-`assets/icons/LICENSE-LUCIDE`; `assets/icons/README.md` lists them).
+`assets/fonts/*/OFL.txt`), a few [Lucide](https://lucide.dev) icons (ISC,
+`assets/icons/LICENSE-LUCIDE`) and the model families' marks shown beside what an agent wrote,
+from [lobe-icons](https://github.com/lobehub/lobe-icons) (MIT,
+`assets/icons/LICENSE-LOBE-ICONS`; the marks are their makers' trademarks);
+`assets/icons/README.md` lists them.

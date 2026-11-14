@@ -237,7 +237,16 @@ fn state_describes_the_empty_shell(cx: &mut TestAppContext) {
     assert_eq!(state["backends"], json!([]));
     assert_eq!(
         state["switcher"],
-        json!({"open": false, "mode": null, "query": null, "selected": null, "items": [], "menu": null})
+        json!({
+            "open": false,
+            "mode": null,
+            "query": null,
+            "selected": null,
+            "items": [],
+            "menu": null,
+            "closing": null,
+            "close_failure": null,
+        })
     );
     assert_eq!(
         state["source_picker"],
@@ -515,7 +524,7 @@ fn a_seeded_repo_opens_as_a_review_and_the_agent_answers(cx: &mut TestAppContext
     assert_eq!(
         state["session"]["ready_note"],
         json!({
-            "author": {"kind": "agent", "name": "claude-code"},
+            "author": {"kind": "agent", "name": "claude-code", "model": null, "family": "claude"},
             "round": 1,
             "note": "Ready for another look.",
             "annotations": 0,

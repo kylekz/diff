@@ -13,10 +13,11 @@ use gpui::{
 use gpui_component::input::{Textarea, TextareaState};
 
 use super::{
-    first_line, initial, relative_time, role_word, shown_anchor_label, state_label, state_note,
-    trail_label,
+    first_line, initial, relative_time, role_tag, role_word, shown_anchor_label, state_label,
+    state_note, trail_label,
 };
 use crate::actions::composer::{Cancel, Post};
+use crate::agents;
 use crate::automation::AutomationTargetExt as _;
 use crate::components::{chip, icon, kbd, kbd_on_accent, primary_button, small_button};
 use crate::failure::Failure;
@@ -348,7 +349,16 @@ impl RenderOnce for ThreadCard {
                     .border_color(c.line)
                     .text_spec(&theme.text.secondary)
                     .text_color(c.fg2)
-                    .child(div().pt(px(1.)).child(icon(DvIcon::Bot, px(13.), c.blue)))
+                    .child(
+                        div().pt(px(1.)).child(agents::glyph(
+                            self.thread
+                                .last_change
+                                .as_ref()
+                                .map(|change| &change.author),
+                            px(13.),
+                            &theme,
+                        )),
+                    )
                     .child(div().flex_1().min_w_0().child(note.to_string()))
             });
         // A comment on the whole file has no lines to show as they were; a card away from its
@@ -456,22 +466,17 @@ impl ThreadCard {
             .gap(theme.spacing.sm)
             .h(px(28.))
             .child(
-                div()
-                    .flex_none()
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .size(px(16.))
-                    .rounded(theme.radii.small)
-                    .bg(c.blue_soft)
-                    .child(icon(DvIcon::Bot, px(10.), c.blue)),
+                agents::mark(&self.thread.author, px(16.), px(10.), &theme)
+                    .rounded(theme.radii.small),
             )
             .child(
                 div()
                     .flex_none()
                     .font_weight(FontWeight::SEMIBOLD)
                     .text_color(c.fg2)
-                    .child(SharedString::from(self.thread.author.name.clone())),
+                    .child(SharedString::from(
+                        agents::shown_name(&self.thread.author).to_string(),
+                    )),
             )
             .child(
                 div()
@@ -522,7 +527,7 @@ impl ThreadCard {
                             .text_color(c.fg3)
                             .child(format!(
                                 "{} · {}",
-                                reply.author.name,
+                                agents::shown_name(&reply.author),
                                 relative_time(reply.created_at, self.now)
                             )),
                     )
@@ -688,7 +693,7 @@ fn comment(
             .text_spec(&theme.text.secondary)
             .text_color(c.fg3)
             .child(role_word(author)),
-        AuthorKind::Agent | AuthorKind::Github => tag(role_word(author), theme),
+        AuthorKind::Agent | AuthorKind::Github => tag(role_tag(author).to_string(), theme),
     };
     div()
         .flex()
@@ -712,8 +717,10 @@ fn comment(
                         .h(px(18.))
                         .child(
                             div()
+                                .min_w_0()
+                                .truncate()
                                 .font_weight(FontWeight::SEMIBOLD)
-                                .child(SharedString::from(author.name.clone())),
+                                .child(SharedString::from(agents::shown_name(author).to_string())),
                         )
                         .child(role)
                         .when(annotation, |this| this.child(tag("annotation", theme)))
@@ -733,8 +740,9 @@ fn comment(
         )
 }
 
-/// A 22px avatar: a round initial for people (the reviewer, GitHub), a square with the bot
-/// glyph for an agent (the board's `avatarKyle` / `avatarAgent`).
+/// A 22px avatar: a round initial for people (the reviewer, GitHub), a square with its model
+/// family's mark, else the bot glyph, for an agent (the board's `avatarKyle` / `avatarAgent`,
+/// [`agents::mark`]).
 fn avatar(author: &Author, theme: &DvTheme) -> AnyElement {
     let c = &theme.colors;
     let base = div()
@@ -744,10 +752,8 @@ fn avatar(author: &Author, theme: &DvTheme) -> AnyElement {
         .justify_center()
         .size(px(22.));
     match author.kind {
-        AuthorKind::Agent => base
+        AuthorKind::Agent => agents::mark(author, px(22.), px(13.), theme)
             .rounded(theme.radii.control)
-            .bg(c.blue_soft)
-            .child(icon(DvIcon::Bot, px(13.), c.blue))
             .into_any_element(),
         AuthorKind::Reviewer | AuthorKind::Github => base
             .rounded_full()
@@ -769,7 +775,7 @@ fn avatar(author: &Author, theme: &DvTheme) -> AnyElement {
 }
 
 /// The board's `agentTag`: 16 high, a `line2` outline, 11/500 in `fg2`.
-fn tag(text: &'static str, theme: &DvTheme) -> Div {
+fn tag(text: impl Into<SharedString>, theme: &DvTheme) -> Div {
     let c = &theme.colors;
     div()
         .flex_none()
@@ -783,7 +789,7 @@ fn tag(text: &'static str, theme: &DvTheme) -> Div {
         .text_color(c.fg2)
         .text_size(px(11.))
         .font_weight(FontWeight::MEDIUM)
-        .child(text)
+        .child(text.into())
 }
 
 /// The composer (see the module docs): its field, why the last post failed, and Cancel /

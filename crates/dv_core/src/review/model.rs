@@ -20,6 +20,11 @@ pub struct Author {
     /// The reviewer's git identity, the agent's name (`claude-code`, `codex`, …) or the GitHub
     /// login.
     pub name: String,
+    /// The model an agent says it runs on, as it names itself ("Claude Fable 5.2"): what the
+    /// app shows for it, with its family's mark (PLAN §2.5). Not part of who the author is
+    /// ([`Author::is`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
 }
 
 impl Author {
@@ -27,6 +32,7 @@ impl Author {
         Self {
             kind: AuthorKind::Reviewer,
             name: name.into(),
+            model: None,
         }
     }
 
@@ -34,6 +40,7 @@ impl Author {
         Self {
             kind: AuthorKind::Agent,
             name: name.into(),
+            model: None,
         }
     }
 
@@ -41,7 +48,21 @@ impl Author {
         Self {
             kind: AuthorKind::Github,
             name: login.into(),
+            model: None,
         }
+    }
+
+    /// This author running on `model`.
+    pub fn with_model(mut self, model: impl Into<String>) -> Self {
+        self.model = Some(model.into());
+        self
+    }
+
+    /// Whether `other` is the same author: the same kind and name, whatever model each wrote
+    /// with, so an agent that changes models still edits and deletes what it wrote (PLAN
+    /// §2.5).
+    pub fn is(&self, other: &Author) -> bool {
+        self.kind == other.kind && self.name == other.name
     }
 }
 

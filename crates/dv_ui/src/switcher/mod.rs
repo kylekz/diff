@@ -24,11 +24,20 @@
 //! one's first row. The open review's repository can't be removed (its menu item is disabled,
 //! the key does nothing): the title bar's source picker lists its targets.
 //!
+//! A row beside an open review has a menu too (a right-click, or its `⋯` under the pointer)
+//! with **Close review**, which closes that review for good (PLAN §2.4: the reviewer's
+//! `closed`, as `dv review close`), the open one included; its target then offers a new
+//! review. `Ctrl Shift W` asks the same of the selected row, which then reads "Close this
+//! review?" until `Enter` closes it or `Esc`, or moving on, keeps it: nothing reopens a
+//! closed review, so the key alone never closes one. A close that fails says why in the
+//! footer.
+//!
 //! [`source`] is the title bar's other menu, the current repository's targets.
 //!
 //! Automation targets: `switcher`, `switcher/filter`, `switcher/repo/<repo>`,
 //! `switcher/repo/<repo>/more` (the header's `⋯`), `switcher/menu`, `switcher/menu/remove`,
-//! `switcher/<key>` for each row ([`items::Item::key`]).
+//! `switcher/menu/close`, `switcher/<key>` for each row ([`items::Item::key`]) and
+//! `switcher/<key>/more` (the `⋯` of a row with a review).
 
 pub mod branches;
 pub mod items;
@@ -46,7 +55,10 @@ use gpui::{
 };
 use gpui_component::input::{InputEvent, InputState};
 
-use crate::actions::switcher::{Confirm, Dismiss, RemoveRepo, SelectNext, SelectPrevious};
+use crate::actions::switcher::{
+    CloseReview, Confirm, Dismiss, RemoveRepo, SelectNext, SelectPrevious,
+};
+use crate::failure::Failure;
 use crate::services::reviews::{OpenRequest, Reviews};
 use branches::Mode;
 use items::{ItemKind, Listing};
@@ -71,14 +83,29 @@ pub enum SwitcherEvent {
     Start { location: Location },
     /// **Remove from list** on the repository at `location` (`Reviews::remove_repo`).
     Remove { location: Location },
+    /// **Close review** on the open review `review` of the repository at `location`
+    /// (`Reviews::close_review`).
+    Close {
+        location: Location,
+        review: ReviewId,
+    },
     /// Closed without picking (`Esc`).
     Dismiss,
 }
 
-/// A repository header's menu: whose, and where it opened.
+/// What an open menu is for.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum MenuTarget {
+    /// A repository's header: **Remove from list**.
+    Repo(Location),
+    /// The row `row` (its key), beside an open review: **Close review**.
+    Review { row: String },
+}
+
+/// The open menu: what for, and where it opened.
 #[derive(Clone, Debug, PartialEq)]
-pub struct RepoMenu {
-    pub location: Location,
+pub struct SwitcherMenu {
+    pub target: MenuTarget,
     pub position: gpui::Point<gpui::Pixels>,
 }
 
@@ -99,9 +126,15 @@ pub struct Switcher {
     started: Option<Location>,
     /// The open review's repository (the one it was opened from), which can't be removed.
     in_use: Option<Location>,
-    /// A repository header's menu, while open.
-    menu: Option<RepoMenu>,
-    /// The row a removal moves the selection to, once the listing drops the repository.
+    /// A repository header's menu or a review row's, while open.
+    menu: Option<SwitcherMenu>,
+    /// The row (its key) `Ctrl Shift W` asked to close the review of: it reads "Close this
+    /// review?" while it has the selection, and `Enter` closes it.
+    closing: Option<String>,
+    /// Why the last close failed, for the footer, until the selection or the list changes.
+    close_failure: Option<String>,
+    /// The row a removal, or closing a review whose row then goes, moves the selection to
+    /// once the listing drops it.
     after_remove: Option<String>,
     scroll: ScrollHandle,
     _subscriptions: Vec<Subscription>,
@@ -143,6 +176,8 @@ impl Switcher {
             started: None,
             in_use,
             menu: None,
+            closing: None,
+            close_failure: None,
             after_remove: None,
             scroll: ScrollHandle::new(),
             _subscriptions: subscriptions,
@@ -200,6 +235,9 @@ impl Switcher {
         cx: &mut Context<Self>,
     ) {
         self.mode = mode;
+        self.menu = None;
+        self.closing = None;
+        self.close_failure = None;
         self.query.clear();
         let placeholder = self.mode.placeholder();
         self.input.update(cx, |input, cx| {
@@ -222,9 +260,23 @@ impl Switcher {
             .map(|item| item.key.as_str())
     }
 
-    /// The open header menu.
-    pub fn menu(&self) -> Option<&RepoMenu> {
+    /// The open menu.
+    pub fn menu(&self) -> Option<&SwitcherMenu> {
         self.menu.as_ref()
+    }
+
+    /// Whether the menu of the repository at `location` is open.
+    fn repo_menu_is(&self, location: &Location) -> bool {
+        self.menu
+            .as_ref()
+            .is_some_and(|menu| menu.target == MenuTarget::Repo(location.clone()))
+    }
+
+    /// Whether the menu of the row `key` is open.
+    fn row_menu_is(&self, key: &str) -> bool {
+        self.menu
+            .as_ref()
+            .is_some_and(|menu| matches!(&menu.target, MenuTarget::Review { row } if row == key))
     }
 
     /// Whether the repository at `location` can be removed: it isn't the open review's.
@@ -251,8 +303,106 @@ impl Switcher {
         position: gpui::Point<gpui::Pixels>,
         cx: &mut Context<Self>,
     ) {
-        self.menu = Some(RepoMenu { location, position });
+        self.closing = None;
+        self.menu = Some(SwitcherMenu {
+            target: MenuTarget::Repo(location),
+            position,
+        });
         cx.notify();
+    }
+
+    /// Opens the menu of the row `key`, which stands beside an open review, at `position`;
+    /// the row takes the selection.
+    pub fn open_row_menu(
+        &mut self,
+        key: &str,
+        position: gpui::Point<gpui::Pixels>,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(ix) = self
+            .listing
+            .position(key)
+            .filter(|ix| self.listing.items[*ix].review().is_some())
+        else {
+            return;
+        };
+        self.select(ix, cx);
+        self.closing = None;
+        self.menu = Some(SwitcherMenu {
+            target: MenuTarget::Review {
+                row: key.to_string(),
+            },
+            position,
+        });
+    }
+
+    /// The row `Ctrl Shift W` asked to close the review of, while it still has the selection
+    /// and a review.
+    pub fn closing(&self) -> Option<&str> {
+        let key = self.closing.as_deref()?;
+        let selected = self.listing.items.get(self.selected)?;
+        (selected.key == key && selected.review().is_some()).then_some(key)
+    }
+
+    /// Whether the selected row stands beside an open review, which `Ctrl Shift W` asks to
+    /// close.
+    pub fn closable(&self) -> bool {
+        self.listing
+            .items
+            .get(self.selected)
+            .is_some_and(|item| item.review().is_some())
+    }
+
+    /// Why the last close failed.
+    pub fn close_failure(&self) -> Option<&str> {
+        self.close_failure.as_deref()
+    }
+
+    /// Closes the open review the row `key` stands beside (module docs): the menu's **Close
+    /// review**, and `Enter` on a row that asked. A row that goes with its review (another
+    /// target's review) hands the selection to the row after it, else the one before.
+    pub fn close_review(&mut self, key: &str, cx: &mut Context<Self>) {
+        self.menu = None;
+        self.closing = None;
+        self.close_failure = None;
+        cx.notify();
+        let Some(ix) = self.listing.position(key) else {
+            return;
+        };
+        let (Some(badge), Some(location)) = (
+            self.listing.items[ix].review(),
+            self.listing.location_of(ix),
+        ) else {
+            return;
+        };
+        if matches!(self.listing.items[ix].kind, ItemKind::Review { .. }) {
+            self.after_remove = self
+                .listing
+                .items
+                .get(ix + 1)
+                .or_else(|| ix.checked_sub(1).and_then(|ix| self.listing.items.get(ix)))
+                .map(|item| item.key.clone());
+        }
+        cx.emit(SwitcherEvent::Close {
+            location: location.clone(),
+            review: badge.id.clone(),
+        });
+    }
+
+    /// A close the shell ran failed: the footer says why.
+    pub fn close_failed(&mut self, failure: &Failure, cx: &mut Context<Self>) {
+        self.close_failure = Some(failure.message.clone());
+        cx.notify();
+    }
+
+    /// `Ctrl Shift W`: asks whether to close the selected row's review (module docs).
+    fn ask_close(&mut self, _: &CloseReview, _: &mut Window, cx: &mut Context<Self>) {
+        if self.closable() {
+            self.menu = None;
+            self.close_failure = None;
+            self.closing = self.selected_key().map(str::to_string);
+            cx.notify();
+        }
     }
 
     pub fn close_menu(&mut self, cx: &mut Context<Self>) {
@@ -326,6 +476,15 @@ impl Switcher {
         if started.is_some() {
             self.started = None;
         }
+        // A row's menu goes with its review (closed from elsewhere meanwhile).
+        if let Some(MenuTarget::Review { row }) = self.menu.as_ref().map(|menu| &menu.target)
+            && !self
+                .listing
+                .position(row)
+                .is_some_and(|ix| self.listing.items[ix].review().is_some())
+        {
+            self.menu = None;
+        }
         let removed_to = self
             .after_remove
             .take()
@@ -334,6 +493,11 @@ impl Switcher {
             .or(removed_to)
             .or_else(|| keep.and_then(|key| self.listing.position(&key)))
             .unwrap_or(0);
+        // A row that asked to close its review and lost the selection, or the review, asks
+        // no more: `Esc` then closes the switcher at once.
+        if self.closing().is_none() {
+            self.closing = None;
+        }
         self.scroll_to_selected();
         cx.notify();
     }
@@ -343,6 +507,8 @@ impl Switcher {
         if query == self.query {
             return;
         }
+        self.closing = None;
+        self.close_failure = None;
         self.query = query;
         self.listing = self.build(cx);
         self.selected = 0;
@@ -351,7 +517,12 @@ impl Switcher {
     }
 
     fn select(&mut self, ix: usize, cx: &mut Context<Self>) {
-        self.selected = ix.min(self.listing.items.len().saturating_sub(1));
+        let ix = ix.min(self.listing.items.len().saturating_sub(1));
+        if ix != self.selected {
+            self.closing = None;
+            self.close_failure = None;
+        }
+        self.selected = ix;
         self.scroll_to_selected();
         cx.notify();
     }
@@ -376,14 +547,19 @@ impl Switcher {
         }
     }
 
+    /// `Enter`: closes the review of a row that asked ([`Switcher::closing`]), else picks
+    /// the selected row.
     fn confirm(&mut self, _: &Confirm, window: &mut Window, cx: &mut Context<Self>) {
-        self.pick(self.selected, window, cx);
+        match self.closing().map(str::to_string) {
+            Some(key) => self.close_review(&key, cx),
+            None => self.pick(self.selected, window, cx),
+        }
     }
 
-    /// `Esc`: closes the header menu when it is open, else a step back in the branch picker
-    /// (module docs), else closes.
+    /// `Esc`: closes the open menu, else keeps the review a row asked to close, else a step
+    /// back in the branch picker (module docs), else closes.
     fn dismiss(&mut self, _: &Dismiss, window: &mut Window, cx: &mut Context<Self>) {
-        if self.menu.take().is_some() {
+        if self.menu.take().is_some() || self.closing.take().is_some() {
             cx.notify();
             return;
         }
@@ -423,6 +599,8 @@ impl Switcher {
             }
             _ => {}
         }
+        self.closing = None;
+        self.close_failure = None;
         self.selected = ix;
         if item.is_starting() {
             cx.notify();

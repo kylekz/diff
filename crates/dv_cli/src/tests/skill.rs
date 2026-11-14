@@ -99,8 +99,12 @@ fn answered_note<'r>(review: &'r dv_core::review::Review, id: &ThreadId) -> Opti
         .and_then(|change| change.note.as_deref())
 }
 
+/// The model the test's agents say they run on, where the skill writes `<model>`.
+const MODEL: &str = "Claude Fable 5.2";
+
 /// `shown`'s arguments after `dv`, its placeholders filled in (`<agent>`: the agent's name, as
-/// the skill tells it to write its own; `<n>`: the round the agent worked on).
+/// the skill tells it to write its own; `<model>`: [`MODEL`]; `<n>`: the round the agent
+/// worked on).
 fn args(shown: &Shown, thread: &str, review: &str, agent: &str, round: u32) -> Vec<String> {
     let words = words(
         &shown
@@ -108,6 +112,7 @@ fn args(shown: &Shown, thread: &str, review: &str, agent: &str, round: u32) -> V
             .replace("<thread-id>", thread)
             .replace("<review-id>", review)
             .replace("<agent>", agent)
+            .replace("<model>", MODEL)
             .replace("<n>", &round.to_string()),
     );
     assert!(
@@ -143,6 +148,7 @@ fn the_skill_is_named_and_says_when_to_use_it() {
     }
     for rule in [
         "--author <agent>",
+        "--model '<model>'",
         "target.kind",
         "git add",
         "--json",
@@ -174,20 +180,20 @@ fn every_command_the_skill_shows_parses() {
             "dv comment list --status open",
             "dv comment list --status addressed",
             "dv comment show <thread-id>",
-            "dv comment reply <thread-id> --author <agent> --body-file -",
-            "dv comment address <thread-id> --author <agent> --note 'Cache lookup moved into getUser'",
-            "dv comment reply <thread-id> --author <agent> --body-file -",
-            "dv review done <review-id> --round <n> --author <agent> --note-file -",
+            "dv comment reply <thread-id> --author <agent> --model '<model>' --body-file -",
+            "dv comment address <thread-id> --author <agent> --model '<model>' --note 'Cache lookup moved into getUser'",
+            "dv comment reply <thread-id> --author <agent> --model '<model>' --body-file -",
+            "dv review done <review-id> --round <n> --author <agent> --model '<model>' --note-file -",
             "dv review wait <review-id> --timeout 600 --json",
             "dv review show <review-id> --json",
-            "dv comment add --file src/app.ts --lines 10:12 --author <agent> --body-file -",
-            "dv comment add --file src/app.ts --author <agent> --body-file -",
-            "dv review new --author <agent> --json",
-            "dv comment annotate --review <review-id> --author <agent> --file src/app.ts --lines 10:12 --body-file -",
-            "dv comment annotate --review <review-id> --author <agent> --file src/app.ts --body-file -",
-            "dv review done <review-id> --author <agent> --note-file -",
-            "dv comment edit <thread-id> --author <agent> --body-file -",
-            "dv comment delete <thread-id> --author <agent>",
+            "dv comment add --file src/app.ts --lines 10:12 --author <agent> --model '<model>' --body-file -",
+            "dv comment add --file src/app.ts --author <agent> --model '<model>' --body-file -",
+            "dv review new --author <agent> --model '<model>' --json",
+            "dv comment annotate --review <review-id> --author <agent> --model '<model>' --file src/app.ts --lines 10:12 --body-file -",
+            "dv comment annotate --review <review-id> --author <agent> --model '<model>' --file src/app.ts --body-file -",
+            "dv review done <review-id> --author <agent> --model '<model>' --note-file -",
+            "dv comment edit <thread-id> --author <agent> --model '<model>' --body-file -",
+            "dv comment delete <thread-id> --author <agent> --model '<model>'",
         ],
         "the test below runs each of these in turn; update it with the skill"
     );
@@ -316,7 +322,11 @@ fn the_loop_the_skill_teaches_runs() {
     );
     let answered = loaded.thread(&id).unwrap();
     assert_eq!(answered.state, ThreadState::Addressed);
-    assert_eq!(answered.replies[0].author, Author::agent("claude-code"));
+    // What it wrote carries the model it named, quoted as the skill writes it.
+    assert_eq!(
+        answered.replies[0].author,
+        Author::agent("claude-code").with_model(MODEL)
+    );
     assert_eq!(
         answered.replies[0].body,
         "Moved the cache lookup into `getUser` and covered the miss path with a test."
@@ -395,7 +405,10 @@ fn the_loop_the_skill_teaches_runs() {
     );
     let replies = &loaded.thread(&id).unwrap().replies;
     assert_eq!(replies.last().unwrap().body, "Renamed the helper as asked.");
-    assert_eq!(replies.last().unwrap().author, Author::agent("codex"));
+    assert_eq!(
+        replies.last().unwrap().author,
+        Author::agent("codex").with_model(MODEL)
+    );
     assert_eq!(loaded.status, ReviewStatus::InProgress);
     // 4. Hand round 3 back, with a Markdown list for a note, piped in.
     run_with(7, &thread, "claude-code", worked_on);
@@ -441,7 +454,7 @@ fn the_hand_over_the_skill_teaches_runs() {
     let loaded = fixture.load(&review);
     let [on_lines, on_file] = [&loaded.threads[0], &loaded.threads[1]];
     assert_eq!(on_lines.state, ThreadState::Annotation);
-    assert_eq!(on_lines.author, Author::agent("codex"));
+    assert_eq!(on_lines.author, Author::agent("codex").with_model(MODEL));
     assert_eq!(
         (on_lines.anchor.start_line, on_lines.anchor.end_line),
         (10, 12)

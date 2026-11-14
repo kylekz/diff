@@ -3,8 +3,8 @@
 //! beside the GUI's options and `dv open`, so `dv --help` lists every command; [`Cli`] is the
 //! same tree without the GUI, which tests and [`crate::main_with`] parse.
 //!
-//! No argument here reads the environment through clap: `$DV_REVIEW`, `$DV_AUTHOR` and
-//! `CLAUDECODE` come from [`crate::Context`], so a command run in-process sees exactly the
+//! No argument here reads the environment through clap: `$DV_REVIEW`, `$DV_AUTHOR`,
+//! `$DV_MODEL` and `CLAUDECODE` come from [`crate::Context`], so a command run in-process sees exactly the
 //! environment its caller gives it.
 
 use std::path::PathBuf;
@@ -38,6 +38,11 @@ pub struct GlobalArgs {
     /// under Claude Code, else the reviewer, by git's user.name]
     #[arg(long, global = true, value_name = "NAME")]
     pub author: Option<String>,
+
+    /// The model the agent runs on, as it names itself ("Claude Fable 5.2"), shown beside
+    /// what it writes [default: $DV_MODEL]
+    #[arg(long, global = true, value_name = "MODEL")]
+    pub model: Option<String>,
 }
 
 /// dv's headless commands on their own: the tree [`crate::main_with`] parses. The `dv` binary

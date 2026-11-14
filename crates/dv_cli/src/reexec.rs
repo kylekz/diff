@@ -33,7 +33,7 @@
 //!   which must be UTF-8: checked here, so the error names the file) and handed to the child's
 //!   stdin as `-`, so a Windows path works and the second run after an install loses nothing;
 //!   with nothing to read the child's stdin is empty.
-//! - **Who it acts as** crosses too: `CLAUDECODE`, `DV_AUTHOR` and `DV_REVIEW`, those set, join
+//! - **Who it acts as** crosses too: `CLAUDECODE`, `DV_AUTHOR`, `DV_MODEL` and `DV_REVIEW`, those set, join
 //!   `WSLENV` as `NAME/u` after whatever else it lists, replacing an entry it has for the same
 //!   name in any case or with other flags, so each crosses verbatim ([`environment`]).
 //! - **Missing pieces:** the build not installed there (`RUN`'s 120) is installed
@@ -63,9 +63,9 @@ use crate::error::{CliError, Exit, code};
 use crate::output;
 use crate::repo;
 
-/// The variables that cross into the distro with a command: who it acts as and which review it
-/// means (PLAN §2.5, §10.2).
-pub(crate) const CROSSING: [&str; 3] = ["CLAUDECODE", "DV_AUTHOR", "DV_REVIEW"];
+/// The variables that cross into the distro with a command: who it acts as, on which model,
+/// and which review it means (PLAN §2.5, §10.2).
+pub(crate) const CROSSING: [&str; 4] = ["CLAUDECODE", "DV_AUTHOR", "DV_MODEL", "DV_REVIEW"];
 
 /// The distro and path of the repository `command` runs on when it runs inside a WSL distro
 /// (module docs); `None` when it runs here.

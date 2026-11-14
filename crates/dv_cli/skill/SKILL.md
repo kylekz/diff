@@ -22,6 +22,10 @@ approves.
 - Pass `--author <agent>` on every command that writes, `<agent>` being your own name:
   `claude-code` for Claude Code, `codex` for Codex. Claude Code is recognised without it; say it
   anyway. The commands below write `<agent>` where your name goes.
+- Pass `--model '<model>'` beside it, `<model>` being the model you run on, by the name your
+  own instructions give it: `'Claude Fable 5.2'`, `'GPT 6.1 Sol'`. dv shows it beside what you
+  write, with that model family's mark. Write the name as you were told it, never a guess:
+  when nothing tells you which model you are, leave `--model` out.
 - A number in front of a line of a thread's code is that line's number now. Act on those, never
   on the numbers in a thread's header ("moved from", "was", or the number of a thread marked
   `(old)`, which counts the file as it was before the change), nor on numbers you read before
@@ -127,10 +131,10 @@ dv comment list --status addressed
 
 ```sh
 dv comment show <thread-id>
-dv comment reply <thread-id> --author <agent> --body-file - <<'EOF'
+dv comment reply <thread-id> --author <agent> --model '<model>' --body-file - <<'EOF'
 Moved the cache lookup into `getUser` and covered the miss path with a test.
 EOF
-dv comment address <thread-id> --author <agent> --note 'Cache lookup moved into getUser'
+dv comment address <thread-id> --author <agent> --model '<model>' --note 'Cache lookup moved into getUser'
 ```
 
 In PowerShell, pipe a here-string instead of the heredoc. In Windows PowerShell 5.1, set
@@ -142,7 +146,7 @@ and any other text that isn't ASCII comes out garbled:
 ```powershell
 @'
 Renamed the helper as asked.
-'@ | dv comment reply <thread-id> --author <agent> --body-file -
+'@ | dv comment reply <thread-id> --author <agent> --model '<model>' --body-file -
 ```
 
 4. When every open thread is answered and addressed (save your own questions still waiting for
@@ -153,7 +157,7 @@ Renamed the helper as asked.
    round finished yet, leave `--round` out):
 
 ```sh
-dv review done <review-id> --round <n> --author <agent> --note-file - <<'EOF'
+dv review done <review-id> --round <n> --author <agent> --model '<model>' --note-file - <<'EOF'
 - Moved the cache lookup into `getUser`
 - Covered the miss path with a test
 EOF
@@ -189,10 +193,10 @@ Exit code 3 means the timeout passed first: run it again, or tell the user you a
 
 ```sh
 dv review show <review-id> --json
-dv comment add --file src/app.ts --lines 10:12 --author <agent> --body-file - <<'EOF'
+dv comment add --file src/app.ts --lines 10:12 --author <agent> --model '<model>' --body-file - <<'EOF'
 Is this branch still reachable?
 EOF
-dv comment add --file src/app.ts --author <agent> --body-file - <<'EOF'
+dv comment add --file src/app.ts --author <agent> --model '<model>' --body-file - <<'EOF'
 Should this module be split in two?
 EOF
 ```
@@ -210,7 +214,7 @@ Do this once the code is final. An annotation sits on the lines as they are when
 and one whose code you rewrite afterwards can't be shown any more.
 
 ```sh
-dv review new --author <agent> --json
+dv review new --author <agent> --model '<model>' --json
 ```
 
 This opens the review of the working tree's changes, or resumes the one already open; add
@@ -223,10 +227,10 @@ Annotate what the reviewer would otherwise have to ask about, on the lines it co
 without `--lines` on why a whole file changed:
 
 ```sh
-dv comment annotate --review <review-id> --author <agent> --file src/app.ts --lines 10:12 --body-file - <<'EOF'
+dv comment annotate --review <review-id> --author <agent> --model '<model>' --file src/app.ts --lines 10:12 --body-file - <<'EOF'
 Reads through the cache first: this query ran on every request, and writes invalidate the entry.
 EOF
-dv comment annotate --review <review-id> --author <agent> --file src/app.ts --body-file - <<'EOF'
+dv comment annotate --review <review-id> --author <agent> --model '<model>' --file src/app.ts --body-file - <<'EOF'
 Split out of `api.ts` so the cache can be tested without the server.
 EOF
 ```
@@ -246,7 +250,7 @@ The overview belongs in the hand-over's note, not in an annotation. Hand the rev
 step 4, without `--round` (no round has been finished yet), then wait as in step 5:
 
 ```sh
-dv review done <review-id> --author <agent> --note-file - <<'EOF'
+dv review done <review-id> --author <agent> --model '<model>' --note-file - <<'EOF'
 - Reads users through a new cache, invalidated on write
 - Split the cache into its own module
 EOF
@@ -257,10 +261,10 @@ annotation` lists them. When the reviewer replies to one, it becomes an open thr
 like any other. To correct an annotation, or withdraw one that turned out wrong:
 
 ```sh
-dv comment edit <thread-id> --author <agent> --body-file - <<'EOF'
+dv comment edit <thread-id> --author <agent> --model '<model>' --body-file - <<'EOF'
 Reads through the cache first; writes invalidate the entry.
 EOF
-dv comment delete <thread-id> --author <agent>
+dv comment delete <thread-id> --author <agent> --model '<model>'
 ```
 
 In a later round, explain a fix in its thread's reply and note, not in an annotation: an

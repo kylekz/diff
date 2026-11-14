@@ -118,8 +118,23 @@ fn the_state_chip_names_who_addressed_a_thread() {
     });
     assert_eq!(state_label(&subject), "Addressed by claude-code");
     assert_eq!(state_note(&subject), Some("Capped at 1,000."));
+    // An agent that named its model shows by it.
+    subject.last_change.as_mut().unwrap().author =
+        Author::agent("claude-code").with_model("Claude Fable 5.2");
+    assert_eq!(state_label(&subject), "Addressed by Claude Fable 5.2");
     subject.state = ThreadState::Resolved;
     assert_eq!(state_label(&subject), "Resolved");
+}
+
+#[test]
+fn a_comments_tag_names_the_agent_behind_a_model() {
+    // Shown by its model, an agent is tagged with its own name; anyone else with their role.
+    let fable = Author::agent("claude-code").with_model("Claude Fable 5.2");
+    assert_eq!(crate::agents::shown_name(&fable), "Claude Fable 5.2");
+    assert_eq!(role_tag(&fable), "claude-code");
+    assert_eq!(role_tag(&Author::agent("codex")), "agent");
+    assert_eq!(role_tag(&Author::github("octocat")), "github");
+    assert_eq!(role_tag(&Author::reviewer("Kyle")), "reviewer");
 }
 
 #[test]

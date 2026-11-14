@@ -639,6 +639,16 @@ fn only_an_items_author_edits_or_deletes_it() {
     ));
 
     edit_body(&store, &id, &thread_item, "Typo here", &reviewer()).unwrap();
+    // The model an agent writes with is no part of who it is (PLAN §2.5): on another model
+    // it still edits what it wrote.
+    edit_body(
+        &store,
+        &id,
+        &reply_item,
+        "Fixed",
+        &agent().with_model("Claude Opus 5.5"),
+    )
+    .unwrap();
     edit_body(&store, &id, &reply_item, "Fixed in 3f2a", &agent()).unwrap();
     delete_item(&store, &id, &reply_item, &agent()).unwrap();
     assert!(matches!(

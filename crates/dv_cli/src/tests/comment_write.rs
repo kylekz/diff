@@ -15,6 +15,74 @@ fn last(fixture: &Fixture, id: &ReviewId) -> EventBody {
 }
 
 #[test]
+fn what_an_agent_writes_carries_the_model_it_names() {
+    let mut fixture = Fixture::new();
+    let review = fixture.review(Target::Working);
+    let thread = fixture.thread(&review, "src/app.ts", 10, 10, "Why a cache?");
+    fixture.finish(&review.id, Verdict::RequestChanges);
+    fixture.env.insert("CLAUDECODE".into(), "1".into());
+    fixture
+        .env
+        .insert("DV_MODEL".into(), "Claude Fable 5.2".into());
+
+    let json = fixture
+        .run(&[
+            "comment",
+            "reply",
+            thread.as_str(),
+            "--body",
+            "It halves the queries.",
+            "--json",
+        ])
+        .ok_json();
+    let fable = json!({"kind": "agent", "name": "claude-code", "model": "Claude Fable 5.2"});
+    assert_eq!(json["reply"]["author"], fable);
+    let loaded = fixture.load(&review.id);
+    assert_eq!(
+        loaded.thread(&thread).unwrap().replies[0].author,
+        Author::agent("claude-code").with_model("Claude Fable 5.2")
+    );
+    // The automatic `in_progress` is the same agent's, model and all.
+    assert_eq!(
+        loaded.status_change.unwrap().author,
+        Some(Author::agent("claude-code").with_model("Claude Fable 5.2"))
+    );
+
+    // On another model it is still the reply's author: it edits it, and the thread's state
+    // change says which model made it.
+    let json = fixture
+        .run(&[
+            "comment",
+            "address",
+            thread.as_str(),
+            "--note",
+            "Kept, with a cap.",
+            "--model",
+            "Claude Opus 5.5",
+            "--json",
+        ])
+        .ok_json();
+    assert_eq!(json["thread"]["author"]["kind"], "reviewer");
+    assert_eq!(
+        fixture
+            .load(&review.id)
+            .thread(&thread)
+            .unwrap()
+            .last_change
+            .as_ref()
+            .unwrap()
+            .author,
+        Author::agent("claude-code").with_model("Claude Opus 5.5")
+    );
+    assert_eq!(
+        fixture
+            .run(&["comment", "show", thread.as_str(), "--json"])
+            .ok_json()["thread"]["replies"][0]["author"],
+        fable
+    );
+}
+
+#[test]
 fn an_agent_answers_a_thread_and_each_write_is_its_event() {
     let mut fixture = Fixture::new();
     let review = fixture.review(Target::Working);
@@ -38,7 +106,7 @@ fn an_agent_answers_a_thread_and_each_write_is_its_event() {
     assert_eq!(json["reply"]["body"], "It halves the queries.");
     assert_eq!(
         json["reply"]["author"],
-        json!({"kind": "agent", "name": "codex"})
+        json!({"kind": "agent", "name": "codex", "model": null})
     );
     assert_eq!(json["thread"]["id"], thread.as_str());
     assert_eq!(json["thread"]["replies"][0]["id"], json["reply"]["id"]);
@@ -271,7 +339,7 @@ fn comment_add_anchors_on_the_side_as_it_is_now() {
     assert_eq!(thread["code"], edited_lines()[9..12].join("\n"));
     assert_eq!(
         thread["author"],
-        json!({"kind": "reviewer", "name": "dv fixture"})
+        json!({"kind": "reviewer", "name": "dv fixture", "model": null})
     );
     match last(&fixture, &review.id) {
         EventBody::ThreadAdded { anchor, author, .. } => {

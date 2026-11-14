@@ -794,7 +794,7 @@ fn check_item_author(
     verb: &str,
 ) -> Result<(), OpError> {
     match state.item_author(item) {
-        Some(author) if author != actor => Err(OpError::NotAllowed {
+        Some(author) if !author.is(actor) => Err(OpError::NotAllowed {
             actor: actor.kind,
             action: format!("{verb} {item}, written by {} {}", author.kind, author.name),
         }),

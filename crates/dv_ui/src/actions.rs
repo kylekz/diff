@@ -114,6 +114,9 @@ pub mod switcher {
             Confirm,
             /// Remove the selected row's repository from the list (`Ctrl Shift Backspace`).
             RemoveRepo,
+            /// Ask whether to close the selected row's review (`Ctrl Shift W`); `Enter` then
+            /// closes it.
+            CloseReview,
             /// Close without opening anything (`Esc`).
             Dismiss,
         ]

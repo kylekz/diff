@@ -144,7 +144,7 @@ fn done_hands_the_round_back_with_a_note() {
         json!({
             "status": "ready",
             "note": "All **fixed**.\nSee the replies.",
-            "author": {"kind": "agent", "name": "claude-code"},
+            "author": {"kind": "agent", "name": "claude-code", "model": null},
             "at": at,
         })
     );

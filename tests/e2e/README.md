@@ -511,6 +511,29 @@ log), `${dv_mock_lsp}` (the `mock_lsp` a header's `lsp` runs),
 `${dv_mock_lsp_log}` (its log) and, with a `gh` header, `${dv_mock_gh}` (the
 absolute path of its file), e.g. `"path": "${workspace}/tests/fixtures/repos/crlf"`.
 
+### What holds on every platform
+
+CI runs every scenario on Windows, Linux and macOS, and a scenario stops at its
+first failure, so what an expectation assumes about one platform is found out
+one failure at a time.
+
+- **A path the app reports** is spelled as the platform spells it
+  (`D:\…\repos\api` on Windows). An expectation names a seeded repository by
+  the path its `seed_repo` replied (`"save": {"api": "/path"}`, then `${api}`),
+  never by `${data_dir}/repos/api`, which only a command takes.
+- **A `bounds` value is exact only where it is a layout constant**: a height,
+  a padding, a fixed or minimum width. A width that holds text is a range, and
+  wider off macOS (Segoe UI on Windows; on Linux the system's font, DejaVu Sans
+  in CI; keycaps that read `Ctrl R`): add `"platforms"` lines rather than
+  loosen macOS's.
+- **gpui snaps to device pixels.** What is centred an odd number of pixels
+  from a whole one (a 28-high button in the title bar above its hairline) sits
+  a pixel apart between a display at 100% (the Linux run, CI's Windows) and one
+  at 200%: a range of the two values, exact on macOS.
+- **The Linux run has no caption buttons** (above), so its title bar has
+  macOS's room at the right and Windows' at the left. Whether something fits
+  there turns on the font: assert it on Linux only where the margin is wide.
+
 ### `mock_gh` scenario files
 
 A header's `gh` file tells `mock_gh` (`crates/mock_gh`, PLAN §14.2, the

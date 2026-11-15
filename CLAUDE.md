@@ -129,7 +129,7 @@ and a gpui bump starts there. Don't guess APIs: grep the sources under
   --publish`: it writes `target/package/releases`, the feed the owner's installed copy updates
   from, so any release there reaches his app; an agent's run is a trial (`target/package/try`).
 - **Live checks are the owner's.** `DV_LIVE_WSL=1` and `DV_LIVE_GH=1` (PLAN §14.3) touch a real
-  distro's home and the `kylekz/difftest` repo; no agent, script or scenario sets them.
+  distro's home and a real GitHub repository; no agent, script or scenario sets them.
 - **The owner's WSL home is off limits.** Nothing an agent, a test or a script runs installs
   into, writes or deletes anything under the distro home's `~/.local/bin/dv`,
   `~/.local/share/dv/**` or `~/.claude` / `~/.agents` / `~/.codex` (the first implementation's

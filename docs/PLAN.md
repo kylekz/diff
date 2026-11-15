@@ -2441,12 +2441,14 @@ branches) is drawn with §10.3's escapes, at most its first 300 characters hande
   "Start round 2" and its interdiff; and the failure states (not authenticated, a 422 on one
   comment then Retry, rate limited, the PR moved before submitting, a pending review on GitHub).
 - **The owner's live check** (`DV_LIVE_GH=1`, §14.3) **isn't written yet**: it is §9.12
-  step 7's, to be `crates/dv_cli/tests/live_gh.rs`, `#[ignore]`, against `kylekz/difftest`
+  step 7's, to be `crates/dv_cli/tests/live_gh.rs`, `#[ignore]`, against a GitHub repository
   and a PR the owner keeps open for it, in a scratch clone: open, refresh, draft a line
   comment, a file comment and a reply to an existing thread, submit as Comment, then read the
   review back from GitHub; mark a file viewed and back; resolve and unresolve a thread. It
-  is what confirms the points marked *(live check)* above and §9.13's list; until it has
-  run, nothing has. No agent runs it.
+  is what confirms the points marked *(live check)* above and §9.13's list. Until it is
+  written, the owner checks the read side by hand, opening real pull requests in a released
+  build: the read side only reads GitHub, but for Resolve and Unresolve. No agent runs
+  either.
 
 ### 9.12 Order within phase 8
 Two cuts. **The read side** (steps 1–4) opens a PR and shows everything GitHub holds about it;
@@ -4138,7 +4140,7 @@ with and without its bytes, only looked at, read past what was asked, a director
 
 ### 14.3 Owner-only live checks
 `DV_LIVE_WSL=1` and `DV_LIVE_GH=1` (§9.11: open, reply, resolve, Viewed and submit a review on
-`kylekz/difftest`; that check isn't written yet, and nothing reads `DV_LIVE_GH` until it is:
+a GitHub repository the owner keeps for it; that check isn't written yet, and nothing reads `DV_LIVE_GH` until it is:
 §9.12 step 7, §9.13). No agent, script or CI run sets these.
 
 The live WSL check is `crates/dv_backend/tests/live_wsl.rs`, `#[ignore]` and inert without

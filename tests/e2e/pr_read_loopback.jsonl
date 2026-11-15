@@ -1,8 +1,8 @@
 {"scenario": {"window_size": "1440x900", "gh": "../fixtures/gh/pr_read.json", "description": "The read side of a pull request in a repository reached through `dv backend --stdio` (PLAN §9.9, §5.1), as a WSL repository's is: the clone's GitHub name is read from its remotes over the connection, beside its listing, and remembered; Ctrl G lists its open pull requests (gh on the app's side, the remotes read where the repository lives) and Enter opens pull request 7; the strip counts the commits a refresh moved the review by (`git rev-list` over the wire) and its PR round from the store there; a pull request's URL typed into Ctrl K finds the clone from the remembered name alone."}}
 {"cmd": "wait_ready", "timeout_ms": 20000}
-{"cmd": "seed_repo", "name": "api", "backend": "loopback", "github": [{"branch": "feat"}, {"checkout": "feat"}, {"write": "src/lib.rs", "text": "pub fn answer() -> u32 {\n    42\n}\n"}, {"commit": "Add the answer"}, {"pr": [7, "feat"]}], "save": {"head": "/github/prs/7"}, "expect_result": {"pointer": "/github/prs/7", "equals": "5746f3cb7598128a528c413ffe03e23666d1e9d6"}}
-{"cmd": "open_review", "path": "${data_dir}/repos/api"}
-{"cmd": "settle", "timeout_ms": 20000, "expect": [{"pointer": "/backends/0/name", "equals": "loopback"}, {"pointer": "/backends/0/state", "equals": "connected"}, {"pointer": "/shell/repo_in_view", "equals": "${data_dir}/repos/api"}, {"pointer": "/repos/0/github", "equals": {"host": "github.com", "owner": "dv-fixture", "repo": "api"}}]}
+{"cmd": "seed_repo", "name": "api", "backend": "loopback", "github": [{"branch": "feat"}, {"checkout": "feat"}, {"write": "src/lib.rs", "text": "pub fn answer() -> u32 {\n    42\n}\n"}, {"commit": "Add the answer"}, {"pr": [7, "feat"]}], "save": {"api": "/path", "head": "/github/prs/7"}, "expect_result": {"pointer": "/github/prs/7", "equals": "5746f3cb7598128a528c413ffe03e23666d1e9d6"}}
+{"cmd": "open_review", "path": "${api}"}
+{"cmd": "settle", "timeout_ms": 20000, "expect": [{"pointer": "/backends/0/name", "equals": "loopback"}, {"pointer": "/backends/0/state", "equals": "connected"}, {"pointer": "/shell/repo_in_view", "equals": "${api}"}, {"pointer": "/repos/0/github", "equals": {"host": "github.com", "owner": "dv-fixture", "repo": "api"}}]}
 {"gh_log": {}, "expect_result": {"pointer": "", "len": 0}}
 
 // Ctrl G: the list, then pull request 7 opened from it.

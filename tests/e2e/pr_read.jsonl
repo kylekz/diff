@@ -5,15 +5,15 @@
 
 // Three clones of fixture GitHub repositories, each with one pull request, and a repository
 // that isn't on GitHub.
-{"cmd": "seed_repo", "name": "api", "github": [{"branch": "feat"}, {"checkout": "feat"}, {"write": "src/lib.rs", "text": "pub fn answer() -> u32 {\n    42\n}\n"}, {"commit": "Add the answer"}, {"pr": [7, "feat"]}], "save": {"head": "/github/prs/7"}, "expect_result": {"pointer": "/github/prs/7", "equals": "5746f3cb7598128a528c413ffe03e23666d1e9d6"}}
-{"cmd": "seed_repo", "name": "web", "github": [{"branch": "fix"}, {"checkout": "fix"}, {"write": "src/app.ts", "text": "export const port = 8080;\n"}, {"commit": "Serve on 8080"}, {"pr": [3, "fix"]}], "expect_result": {"pointer": "/github/prs/3", "equals": "797f864d54c21b95b3eddbfc15fa58c34bb2d559"}}
-{"cmd": "seed_repo", "name": "docs", "github": [{"branch": "guide"}, {"checkout": "guide"}, {"write": "guide.md", "text": "# Guide\n\nStart here.\n"}, {"commit": "Add the guide"}, {"pr": [2, "guide"]}], "expect_result": {"pointer": "/github/prs/2", "equals": "214a26838092107cd57cf3d667b4dfdbc0a7920e"}}
-{"cmd": "seed_repo", "name": "plain", "steps": [{"write": "a.txt", "text": "a\n"}, {"commit": "base"}, {"write": "a.txt", "text": "b\n"}]}
+{"cmd": "seed_repo", "name": "api", "github": [{"branch": "feat"}, {"checkout": "feat"}, {"write": "src/lib.rs", "text": "pub fn answer() -> u32 {\n    42\n}\n"}, {"commit": "Add the answer"}, {"pr": [7, "feat"]}], "save": {"api": "/path", "head": "/github/prs/7"}, "expect_result": {"pointer": "/github/prs/7", "equals": "5746f3cb7598128a528c413ffe03e23666d1e9d6"}}
+{"cmd": "seed_repo", "name": "web", "github": [{"branch": "fix"}, {"checkout": "fix"}, {"write": "src/app.ts", "text": "export const port = 8080;\n"}, {"commit": "Serve on 8080"}, {"pr": [3, "fix"]}], "expect_result": {"pointer": "/github/prs/3", "equals": "797f864d54c21b95b3eddbfc15fa58c34bb2d559"}, "save": {"web": "/path"}}
+{"cmd": "seed_repo", "name": "docs", "github": [{"branch": "guide"}, {"checkout": "guide"}, {"write": "guide.md", "text": "# Guide\n\nStart here.\n"}, {"commit": "Add the guide"}, {"pr": [2, "guide"]}], "expect_result": {"pointer": "/github/prs/2", "equals": "214a26838092107cd57cf3d667b4dfdbc0a7920e"}, "save": {"docs": "/path"}}
+{"cmd": "seed_repo", "name": "plain", "steps": [{"write": "a.txt", "text": "a\n"}, {"commit": "base"}, {"write": "a.txt", "text": "b\n"}], "save": {"plain": "/path"}}
 
 // api's working review is open: api is the repository in view. web is a known repository too.
-{"cmd": "open_review", "path": "${data_dir}/repos/api"}
-{"cmd": "settle", "timeout_ms": 20000, "expect": [{"pointer": "/shell/repo_in_view", "equals": "${data_dir}/repos/api"}, {"pointer": "/pr_strip", "equals": null}, {"pointer": "/pr_picker/open", "equals": false}]}
-{"cmd": "open", "path": "${data_dir}/repos/web"}
+{"cmd": "open_review", "path": "${api}"}
+{"cmd": "settle", "timeout_ms": 20000, "expect": [{"pointer": "/shell/repo_in_view", "equals": "${api}"}, {"pointer": "/pr_strip", "equals": null}, {"pointer": "/pr_picker/open", "equals": false}]}
+{"cmd": "open", "path": "${web}"}
 {"cmd": "settle", "timeout_ms": 20000, "expect": {"pointer": "/switcher/open", "equals": true}}
 {"cmd": "key", "keystroke": "escape"}
 // Each clone's GitHub name was read beside its listing, from its remotes alone.
@@ -22,13 +22,16 @@
 
 // Ctrl G: api's open pull requests, the one asking for the viewer's review first.
 {"cmd": "key", "keystroke": "secondary-g"}
-{"cmd": "settle", "timeout_ms": 20000, "expect": [{"pointer": "/pr_picker/open", "equals": true}, {"pointer": "/pr_picker/focused", "equals": true}, {"pointer": "/pr_picker/repo", "equals": "${data_dir}/repos/api"}, {"pointer": "/pr_picker/github", "equals": "dv-fixture/api"}, {"pointer": "/pr_picker/list", "equals": "listed"}, {"pointer": "/pr_picker/loading", "equals": false}, {"pointer": "/pr_picker/listed", "equals": 4}, {"pointer": "/pr_picker/failure", "equals": null}, {"pointer": "/pr_picker/selected", "equals": "pr/7"}]}
+{"cmd": "settle", "timeout_ms": 20000, "expect": [{"pointer": "/pr_picker/open", "equals": true}, {"pointer": "/pr_picker/focused", "equals": true}, {"pointer": "/pr_picker/repo", "equals": "${api}"}, {"pointer": "/pr_picker/github", "equals": "dv-fixture/api"}, {"pointer": "/pr_picker/list", "equals": "listed"}, {"pointer": "/pr_picker/loading", "equals": false}, {"pointer": "/pr_picker/listed", "equals": 4}, {"pointer": "/pr_picker/failure", "equals": null}, {"pointer": "/pr_picker/selected", "equals": "pr/7"}]}
 {"cmd": "state", "expect": [{"pointer": "/pr_picker/rows", "len": 4}, {"pointer": "/pr_picker/rows/0", "contains": {"key": "pr/7", "kind": "listed", "number": 7, "title": "Add the answer", "author": "octocat", "draft": false, "review_requested": true}}, {"pointer": "/pr_picker/rows/1", "contains": {"key": "pr/12", "review_requested": false}}, {"pointer": "/pr_picker/rows/2", "contains": {"key": "pr/9", "draft": true}}, {"pointer": "/pr_picker/rows/3", "contains": {"key": "pr/4", "author": "dependabot"}}]}
 // The picker hangs 8 under the PRs button, from its right edge (DESIGN §4.5): on macOS, where
-// nothing stands right of the button but the menu, both end at 1404.
+// nothing stands right of the button but the menu, both end at 1404. The button is centred
+// in the bar above its hairline, half a pixel off a whole one: where a logical pixel is one
+// device pixel (the Linux run, a Windows display at 100%) it sits a pixel higher, and the
+// picker with it.
 {"cmd": "bounds", "target": "titlebar/prs", "expect_result": [{"pointer": "/visible/w", "gte": 70}, {"pointer": "/visible/w", "lte": 130}, {"pointer": "/visible/h", "equals": 28}]}
-{"cmd": "bounds", "target": "pr_picker", "expect_result": [{"pointer": "/visible/y", "equals": 42}, {"pointer": "/visible/w", "equals": 560}]}
-{"cmd": "bounds", "target": "pr_picker", "platforms": ["macos"], "expect_result": {"pointer": "/visible/x", "equals": 844}}
+{"cmd": "bounds", "target": "pr_picker", "expect_result": [{"pointer": "/visible/y", "gte": 41}, {"pointer": "/visible/y", "lte": 42}, {"pointer": "/visible/w", "equals": 560}]}
+{"cmd": "bounds", "target": "pr_picker", "platforms": ["macos"], "expect_result": [{"pointer": "/visible/x", "equals": 844}, {"pointer": "/visible/y", "equals": 42}]}
 {"cmd": "bounds", "target": "titlebar/prs", "platforms": ["macos"], "expect_result": [{"pointer": "/visible/x", "equals": 1312}, {"pointer": "/visible/w", "equals": 92}]}
 {"cmd": "screenshot", "name": "pr-picker"}
 {"gh_log": {}, "expect_result": [{"pointer": "", "len": 2}, {"pointer": "/0/argv/0", "equals": "pr"}, {"pointer": "/0/argv/1", "equals": "list"}, {"pointer": "/1/argv/3", "equals": "review-requested:@me"}]}
@@ -37,7 +40,7 @@
 // of one dv doesn't know.
 {"cmd": "type", "text": "config", "expect": [{"pointer": "/pr_picker/rows", "len": 1}, {"pointer": "/pr_picker/rows/0/key", "equals": "pr/12"}]}
 {"cmd": "keys", "keys": "backspace backspace backspace backspace backspace backspace"}
-{"cmd": "type", "text": "#9", "expect": [{"pointer": "/pr_picker/rows", "len": 1}, {"pointer": "/pr_picker/rows/0", "equals": {"key": "open/api", "kind": "reference", "name": "dv-fixture/api#9", "title": "Stream the response body instead of buffering all of it in memory first", "clone": null, "repo": "${data_dir}/repos/api"}}]}
+{"cmd": "type", "text": "#9", "expect": [{"pointer": "/pr_picker/rows", "len": 1}, {"pointer": "/pr_picker/rows/0", "equals": {"key": "open/api", "kind": "reference", "name": "dv-fixture/api#9", "title": "Stream the response body instead of buffering all of it in memory first", "clone": null, "repo": "${api}"}}]}
 {"cmd": "keys", "keys": "backspace backspace"}
 {"cmd": "type", "text": "dv-fixture/web#3", "expect": [{"pointer": "/pr_picker/rows", "len": 1}, {"pointer": "/pr_picker/rows/0", "contains": {"key": "open/web", "kind": "reference", "name": "dv-fixture/web#3", "clone": "web"}}]}
 {"cmd": "screenshot", "name": "pr-picker-other-repository"}
@@ -112,7 +115,7 @@
 {"cmd": "screenshot", "name": "palette-pr-url"}
 {"cmd": "key", "keystroke": "enter"}
 {"cmd": "wait_for", "pointer": "/session/pr/number", "equals": 3, "timeout_ms": 20000}
-{"cmd": "settle", "timeout_ms": 20000, "expect": [{"pointer": "/palette/open", "equals": false}, {"pointer": "/shell/banner", "equals": null}, {"pointer": "/shell/repo_in_view", "equals": "${data_dir}/repos/web"}, {"pointer": "/pr_strip/number", "equals": 3}, {"pointer": "/pr_strip/title", "equals": "Serve on 8080"}, {"pointer": "/pr_strip/author", "equals": "mona"}, {"pointer": "/pr_strip/branches", "equals": "main ← fix"}, {"pointer": "/pr_strip/checks", "equals": {"passing": 0, "failing": 0, "pending": 0}}, {"pointer": "/pr_strip/round", "equals": 1}]}
+{"cmd": "settle", "timeout_ms": 20000, "expect": [{"pointer": "/palette/open", "equals": false}, {"pointer": "/shell/banner", "equals": null}, {"pointer": "/shell/repo_in_view", "equals": "${web}"}, {"pointer": "/pr_strip/number", "equals": 3}, {"pointer": "/pr_strip/title", "equals": "Serve on 8080"}, {"pointer": "/pr_strip/author", "equals": "mona"}, {"pointer": "/pr_strip/branches", "equals": "main ← fix"}, {"pointer": "/pr_strip/checks", "equals": {"passing": 0, "failing": 0, "pending": 0}}, {"pointer": "/pr_strip/round", "equals": 1}]}
 // `#n` names the repository in view; a bare number is a search.
 {"cmd": "key", "keystroke": "secondary-k"}
 {"cmd": "type", "text": "#3", "expect": [{"pointer": "/palette/rows/0", "equals": {"key": "pr/web", "section": "pull_request", "label": "Open pull request dv-fixture/web#3"}}]}
@@ -127,21 +130,21 @@
 {"cmd": "type", "text": "dv-fixture/docs#2", "expect": [{"pointer": "/palette/rows", "len": 1}, {"pointer": "/palette/rows/0", "equals": {"key": "pr/choose_folder", "section": "pull_request", "label": "dv-fixture/docs isn't open in dv yet"}}]}
 {"cmd": "key", "keystroke": "enter"}
 {"cmd": "settle", "expect": [{"pointer": "/palette/open", "equals": true}, {"pointer": "/palette/notice", "equals": null}, {"pointer": "/system/requests/2", "equals": {"kind": "pick_folder", "prompt": "Choose its folder"}}]}
-{"cmd": "folder_answer", "path": "${data_dir}/repos/api", "expect_result": {"pointer": "/answers_left", "equals": 1}}
+{"cmd": "folder_answer", "path": "${api}", "expect_result": {"pointer": "/answers_left", "equals": 1}}
 {"cmd": "key", "keystroke": "enter"}
-{"cmd": "settle", "timeout_ms": 20000, "expect": [{"pointer": "/palette/open", "equals": true}, {"pointer": "/palette/notice", "equals": "`${data_dir}/repos/api` is dv-fixture/api, not dv-fixture/docs"}, {"pointer": "/repos", "len": 2}]}
+{"cmd": "settle", "timeout_ms": 20000, "expect": [{"pointer": "/palette/open", "equals": true}, {"pointer": "/palette/notice", "equals": "`${api}` is dv-fixture/api, not dv-fixture/docs"}, {"pointer": "/repos", "len": 2}]}
 {"cmd": "screenshot", "name": "palette-folder-refused"}
 {"cmd": "folder_answer", "path": "${data_dir}"}
 {"cmd": "key", "keystroke": "enter"}
 {"cmd": "settle", "timeout_ms": 20000, "expect": {"pointer": "/palette/notice", "equals": "`${data_dir}` isn't a git repository"}}
-{"cmd": "folder_answer", "path": "${data_dir}/repos/plain"}
+{"cmd": "folder_answer", "path": "${plain}"}
 {"cmd": "key", "keystroke": "enter"}
-{"cmd": "settle", "timeout_ms": 20000, "expect": [{"pointer": "/palette/notice", "equals": "`${data_dir}/repos/plain`: this repository has no remotes"}, {"pointer": "/repos", "len": 2}, {"pointer": "/session/pr/number", "equals": 3}]}
+{"cmd": "settle", "timeout_ms": 20000, "expect": [{"pointer": "/palette/notice", "equals": "`${plain}`: this repository has no remotes"}, {"pointer": "/repos", "len": 2}, {"pointer": "/session/pr/number", "equals": 3}]}
 // Its clone: the pull request opens there, and the clone is a known repository from now on.
-{"cmd": "folder_answer", "path": "${data_dir}/repos/docs"}
+{"cmd": "folder_answer", "path": "${docs}"}
 {"cmd": "key", "keystroke": "enter"}
 {"cmd": "wait_for", "pointer": "/session/pr/number", "equals": 2, "timeout_ms": 20000}
-{"cmd": "settle", "timeout_ms": 20000, "expect": [{"pointer": "/palette/open", "equals": false}, {"pointer": "/shell/banner", "equals": null}, {"pointer": "/shell/repo_in_view", "equals": "${data_dir}/repos/docs"}, {"pointer": "/pr_strip/title", "equals": "Add the guide"}, {"pointer": "/pr_strip/state", "equals": "Draft PR"}, {"pointer": "/repos", "len": 3}, {"pointer": "/repos", "contains": {"name": "docs", "github": {"host": "github.com", "owner": "dv-fixture", "repo": "docs"}}}]}
+{"cmd": "settle", "timeout_ms": 20000, "expect": [{"pointer": "/palette/open", "equals": false}, {"pointer": "/shell/banner", "equals": null}, {"pointer": "/shell/repo_in_view", "equals": "${docs}"}, {"pointer": "/pr_strip/title", "equals": "Add the guide"}, {"pointer": "/pr_strip/state", "equals": "Draft PR"}, {"pointer": "/repos", "len": 3}, {"pointer": "/repos", "contains": {"name": "docs", "github": {"host": "github.com", "owner": "dv-fixture", "repo": "docs"}}}]}
 
 // The picker says why it has no list: here gh isn't signed in (the fixture's answer for
 // docs). Its field works all the same: pull request 9 is asked for, and gh refusing it is the
@@ -152,18 +155,18 @@
 {"cmd": "type", "text": "9", "expect": [{"pointer": "/pr_picker/rows", "len": 1}, {"pointer": "/pr_picker/rows/0", "contains": {"key": "open/docs", "kind": "reference", "name": "dv-fixture/docs#9"}}]}
 {"cmd": "key", "keystroke": "enter"}
 {"cmd": "wait_for", "pointer": "/shell/banner/message", "equals": "couldn't open #9: gh isn't signed in to github.com: run `gh auth login`", "timeout_ms": 20000}
-{"cmd": "settle", "timeout_ms": 20000, "expect": [{"pointer": "/pr_picker/open", "equals": false}, {"pointer": "/shell/banner/retry", "equals": true}, {"pointer": "/session/pr/number", "equals": 2}, {"pointer": "/shell/repo_in_view", "equals": "${data_dir}/repos/docs"}]}
+{"cmd": "settle", "timeout_ms": 20000, "expect": [{"pointer": "/pr_picker/open", "equals": false}, {"pointer": "/shell/banner/retry", "equals": true}, {"pointer": "/session/pr/number", "equals": 2}, {"pointer": "/shell/repo_in_view", "equals": "${docs}"}]}
 {"cmd": "screenshot", "name": "pr-open-refused"}
 {"cmd": "click", "target": "banner/main/dismiss"}
 
 // A repository with no open pull requests, and one that isn't on GitHub.
-{"cmd": "open_pr", "path": "${data_dir}/repos/web", "pr": "#3", "expect_result": {"pointer": "/created", "equals": false}}
+{"cmd": "open_pr", "path": "${web}", "pr": "#3", "expect_result": {"pointer": "/created", "equals": false}}
 {"cmd": "settle", "timeout_ms": 20000}
 {"cmd": "key", "keystroke": "secondary-g"}
 {"cmd": "settle", "timeout_ms": 20000, "expect": [{"pointer": "/pr_picker/github", "equals": "dv-fixture/web"}, {"pointer": "/pr_picker/list", "equals": "empty"}, {"pointer": "/pr_picker/listed", "equals": 0}, {"pointer": "/pr_picker/failure", "equals": null}]}
 {"cmd": "key", "keystroke": "escape", "expect": {"pointer": "/pr_picker/open", "equals": false}}
-{"cmd": "open_review", "path": "${data_dir}/repos/plain"}
-{"cmd": "settle", "timeout_ms": 20000, "expect": [{"pointer": "/pr_strip", "equals": null}, {"pointer": "/shell/repo_in_view", "equals": "${data_dir}/repos/plain"}]}
+{"cmd": "open_review", "path": "${plain}"}
+{"cmd": "settle", "timeout_ms": 20000, "expect": [{"pointer": "/pr_strip", "equals": null}, {"pointer": "/shell/repo_in_view", "equals": "${plain}"}]}
 {"cmd": "click", "target": "titlebar/prs"}
 {"cmd": "settle", "timeout_ms": 20000, "expect": [{"pointer": "/pr_picker/open", "equals": true}, {"pointer": "/pr_picker/github", "equals": "plain"}, {"pointer": "/pr_picker/list", "equals": "failed"}, {"pointer": "/pr_picker/failure/kind", "equals": "not_on_github"}, {"pointer": "/pr_picker/failure/message", "equals": "this repository has no remotes"}]}
 {"cmd": "screenshot", "name": "pr-picker-not-on-github"}
@@ -171,7 +174,7 @@
 
 // The switcher lists each repository's PR reviews under "Pull requests", by number and title.
 {"cmd": "key", "keystroke": "secondary-o"}
-{"cmd": "settle", "timeout_ms": 20000, "expect": [{"pointer": "/switcher/items", "contains": {"kind": "pr", "label": "#7 Add the answer", "review": {"round": 1}, "repo": "${data_dir}/repos/api"}}, {"pointer": "/switcher/items", "contains": {"kind": "pr", "label": "#3 Serve on 8080", "review": {"round": 1}, "repo": "${data_dir}/repos/web"}}, {"pointer": "/switcher/items", "contains": {"kind": "pr", "label": "#2 Add the guide", "review": {"round": 1}, "repo": "${data_dir}/repos/docs"}}]}
+{"cmd": "settle", "timeout_ms": 20000, "expect": [{"pointer": "/switcher/items", "contains": {"kind": "pr", "label": "#7 Add the answer", "review": {"round": 1}, "repo": "${api}"}}, {"pointer": "/switcher/items", "contains": {"kind": "pr", "label": "#3 Serve on 8080", "review": {"round": 1}, "repo": "${web}"}}, {"pointer": "/switcher/items", "contains": {"kind": "pr", "label": "#2 Add the guide", "review": {"round": 1}, "repo": "${docs}"}}]}
 {"cmd": "screenshot", "name": "switcher-pull-requests"}
 // Typing its number and Enter opens that review. GitHub is slow to answer (the fixture's
 // delayed answer): the review shows what was last read of its pull request meanwhile (the
@@ -189,7 +192,7 @@
 // long title, login and branch and three kinds of checks; its review is closed, so it stays
 // at its head when the pull request moves on; and the refresh after that fails.
 {"cmd": "repo_edit", "name": "api", "github": [{"checkout": "main"}, {"branch": "cache"}, {"checkout": "cache"}, {"write": "src/config.rs", "text": "pub fn config() -> u32 {\n    1\n}\n"}, {"commit": "Cache the config"}, {"pr": [12, "cache"]}], "save": {"cache": "/github/prs/12"}, "expect_result": {"pointer": "/github/prs/12", "equals": "295b0f6d20624fd69b34778efd752fa98450720d"}}
-{"cmd": "open_pr", "path": "${data_dir}/repos/api", "pr": "#12", "save": {"review12": "/review_id"}, "expect_result": {"pointer": "/created", "equals": true}}
+{"cmd": "open_pr", "path": "${api}", "pr": "#12", "save": {"review12": "/review_id"}, "expect_result": {"pointer": "/created", "equals": true}}
 {"cmd": "settle", "timeout_ms": 20000, "expect": [{"pointer": "/pr_strip/number", "equals": 12}, {"pointer": "/pr_strip/checks", "equals": {"passing": 12, "failing": 1, "pending": 2}}, {"pointer": "/pr_strip/moved", "equals": null}]}
 {"cmd": "cli", "cwd": "repos/api", "args": ["review", "close", "${review12}", "--json"], "expect_result": {"pointer": "/exit", "equals": 0}}
 {"cmd": "wait_for", "pointer": "/session/status", "equals": "closed", "timeout_ms": 20000}
@@ -207,24 +210,37 @@
 // refresh failed and the two buttons, each at its own width and inside the window (Open on
 // GitHub ends 12 short of its right edge). What does: how far it moved, then the author and the
 // branches, each down to the 36 that keeps an ellipsis under the pointer, then the title.
-// Widths that depend on a platform's text are held to a range.
-{"cmd": "bounds", "target": "pr_strip/number", "expect_result": [{"pointer": "/visible/x", "equals": 12}, {"pointer": "/visible/w", "gte": 18}, {"pointer": "/visible/w", "lte": 30}]}
-{"cmd": "bounds", "target": "pr_strip/state", "expect_result": [{"pointer": "/visible/w", "gte": 36}, {"pointer": "/visible/w", "lte": 52}]}
+// Widths that depend on a platform's text are held to a range, wider where the font isn't
+// macOS's (Segoe UI on Windows; on Linux whatever the system names, DejaVu Sans in CI, and
+// the keycap reads "Ctrl R").
+{"cmd": "bounds", "target": "pr_strip/number", "expect_result": {"pointer": "/visible/x", "equals": 12}}
+{"cmd": "bounds", "target": "pr_strip/number", "platforms": ["macos"], "expect_result": [{"pointer": "/visible/w", "gte": 18}, {"pointer": "/visible/w", "lte": 30}]}
+{"cmd": "bounds", "target": "pr_strip/number", "platforms": ["windows", "linux"], "expect_result": [{"pointer": "/visible/w", "gte": 15}, {"pointer": "/visible/w", "lte": 32}]}
+{"cmd": "bounds", "target": "pr_strip/state", "platforms": ["macos"], "expect_result": [{"pointer": "/visible/w", "gte": 36}, {"pointer": "/visible/w", "lte": 52}]}
+{"cmd": "bounds", "target": "pr_strip/state", "platforms": ["windows", "linux"], "expect_result": [{"pointer": "/visible/w", "gte": 36}, {"pointer": "/visible/w", "lte": 62}]}
 {"cmd": "bounds", "target": "pr_strip/checks", "expect_result": [{"pointer": "/visible/w", "gte": 80}, {"pointer": "/visible/w", "lte": 120}]}
-{"cmd": "bounds", "target": "pr_strip/round", "expect_result": [{"pointer": "/visible/w", "gte": 38}, {"pointer": "/visible/w", "lte": 58}]}
-{"cmd": "bounds", "target": "pr_strip/refresh", "expect_result": [{"pointer": "/visible/x", "gte": 920}, {"pointer": "/visible/x", "lte": 990}, {"pointer": "/visible/w", "gte": 70}, {"pointer": "/visible/w", "lte": 136}]}
+{"cmd": "bounds", "target": "pr_strip/round", "platforms": ["macos"], "expect_result": [{"pointer": "/visible/w", "gte": 38}, {"pointer": "/visible/w", "lte": 58}]}
+{"cmd": "bounds", "target": "pr_strip/round", "platforms": ["windows", "linux"], "expect_result": [{"pointer": "/visible/w", "gte": 34}, {"pointer": "/visible/w", "lte": 66}]}
+{"cmd": "bounds", "target": "pr_strip/refresh", "platforms": ["macos"], "expect_result": [{"pointer": "/visible/x", "gte": 920}, {"pointer": "/visible/x", "lte": 990}, {"pointer": "/visible/w", "gte": 70}, {"pointer": "/visible/w", "lte": 136}]}
+{"cmd": "bounds", "target": "pr_strip/refresh", "platforms": ["windows", "linux"], "expect_result": [{"pointer": "/visible/x", "gte": 896}, {"pointer": "/visible/x", "lte": 990}, {"pointer": "/visible/w", "gte": 66}, {"pointer": "/visible/w", "lte": 160}]}
 {"cmd": "bounds", "target": "pr_strip/open", "expect_result": [{"pointer": "/visible/x", "equals": 1064}, {"pointer": "/visible/w", "equals": 24}]}
-{"cmd": "bounds", "target": "pr_strip/title", "expect_result": [{"pointer": "/visible/x", "gte": 34}, {"pointer": "/visible/x", "lte": 50}, {"pointer": "/visible/w", "gte": 200}]}
+{"cmd": "bounds", "target": "pr_strip/title", "platforms": ["macos"], "expect_result": [{"pointer": "/visible/x", "gte": 34}, {"pointer": "/visible/x", "lte": 50}, {"pointer": "/visible/w", "gte": 200}]}
+{"cmd": "bounds", "target": "pr_strip/title", "platforms": ["windows", "linux"], "expect_result": [{"pointer": "/visible/x", "gte": 34}, {"pointer": "/visible/x", "lte": 53}, {"pointer": "/visible/w", "gte": 200}]}
 {"cmd": "bounds", "target": "pr_strip/branches", "expect_result": [{"pointer": "/visible/w", "equals": 36}]}
 {"cmd": "bounds", "target": "pr_strip/author", "expect_result": [{"pointer": "/visible/w", "equals": 36}]}
 {"cmd": "bounds", "target": "pr_strip/moved", "expect_result": [{"pointer": "/visible/w", "equals": 36}]}
-{"cmd": "bounds", "target": "pr_strip/status", "expect_result": [{"pointer": "/visible/w", "gte": 130}, {"pointer": "/visible/w", "lte": 230}]}
+{"cmd": "bounds", "target": "pr_strip/status", "platforms": ["macos"], "expect_result": [{"pointer": "/visible/w", "gte": 130}, {"pointer": "/visible/w", "lte": 230}]}
+{"cmd": "bounds", "target": "pr_strip/status", "platforms": ["windows", "linux"], "expect_result": [{"pointer": "/visible/w", "gte": 110}, {"pointer": "/visible/w", "lte": 230}]}
 // The title bar names the review by at most 48 characters of `#12 Title` (DESIGN §4.1), so the
 // title leaves the command field where a long branch's name would. With the caption buttons
-// at its right (Windows, Linux) the PRs button is its glyph alone at this width; on macOS it
-// keeps its words. (`review_chrome` holds the glyph alone on every platform, under a long
-// repository name.)
-{"cmd": "bounds", "target": "titlebar/prs", "platforms": ["windows", "linux"], "expect_result": [{"pointer": "/visible/w", "lte": 40}, {"pointer": "/visible/h", "equals": 28}]}
+// at its right (Windows: 138 less room) the PRs button is its glyph alone at this width; on
+// macOS it keeps its words. On Linux the runner's display has no window manager, so dv
+// draws no caption buttons (README, "Xvfb") and the bar has macOS's room at its right:
+// which of the two the button is there turns on the font's width, within a few pixels of
+// the room, so only its height and that it is no wider than its words are held.
+// (`review_chrome` holds the glyph alone on every platform, under a longer repository name.)
+{"cmd": "bounds", "target": "titlebar/prs", "platforms": ["windows"], "expect_result": [{"pointer": "/visible/w", "lte": 40}, {"pointer": "/visible/h", "equals": 28}]}
+{"cmd": "bounds", "target": "titlebar/prs", "platforms": ["linux"], "expect_result": [{"pointer": "/visible/w", "lte": 130}, {"pointer": "/visible/h", "equals": 28}]}
 {"cmd": "bounds", "target": "titlebar/prs", "platforms": ["macos"], "expect_result": [{"pointer": "/visible/w", "gte": 70}, {"pointer": "/visible/h", "equals": 28}]}
 {"cmd": "state", "expect": [{"pointer": "/shell/title_target", "equals": "#12 Cache the parsed config between requests so…"}, {"pointer": "/session/target_label", "contains": "validates every file again"}]}
 {"cmd": "screenshot", "name": "pr-strip-narrow"}
@@ -234,7 +250,7 @@
 {"cmd": "set_setting", "key": "mode", "value": "dark"}
 {"cmd": "resize", "w": 1440, "h": 900}
 {"cmd": "settle"}
-{"cmd": "open_pr", "path": "${data_dir}/repos/api", "pr": "#7", "expect_result": {"pointer": "/created", "equals": false}}
+{"cmd": "open_pr", "path": "${api}", "pr": "#7", "expect_result": {"pointer": "/created", "equals": false}}
 {"cmd": "settle", "timeout_ms": 20000, "expect": [{"pointer": "/pr_strip/number", "equals": 7}, {"pointer": "/pr_strip/read/kind", "equals": "read"}]}
 
 // Light.

@@ -1,7 +1,8 @@
 //! Helpers shared by every dv crate's tests, chiefly [`FixtureRepo`]: real git repos built in temp
 //! dirs through the `git` CLI, so tests exercise git's own behaviour (docs/PLAN.md §14.2);
-//! [`FixtureGithub`], a GitHub repository and its clone without GitHub (PLAN §9.11); and where
-//! the fake `gh` is ([`mock_gh`]).
+//! [`FixtureGithub`], a GitHub repository and its clone without GitHub (PLAN §9.11); what the
+//! fake `gh` answers about its pull requests ([`fixture_gh`]); and where the fake `gh` is
+//! ([`mock_gh`]).
 //!
 //! gpui: **never**. Headless crates' tests depend on it, and `script/check` fails when gpui
 //! appears in its dependency tree (PLAN §4, §13.2).
@@ -9,12 +10,14 @@
 //! These are test helpers: a fixture that can't be built is a broken test, so every method panics
 //! with a message naming the step that failed (and git's stderr) instead of returning an error.
 
+pub mod fixture_gh;
 mod fixture_github;
 mod fixture_repo;
 
 use std::path::PathBuf;
 
-pub use fixture_github::{FixtureGithub, GITHUB_OWNER};
+pub use fixture_gh::GhPr;
+pub use fixture_github::{FixtureGithub, GITHUB_OWNER, GithubOrigin};
 pub use fixture_repo::{AUTHOR_EMAIL, AUTHOR_NAME, EPOCH, FixtureRepo, TICK_SECS};
 
 /// `mock_gh`, the fake `gh` (PLAN §14.2), where cargo builds it beside the test executable

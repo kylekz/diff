@@ -46,6 +46,7 @@ fn remote_session(
                 reviewer: reviewer(),
                 labels: LabelContext::default(),
                 connection: Some(connection.clone()),
+                pr: None,
             },
             cx,
         )

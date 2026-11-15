@@ -9,6 +9,7 @@
 use dv_core::backend::BackendError;
 use dv_core::diff::DiffError;
 use dv_core::git::GitError;
+use dv_core::github::GithubError;
 use dv_core::review::{OpError, StoreError};
 use dv_core::target::TargetError;
 
@@ -109,6 +110,10 @@ pub mod code {
     pub const IO: &str = "io";
     /// Anything else that went wrong inside dv.
     pub const INTERNAL: &str = "internal";
+    /// GitHub, through `gh`, failed (exit 5): `error.detail`'s first line is the kind
+    /// (`dv_core::github::GithubError::kind`: `not_authenticated`, `not_found`, `moved`, …),
+    /// and what `gh` ran and said follows it.
+    pub const GITHUB: &str = "github";
 }
 
 /// A command's failure (module docs).
@@ -260,6 +265,38 @@ impl From<StoreError> for CliError {
             }
             other => Self::new(Exit::Failure, code::INTERNAL, other.to_string()),
         }
+    }
+}
+
+/// What a GitHub failure says in one line (PLAN §9.10): what failed, what git itself said
+/// when it was git (a fetch that failed says why), and the command that fixes it when there
+/// is one. The same for exit 5 and for the warning of an open that went on without GitHub.
+pub(crate) fn github_message(error: &GithubError) -> String {
+    let message = match error.git_said() {
+        Some(said) => format!("{error}: {said}"),
+        None => error.to_string(),
+    };
+    match error.fix() {
+        Some(fix) if !message.contains(&fix) => format!("{message}: run `{fix}`"),
+        _ => message,
+    }
+}
+
+/// Exit 5, `github` (PLAN §9.10): the message says what failed ([`github_message`]); the
+/// detail's first line is the error's kind, then what `gh` ran and
+/// printed. The review store failing under a GitHub operation keeps its own code.
+impl From<GithubError> for CliError {
+    fn from(error: GithubError) -> Self {
+        let error = match error {
+            GithubError::Store(error) => return error.into(),
+            error => error,
+        };
+        let message = github_message(&error);
+        let detail = match error.detail() {
+            Some(detail) => format!("{}\n{detail}", error.kind()),
+            None => error.kind().to_string(),
+        };
+        Self::new(Exit::GitHub, code::GITHUB, message).with_detail(Some(detail))
     }
 }
 

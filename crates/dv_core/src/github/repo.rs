@@ -25,7 +25,7 @@
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
 
-use crate::backend::{Backend, GitOpts};
+use crate::backend::{Backend, BackendError, GitOpts};
 
 use super::error::Elsewhere;
 use super::{Gh, GithubError};
@@ -206,7 +206,7 @@ impl Hash for RepoUrl {
 
 /// The clone's remotes, in the order its configuration lists them (`git config -z
 /// --get-regexp '^remote\..*\.(url|gh-resolved)$'`).
-pub fn configured_remotes(backend: &dyn Backend) -> Result<Vec<ConfiguredRemote>, GithubError> {
+pub fn configured_remotes(backend: &dyn Backend) -> Result<Vec<ConfiguredRemote>, BackendError> {
     const ARGS: &[&str] = &[
         "config",
         "-z",
@@ -252,9 +252,29 @@ pub fn configured_remotes(backend: &dyn Backend) -> Result<Vec<ConfiguredRemote>
 
 /// A remote's URL as git fetches from it, `url.<base>.insteadOf` applied (`git remote
 /// get-url`, which reads the configuration alone).
-fn rewritten_url(backend: &dyn Backend, remote: &str) -> Result<String, GithubError> {
+fn rewritten_url(backend: &dyn Backend, remote: &str) -> Result<String, BackendError> {
     let output = backend.git(&["remote", "get-url", "--", remote], &GitOpts::new())?;
     Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+}
+
+/// Every host a remote of the clone names, as configured or as git rewrites its URL, and
+/// `github.com`, each once: the hosts a pull request's mirror may be kept under (PLAN §9.4),
+/// read without asking gh which of them are GitHub's.
+pub(crate) fn remote_hosts(backend: &dyn Backend) -> Result<Vec<String>, BackendError> {
+    let mut hosts = vec![GITHUB_COM.to_string()];
+    for remote in configured_remotes(backend)? {
+        let Some(url) = remote.url else {
+            continue;
+        };
+        for url in [rewritten_url(backend, &remote.name)?, url] {
+            if let Some(repo) = parse_url(&url)
+                && !hosts.contains(&repo.host)
+            {
+                hosts.push(repo.host);
+            }
+        }
+    }
+    Ok(hosts)
 }
 
 /// The remote whose repository pull requests live in, by the three rules (module docs).

@@ -20,6 +20,7 @@ const HOST: &str = "github.com";
 /// A [`Gh`] that runs `mock_gh` with a scenario of its own, and the log of its calls.
 pub(in crate::github) struct MockGh {
     pub gh: Gh,
+    scenario: PathBuf,
     log: PathBuf,
     _dir: tempfile::TempDir,
 }
@@ -38,15 +39,25 @@ impl MockGh {
         let log = dir.path().join("gh_calls.jsonl");
         let mut options = GhOptions::new(mock_gh().into_os_string());
         options.env = vec![
-            ("DV_MOCK_GH".into(), Some(scenario.into_os_string())),
+            ("DV_MOCK_GH".into(), Some(scenario.clone().into_os_string())),
             ("DV_MOCK_GH_LOG".into(), Some(log.clone().into_os_string())),
         ];
+        // No test waits for GitHub's refs to catch up with its API unless it says so.
+        options.settle = Duration::ZERO;
         tweak(&mut options);
         Self {
             gh: Gh::new(options),
+            scenario,
             log,
             _dir: dir,
         }
+    }
+
+    /// Has `mock_gh` answer from `calls` from now on, its log starting over (an entry's
+    /// `times` counts the calls in the log).
+    pub fn answer(&self, calls: Value) {
+        std::fs::write(&self.scenario, json!({ "calls": calls }).to_string()).unwrap();
+        let _ = std::fs::remove_file(&self.log);
     }
 
     /// The calls made so far: `{"argv", "stdin", "matched"}` each.
@@ -89,6 +100,48 @@ fn the_program_is_what_dv_gh_names_else_gh() {
     assert_eq!(program(None), "gh");
     assert_eq!(program(Some("".into())), "gh");
     assert_eq!(program(Some("/opt/mock_gh".into())), "/opt/mock_gh");
+}
+
+#[test]
+fn the_version_is_read_from_what_gh_prints() {
+    for (said, version) in [
+        (
+            "gh version 2.48.0 (2024-04-03)\nhttps://github.com/cli/cli/releases/tag/v2.48.0\n",
+            Some(Version(2, 48, 0)),
+        ),
+        (
+            "gh version 2.103.3 (2026-10-26)\n",
+            Some(Version(2, 103, 3)),
+        ),
+        ("gh version 3.0\n", Some(Version(3, 0, 0))),
+        (
+            "gh version 2.40.1-rc1 (2023-12-13)\n",
+            Some(Version(2, 40, 1)),
+        ),
+        ("a development build\n", None),
+        ("gh version\n", None),
+        ("", None),
+    ] {
+        assert_eq!(Version::parse(said), version, "{said:?}");
+    }
+    assert!(Version(2, 47, 9) < MIN_VERSION);
+    assert!(Version(2, 48, 0) >= MIN_VERSION);
+    assert!(Version(2, 103, 3) > MIN_VERSION);
+    assert!(Version(10, 0, 0) > Version(9, 99, 99));
+    assert_eq!(MIN_VERSION.to_string(), "2.48.0");
+
+    let mock = MockGh::new(json!([
+        {"argv": ["--version"], "stdout": "gh version 2.47.0 (2024-03-19)\n"}
+    ]));
+    assert_eq!(mock.gh.version().unwrap(), Some(Version(2, 47, 0)));
+    // One that says nothing readable, and one that isn't there.
+    let silent = MockGh::new(json!([]));
+    assert_eq!(silent.gh.version().unwrap(), None);
+    let missing = Gh::new(GhOptions::new("dv-test-has-no-gh".into()));
+    assert!(matches!(
+        missing.version(),
+        Err(GithubError::GhMissing { .. })
+    ));
 }
 
 #[test]

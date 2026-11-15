@@ -1708,6 +1708,7 @@ dependencies = [
 name = "dv_test_support"
 version = "0.5.1"
 dependencies = [
+ "serde_json",
  "tempfile",
 ]
 

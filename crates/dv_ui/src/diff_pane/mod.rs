@@ -421,7 +421,7 @@ impl DiffPane {
                         SessionEvent::ReviewChanged
                         | SessionEvent::HistoryLoaded
                         | SessionEvent::AnnotationsShown => this.refresh_blocks(cx),
-                        SessionEvent::Error => cx.notify(),
+                        SessionEvent::Error | SessionEvent::PrChanged => cx.notify(),
                         SessionEvent::WorktreeChanged { .. } => {}
                     }),
                     cx.observe(session, |this, _, cx| {

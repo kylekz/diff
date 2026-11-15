@@ -193,7 +193,7 @@ pub const AUTOMATION_HOME: &str = "home";
 pub const AUTOMATION_USER_PATH: &str = "user-path.txt";
 
 /// Opens what `dv` or `dv open` asked for in the main window: the working directory's or the
-/// named repository with the switcher on it, or a review (PLAN §10.1). It runs in the
+/// named repository with the switcher on it, a review, or a pull request's (PLAN §10.1, §9.3). It runs in the
 /// background like any open; a failure shows in the main area's banner, except bare `dv`
 /// outside any repository, which opens nothing.
 fn open_startup(open: Startup, main: &MainWindow, cx: &mut App) -> Result<()> {
@@ -209,6 +209,9 @@ fn open_startup(open: Startup, main: &MainWindow, cx: &mut App) -> Result<()> {
                 .detach(),
             Startup::Review(location, id) => shell
                 .open(location, OpenRequest::Review(id), window, cx)
+                .detach(),
+            Startup::Pr(location, reference) => shell
+                .open(location, OpenRequest::Pr(reference), window, cx)
                 .detach(),
         })
     })?;

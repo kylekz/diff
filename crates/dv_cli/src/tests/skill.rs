@@ -164,6 +164,10 @@ fn the_skill_is_named_and_says_when_to_use_it() {
         "unseen_round",
         "dv comment annotate",
         "Do this once the code is final",
+        // A GitHub pull request's review is the reviewer's (PLAN §9.10).
+        "read-only for you",
+        "dv review new --pr <number>",
+        "dv review refresh <review-id>",
     ] {
         assert!(SKILL_MD.contains(rule), "{rule:?}");
     }

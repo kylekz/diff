@@ -41,6 +41,13 @@ pub const TICK_SECS: i64 = 60;
 /// A superset of dv_core's `git::command::DROPPED_ENV` (which this crate can't import, being
 /// dv_core's dev-dependency), so a test's reference `git diff` and the code under test drop the
 /// same variables; a dv_core test checks the two lists stay in step.
+/// `GIT_ALLOW_PROTOCOL=file`: git fetches, clones and pushes only from and to a local path
+/// (a `file://` URL too), and refuses every other transport before it connects. A remote
+/// that names a real host (`https://github.com/…`, without a rewrite to a path) then fails
+/// at once instead of reaching the network (PLAN §14.2). It overrides `protocol.*.allow`,
+/// so a submodule's local path is allowed too.
+pub const LOCAL_TRANSPORT: (&str, &str) = ("GIT_ALLOW_PROTOCOL", "file");
+
 const INHERITED_GIT_VARS: &[&str] = &[
     "GIT_DIR",
     "GIT_WORK_TREE",
@@ -261,6 +268,7 @@ impl FixtureRepo {
     /// and `(name, None)` to remove: none of the developer's system, global or XDG configuration
     /// (`HOME`, `XDG_CONFIG_HOME` and `GIT_CONFIG_GLOBAL` point into the fixture), no system
     /// gitattributes, no repository discovery above the fixture (`GIT_CEILING_DIRECTORIES`),
+    /// no transport but a local path's ([`LOCAL_TRANSPORT`]),
     /// `LC_ALL=C`, the fixture identity and the next commit's dates,
     /// and none of the inherited variables that point git elsewhere or change what it prints
     /// ([`INHERITED_GIT_VARS`]).
@@ -290,6 +298,7 @@ impl FixtureRepo {
             set("GIT_ATTR_NOSYSTEM", "1".as_ref()),
             set("GIT_CEILING_DIRECTORIES", self.ceiling.as_os_str()),
             set("GIT_TERMINAL_PROMPT", "0".as_ref()),
+            set(LOCAL_TRANSPORT.0, LOCAL_TRANSPORT.1.as_ref()),
             set("GIT_MERGE_AUTOEDIT", "no".as_ref()),
             set("LC_ALL", "C".as_ref()),
             set("GIT_AUTHOR_NAME", AUTHOR_NAME.as_ref()),

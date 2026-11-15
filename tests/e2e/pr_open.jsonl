@@ -1,0 +1,64 @@
+{"scenario": {"window_size": "1440x900", "gh": "../fixtures/gh/pr_open.json", "description": "Opening a GitHub pull request (PLAN §9.3–§9.5, §9.12 step 2) against a fixture GitHub and mock_gh: `open_pr` (what `dv open --pr 7` starts the app on) fetches pull request 7 into refs/dv/pr, makes its draft review and reads its mirror; the review shows the head against its merge base from its pins, named by the pull request's number and title; a push to the pull request and a refresh move the pins, the files list again and the reviewer's thread relocates; opening the review again resumes it; Ctrl Enter and `dv review submit` say that submitting to GitHub arrives in a later version; a `gh` that isn't signed in (the fixture's answer for pull request 9) fails the open with the main area's banner, the open review left as it is."}}
+{"cmd": "wait_ready", "timeout_ms": 20000}
+{"cmd": "set_setting", "key": "mode", "value": "dark"}
+{"cmd": "settle"}
+
+// The fixture GitHub: dv-fixture/api with pull request 7, `feat` into `main`, one commit that
+// adds src/lib.rs. Its clone knows nothing of the pull request until dv fetches it.
+{"cmd": "seed_repo", "name": "api", "github": [{"branch": "feat"}, {"checkout": "feat"}, {"write": "src/lib.rs", "text": "pub fn answer() -> u32 {\n    42\n}\n"}, {"commit": "Add the answer"}, {"pr": [7, "feat"]}], "save": {"head": "/github/prs/7"}, "expect_result": [{"pointer": "/github/prs/7", "equals": "5746f3cb7598128a528c413ffe03e23666d1e9d6"}, {"pointer": "/github/commits", "len": 1}]}
+{"cmd": "cli", "cwd": "repos/api", "args": ["review", "list", "--all", "--json"], "expect_result": [{"pointer": "/exit", "equals": 0}, {"pointer": "/json/reviews", "len": 0}]}
+
+// Open it: a new draft of the pull request, its files the head's against the merge base.
+{"cmd": "open_pr", "path": "${data_dir}/repos/api", "pr": "#7", "save": {"review": "/review_id"}, "expect_result": {"pointer": "/created", "equals": true}}
+{"cmd": "settle", "timeout_ms": 20000, "expect": [{"pointer": "/shell/banner", "equals": null}, {"pointer": "/session/review_id", "equals": "${review}"}, {"pointer": "/session/status", "equals": "draft"}, {"pointer": "/session/round", "equals": 1}, {"pointer": "/session/read_only", "equals": false}, {"pointer": "/session/target/pr/owner", "equals": "dv-fixture"}, {"pointer": "/session/target/pr/repo", "equals": "api"}, {"pointer": "/session/target/pr/number", "equals": 7}, {"pointer": "/session/target/pr/head_oid", "equals": "${head}"}, {"pointer": "/session/target/pr/base_oid", "equals": "15ced05b6eeefb27e5092d5b9fe0876cf642a38e"}]}
+{"cmd": "state", "expect": [{"pointer": "/session/target_label", "equals": "#7 Add the answer"}, {"pointer": "/session/side_labels", "equals": {"old": "main", "new": "feat"}}, {"pointer": "/session/spec", "equals": {"old": {"commit": "15ced05b6eeefb27e5092d5b9fe0876cf642a38e"}, "new": {"commit": "${head}"}}}, {"pointer": "/session/total", "equals": 1}, {"pointer": "/session/files/0/path", "equals": "src/lib.rs"}, {"pointer": "/session/files/0/status", "equals": "added"}, {"pointer": "/session/comparison_available", "equals": false}]}
+// Its pull request as the open's refresh read it: the pins, and the mirror the viewer's.
+{"cmd": "state", "expect": [{"pointer": "/session/pr/number", "equals": 7}, {"pointer": "/session/pr/refreshing", "equals": false}, {"pointer": "/session/pr/read", "equals": true}, {"pointer": "/session/pr/stale", "equals": null}, {"pointer": "/session/pr/pins", "equals": {"head": "${head}", "base": "15ced05b6eeefb27e5092d5b9fe0876cf642a38e"}}, {"pointer": "/session/pr/moved_from", "equals": null}, {"pointer": "/session/pr/mirror/login", "equals": "kylekz"}, {"pointer": "/session/pr/mirror/title", "equals": "Add the answer"}, {"pointer": "/session/pr/mirror/state", "equals": "open"}, {"pointer": "/session/pr/mirror/author", "equals": "octocat"}, {"pointer": "/session/pr/mirror/head_oid", "equals": "${head}"}, {"pointer": "/session/pr/mirror/checks", "equals": {"passing": 1, "failing": 0, "pending": 1}}, {"pointer": "/session/pr/mirror/threads", "equals": 1}, {"pointer": "/session/pr/mirror/files", "equals": 1}]}
+// The repository is a known one now, and the CLI sees the same review.
+{"cmd": "cli", "cwd": "repos/api", "args": ["review", "show", "${review}", "--json"], "expect_result": [{"pointer": "/exit", "equals": 0}, {"pointer": "/json/review/status", "equals": "draft"}, {"pointer": "/json/review/pr", "equals": {"owner": "dv-fixture", "repo": "api", "number": 7, "url": "https://github.com/dv-fixture/api/pull/7", "state": "open", "head_oid": "${head}", "pr_round": 1}}]}
+{"cmd": "state", "expect": [{"pointer": "/repos", "len": 1}, {"pointer": "/repos/0/name", "equals": "api"}]}
+{"cmd": "screenshot", "name": "pr-open"}
+
+// The reviewer comments on line 2; the card is drawn there.
+{"cmd": "cli", "cwd": "repos/api", "args": ["comment", "add", "--review", "${review}", "--file", "src/lib.rs", "--lines", "2", "--body", "Why 42?", "--json"], "save": {"thread": "/json/thread/id"}, "expect_result": [{"pointer": "/exit", "equals": 0}, {"pointer": "/json/thread/code", "equals": "    42"}]}
+{"cmd": "wait_for", "pointer": "/session/threads", "len": 1}
+{"cmd": "settle", "expect": [{"pointer": "/session/threads/0/id", "equals": "${thread}"}, {"pointer": "/session/threads/0/placement", "equals": "unchanged"}, {"pointer": "/session/threads/0/lines", "equals": {"start": 2, "end": 2}}, {"pointer": "/session/threads/0/card", "equals": true}]}
+
+// A push to the pull request puts two lines above the commented one. Nothing polls: the
+// review shows the head it was last refreshed to.
+{"cmd": "repo_edit", "name": "api", "github": [{"write": "src/lib.rs", "text": "// The answer.\n\npub fn answer() -> u32 {\n    42\n}\n"}, {"commit": "Say what it is"}, {"pr": [7, "feat"]}], "save": {"pushed": "/github/prs/7"}, "expect_result": {"pointer": "/github/prs/7", "equals": "d6a2122275d9bc53a045b9dbdbc5838db7cc3d41"}}
+{"cmd": "settle", "expect": [{"pointer": "/session/pr/pins/head", "equals": "${head}"}, {"pointer": "/session/spec/new", "equals": {"commit": "${head}"}}]}
+
+// Refresh: the pins move to the new head, the files list again, the thread relocates.
+{"cmd": "pr_refresh", "expect_result": {"pointer": "/refreshing", "equals": true}}
+{"cmd": "wait_for", "pointer": "/session/pr/pins/head", "equals": "${pushed}", "timeout_ms": 20000}
+{"cmd": "settle", "timeout_ms": 20000, "expect": [{"pointer": "/session/pr/refreshing", "equals": false}, {"pointer": "/session/pr/stale", "equals": null}, {"pointer": "/session/pr/pins", "equals": {"head": "${pushed}", "base": "15ced05b6eeefb27e5092d5b9fe0876cf642a38e"}}, {"pointer": "/session/pr/moved_from", "equals": {"head": "${head}", "base": "15ced05b6eeefb27e5092d5b9fe0876cf642a38e"}}, {"pointer": "/session/pr/mirror/head_oid", "equals": "${pushed}"}, {"pointer": "/session/spec", "equals": {"old": {"commit": "15ced05b6eeefb27e5092d5b9fe0876cf642a38e"}, "new": {"commit": "${pushed}"}}}, {"pointer": "/session/total", "equals": 1}, {"pointer": "/session/status", "equals": "draft"}]}
+// The target keeps the commits the review was made at (PLAN §2.2).
+{"cmd": "state", "expect": [{"pointer": "/session/target/pr/head_oid", "equals": "${head}"}, {"pointer": "/session/threads/0/placement", "equals": "moved"}, {"pointer": "/session/threads/0/lines", "equals": {"start": 4, "end": 4}}, {"pointer": "/session/threads/0/original_lines", "equals": {"start": 2, "end": 2}}, {"pointer": "/session/threads/0/outdated", "equals": false}, {"pointer": "/session/threads/0/card", "equals": true}]}
+{"cmd": "cli", "cwd": "repos/api", "args": ["comment", "show", "${thread}", "--json"], "expect_result": [{"pointer": "/exit", "equals": 0}, {"pointer": "/json/thread/placement", "equals": "moved"}, {"pointer": "/json/thread/anchor/current/start_line", "equals": 4}]}
+{"cmd": "screenshot", "name": "pr-refreshed"}
+
+// Ctrl Enter: a PR review is submitted to GitHub, which a later version does (PLAN §9.12).
+{"cmd": "key", "keystroke": "secondary-enter"}
+{"cmd": "settle", "expect": [{"pointer": "/session/sheet", "equals": null}, {"pointer": "/shell/banner/message", "equals": "Submitting to GitHub arrives in a later version"}, {"pointer": "/session/status", "equals": "draft"}]}
+{"cmd": "cli", "cwd": "repos/api", "args": ["review", "submit", "${review}", "--verdict", "comment", "--json"], "expect_result": [{"pointer": "/exit", "equals": 2}, {"pointer": "/json/error/code", "equals": "unsupported"}, {"pointer": "/json/error/message", "equals": "Submitting to GitHub arrives in a later version"}]}
+
+// Opening the pull request again resumes its draft: one review, still open.
+{"cmd": "open_pr", "path": "${data_dir}/repos/api", "pr": "https://github.com/dv-fixture/api/pull/7/files", "expect_result": [{"pointer": "/created", "equals": false}, {"pointer": "/review_id", "equals": "${review}"}]}
+{"cmd": "settle", "timeout_ms": 20000, "expect": [{"pointer": "/session/review_id", "equals": "${review}"}, {"pointer": "/session/pr/pins/head", "equals": "${pushed}"}, {"pointer": "/shell/banner", "equals": null}]}
+{"cmd": "cli", "cwd": "repos/api", "args": ["review", "list", "--all", "--json"], "expect_result": [{"pointer": "/exit", "equals": 0}, {"pointer": "/json/reviews", "len": 1}]}
+
+// Another repository's pull request is refused before gh is asked.
+{"cmd": "open_pr", "path": "${data_dir}/repos/api", "pr": "acme/web#3", "expect_error": "couldn't open #3: #3 is in acme/web; open it from a clone of that repository"}
+{"cmd": "settle", "expect": [{"pointer": "/shell/banner/message", "equals": "couldn't open #3: #3 is in acme/web; open it from a clone of that repository"}, {"pointer": "/shell/banner/retry", "equals": false}, {"pointer": "/session/review_id", "equals": "${review}"}]}
+
+// Not signed in (the fixture's gh for pull request 9): the open fails where any open does,
+// the main area's banner, with the command that fixes it and what gh said behind it.
+{"cmd": "open_pr", "path": "${data_dir}/repos/api", "pr": "#9", "expect_error": "couldn't open #9: gh isn't signed in to github.com"}
+{"cmd": "settle", "expect": [{"pointer": "/shell/banner/message", "equals": "couldn't open #9: gh isn't signed in to github.com: run `gh auth login`"}, {"pointer": "/shell/banner/retry", "equals": true}, {"pointer": "/shell/opening", "equals": false}, {"pointer": "/session/review_id", "equals": "${review}"}, {"pointer": "/session/pr/pins/head", "equals": "${pushed}"}]}
+{"cmd": "state", "expect": {"pointer": "/shell/banner/detail", "contains": "exit code 4"}}
+{"cmd": "screenshot", "name": "pr-open-failed"}
+// Nothing was made of a pull request that couldn't be read.
+{"cmd": "cli", "cwd": "repos/api", "args": ["review", "list", "--all", "--json"], "expect_result": [{"pointer": "/exit", "equals": 0}, {"pointer": "/json/reviews", "len": 1}]}
+{"gh_log": {}, "expect_result": [{"pointer": "/0/argv/0", "equals": "pr"}, {"pointer": "/0/argv/2", "equals": "7"}]}
+{"cmd": "quit"}

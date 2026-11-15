@@ -10,7 +10,8 @@
 //! | `status` | [`StatusDoc`]: `dv` (this build: `{version, channel}`, `channel` `release` for a packaged build, else `development`), `repo`, `author` (who this command acts as), `current` (the review the commands mean, or `null`), `reviews` (the open ones), `unreadable` |
 //! | `review list` | [`ReviewListDoc`]: `reviews`, `unreadable` (logs that don't load: `{id, error}`) |
 //! | `review show` | [`ReviewShowDoc`]: `review` |
-//! | `review new` | [`ReviewNewDoc`]: `created` (`false`: the target's open review, resumed), `review` |
+//! | `review new` | [`ReviewNewDoc`]: `created` (`false`: the target's open review, resumed; with `--pr`, the pull request's review, PLAN §9.3), `review`, `stale` (`null`, or with `--pr` the GitHub failure the review was opened without: `{kind, message}`) |
+//! | `review refresh` | [`ReviewRefreshDoc`]: `review`, `moved` (`{from, to}`: the head the draft showed and the one it shows now, or `null` when it didn't move) |
 //! | `review wait` | [`WaitDoc`]: `outcome` (`changes_requested`, `approved`, `closed`), `review`, `round` (the last closed one, or `null`), `threads`; on `--timeout` (exit 3) [`WaitTimeoutDoc`]: `outcome: "timeout"` alone |
 //! | `review done`, `review close` | [`ReviewChangeDoc`]: `changed` (`false`: nothing written), `review` |
 //! | `review submit` | [`ReviewSubmitDoc`]: `review`, `round` (the round it closed) |
@@ -32,7 +33,14 @@
 //! it was made in), `status`, `round` (the round in progress; a finished review's last),
 //! `rounds` (the closed ones: `{n, verdict, body, closed_at}`), `threads` (`{open, addressed,
 //! resolved, annotation}`, `annotation` the agent's annotations nobody asked about, PLAN §19), `worktree`, `created_at`, `updated_at`, `status_note` (the note the last status
-//! change carried, e.g. `dv review done --note`, or `null`).
+//! change carried, e.g. `dv review done --note`, or `null`), `pr` (a PR review's pull request,
+//! PLAN §9.10: `{owner, repo, number, url, state, head_oid, pr_round}`, `state` `open`, `draft`,
+//! `merged` or `closed` as GitHub last said, `url` and `state` `null` while the pull request
+//! was never read here or the clone's GitHub repository can't be told, `head_oid` the head
+//! the review shows, `pr_round` its place among the pull request's reviews in this
+//! repository, 1 for the first; `null` for a local review) and `submissions` (the reviews dv
+//! posted to GitHub for it: `{github_review_id, url, event, at}`, `event` `comment`, `approve`
+//! or `request_changes`).
 //!
 //! A thread ([`ThreadDto`]): `id`, `review_id`, `state` (`open`, `addressed`, `resolved`, or
 //! `annotation`: an agent's explanation of its change, waiting on no one, PLAN §19),
@@ -73,7 +81,7 @@
 
 use dv_core::label::Labels;
 use dv_core::review::{
-    Anchor, AnchorSide, Author, Comment, Placement, Review, Round, Thread, Trail, Went,
+    Anchor, AnchorSide, Author, Comment, Placement, Review, Round, Submission, Thread, Trail, Went,
     shows_edited, shows_moved,
 };
 use dv_core::target::Target;
@@ -259,6 +267,46 @@ pub struct StatusNoteDto {
     pub at: u64,
 }
 
+/// A PR review's pull request (module docs).
+#[derive(Serialize, Debug, Clone, PartialEq, Eq)]
+pub struct PrDto {
+    pub owner: String,
+    pub repo: String,
+    pub number: u64,
+    /// The pull request on GitHub, when the clone's GitHub repository can be told.
+    pub url: Option<String>,
+    /// `open`, `draft`, `merged` or `closed`, as GitHub last said; `null` before the pull
+    /// request was read here.
+    pub state: Option<&'static str>,
+    /// The head the review shows: a draft's as last refreshed, a submitted review's as
+    /// submitted.
+    pub head_oid: String,
+    /// The review's place among the pull request's reviews in this repository, 1 for the
+    /// first (PLAN §9.5).
+    pub pr_round: u32,
+}
+
+/// A review dv posted to GitHub.
+#[derive(Serialize, Debug, Clone, PartialEq, Eq)]
+pub struct SubmissionDto {
+    pub github_review_id: u64,
+    pub url: String,
+    /// `comment`, `approve` or `request_changes`.
+    pub event: &'static str,
+    pub at: u64,
+}
+
+impl From<&Submission> for SubmissionDto {
+    fn from(submission: &Submission) -> Self {
+        Self {
+            github_review_id: submission.github_review_id,
+            url: submission.url.clone(),
+            event: submission.event.as_str(),
+            at: submission.at,
+        }
+    }
+}
+
 /// A review (module docs).
 #[derive(Serialize, Debug, Clone, PartialEq, Eq)]
 pub struct ReviewDto {
@@ -274,10 +322,15 @@ pub struct ReviewDto {
     pub created_at: u64,
     pub updated_at: u64,
     pub status_note: Option<StatusNoteDto>,
+    /// A PR review's pull request; `null` for a local review.
+    pub pr: Option<PrDto>,
+    pub submissions: Vec<SubmissionDto>,
 }
 
 impl ReviewDto {
-    pub fn new(review: &Review, labels: &Labels) -> Self {
+    /// `review` as printed; `pr` is its pull request, read by the caller when it is a PR
+    /// review (`crate::pr::dto`).
+    pub fn new(review: &Review, labels: &Labels, pr: Option<PrDto>) -> Self {
         Self {
             id: review.id.to_string(),
             target: TargetDto::new(&review.target, &review.worktree, labels),
@@ -296,6 +349,8 @@ impl ReviewDto {
                     at: change.at,
                 })
             }),
+            pr,
+            submissions: review.submissions.iter().map(SubmissionDto::from).collect(),
         }
     }
 }
@@ -669,6 +724,35 @@ pub struct ReviewNewDoc {
     /// `false` when the target's open review already existed and was resumed (PLAN §2.4).
     pub created: bool,
     pub review: ReviewDto,
+    /// With `--pr`: why what GitHub holds about the pull request couldn't be read, the
+    /// review printed as it was last read (PLAN §9.3); `null` when it was, and for a local
+    /// review.
+    pub stale: Option<StaleDto>,
+}
+
+/// A GitHub failure an open went on without (PLAN §9.10): exit 5's kind and message.
+#[derive(Serialize, Debug, Clone, PartialEq, Eq)]
+pub struct StaleDto {
+    /// `GithubError::kind`: `gh_missing`, `not_authenticated`, `unavailable`, `git`, …
+    pub kind: &'static str,
+    pub message: String,
+}
+
+/// `dv review refresh`.
+#[derive(Serialize, Debug, Clone, PartialEq, Eq)]
+pub struct ReviewRefreshDoc {
+    pub review: ReviewDto,
+    /// The heads the refresh moved the review between; `null` when it stayed.
+    pub moved: Option<MovedDto>,
+}
+
+/// A draft PR review following its pull request's head (PLAN §9.5).
+#[derive(Serialize, Debug, Clone, PartialEq, Eq)]
+pub struct MovedDto {
+    /// The head the review showed.
+    pub from: String,
+    /// The head it shows now.
+    pub to: String,
 }
 
 /// `dv review done` and `dv review close`.

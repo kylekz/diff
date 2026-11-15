@@ -138,7 +138,9 @@ fn gui(cli: Cli, open: Option<cli::OpenArgs>, args: &[OsString], entry: Entry) -
     };
     let cwd = std::env::current_dir().unwrap_or_default();
     let here = dv_cli::this_distro(&dv_cli::Env::Process);
-    let startup = match launch::startup(&cli, open.as_ref(), &cwd, here.as_deref()) {
+    let startup = match launch::startup(&cli, open.as_ref(), &cwd, here.as_deref(), &|path| {
+        path.exists()
+    }) {
         Ok(startup) => startup,
         Err(error) => return report(error),
     };
@@ -182,6 +184,7 @@ fn gui(cli: Cli, open: Option<cli::OpenArgs>, _args: &[OsString], _entry: Entry)
         open.as_ref(),
         &ctx.cwd,
         std::env::var("WSL_DISTRO_NAME").ok().as_deref(),
+        &|path| path.exists(),
     );
     dv_cli::output::error(&mut ctx, cli.global.json, &error).into()
 }

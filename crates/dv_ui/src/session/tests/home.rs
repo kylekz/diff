@@ -33,7 +33,8 @@ fn services(
         locations.register_env(repo.path().to_path_buf(), env.clone());
         locations.register_env(linked.to_path_buf(), env);
     });
-    cx.new(|cx| Reviews::new(locations, data, cx))
+    let github = cx.new(|_| crate::services::GitHub::without_gh());
+    cx.new(|cx| Reviews::new(locations, github, data, cx))
 }
 
 /// Opens `request` from the main work tree's row, as the switcher would.

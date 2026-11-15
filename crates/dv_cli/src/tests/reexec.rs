@@ -41,6 +41,9 @@ fn the_commands_that_read_a_repository_cross_and_the_others_dont() {
         &["review", "submit", "--verdict", "approve"],
         &["review", "close", "r-1"],
         &["review", "delete", "r-1"],
+        // A pull request's commands run the distro's gh (PLAN §9.10).
+        &["review", "new", "--pr", "482"],
+        &["review", "refresh"],
         &["comment", "list"],
         &["comment", "show", "t-1"],
         &[
@@ -59,8 +62,6 @@ fn the_commands_that_read_a_repository_cross_and_the_others_dont() {
         &["setup"],
         &["doctor"],
         &["backend", "--stdio"],
-        // Refused before any repository is read.
-        &["review", "new", "--pr", "482"],
     ] {
         assert!(!reads_repository(&parsed(line).command), "{line:?}");
     }
@@ -574,6 +575,15 @@ mod windows {
             &["status", "--repo", r"\\wsl$\Ubuntu\home\kyle\api"],
             &["review", "list", "--wsl", "Ubuntu:/home/kyle/api"],
             &["comment", "show", "t-1", "--wsl", "Ubuntu:/home/kyle/api"],
+            // A pull request's commands run in the distro too, with its gh (PLAN §9.10).
+            &[
+                "review",
+                "new",
+                "--pr",
+                "482",
+                "--wsl",
+                "Ubuntu:/home/kyle/api",
+            ],
         ] {
             let mut line = line.to_vec();
             line.push("--json");
@@ -593,24 +603,6 @@ mod windows {
                 .error(Exit::Unavailable, "backend_unavailable");
             assert_eq!(error["message"], message, "{line:?}");
         }
-        // What reads no repository runs here as ever.
-        let refused = fixture
-            .run(&[
-                "review",
-                "new",
-                "--pr",
-                "482",
-                "--wsl",
-                "Ubuntu:/home/kyle/api",
-                "--json",
-            ])
-            .error(Exit::Usage, "unsupported");
-        assert!(
-            refused["message"]
-                .as_str()
-                .unwrap()
-                .starts_with("GitHub PRs arrive in a later version")
-        );
     }
 
     #[test]

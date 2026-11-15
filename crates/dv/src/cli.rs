@@ -2,6 +2,7 @@
 //! commands and the global flags from `dv_cli`, composed so `dv --help` lists every command.
 
 use std::ffi::OsString;
+use std::path::Path;
 #[cfg(feature = "gui")]
 use std::{fmt, path::PathBuf, str::FromStr};
 
@@ -88,21 +89,54 @@ impl Cli {
 /// The subcommands: `open`, the GUI's, and the headless ones (`dv_cli`).
 #[derive(Subcommand, Debug, Clone, PartialEq)]
 pub enum Command {
-    /// Open the app on a repository (the switcher on its changes) or, with --review, on a
-    /// review
+    /// Open the app on a repository (the switcher on its changes), with --review on a
+    /// review, or on a GitHub pull request's review
     Open(OpenArgs),
 
     #[command(flatten)]
     Headless(dv_cli::Command),
 }
 
-/// `dv open [<path> | <PR-url> | #<n>] [--review <id>]`.
+/// `dv open [<path> | <PR>] [--pr <PR>] [--review <id>]`.
 #[derive(Args, Debug, Clone, PartialEq, Eq)]
 pub struct OpenArgs {
     /// A path inside a repository's working tree, or \\wsl.localhost\<distro>\<path>
-    /// [default: the current directory]; a PR (URL or #<n>) in a later version
-    #[arg(value_name = "PATH")]
+    /// [default: the current directory]; or, when no such path exists, a GitHub pull request
+    /// of the repository ("#<n>" quoted, owner/repo#<n> or its URL), which opens as a review
+    #[arg(value_name = "PATH|PR")]
     pub target: Option<String>,
+
+    /// Open a GitHub pull request of the repository as a review: its number, #<n>,
+    /// owner/repo#<n> or its URL
+    #[arg(long, value_name = "PR")]
+    pub pr: Option<String>,
+}
+
+impl OpenArgs {
+    /// The pull request the line names, as written (PLAN §9.3): `--pr`'s value, whose every
+    /// form `dv review new --pr` takes too; else the argument when it reads as one (`#482`,
+    /// `owner/repo#482` or its URL) and names nothing that `exists` from `cwd`. A path that
+    /// is there is always the path, and a bare number is a folder's name, as any other
+    /// argument is.
+    pub fn pr(&self, cwd: &Path, exists: &dyn Fn(&Path) -> bool) -> Option<&str> {
+        if let Some(reference) = &self.pr {
+            return Some(reference);
+        }
+        let target = self.target.as_deref()?;
+        dv_core::github::PrRef::parse(target)
+            .filter(|reference| !matches!(reference, dv_core::github::PrRef::Number(_)))
+            .filter(|_| !exists(&cwd.join(target)))
+            .map(|_| target)
+    }
+
+    /// The path the line names: the argument, unless it is the pull request
+    /// ([`OpenArgs::pr`]).
+    pub fn path(&self, cwd: &Path, exists: &dyn Fn(&Path) -> bool) -> Option<&str> {
+        match (&self.pr, self.pr(cwd, exists)) {
+            (None, Some(_)) => None,
+            _ => self.target.as_deref(),
+        }
+    }
 }
 
 /// The command line `args` (the program name first, as parsed) as `dv_cli`'s own tree reads
@@ -366,7 +400,23 @@ mod tests {
         assert_eq!(
             parse(&["open", "../api"]).unwrap().command,
             Some(Command::Open(OpenArgs {
-                target: Some("../api".into())
+                target: Some("../api".into()),
+                pr: None,
+            }))
+        );
+        // A pull request by its flag, alone or beside the repository's path.
+        assert_eq!(
+            parse(&["open", "--pr", "482"]).unwrap().command,
+            Some(Command::Open(OpenArgs {
+                target: None,
+                pr: Some("482".into()),
+            }))
+        );
+        assert_eq!(
+            parse(&["open", "../api", "--pr", "#482"]).unwrap().command,
+            Some(Command::Open(OpenArgs {
+                target: Some("../api".into()),
+                pr: Some("#482".into()),
             }))
         );
         let cli = parse(&["backend", "--stdio"]).unwrap();
@@ -428,7 +478,8 @@ mod tests {
         assert_eq!(
             cli.command,
             Some(Command::Open(OpenArgs {
-                target: Some("repos/api-server".into())
+                target: Some("repos/api-server".into()),
+                pr: None,
             }))
         );
         assert_eq!(
@@ -437,7 +488,10 @@ mod tests {
         );
         assert_eq!(
             parse(&["--no-detach", "open"]).unwrap().command,
-            Some(Command::Open(OpenArgs { target: None }))
+            Some(Command::Open(OpenArgs {
+                target: None,
+                pr: None,
+            }))
         );
 
         // The app's options belong to the app, not to the headless commands.

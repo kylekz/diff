@@ -548,3 +548,50 @@ fn the_pending_reviews_comments_are_the_threads_own() {
     };
     assert_eq!(none.pending_comments().count(), 0);
 }
+
+#[test]
+fn a_store_path_is_a_pull_requests_mirror_whatever_the_host_and_login() {
+    let path = key().path();
+    assert_eq!(path, "github/github.com/acme/api/pr-482/kylekz.json");
+    assert!(is_mirror_of(&path, "acme", "api", 482));
+    // As GitHub's names have no case, and as they are spelled in the store.
+    assert!(is_mirror_of(&path, "Acme", "API", 482));
+    assert!(is_mirror_of(
+        "github/ghe.example.com%3a8443/acme/%2egithub/pr-7/octocat.json",
+        "acme",
+        ".github",
+        7
+    ));
+    for (other, owner, repo, number) in [
+        (path.as_str(), "acme", "api", 48),
+        (path.as_str(), "acme", "web", 482),
+        (path.as_str(), "other", "api", 482),
+        ("github/github.com/acme/api/pr-482", "acme", "api", 482),
+        (
+            "github/github.com/acme/api/pr-482/kylekz.json.tmp",
+            "acme",
+            "api",
+            482,
+        ),
+        (
+            "github/github.com/acme/api/pr-482/x/kylekz.json",
+            "acme",
+            "api",
+            482,
+        ),
+        (
+            "reviews/github.com/acme/api/pr-482/kylekz.json",
+            "acme",
+            "api",
+            482,
+        ),
+        (
+            "reviews/r-01k6zzzzzzzzzzzzzzzzzzzzzz.jsonl",
+            "acme",
+            "api",
+            482,
+        ),
+    ] {
+        assert!(!is_mirror_of(other, owner, repo, number), "{other}");
+    }
+}

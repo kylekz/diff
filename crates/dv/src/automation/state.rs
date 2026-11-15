@@ -68,15 +68,23 @@ pub fn shell(shell: &Shell, window: &Window, cx: &App) -> Value {
             "repo": pending.location.display_name(),
             "target": match &pending.request {
                 OpenRequest::Target(target) => json!(target),
-                OpenRequest::Review(_) => Value::Null,
+                OpenRequest::Review(_) | OpenRequest::Pr(_) => Value::Null,
             },
             "review": match &pending.request {
                 OpenRequest::Review(id) => json!(id),
-                OpenRequest::Target(_) => Value::Null,
+                OpenRequest::Target(_) | OpenRequest::Pr(_) => Value::Null,
+            },
+            "pr": match &pending.request {
+                OpenRequest::Pr(reference) => json!(reference.number()),
+                OpenRequest::Target(_) | OpenRequest::Review(_) => Value::Null,
             },
             "connection": pending.connection().name(),
         })),
-        "banner": shell.banner().map(|banner| failure(Some(&banner.failure))),
+        "banner": shell.banner().map(|banner| json!({
+            "message": banner.failure.message,
+            "detail": banner.failure.detail,
+            "retry": banner.retry.is_some(),
+        })),
         "backend_banner": shell.backend_down(cx).map(|down| json!({
             "message": down.failure.message,
             "detail": down.failure.detail,
@@ -341,11 +349,16 @@ pub fn session(shell: &Shell, cx: &App) -> Value {
             })
         })
         .collect();
+    let side_labels = session.side_labels();
     json!({
         "review_id": review.id,
         "repo": session.backend().repo().toplevel,
         "target": review.target,
         "target_label": session.target_label(),
+        "side_labels": {"old": side_labels.0, "new": side_labels.1},
+        // The two sides the files were listed with: a PR review's are its pins.
+        "spec": session.spec(),
+        "pr": pr(session),
         "status": status(review.status),
         "round": review.shown_round(),
         "read_only": session.is_read_only(),
@@ -385,6 +398,42 @@ pub fn session(shell: &Shell, cx: &App) -> Value {
         "ready_note": ready_note(shell, cx),
         // `A` (PLAN §19.3): whether the stream draws the agent's annotations.
         "annotations_shown": session.annotations_shown(),
+    })
+}
+
+/// `state.session.pr`: a PR review's pull request as last refreshed (PLAN §9.4), `null` for
+/// a local review.
+pub fn pr(session: &ReviewSession) -> Value {
+    let Some(link) = session.review().pr_target() else {
+        return Value::Null;
+    };
+    let read = session.pr();
+    let mirror = read.and_then(|read| read.mirror.as_ref());
+    let pins = |pins: &dv_core::review::Pins| json!({"head": pins.head, "base": pins.base});
+    json!({
+        "owner": link.owner,
+        "repo": link.repo,
+        "number": link.number,
+        "refreshing": session.is_refreshing_pr(),
+        // Whether a refresh has landed; what it found is `null` before.
+        "read": read.is_some(),
+        "stale": read.and_then(|read| read.stale.as_ref()).map(|stale| failure(Some(stale))),
+        "pins": read.and_then(|read| read.pins.as_ref()).map(pins),
+        "moved_from": read.and_then(|read| read.moved_from.as_ref()).map(pins),
+        "mirror": mirror.map(|mirror| json!({
+            "login": mirror.key.login,
+            "read_at": mirror.read_at,
+            "title": mirror.pr.title,
+            "state": mirror.pr.state,
+            "author": mirror.pr.author,
+            "base_ref": mirror.pr.base_ref,
+            "head_ref": mirror.pr.head_ref,
+            "head_oid": mirror.pr.head_oid,
+            "url": mirror.pr.url,
+            "checks": mirror.checks,
+            "threads": mirror.threads.len(),
+            "files": mirror.files.len(),
+        })),
     })
 }
 

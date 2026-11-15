@@ -1,7 +1,7 @@
-//! Fixture repos for scenarios (PLAN §14.2): `seed_repo {name, steps, backend?}` builds one at
-//! `<data_dir>/repos/<name>` with `dv_test_support::FixtureRepo::persistent`, and
-//! `repo_edit {name, steps}` runs more steps on it, which is how a scenario plays the agent
-//! editing and committing. `"backend": "loopback"` reaches it through the loopback
+//! Fixture repos for scenarios (PLAN §14.2): `seed_repo {name, steps, backend?, github?}`
+//! builds one at `<data_dir>/repos/<name>` with `dv_test_support::FixtureRepo::persistent`, and
+//! `repo_edit {name, steps, github?}` runs more steps on it, which is how a scenario plays the
+//! agent editing and committing. `"backend": "loopback"` reaches it through the loopback
 //! `dv backend --stdio` (`super::backends`); a `<name>.loopback` file beside it says so after a
 //! restart. Steps are small JSON objects over the fixture's own methods:
 //!
@@ -19,6 +19,23 @@
 //! | `{"worktree": [name, branch]}` | adds a linked worktree on a new branch at `HEAD`, at `<data_dir>/repos/<repo>.fixture/worktrees/<name>` |
 //! | `{"git": [args…]}` | any other git command, the escape hatch |
 //!
+//! **A fixture GitHub** (PLAN §9.11): with `github` (a list of steps, possibly empty) the repo
+//! is the clone of `dv_test_support::FixtureGithub::persistent`: its `origin` reads as
+//! `https://github.com/dv-fixture/<name>.git` and fetches from a bare repository beside it,
+//! which lives as long as the scenario's output and is found again after a restart. The
+//! `github` steps run on the author's repository there, where the pull requests' commits are
+//! made (it starts with one commit on `main`, a `README.md`), with two steps of their own:
+//!
+//! | Step | Does |
+//! |---|---|
+//! | `{"publish": branch}` | pushes the author's branch to the fixture GitHub, forced |
+//! | `{"pr": [n, rev]}` | makes `rev` the head of pull request `n`; again, it is a push to it |
+//!
+//! `steps` still run on the clone, after them. What `gh` says about the pull requests is the
+//! scenario header's `gh` file's to answer (`mock_gh`): the fixture's commits have fixed
+//! identities and dates, so that file names their ids. The reply's `github` is `{commits,
+//! prs}`: the commits the `github` steps made and each pull request's head by its number.
+//!
 //! The work runs off the UI thread. A fixture method panics on failure (it is a test helper);
 //! the panic is caught and becomes the command's error.
 //!
@@ -31,7 +48,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use anyhow::{Context as _, Result, anyhow, bail};
-use dv_test_support::FixtureRepo;
+use dv_test_support::{FixtureGithub, FixtureRepo, GithubOrigin};
 use dv_ui::ActiveServices as _;
 use gpui::{AppContext as _, Context, Task};
 use serde_json::{Map, Value, json};
@@ -219,6 +236,94 @@ impl Step {
     }
 }
 
+/// One step of a `seed_repo`'s or `repo_edit`'s `github`: a step on the author's repository,
+/// or one that reaches the fixture GitHub (module docs).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum GithubStep {
+    Author(Step),
+    Publish(String),
+    Pr(u64, String),
+}
+
+impl GithubStep {
+    /// Parses one step object: `publish`, `pr`, or a step on the author's repository.
+    pub fn parse(value: &Value) -> Result<Self> {
+        let field = |verb: &str| value.as_object().and_then(|object| object.get(verb));
+        if let Some(branch) = field("publish") {
+            let branch = branch
+                .as_str()
+                .with_context(|| format!("\"publish\" takes a branch's name: {value}"))?;
+            return Ok(Self::Publish(branch.to_string()));
+        }
+        if let Some(pr) = field("pr") {
+            return match pr.as_array().map(Vec::as_slice) {
+                Some([number, rev]) => Ok(Self::Pr(
+                    number
+                        .as_u64()
+                        .filter(|number| *number > 0)
+                        .with_context(|| format!("\"pr\" takes [number, rev]: {value}"))?,
+                    rev.as_str()
+                        .with_context(|| format!("\"pr\" takes [number, rev]: {value}"))?
+                        .to_string(),
+                )),
+                _ => bail!("\"pr\" takes [number, rev]: {value}"),
+            };
+        }
+        Step::parse(value).map(Self::Author)
+    }
+
+    /// Runs the step on `origin`: a commit's id, or a pull request's number and its head.
+    fn apply(&self, origin: &GithubOrigin, done: &mut GithubDone) {
+        match self {
+            Self::Author(step) => done.commits.extend(step.apply(origin.author())),
+            Self::Publish(branch) => origin.publish(branch),
+            Self::Pr(number, rev) => {
+                let head = origin.open_pr(*number, rev);
+                done.prs.insert(number.to_string(), Value::from(head));
+            }
+        }
+    }
+}
+
+/// What a command's `github` steps did: the reply's `github`.
+#[derive(Debug, Default)]
+struct GithubDone {
+    commits: Vec<String>,
+    /// Each pull request the steps opened or pushed to, by number, with its head now.
+    prs: Map<String, Value>,
+}
+
+impl GithubDone {
+    fn reply(self) -> Value {
+        json!({"commits": self.commits, "prs": self.prs})
+    }
+}
+
+/// Parses a command's `github` steps; `None` when it has none.
+fn parse_github(args: &Map<String, Value>) -> Result<Option<Vec<GithubStep>>> {
+    match args.get("github") {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::Array(steps)) => steps
+            .iter()
+            .map(GithubStep::parse)
+            .collect::<Result<_>>()
+            .map(Some),
+        Some(other) => bail!("\"github\" is a list of steps, not {other}"),
+    }
+}
+
+/// Runs `steps` on `origin`, turning a fixture panic into an error.
+fn run_github(origin: &GithubOrigin, steps: &[GithubStep]) -> Result<GithubDone> {
+    let mut done = GithubDone::default();
+    catch_unwind(AssertUnwindSafe(|| {
+        for step in steps {
+            step.apply(origin, &mut done);
+        }
+    }))
+    .map_err(fixture_panic)?;
+    Ok(done)
+}
+
 /// Parses a command's `steps` list.
 pub fn parse_steps(args: &Map<String, Value>) -> Result<Vec<Step>> {
     match args.get("steps") {
@@ -248,14 +353,17 @@ fn run_steps(repo: &FixtureRepo, steps: &[Step]) -> Result<Vec<String>> {
     catch_unwind(AssertUnwindSafe(|| {
         steps.iter().filter_map(|step| step.apply(repo)).collect()
     }))
-    .map_err(|panic| {
-        let message = panic
-            .downcast_ref::<String>()
-            .cloned()
-            .or_else(|| panic.downcast_ref::<&str>().map(|text| text.to_string()))
-            .unwrap_or_else(|| "the fixture panicked".to_string());
-        anyhow!("{message}")
-    })
+    .map_err(fixture_panic)
+}
+
+/// A fixture method's panic as the command's error.
+fn fixture_panic(panic: Box<dyn std::any::Any + Send>) -> anyhow::Error {
+    let message = panic
+        .downcast_ref::<String>()
+        .cloned()
+        .or_else(|| panic.downcast_ref::<&str>().map(|text| text.to_string()))
+        .unwrap_or_else(|| "the fixture panicked".to_string());
+    anyhow!("{message}")
 }
 
 /// The roots a seeded repo's environment applies to: its work tree and each of its linked
@@ -280,9 +388,12 @@ pub fn roots(fixture: &FixtureRepo) -> Vec<PathBuf> {
     roots
 }
 
-/// The seeded repos already in `data_dir` (an earlier launch of the same scenario), by name,
-/// with how each is reached.
-pub fn reopen_seeded(data_dir: &Path) -> Vec<(String, FixtureRepo, SeededBackend)> {
+/// A seeded repo found again: its name, its fixture, how it is reached, and its GitHub side
+/// when it was seeded with one.
+pub type Reopened = (String, FixtureRepo, SeededBackend, Option<GithubOrigin>);
+
+/// The seeded repos already in `data_dir` (an earlier launch of the same scenario).
+pub fn reopen_seeded(data_dir: &Path) -> Vec<Reopened> {
     let dir = data_dir.join(REPOS_DIR);
     let Ok(entries) = std::fs::read_dir(&dir) else {
         return Vec::new();
@@ -302,8 +413,8 @@ pub fn reopen_seeded(data_dir: &Path) -> Vec<(String, FixtureRepo, SeededBackend
         } else {
             SeededBackend::Local
         };
-        match catch_unwind(|| FixtureRepo::reopen(&path)) {
-            Ok(fixture) => found.push((name, fixture, backend)),
+        match catch_unwind(|| (FixtureRepo::reopen(&path), GithubOrigin::reopen(&path))) {
+            Ok((fixture, origin)) => found.push((name, fixture, backend, origin)),
             Err(_) => log::warn!("couldn't reopen the seeded repo {}", path.display()),
         }
     }
@@ -311,9 +422,11 @@ pub fn reopen_seeded(data_dir: &Path) -> Vec<(String, FixtureRepo, SeededBackend
 }
 
 impl DvAutomation {
-    /// `seed_repo {name, steps, backend?}`: builds `<data_dir>/repos/<name>` and runs `steps`
-    /// on it; replies `{path, commits}` once it is registered with `Locations`, reached in
-    /// process or, with `"backend": "loopback"`, through the loopback server.
+    /// `seed_repo {name, steps, backend?, github?}`: builds `<data_dir>/repos/<name>` (with
+    /// `github`, as the clone of a fixture GitHub, whose steps run first) and runs `steps` on
+    /// it; replies `{path, commits}`, and `github` for a fixture GitHub's side, once it is
+    /// registered with `Locations`, reached in process or, with `"backend": "loopback"`,
+    /// through the loopback server.
     pub(super) fn seed_repo(
         &mut self,
         args: Value,
@@ -322,9 +435,9 @@ impl DvAutomation {
         let args = args.as_object().cloned().unwrap_or_default();
         if let Some(unknown) = args
             .keys()
-            .find(|key| !["name", "steps", "backend"].contains(&key.as_str()))
+            .find(|key| !["name", "steps", "backend", "github"].contains(&key.as_str()))
         {
-            bail!("seed_repo takes name, steps and backend, not {unknown:?}");
+            bail!("seed_repo takes name, steps, backend and github, not {unknown:?}");
         }
         let name = args
             .get("name")
@@ -333,6 +446,7 @@ impl DvAutomation {
             .to_string();
         check_name(&name)?;
         let steps = parse_steps(&args)?;
+        let github = parse_github(&args)?;
         let backend = match args.get("backend") {
             None | Some(Value::Null) => SeededBackend::Local,
             Some(Value::String(kind)) if kind == "local" => SeededBackend::Local,
@@ -346,27 +460,43 @@ impl DvAutomation {
         }
         let mark = repos.join(format!("{name}.{LOOPBACK_MARK}"));
         let job = cx.background_spawn(async move {
-            let fixture = catch_unwind(|| FixtureRepo::persistent(&path))
-                .map_err(|_| anyhow!("couldn't build a repo at {}", path.display()))?;
+            let (fixture, origin) = catch_unwind(|| match github {
+                Some(_) => {
+                    let (clone, origin) = FixtureGithub::persistent(&path).into_parts();
+                    (clone, Some(origin))
+                }
+                None => (FixtureRepo::persistent(&path), None),
+            })
+            .map_err(|_| anyhow!("couldn't build a repo at {}", path.display()))?;
+            let pushed = match (&origin, &github) {
+                (Some(origin), Some(steps)) => Some(run_github(origin, steps)?),
+                _ => None,
+            };
             let commits = run_steps(&fixture, &steps)?;
             let roots = roots(&fixture);
             if backend == SeededBackend::Loopback {
                 std::fs::write(&mark, "")
                     .with_context(|| format!("couldn't write {}", mark.display()))?;
             }
-            anyhow::Ok((fixture, commits, roots))
+            anyhow::Ok((fixture, origin, commits, pushed, roots))
         });
         Ok(cx.spawn(async move |this, cx| {
-            let (fixture, commits, roots) = job.await?;
+            let (fixture, origin, commits, pushed, roots) = job.await?;
             let path = fixture.path().display().to_string();
             this.update(cx, |this, cx| {
-                this.register(name, fixture, backend, roots, cx)
+                this.register(name, fixture, backend, origin, roots, cx)
             })?;
-            Ok(json!({"path": path, "commits": commits}))
+            let mut reply = json!({"path": path, "commits": commits});
+            if let Some(pushed) = pushed {
+                reply["github"] = pushed.reply();
+            }
+            Ok(reply)
         }))
     }
 
-    /// `repo_edit {name, steps}`: runs `steps` on a seeded repo; replies `{path, commits}`.
+    /// `repo_edit {name, steps, github?}`: runs `steps` on a seeded repo, after `github` on
+    /// its fixture GitHub's side (a push to a pull request); replies `{path, commits}`, and
+    /// `github` as `seed_repo` does.
     pub(super) fn repo_edit(
         &mut self,
         args: Value,
@@ -375,33 +505,54 @@ impl DvAutomation {
         let args = args.as_object().cloned().unwrap_or_default();
         if let Some(unknown) = args
             .keys()
-            .find(|key| !["name", "steps"].contains(&key.as_str()))
+            .find(|key| !["name", "steps", "github"].contains(&key.as_str()))
         {
-            bail!("repo_edit takes name and steps, not {unknown:?}");
+            bail!("repo_edit takes name, steps and github, not {unknown:?}");
         }
         let name = args
             .get("name")
             .and_then(Value::as_str)
             .context("repo_edit needs a \"name\"")?;
         let steps = parse_steps(&args)?;
+        let github = parse_github(&args)?;
         let (fixture, backend): (Arc<Mutex<FixtureRepo>>, SeededBackend) = self
             .seeded
             .get(name)
             .cloned()
             .with_context(|| format!("no repo named {name:?} was seeded"))?;
+        let origin = match &github {
+            Some(_) => Some(self.origins.get(name).cloned().with_context(|| {
+                format!("the repo {name:?} was seeded without a fixture GitHub (\"github\")")
+            })?),
+            None => None,
+        };
         let job = cx.background_spawn(async move {
+            let pushed = match (origin, &github) {
+                (Some(origin), Some(steps)) => {
+                    let origin = origin
+                        .lock()
+                        .map_err(|_| anyhow!("an earlier step on this repo panicked"))?;
+                    Some(run_github(&origin, steps)?)
+                }
+                _ => None,
+            };
             let fixture = fixture
                 .lock()
                 .map_err(|_| anyhow!("an earlier step on this repo panicked"))?;
             let commits = run_steps(&fixture, &steps)?;
             let env = fixture.env_overlay();
-            anyhow::Ok((fixture.path().to_path_buf(), commits, roots(&fixture), env))
+            let path = fixture.path().to_path_buf();
+            anyhow::Ok((path, commits, pushed, roots(&fixture), env))
         });
         Ok(cx.spawn(async move |this, cx| {
-            let (path, commits, roots, env) = job.await?;
+            let (path, commits, pushed, roots, env) = job.await?;
             // A worktree the steps added gets the fixture's environment from now on.
             this.update(cx, |this, cx| this.register_roots(roots, env, backend, cx))?;
-            Ok(json!({"path": path.display().to_string(), "commits": commits}))
+            let mut reply = json!({"path": path.display().to_string(), "commits": commits});
+            if let Some(pushed) = pushed {
+                reply["github"] = pushed.reply();
+            }
+            Ok(reply)
         }))
     }
 }

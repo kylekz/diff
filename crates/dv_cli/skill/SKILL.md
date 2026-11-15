@@ -71,6 +71,16 @@ tell which, stop and tell the user; don't guess, and don't start a review.
   are staged: ask the user before you run `git add`, and say so when you hand back.
 - `commit`, `range`: fixed history. Edits can't change what this review shows: tell the user
   instead of handing back.
+- `pr`: a GitHub pull request the reviewer is reviewing in dv (`pr` in the review says which,
+  and `pr.head_oid` the commit it shows). It is the reviewer's own and read-only for you: its
+  threads are theirs until they submit them to GitHub, so every command that writes to it
+  (`dv comment add`, `annotate`, `reply`, `address`, `edit` and `delete`, `dv review done`)
+  exits 1 with `not_allowed`, and there is no round to hand back or wait for. You can read it
+  (`dv review show`, `dv comment list`, `dv comment show`) and, when the user asks, open or
+  refresh it (`dv review new --pr <number>`, `dv review refresh <review-id>`), which read
+  GitHub and write nothing the reviewer wrote. What its threads ask for you can still do in
+  the code: read them, fix the code where the pull request's branch is checked out, and tell
+  the user what you did. dv takes no answer from you on a pull request's review.
 
 2. Read what the reviewer asked for. The summary of the round they finished is the `body` of the
    last of `current.rounds` (`round.body` in step 5's output): it speaks for the whole round
@@ -285,6 +295,8 @@ annotation is for a change nobody asked for.
 - `3`: `dv review wait` timed out.
 - `4`: dv couldn't reach the WSL distro the repository is in (WSL, the distro or dv's Linux
   build is missing; the message says which): tell the user.
+- `5`: GitHub couldn't be read for a pull request's review (`gh` is missing or not signed in,
+  the network, a rate limit; the message says which): tell the user.
 
 Errors go to stderr as `dv: <message>`; only with `--json` does stdout also carry `{"schema":
 1, "error": {"code", "message"}}`, the one place an error's `code` appears.

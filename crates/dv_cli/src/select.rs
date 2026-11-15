@@ -12,6 +12,7 @@ use dv_core::label::Labels;
 use dv_core::review::{
     ItemId, ListEntry, Review, ReviewId, ReviewSummary, StoreError, Thread, ThreadId, ops,
 };
+use dv_core::target::Target;
 
 use crate::args::GlobalArgs;
 use crate::context::Context;
@@ -109,6 +110,59 @@ pub(crate) fn review(
     match in_context(repo, &listing)?.as_slice() {
         [one] => load(repo, &one.id),
         matches => Err(unclear(repo, &listing, matches.len())),
+    }
+}
+
+/// The PR review `dv review refresh` means (PLAN §9.10): the one named (`positional`,
+/// `--review`, `$DV_REVIEW`), which must be a PR review, else the repository's one open PR
+/// review; none or several is exit 2 with the open PR reviews as candidates. A PR review is
+/// the same from every worktree, so no worktree is its context ([`review`]'s rule).
+pub(crate) fn pr_review(
+    repo: &Repo,
+    global: &GlobalArgs,
+    ctx: &Context,
+    positional: Option<&str>,
+) -> Result<Review, CliError> {
+    if let Some(id) = named(global, ctx, positional)? {
+        let review = load(repo, &id)?;
+        if !review.is_pr_review() {
+            return Err(CliError::usage(format!(
+                "review {id} is a local review: only a PR review (`dv review new --pr <n>`) \
+                 refreshes from GitHub"
+            )));
+        }
+        return Ok(review);
+    }
+    let listing = Listing::read(repo)?;
+    let open: Vec<&ReviewSummary> = listing
+        .open()
+        .filter(|summary| matches!(summary.target, Target::Pr { .. }))
+        .collect();
+    match open.as_slice() {
+        [one] => load(repo, &one.id),
+        [] => Err(CliError::new(
+            Exit::Usage,
+            code::NO_REVIEW,
+            "no open PR review in this repository; open one with `dv review new --pr <n>`",
+        )
+        .with_candidates(Vec::new())),
+        several => {
+            let labels = repo.labels();
+            Err(CliError::new(
+                Exit::Usage,
+                code::AMBIGUOUS_REVIEW,
+                format!(
+                    "{} open PR reviews in this repository; name one with --review <id>",
+                    several.len()
+                ),
+            )
+            .with_candidates(
+                several
+                    .iter()
+                    .map(|summary| candidate(summary, &labels))
+                    .collect(),
+            ))
+        }
     }
 }
 

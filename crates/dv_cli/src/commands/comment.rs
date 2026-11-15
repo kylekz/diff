@@ -10,7 +10,7 @@ use dv_core::review::{Thread, ThreadState};
 use super::format;
 use crate::args::{CommentListArgs, GlobalArgs, ThreadStatusArg};
 use crate::context::Context;
-use crate::dto::{CommentListDoc, CommentShowDoc, ReviewDto, ThreadDto};
+use crate::dto::{CommentListDoc, CommentShowDoc, ThreadDto};
 use crate::error::{CliError, Exit};
 use crate::output;
 use crate::placement;
@@ -99,10 +99,9 @@ pub(crate) fn list(
             })
             .collect()
     } else {
-        let mut lines = vec![format::review_line(&ReviewDto::new(
-            &review,
-            &repo.labels(),
-        ))];
+        let mut lines = vec![format::review_line(
+            &repo.review_dto(&review, &repo.labels()),
+        )];
         for thread in &doc.threads {
             lines.push(String::new());
             lines.extend(format::thread_block(thread));
@@ -126,7 +125,7 @@ pub(crate) fn show(global: &GlobalArgs, id: &str, ctx: &mut Context) -> Result<E
         output::json(ctx, &doc)?;
     } else {
         let mut lines = vec![
-            format::review_line(&ReviewDto::new(&review, &repo.labels())),
+            format::review_line(&repo.review_dto(&review, &repo.labels())),
             String::new(),
         ];
         lines.extend(format::thread_block(&doc.thread));

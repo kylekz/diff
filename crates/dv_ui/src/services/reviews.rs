@@ -22,8 +22,9 @@
 //! distro, and then lists the repository as usual.
 //!
 //! [`Reviews::open_review`] opens or resumes a target's review (PLAN §2.4: at most one open
-//! review per target) as the reviewer, records that the repository was used, and hands back
-//! what a `ReviewSession` starts from. An open whose connection is lost under it, at any of its
+//! review per target; a pull request's through the [`GitHub`] service, PLAN §9.3) as the
+//! reviewer, records that the repository was used, and hands back what a `ReviewSession`
+//! starts from. An open whose connection is lost under it, at any of its
 //! steps, waits for the reconnect (starting nothing itself) and runs once more (PLAN §5.2). A
 //! remote repository that can't be reached, or whose connection is lost again, fails with a
 //! one-line headline ("couldn't open Ubuntu:/home/kyle/api"), the connection's error and
@@ -49,6 +50,7 @@ use std::sync::Arc;
 use dv_backend::{Connection, ConnectionKey};
 use dv_core::diff::file_list;
 use dv_core::git::branches::Branch;
+use dv_core::github::PrRef;
 use dv_core::label::{LabelContext, Labels};
 use dv_core::review::{
     Author, Home, HomeError, ListEntry, LoadedReview, ReviewId, ReviewStatus, ReviewStore,
@@ -60,6 +62,7 @@ use gpui::{
     App, AppContext as _, AsyncApp, Context, Entity, EventEmitter, Subscription, Task, WeakEntity,
 };
 
+use super::github::{GitHub, PrRead};
 use super::locations::{Locations, LocationsEvent, Reach};
 use super::persist::{JsonFile, ReadObject, read_object};
 use crate::failure::Failure;
@@ -256,11 +259,14 @@ impl Unopened {
     }
 }
 
-/// What [`Reviews::open`] opens: a target's review (resumed when one is open) or a review by id.
+/// What [`Reviews::open`] opens: a target's review (resumed when one is open), a review by id,
+/// or a GitHub pull request's review (PLAN §9.3: its open draft, its review submitted at the
+/// head, or a new draft).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum OpenRequest {
     Target(Target),
     Review(ReviewId),
+    Pr(PrRef),
 }
 
 /// A target's review, opened or resumed ([`Reviews::open_review`]).
@@ -281,11 +287,16 @@ pub struct OpenedReview {
     /// The repository's labels as the review opened, so its target is named in full
     /// ("working tree vs main") from the start rather than once its files are listed.
     pub labels: LabelContext,
+    /// What opening a pull request read of it (PLAN §9.3: an open by its reference refreshes
+    /// its mirror); `None` for any other open, a PR review's by id included, which the
+    /// session then refreshes itself.
+    pub pr: Option<PrRead>,
 }
 
 /// The reviews service (see the module docs).
 pub struct Reviews {
     locations: Entity<Locations>,
+    github: Entity<GitHub>,
     known: KnownReposFile,
     file: Entity<JsonFile>,
     rows: HashMap<Location, RepoRow>,
@@ -302,7 +313,12 @@ impl EventEmitter<ReviewsEvent> for Reviews {}
 impl Reviews {
     /// Reads `<data_dir>/known_repos.json` synchronously (it is small) and lists every known
     /// repository; their rows fill in as [`Reviews::refresh`] computes them.
-    pub fn new(locations: Entity<Locations>, data_dir: &Path, cx: &mut Context<Self>) -> Self {
+    pub fn new(
+        locations: Entity<Locations>,
+        github: Entity<GitHub>,
+        data_dir: &Path,
+        cx: &mut Context<Self>,
+    ) -> Self {
         let path = data_dir.join(KNOWN_REPOS_FILE);
         let (known, unsaveable) = match read_object(&path) {
             ReadObject::Missing => (KnownReposFile::default(), None),
@@ -348,6 +364,7 @@ impl Reviews {
             );
         Self {
             locations,
+            github,
             known,
             file,
             rows,
@@ -464,11 +481,13 @@ impl Reviews {
     ) -> Task<Result<OpenedReview, Failure>> {
         self.opening += 1;
         let locations = self.locations.clone();
+        let github = self.github.clone();
         let open = self
             .locations
             .update(cx, |locations, cx| locations.open(location.clone(), cx));
         detached(cx, async move |this, cx| {
-            let mut result = open_once(&locations, &location, request.clone(), open, cx).await;
+            let mut result =
+                open_once(&locations, &github, &location, request.clone(), open, cx).await;
             let lost = result.as_ref().is_err_and(|failure| failure.disconnected);
             let connection =
                 locations.read_with(cx, |locations, _| locations.connection_for(&location));
@@ -483,7 +502,7 @@ impl Reviews {
                     Ok(()) => {
                         let open = locations
                             .update(cx, |locations, cx| locations.open(location.clone(), cx));
-                        open_once(&locations, &location, request, open, cx).await
+                        open_once(&locations, &github, &location, request, open, cx).await
                     }
                     Err(error) => {
                         let named =
@@ -875,26 +894,28 @@ fn closing() -> Failure {
     Failure::new("dv is closing")
 }
 
-/// What [`find_blocking`] found: the review, whether it was just created, and its home.
+/// What [`find_blocking`] found: the review, whether it was just created, and its home; for
+/// a pull request, what opening it read.
 struct Found {
     id: ReviewId,
     created: bool,
     home: Home,
+    pr: Option<PrRead>,
 }
 
 /// `ops::open_review` as the reviewer (or the review asked for by id) in `backend`'s
 /// worktree, and the review's home (blocking). A review whose home worktree is gone fails,
 /// saying so.
-fn find_blocking(backend: Arc<dyn Backend>, request: OpenRequest) -> Result<Found, Failure> {
+fn find_blocking(backend: Arc<dyn Backend>, request: FindRequest) -> Result<Found, Failure> {
     let store = ReviewStore::new(backend.clone());
     let (review, created) = match request {
-        OpenRequest::Target(target) => {
+        FindRequest::Target(target) => {
             let opened =
                 ops::open_review_as(&store, target, || reviewer_identity(backend.as_ref()))
                     .map_err(|e| Failure::from(&e))?;
             (opened.review, opened.created)
         }
-        OpenRequest::Review(id) => (
+        FindRequest::Review(id) => (
             store.load(&id).map_err(|e| Failure::from(&e))?.review,
             false,
         ),
@@ -916,7 +937,15 @@ fn find_blocking(backend: Arc<dyn Backend>, request: OpenRequest) -> Result<Foun
         id: review.id,
         created,
         home,
+        pr: None,
     })
+}
+
+/// What [`find_blocking`] finds in the store alone: every [`OpenRequest`] but a pull
+/// request's, which asks GitHub first (the [`GitHub`] service).
+enum FindRequest {
+    Target(Target),
+    Review(ReviewId),
 }
 
 /// What [`load_blocking`] read.
@@ -955,6 +984,7 @@ fn joined<T>(job: std::thread::ScopedJoinHandle<'_, T>) -> T {
 /// later steps that lost the connection under it reads as the open's ([`couldnt_open`]).
 async fn open_once(
     locations: &Entity<Locations>,
+    github: &Entity<GitHub>,
     location: &Location,
     request: OpenRequest,
     open: Task<super::locations::OpenResult>,
@@ -973,11 +1003,36 @@ async fn open_once(
         }
     };
     let found = async {
+        let find = match request {
+            OpenRequest::Target(target) => FindRequest::Target(target),
+            OpenRequest::Review(id) => FindRequest::Review(id),
+            // A pull request has no home worktree: it is the same from every one (PLAN §2.2).
+            OpenRequest::Pr(reference) => {
+                let opened = github
+                    .update(cx, |github, cx| github.open(origin.clone(), reference, cx))
+                    .await?;
+                return Ok::<_, Failure>(Found {
+                    id: opened.review.id,
+                    created: opened.created,
+                    home: Home::Anywhere,
+                    pr: Some(opened.refreshed.into()),
+                });
+            }
+        };
         let job = cx.background_spawn({
             let backend = origin.clone();
-            async move { find_blocking(backend, request) }
+            async move { find_blocking(backend, find) }
         });
-        let Found { id, created, home } = job.await?;
+        job.await
+    }
+    .await;
+    let found = async {
+        let Found {
+            id,
+            created,
+            home,
+            pr,
+        } = found?;
         let backend = match &home {
             Home::Worktree(root) if !home.is(&origin.repo().location, &origin.repo().toplevel) => {
                 let there = sibling(&origin.repo().location, root);
@@ -993,10 +1048,10 @@ async fn open_once(
             async move { load_blocking(backend, &id) }
         });
         let loading = job.await?;
-        Ok::<_, Failure>((backend, created, loading))
+        Ok::<_, Failure>((backend, created, loading, pr))
     }
     .await;
-    let (backend, created, loading) = match found {
+    let (backend, created, loading, pr) = match found {
         Ok(found) => found,
         Err(failure) if failure.disconnected => {
             let connection =
@@ -1023,6 +1078,7 @@ async fn open_once(
         reviewer,
         labels,
         connection,
+        pr,
     })
 }
 
@@ -1062,6 +1118,7 @@ fn couldnt_open(location: &Location, failure: Failure, connection: Option<&Conne
         message: format!("couldn't open {}", location.display_name()),
         detail: Some(detail),
         disconnected: failure.disconnected,
+        retryable: true,
     }
 }
 

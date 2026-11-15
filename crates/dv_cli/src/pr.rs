@@ -1,0 +1,184 @@
+//! Pull requests in the CLI (docs/PLAN.md §9.10): the `gh` a command runs, a PR review's
+//! `pr` document, and what an agent is told when it writes to one.
+//!
+//! The CLI runs `gh` where it runs (PLAN §9.2): inside the distro for a WSL repository, with
+//! the distro's own login. The program is `$DV_GH`, else `gh`, as for the setup check
+//! (`crate::checks`).
+
+use std::collections::HashMap;
+use std::ffi::OsString;
+use std::sync::Mutex;
+
+use dv_core::github::fetch::refs_prefix;
+use dv_core::github::{Gh, GhOptions, MirrorStore, PrState, program};
+use dv_core::review::{ListEntry, OpError, PrLink, Review, ReviewId, ops, pins};
+use dv_core::target::Target;
+
+use crate::args::GlobalArgs;
+use crate::checks::GH_VAR;
+use crate::context::{Context, Env};
+use crate::dto::PrDto;
+use crate::error::CliError;
+use crate::identity;
+use crate::repo::Repo;
+use crate::select;
+
+/// The `gh` runner of a command run with `ctx`: `$DV_GH` or `gh`, with an explicit
+/// environment's variables (a test's `DV_MOCK_GH`) and the git overlay handed down, as the
+/// setup checks hand them to the programs they run.
+pub(crate) fn gh(ctx: &Context) -> Gh {
+    let mut env: Vec<(OsString, Option<OsString>)> = Vec::new();
+    if let Env::Vars(vars) = &ctx.env {
+        env.extend(
+            vars.iter()
+                .map(|(name, value)| (OsString::from(name), Some(OsString::from(value)))),
+        );
+    }
+    env.extend(ctx.git_env.iter().cloned());
+    Gh::new(GhOptions {
+        env,
+        ..GhOptions::new(program(ctx.env.non_empty(GH_VAR).map(OsString::from)))
+    })
+}
+
+/// What a command that writes names, for [`refuse_agent`].
+pub(crate) enum Written<'a> {
+    /// The review the command means: its argument (`dv review done <id>`), `--review`,
+    /// `$DV_REVIEW`, or the working directory's (`crate::select::review`).
+    Review(Option<&'a str>),
+    /// A thread or a reply by its id, in `--review`'s review or whichever review holds it
+    /// (`crate::select::item`).
+    Item(&'a str),
+}
+
+/// Refuses a write an agent asks for on a PR review: exit 1, `not_allowed` (PLAN §9.10).
+/// Asked before anything else about the command is looked at (its text, the file or the
+/// thread it names), so an agent hears the same answer whatever else is wrong with its
+/// command line. Whatever keeps the review from being told here (no repository, no such
+/// review, none in context, an id that names nothing) is the command's own to report;
+/// `review::ops` refuses the write too.
+pub(crate) fn refuse_agent(
+    global: &GlobalArgs,
+    ctx: &Context,
+    written: Written,
+) -> Result<(), CliError> {
+    let Ok(Some(agent)) = identity::agent(global, ctx) else {
+        return Ok(());
+    };
+    let Ok(repo) = Repo::open(global, ctx) else {
+        return Ok(());
+    };
+    let review = match (written, &global.review) {
+        (Written::Review(named), _) => select::review(&repo, global, ctx, named).ok(),
+        // `--review` names the review the thread is looked for in.
+        (Written::Item(_), Some(_)) => select::review(&repo, global, ctx, None).ok(),
+        (Written::Item(id), None) => select::item(&repo, global, id)
+            .ok()
+            .map(|(review, _)| review),
+    };
+    match review {
+        Some(review) if review.is_pr_review() => Err(OpError::NotAllowed {
+            actor: agent.kind,
+            action: ops::PR_REVIEWS_ARE_THE_REVIEWERS.to_string(),
+        }
+        .into()),
+        _ => Ok(()),
+    }
+}
+
+/// What a command's PR reviews are printed from, read once however many it prints
+/// ([`Repo::stored_prs`]): the store's PR reviews and the hosts a mirror may be kept under.
+/// Nothing here asks `gh`: a command that only reads never starts it (PLAN §9.10).
+pub(crate) struct StoredPrs {
+    /// Every PR review in the store with its target, oldest first: ids lead with their time.
+    reviews: Vec<(ReviewId, Target)>,
+    hosts: Vec<String>,
+    /// Each pull request's URL and state as its stored mirror has them, by the pull
+    /// request's ref namespace (`refs_prefix`: one spelling per pull request), read when its
+    /// first review is printed; `None` for one without a mirror.
+    mirrors: Mutex<HashMap<String, Option<(String, &'static str)>>>,
+}
+
+impl StoredPrs {
+    /// Read from `repo`'s store and its clone's remotes (blocking: one listing, a few git
+    /// calls). What can't be read is left out, as in [`dto`].
+    pub fn read(repo: &Repo) -> Self {
+        let mut reviews: Vec<_> = repo
+            .store
+            .list()
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|entry| match entry {
+                ListEntry::Ok(summary) if matches!(summary.target, Target::Pr { .. }) => {
+                    Some((summary.id, summary.target))
+                }
+                _ => None,
+            })
+            .collect();
+        reviews.sort_by(|a, b| a.0.cmp(&b.0));
+        Self {
+            reviews,
+            hosts: MirrorStore::new(repo.backend.clone())
+                .hosts()
+                .unwrap_or_default(),
+            mirrors: Mutex::default(),
+        }
+    }
+
+    /// The URL and the state of `link`'s pull request as its most recently read mirror has
+    /// them (blocking the first time a pull request is asked about: its mirror files).
+    fn mirror(&self, repo: &Repo, link: &PrLink) -> Option<(String, &'static str)> {
+        let mut mirrors = self
+            .mirrors
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        mirrors
+            .entry(refs_prefix(&link.owner, &link.repo, link.number))
+            .or_insert_with(|| {
+                let mirror = MirrorStore::new(repo.backend.clone())
+                    .latest_stored(&self.hosts, link)
+                    .ok()
+                    .flatten()?;
+                let state = match mirror.pr.state {
+                    PrState::Open => "open",
+                    PrState::Draft => "draft",
+                    PrState::Merged => "merged",
+                    PrState::Closed => "closed",
+                };
+                Some((mirror.pr.url, state))
+            })
+            .clone()
+    }
+}
+
+/// The `pr` document of `review`, a PR review; `None` for a local one (blocking: the
+/// review's pins and, once per command, [`StoredPrs`] and the pull request's stored mirror).
+/// Only what is stored is read, never `gh`. What can't be read is left out rather than
+/// failing the command: the head falls back to the one the review was made at, the URL and
+/// the state, which only a mirror has, to `null`.
+pub(crate) fn dto(repo: &Repo, review: &Review) -> Option<PrDto> {
+    let (link, Target::Pr { head_oid, .. }) = (review.pr_target()?, &review.target) else {
+        return None;
+    };
+    let head = match pins::read(&repo.git, &review.id) {
+        Ok(Some(pins)) => pins.head.to_string(),
+        _ => head_oid.to_string(),
+    };
+    let stored = repo.stored_prs();
+    let round = stored
+        .reviews
+        .iter()
+        .filter(|(_, target)| link.is_target(target))
+        .position(|(id, _)| *id == review.id)
+        .map_or(1, |index| index + 1);
+    let (url, state) = stored.mirror(repo, link).unzip();
+    Some(PrDto {
+        owner: link.owner.clone(),
+        repo: link.repo.clone(),
+        number: link.number,
+        url,
+        state,
+        head_oid: head,
+        pr_round: u32::try_from(round).unwrap_or(u32::MAX),
+    })
+}

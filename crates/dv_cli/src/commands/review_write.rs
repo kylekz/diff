@@ -11,12 +11,11 @@ use super::format;
 use crate::args::{GlobalArgs, ReviewDoneArgs, ReviewNewArgs, ReviewSubmitArgs, VerdictArg};
 use crate::body;
 use crate::context::Context;
-use crate::dto::{
-    ReviewChangeDoc, ReviewDeleteDoc, ReviewDto, ReviewNewDoc, ReviewSubmitDoc, RoundDto,
-};
+use crate::dto::{ReviewChangeDoc, ReviewDeleteDoc, ReviewNewDoc, ReviewSubmitDoc, RoundDto};
 use crate::error::{CliError, Exit, code};
 use crate::identity;
 use crate::output;
+use crate::pr::Written;
 use crate::repo::Repo;
 use crate::select;
 
@@ -36,7 +35,8 @@ pub(crate) fn new(
     let opened = ops::open_review(&repo.store, target, author)?;
     let doc = ReviewNewDoc {
         created: opened.created,
-        review: ReviewDto::new(&opened.review, &repo.labels()),
+        review: repo.review_dto(&opened.review, &repo.labels()),
+        stale: None,
     };
     if global.json {
         output::json(ctx, &doc)?;
@@ -93,6 +93,7 @@ pub(crate) fn done(
     args: &ReviewDoneArgs,
     ctx: &mut Context,
 ) -> Result<Exit, CliError> {
+    crate::pr::refuse_agent(global, ctx, Written::Review(args.review.id.as_deref()))?;
     let agent = identity::require_agent(
         global,
         ctx,
@@ -137,20 +138,20 @@ fn unseen_round(review: &ReviewId, round: u32) -> CliError {
 /// `dv review submit [<id>] --verdict approve|request-changes [--body | --body-file]`: the
 /// reviewer finishes the round in progress of a local review (PLAN §2.3: snapshot, then
 /// `round_closed` and the verdict's status). A local round approves or requests changes; a PR
-/// review is submitted to GitHub, which arrives in a later version.
+/// review is submitted to GitHub, which arrives in a later version (PLAN §9.12: exit 2), and
+/// is never an agent's to submit (`not_allowed`, as its every other write).
 pub(crate) fn submit(
     global: &GlobalArgs,
     args: &ReviewSubmitArgs,
     ctx: &mut Context,
 ) -> Result<Exit, CliError> {
+    crate::pr::refuse_agent(global, ctx, Written::Review(args.review.id.as_deref()))?;
     let body = body::optional(&args.body, ctx)?;
     let repo = Repo::open(global, ctx)?;
     let author = identity::author(global, ctx, repo.backend.as_ref())?;
     let review = select::review(&repo, global, ctx, args.review.id.as_deref())?;
     if review.is_pr_review() {
-        return Err(CliError::unsupported(
-            "submitting a PR review to GitHub arrives in a later version",
-        ));
+        return Err(super::later::pr_submit());
     }
     let verdict = match args.verdict {
         VerdictArg::Approve => Verdict::Approve,
@@ -173,7 +174,7 @@ pub(crate) fn submit(
         &author,
     )?;
     let doc = ReviewSubmitDoc {
-        review: ReviewDto::new(&finished.review, &repo.labels()),
+        review: repo.review_dto(&finished.review, &repo.labels()),
         round: RoundDto::from(&finished.round),
     };
     if global.json {
@@ -249,7 +250,7 @@ fn print_change(
 ) -> Result<Exit, CliError> {
     let doc = ReviewChangeDoc {
         changed,
-        review: ReviewDto::new(review, &repo.labels()),
+        review: repo.review_dto(review, &repo.labels()),
     };
     if global.json {
         output::json(ctx, &doc)?;

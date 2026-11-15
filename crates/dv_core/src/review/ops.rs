@@ -6,7 +6,8 @@
 //! that state. On top of them come the checks that need to know who is asking, which some
 //! events don't record (`body_edited`, `deleted`) or record only optionally (`status`): agents
 //! set only `in_progress` and `ready`, the reviewer the verdict statuses, and only an item's
-//! author edits or deletes it. A finished local review (`approved`, `closed`) takes no more
+//! author edits or deletes it. A PR review takes no write from an agent at all (PLAN §2.4,
+//! §9.10). A finished local review (`approved`, `closed`) takes no more
 //! threads, replies, state changes, edits or viewed marks ([`OpError::Finished`]), as the GUI
 //! shows it read-only (PLAN §2.4); a submitted PR review refuses every later event in the fold
 //! itself.
@@ -30,6 +31,11 @@ use super::snapshot::{self, SnapshotError};
 use super::store::{ListEntry, ReviewStore, StoreError};
 use crate::git::{GitError, GitRepo, Oid};
 use crate::target::{Side, Target, TargetError};
+
+/// What an agent's write to a PR review is refused with, after "an agent can't" (PLAN
+/// §9.10).
+pub const PR_REVIEWS_ARE_THE_REVIEWERS: &str = "write to a PR review: PR reviews are the \
+    reviewer's; read the threads with `dv comment list`";
 
 /// Why an operation was refused.
 #[derive(Debug, thiserror::Error)]
@@ -137,6 +143,7 @@ pub fn add_thread(
 ) -> Result<ThreadId, OpError> {
     check_body(body, "comment")?;
     let id = ThreadId::generate();
+    let actor = author.kind;
     commit(
         store,
         review,
@@ -147,14 +154,17 @@ pub fn add_thread(
             author,
             annotation: false,
         },
-        check_not_finished,
+        |state| {
+            check_pr_writer(state, actor)?;
+            check_not_finished(state)
+        },
     )?;
     Ok(id)
 }
 
 /// Adds an agent's annotation anchored at `anchor` (PLAN §19): a thread in state
 /// `annotation`, waiting on no one; returns its id. Only an agent annotates, and never a PR
-/// review, which is the reviewer's (PLAN §2.4).
+/// review, which takes no write of an agent's (PLAN §2.4).
 pub fn annotate(
     store: &ReviewStore,
     review: &ReviewId,
@@ -182,14 +192,8 @@ pub fn annotate(
             annotation: true,
         },
         |state| {
-            check_not_finished(state)?;
-            if state.is_pr_review() {
-                return Err(OpError::NotAllowed {
-                    actor,
-                    action: "annotate a PR review: PR reviews are the reviewer's".to_string(),
-                });
-            }
-            Ok(())
+            check_pr_writer(state, actor)?;
+            check_not_finished(state)
         },
     )?;
     Ok(id)
@@ -209,6 +213,7 @@ pub fn reply(
 ) -> Result<CommentId, OpError> {
     check_body(body, "reply")?;
     let id = CommentId::generate();
+    let actor = author.kind;
     commit(
         store,
         review,
@@ -219,7 +224,10 @@ pub fn reply(
             author,
             anchor: relocated,
         },
-        check_not_finished,
+        |state| {
+            check_pr_writer(state, actor)?;
+            check_not_finished(state)
+        },
     )?;
     Ok(id)
 }
@@ -255,6 +263,7 @@ pub fn set_thread_state(
             anchor: relocated,
         },
         |review| {
+            check_pr_writer(review, actor)?;
             if review
                 .thread(thread)
                 .is_some_and(|found| found.state == ThreadState::Annotation)
@@ -351,9 +360,12 @@ pub fn set_status(
             if_status: None,
             if_round: None,
         },
-        |state| match state.status {
-            from if from != status => check_not_finished(state),
-            _ => Ok(()),
+        |state| {
+            check_pr_writer(state, author.kind)?;
+            match state.status {
+                from if from != status => check_not_finished(state),
+                _ => Ok(()),
+            }
         },
     )?;
     Ok(outcome == Outcome::Changed)
@@ -402,6 +414,7 @@ pub(crate) fn hand_back_on(
     note: Option<&str>,
     seen_round: Option<u32>,
 ) -> Result<bool, OpError> {
+    check_pr_writer(&state, author.kind)?;
     if state.status != ReviewStatus::Ready {
         check_not_finished(&state)?;
     }
@@ -713,6 +726,7 @@ pub fn edit_body(
             body: body.to_string(),
         },
         |state| {
+            check_pr_writer(state, editor.kind)?;
             check_not_finished(state)?;
             check_item_author(state, item, editor, "edit")
         },
@@ -734,6 +748,7 @@ pub fn delete_item(
             target_id: item.clone(),
         },
         |state| {
+            check_pr_writer(state, by.kind)?;
             check_not_finished(state)?;
             check_item_author(state, item, by, "delete")
         },
@@ -770,6 +785,19 @@ fn apply_and_append(
 }
 
 fn no_extra_check(_: &Review) -> Result<(), OpError> {
+    Ok(())
+}
+
+/// A PR review is the reviewer's alone (PLAN §2.4, §9.10): an agent reads it, and every
+/// write it asks for is [`OpError::NotAllowed`], whatever the write and whatever state the
+/// review is in.
+fn check_pr_writer(state: &Review, actor: AuthorKind) -> Result<(), OpError> {
+    if state.is_pr_review() && actor == AuthorKind::Agent {
+        return Err(OpError::NotAllowed {
+            actor,
+            action: PR_REVIEWS_ARE_THE_REVIEWERS.to_string(),
+        });
+    }
     Ok(())
 }
 

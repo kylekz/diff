@@ -56,7 +56,7 @@ use dv_backend::install::{self, BuildState, LINUX_DIR_VAR, LinuxBuilds, WSL_HOME
 use dv_backend::wsl::{self, Arch, RUN, RUN_MISSING, RUN_NO_BUILD, Shell, WslError};
 use dv_core::location::Location;
 
-use crate::args::{Command, GlobalArgs, ReviewCommand};
+use crate::args::{Command, GlobalArgs};
 use crate::body;
 use crate::context::{Context, Env};
 use crate::error::{CliError, Exit, code};
@@ -84,13 +84,11 @@ pub(crate) fn wsl_repository(
     })
 }
 
-/// Whether `command` reads a repository: all but `setup`, `doctor` and `backend`, and `review
-/// new --pr`, which is refused before any repository is read.
+/// Whether `command` reads a repository: all but `setup`, `doctor` and `backend`. A pull
+/// request's commands cross too, and run the distro's `gh` (PLAN §9.10).
 pub(crate) fn reads_repository(command: &Command) -> bool {
     match command {
-        Command::Status | Command::Comment(_) => true,
-        Command::Review(ReviewCommand::New(args)) => args.pr.is_none(),
-        Command::Review(_) => true,
+        Command::Status | Command::Comment(_) | Command::Review(_) => true,
         Command::Setup(_) | Command::Doctor | Command::Backend(_) => false,
     }
 }

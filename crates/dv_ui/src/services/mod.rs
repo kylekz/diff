@@ -10,6 +10,8 @@
 //!   its reviews and uncommitted changes, as the switcher lists them.
 //! - [`ReviewUi`] (`review_ui`): what the reviewer chose per review (`review_ui.json`: split or
 //!   unified).
+//! - [`GitHub`] (`github`): the app's `gh` runner, and the pull requests it opens and
+//!   refreshes off the UI thread (PLAN §9).
 //! - [`LanguageServers`] (`language_servers`): the language servers of every worktree a review
 //!   is open on (`crate::intel::servers`, PLAN §18.5), with `settings.json`'s `lsp`.
 //! - [`Setup`] (`setup`): every environment's setup checks, the first-run marker and the
@@ -22,6 +24,7 @@
 //! picker, the clipboard) is the separate [`crate::system`] global, because automation swaps it
 //! for a recorder.
 
+pub mod github;
 pub mod locations;
 pub mod persist;
 pub mod review_ui;
@@ -36,6 +39,7 @@ use gpui::{App, AppContext as _, Entity, Global};
 
 use crate::intel::LanguageServers;
 
+pub use github::GitHub;
 pub use locations::{EnvOverlay, Locations, LocationsEvent, Reach, Route, WslAccess};
 pub use review_ui::{ReviewUi, ViewMode};
 pub use reviews::{Reviews, ReviewsEvent};
@@ -62,6 +66,7 @@ pub struct Services {
     pub locations: Entity<Locations>,
     pub reviews: Entity<Reviews>,
     pub review_ui: Entity<ReviewUi>,
+    pub github: Entity<GitHub>,
     pub language_servers: Entity<LanguageServers>,
     pub setup: Entity<Setup>,
     pub updates: Entity<Updates>,
@@ -81,6 +86,7 @@ impl Services {
             && self.locations.read(cx).is_settled()
             && self.reviews.read(cx).is_settled(cx)
             && self.review_ui.read(cx).is_settled(cx)
+            && self.github.read(cx).is_settled()
             && self.language_servers.read(cx).is_settled()
             && self.setup.read(cx).is_settled()
     }
@@ -97,7 +103,8 @@ pub fn init(config: ServicesConfig, cx: &mut App) {
     let path = data_dir.join(settings::SETTINGS_FILE);
     let settings = cx.new(|cx| Settings::load(path, cx));
     let locations = cx.new(|cx| Locations::new(wsl, cx));
-    let reviews = cx.new(|cx| Reviews::new(locations.clone(), &data_dir, cx));
+    let github = cx.new(|_| GitHub::new(&setup.seams));
+    let reviews = cx.new(|cx| Reviews::new(locations.clone(), github.clone(), &data_dir, cx));
     let review_ui = cx.new(|cx| ReviewUi::new(&data_dir, cx));
     let lsp = settings.read(cx).file().lsp_settings();
     let language_servers = cx.new(|cx| LanguageServers::new(lsp, cx));
@@ -108,6 +115,7 @@ pub fn init(config: ServicesConfig, cx: &mut App) {
         locations,
         reviews,
         review_ui,
+        github,
         language_servers,
         setup,
         updates,

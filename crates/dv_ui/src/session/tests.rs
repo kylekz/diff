@@ -61,6 +61,7 @@ fn session(repo: &FixtureRepo, target: Target, cx: &mut TestAppContext) -> Entit
                 reviewer: reviewer(),
                 labels,
                 connection: None,
+                pr: None,
             },
             cx,
         )
@@ -710,6 +711,7 @@ fn session_over(
                 reviewer: reviewer(),
                 labels: LabelContext::default(),
                 connection: None,
+                pr: None,
             },
             cx,
         )

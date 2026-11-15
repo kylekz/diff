@@ -45,6 +45,18 @@ use super::locations::{Locations, WslAccess};
 /// The first-run marker in the data dir.
 pub const ONBOARDING_FILE: &str = "onboarding.json";
 
+/// The program an automation run or a test runs as `gh` when `DV_GH` names none: one that
+/// isn't there, so nothing automated reaches the real `gh` (CLAUDE.md). The app's own, and
+/// the one its `cli` children get.
+pub const NO_GH: &str = "dv-sandbox-has-no-gh";
+
+/// Whether `DV_GH`'s `value` names the program to run as `gh`: set and not empty. An empty
+/// one is unset to the runner (`dv_core::github::program`), which would then run the real
+/// `gh`.
+pub fn names_gh(value: Option<&std::ffi::OsStr>) -> bool {
+    value.is_some_and(|value| !value.is_empty())
+}
+
 /// What the app's setup is built with (the `dv` binary decides; PLAN §14.1).
 #[derive(Clone, Debug)]
 pub struct SetupConfig {
@@ -93,8 +105,8 @@ impl SetupConfig {
         if std::env::var_os(dv_cli::checks::user_path::USER_PATH_FILE_VAR).is_none() {
             seams.user_path = dv_cli::checks::user_path::UserPath::file(user_path);
         }
-        if std::env::var_os(dv_cli::checks::GH_VAR).is_none() {
-            seams.gh = "dv-sandbox-has-no-gh".into();
+        if !names_gh(std::env::var_os(dv_cli::checks::GH_VAR).as_deref()) {
+            seams.gh = NO_GH.into();
         }
         seams.distro_env = vec![(
             dv_cli::checks::GH_VAR.to_string(),

@@ -26,13 +26,14 @@
 //!   and ends as [`GithubError::NotGithub`] without running gh for any other, wherever the
 //!   host came from: gh is never pointed at another forge, and a token in the environment
 //!   ([`ENTERPRISE_TOKEN_ENV`]) never reaches a host gh itself wouldn't contact.
-//! - **Signed in or not** ([`Gh::auth_status`]) is the setup check's question (PLAN §12.2),
-//!   asked through the same runner.
+//! - **Signed in or not** ([`Gh::auth_status`]) and **which gh** ([`Gh::version`], against
+//!   [`MIN_VERSION`]) are the setup check's questions (PLAN §12.2), asked through the same
+//!   runner.
 
 mod pages;
 mod response;
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::ffi::OsString;
 use std::sync::{Mutex, PoisonError};
 use std::time::{Duration, Instant};
@@ -78,6 +79,40 @@ pub const POST_TIMEOUT: Duration = Duration::from_secs(60);
 pub const LIST_TIMEOUT: Duration = Duration::from_secs(120);
 /// The least time between one mutation's end and the next one's start.
 pub const MUTATION_GAP: Duration = Duration::from_secs(1);
+/// How long a pull request whose fetched head isn't the one gh reported is left before both
+/// are read again (PLAN §9.3): GitHub's `refs/pull/<n>/head` can lag its API by a moment.
+pub const SETTLE: Duration = Duration::from_millis(1500);
+
+/// The oldest gh dv works with (PLAN §12.2): `gh api --slurp`, which a REST list is read
+/// whole with (PLAN §9.2), came with it.
+pub const MIN_VERSION: Version = Version(2, 48, 0);
+
+/// A gh version: `2.48.0`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub struct Version(pub u32, pub u32, pub u32);
+
+impl Version {
+    /// The version `gh --version` names ("gh version 2.48.0 (2024-04-03)"), when it names
+    /// one.
+    pub fn parse(said: &str) -> Option<Self> {
+        let mut numbers = said
+            .split("gh version ")
+            .nth(1)?
+            .split(|c: char| !c.is_ascii_digit())
+            .map(|part| part.parse::<u32>().ok());
+        Some(Self(
+            numbers.next()??,
+            numbers.next()??,
+            numbers.next().flatten().unwrap_or(0),
+        ))
+    }
+}
+
+impl std::fmt::Display for Version {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}.{}.{}", self.0, self.1, self.2)
+    }
+}
 
 /// The program dv runs as `gh`: what `DV_GH` names (`named`, its value when set and not
 /// empty), else `gh` on `PATH`.
@@ -99,6 +134,8 @@ pub struct GhOptions {
     pub post_timeout: Duration,
     pub list_timeout: Duration,
     pub mutation_gap: Duration,
+    /// [`SETTLE`]; tests don't wait.
+    pub settle: Duration,
 }
 
 impl GhOptions {
@@ -111,6 +148,7 @@ impl GhOptions {
             post_timeout: POST_TIMEOUT,
             list_timeout: LIST_TIMEOUT,
             mutation_gap: MUTATION_GAP,
+            settle: SETTLE,
         }
     }
 }
@@ -164,6 +202,8 @@ pub struct Gh {
     pace: Mutex<Option<Instant>>,
     /// The hosts gh said it holds a login for.
     logins: Mutex<HashSet<String>>,
+    /// The login gh is signed in as, by host ([`Gh::viewer`]).
+    viewers: Mutex<HashMap<String, String>>,
 }
 
 impl Gh {
@@ -172,13 +212,48 @@ impl Gh {
             options,
             pace: Mutex::new(None),
             logins: Mutex::new(HashSet::new()),
+            viewers: Mutex::new(HashMap::new()),
         }
+    }
+
+    /// The login gh is signed in as on `host` (`gh api user`): the viewer, whose Viewed
+    /// state, pending review and permissions a pull request's mirror holds (PLAN §9.4). Asked
+    /// once per host and remembered (PLAN §9.3); a failure is asked again the next time.
+    pub fn viewer(&self, host: &str) -> Result<String, GithubError> {
+        if let Some(login) = self.known_viewer(host) {
+            return Ok(login);
+        }
+        let user = self.rest(host, "user")?;
+        let login = user
+            .get("login")
+            .and_then(Value::as_str)
+            .filter(|login| !login.is_empty())
+            .ok_or_else(|| unexpected("api user", "the answer has no login", &user.to_string()))?
+            .to_string();
+        self.viewers
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .insert(host.to_string(), login.clone());
+        Ok(login)
     }
 
     /// `gh auth status`: whether gh is signed in, over every host it knows. An error only
     /// when gh couldn't be run to its end ([`GithubError::GhMissing`], a timeout).
     pub fn auth_status(&self) -> Result<AuthStatus, GithubError> {
         self.ask_auth_status(None)
+    }
+
+    /// The version of the gh dv runs (`gh --version`); `None` when what it printed names
+    /// none. An error only when gh couldn't be run to its end, as for [`Gh::auth_status`].
+    pub fn version(&self) -> Result<Option<Version>, GithubError> {
+        let output = self.run_to_end(&Call {
+            args: vec!["--version".to_string()],
+            body: None,
+            host: "",
+            kind: Kind::Read,
+            without: &[],
+        })?;
+        Ok(Version::parse(&String::from_utf8_lossy(&output.stdout)))
     }
 
     /// Runs [`auth_status_call`] and returns what gh said, however it exited.
@@ -189,6 +264,20 @@ impl Gh {
             stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
             stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
         })
+    }
+
+    /// The viewer on `host` when [`Gh::viewer`] has read it already: asks nothing.
+    pub fn known_viewer(&self, host: &str) -> Option<String> {
+        self.viewers
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(host)
+            .cloned()
+    }
+
+    /// Waits [`GhOptions::settle`]: before a pull request is read again.
+    pub(super) fn settle(&self) {
+        std::thread::sleep(self.options.settle);
     }
 
     /// Whether `host` is GitHub's or a GitHub Enterprise host (PLAN §9.1): `github.com`, a

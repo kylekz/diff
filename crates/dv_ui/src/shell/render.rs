@@ -351,6 +351,13 @@ impl Shell {
                             !session.review().status.is_final()
                                 && &session.review().target == target
                         }
+                        OpenRequest::Pr(reference) => {
+                            !session.review().status.is_final()
+                                && session
+                                    .review()
+                                    .pr_target()
+                                    .is_some_and(|link| link.number == reference.number())
+                        }
                     }
             }
             _ => false,

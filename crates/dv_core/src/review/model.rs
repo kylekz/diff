@@ -317,6 +317,26 @@ impl PrLink {
     }
 }
 
+impl PrLink {
+    /// Whether `target` is this pull request, whatever commits it was fetched at: the rule
+    /// "at most one open review per target" counts a PR target by (PLAN §2.4).
+    pub fn is_target(&self, target: &Target) -> bool {
+        match target {
+            Target::Pr {
+                owner,
+                repo,
+                number,
+                ..
+            } => {
+                *number == self.number
+                    && owner.eq_ignore_ascii_case(&self.owner)
+                    && repo.eq_ignore_ascii_case(&self.repo)
+            }
+            _ => false,
+        }
+    }
+}
+
 impl fmt::Display for PrLink {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{}/{}#{}", self.owner, self.repo, self.number)
@@ -537,6 +557,11 @@ impl Review {
     /// a PR and keeps the local lifecycle, PLAN §2.4).
     pub fn is_pr_review(&self) -> bool {
         matches!(self.target, Target::Pr { .. })
+    }
+
+    /// The pull request a PR review is of; `None` for a local review, linked to one or not.
+    pub fn pr_target(&self) -> Option<&PrLink> {
+        self.pr.as_ref().filter(|_| self.is_pr_review())
     }
 
     /// A thread by id, deleted or not.

@@ -9,7 +9,7 @@ use dv_ui::system::SystemShell;
 use gpui::{TestAppContext, VisualTestContext};
 use pretty_assertions::assert_eq;
 
-use super::repos::Step;
+use super::repos::{GithubStep, Step};
 use super::*;
 
 fn open(
@@ -980,4 +980,189 @@ fn wsl_distros_script_the_stand_in(cx: &mut TestAppContext) {
     assert!(error.to_string().contains("\"running\""), "{error}");
     let error = custom(json!({}), cx).unwrap_err();
     assert!(error.to_string().contains("needs a list"), "{error}");
+}
+
+#[test]
+fn github_steps_parse_strictly() {
+    let parse = |value: Value| GithubStep::parse(&value);
+    assert_eq!(
+        parse(json!({"publish": "main"})).unwrap(),
+        GithubStep::Publish("main".into())
+    );
+    assert_eq!(
+        parse(json!({"pr": [7, "feat"]})).unwrap(),
+        GithubStep::Pr(7, "feat".into())
+    );
+    // Anything else is a step on the author's repository.
+    assert_eq!(
+        parse(json!({"commit": "Add the answer"})).unwrap(),
+        GithubStep::Author(Step::Commit("Add the answer".into()))
+    );
+    for (step, error) in [
+        (json!({"publish": 7}), "takes a branch's name"),
+        (json!({"pr": 7}), "takes [number, rev]"),
+        (json!({"pr": [0, "feat"]}), "takes [number, rev]"),
+        (json!({"pr": ["7", "feat"]}), "takes [number, rev]"),
+        (json!({"pr": [7]}), "takes [number, rev]"),
+        (json!({"merge": "feat"}), "exactly one of"),
+    ] {
+        let message = parse(step.clone()).unwrap_err().to_string();
+        assert!(message.contains(error), "{step}: {message}");
+    }
+}
+
+#[gpui::test]
+fn a_repo_seeded_with_a_fixture_github_has_pull_requests_to_open(cx: &mut TestAppContext) {
+    cx.executor().allow_parking();
+    let (_dir, host, cx) = open(cx);
+    let seeded = run(
+        &host,
+        "seed_repo",
+        json!({"name": "api", "github": [
+            {"branch": "feat"},
+            {"checkout": "feat"},
+            {"write": "src/lib.rs", "text": "pub fn answer() -> u32 {\n    42\n}\n"},
+            {"commit": "Add the answer"},
+            {"pr": [7, "feat"]},
+        ], "steps": [{"write": "notes.txt", "text": "mine\n"}]}),
+        cx,
+    )
+    .unwrap();
+    // The fixture's commits are the same on every machine, wherever it is built.
+    assert_eq!(
+        seeded["github"],
+        json!({
+            "commits": ["5746f3cb7598128a528c413ffe03e23666d1e9d6"],
+            "prs": {"7": "5746f3cb7598128a528c413ffe03e23666d1e9d6"},
+        })
+    );
+    assert_eq!(seeded["commits"], json!([]));
+    let path = PathBuf::from(seeded["path"].as_str().unwrap());
+    // The clone reads as a GitHub repository and knows nothing of the pull request yet.
+    let git = |args: &[&str]| {
+        let output = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&path)
+            .args(args)
+            .output()
+            .unwrap();
+        String::from_utf8_lossy(&output.stdout).trim().to_string()
+    };
+    assert_eq!(
+        git(&["config", "remote.origin.url"]),
+        "https://github.com/dv-fixture/api.git"
+    );
+    assert_eq!(git(&["for-each-ref", "refs/dv/"]), "");
+    assert!(path.join("notes.txt").is_file());
+
+    // A push to the pull request, and a base branch that moved on.
+    let pushed = run(
+        &host,
+        "repo_edit",
+        json!({"name": "api", "github": [
+            {"write": "src/lib.rs", "text": "pub fn answer() -> u32 {\n    43\n}\n"},
+            {"commit": "Change the answer"},
+            {"pr": [7, "feat"]},
+            {"checkout": "main"},
+            {"write": "CHANGES.md", "text": "later\n"},
+            {"commit": "Notes"},
+            {"publish": "main"},
+        ]}),
+        cx,
+    )
+    .unwrap();
+    let head = pushed["github"]["prs"]["7"].as_str().unwrap().to_string();
+    assert_eq!(pushed["github"]["commits"].as_array().unwrap().len(), 2);
+    let remote = git(&["ls-remote", "origin"]);
+    assert!(
+        remote.contains(&format!("{head}\trefs/pull/7/head")),
+        "{remote}"
+    );
+
+    // A repo seeded without one has no GitHub side to push to; the commands say what they take.
+    run(&host, "seed_repo", json!({"name": "plain"}), cx).unwrap();
+    let error = run(
+        &host,
+        "repo_edit",
+        json!({"name": "plain", "github": [{"pr": [1, "main"]}]}),
+        cx,
+    )
+    .unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("was seeded without a fixture GitHub"),
+        "{error}"
+    );
+    let error = run(&host, "seed_repo", json!({"name": "x", "github": {}}), cx).unwrap_err();
+    assert!(error.to_string().contains("is a list of steps"), "{error}");
+
+    // After a restart (a new host on the same data dir) its GitHub side is found again.
+    let shell = host.read_with(cx, |host, _| host.shell.clone());
+    let again = cx.update(|_, cx| cx.new(|cx| DvAutomation::new(shell, cx)));
+    let pushed = run(
+        &again,
+        "repo_edit",
+        json!({"name": "api", "github": [{"pr": [8, "feat"]}]}),
+        cx,
+    )
+    .unwrap();
+    assert_eq!(pushed["github"]["prs"]["8"], head.as_str());
+
+    // The app's gh in an automation run without `DV_GH` is a program that isn't there: an
+    // open says so, in the reply and as the main area's banner, and makes nothing.
+    if !dv_ui::services::setup::names_gh(std::env::var_os("DV_GH").as_deref()) {
+        let error = run_waiting(
+            &host,
+            "open_pr",
+            json!({"path": path.display().to_string(), "pr": "#7"}),
+            cx,
+        )
+        .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .starts_with("couldn't open #7: gh isn't installed"),
+            "{error}"
+        );
+        let state = wait_until(&host, cx, "the banner", |state| {
+            state["shell"]["banner"].is_object()
+        });
+        assert!(
+            state["shell"]["banner"]["message"]
+                .as_str()
+                .unwrap()
+                .starts_with("couldn't open #7: gh isn't installed"),
+            "{state:#}"
+        );
+        assert_eq!(state["session"], Value::Null);
+        assert_eq!(git(&["for-each-ref", "refs/dv/"]), "");
+    }
+    // What isn't a pull request, and a refresh with no PR review open, are refused.
+    let error = cx
+        .update(|window, cx| {
+            host.update(cx, |host, cx| {
+                host.custom_task(
+                    "open_pr",
+                    json!({"path": path.display().to_string(), "pr": "seven"}),
+                    window,
+                    cx,
+                )
+            })
+        })
+        .unwrap();
+    let error = cx.foreground_executor().block_test(error).unwrap_err();
+    assert!(error.to_string().contains("not a pull request"), "{error}");
+    let refused = cx
+        .update(|window, cx| {
+            host.update(cx, |host, cx| {
+                host.custom("pr_refresh", json!({}), window, cx)
+            })
+        })
+        .unwrap()
+        .unwrap_err();
+    assert!(
+        refused.to_string().contains("needs an open PR review"),
+        "{refused}"
+    );
 }

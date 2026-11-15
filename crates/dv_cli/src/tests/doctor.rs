@@ -217,6 +217,56 @@ fn a_gh_that_fails_otherwise_says_what_gh_said() {
 }
 
 #[test]
+fn a_gh_older_than_dv_needs_is_out_of_date() {
+    let home = tempfile::tempdir().unwrap();
+    let version = |said: &str| {
+        let mut calls = vec![json!({"argv": ["--version"], "stdout": said})];
+        calls.extend(signed_in().as_array().unwrap().iter().cloned());
+        let fixture = with_home(home.path(), Some(Value::Array(calls)));
+        checks(&doctor(&fixture).1)["gh"].clone()
+    };
+    // `gh api --slurp`, which dv reads a pull request's files with, came with gh 2.48.
+    assert_eq!(
+        version(
+            "gh version 2.47.0 (2024-03-19)\nhttps://github.com/cli/cli/releases/tag/v2.47.0\n"
+        ),
+        (
+            "out_of_date".to_string(),
+            "gh 2.47.0 is older than dv needs (gh 2.48.0 or later): update it \
+             (https://cli.github.com)"
+                .to_string()
+        )
+    );
+    let signed_in = (
+        "ok".to_string(),
+        "signed in to github.com as kylekz".to_string(),
+    );
+    for said in [
+        "gh version 2.48.0 (2024-04-03)\n",
+        "gh version 2.103.3 (2026-10-26)\nhttps://github.com/cli/cli/releases/tag/v2.103.3\n",
+        "gh version 3.0.0\n",
+        // A gh that doesn't say is asked the rest as it is.
+        "a development build\n",
+    ] {
+        assert_eq!(version(said), signed_in, "{said}");
+    }
+    let text = with_home(
+        home.path(),
+        Some(json!([{"argv": ["--version"], "stdout": "gh version 2.9.0 (2022-04-26)\n"}])),
+    )
+    .run(&["doctor"]);
+    assert_eq!(text.exit, Exit::Failure);
+    assert!(
+        text.stdout.contains(
+            "  out of date  GitHub CLI  gh 2.9.0 is older than dv needs (gh 2.48.0 or later): \
+             update it (https://cli.github.com)\n"
+        ),
+        "{}",
+        text.stdout
+    );
+}
+
+#[test]
 fn a_gh_that_isnt_there_is_missing() {
     let home = tempfile::tempdir().unwrap();
     let mut fixture = with_home(home.path(), None);

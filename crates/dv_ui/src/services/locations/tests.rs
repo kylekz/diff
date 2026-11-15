@@ -740,3 +740,39 @@ async fn a_distros_connection_is_named_as_wsl_spells_it(cx: &mut TestAppContext)
         );
     });
 }
+
+#[gpui::test]
+async fn the_base_environment_reaches_every_backends_git(cx: &mut TestAppContext) {
+    // Two repositories: one with a route of its own (a seeded repo's), one without.
+    let (routed, plain) = (FixtureRepo::new(), FixtureRepo::new());
+    for repo in [&routed, &plain] {
+        repo.write("a.txt", "a\n");
+        repo.commit("base");
+    }
+    let locations = locations(cx, Vec::new());
+    // A transport git doesn't use here stands for an automation run's `file`: with it, a
+    // local path is refused, which shows the variable reached git without leaving the disk.
+    let base = |transport: &str| vec![("GIT_ALLOW_PROTOCOL".into(), Some(transport.into()))];
+    locations.update(cx, |locations, _| {
+        locations.set_base_env(base("ssh"));
+        locations.register_env(routed.path().to_path_buf(), routed.env_overlay());
+    });
+    let ls_remote = |backend: &Arc<dyn Backend>| {
+        let own = backend.repo().toplevel.clone();
+        backend.git(&["ls-remote", &own], &dv_core::backend::GitOpts::new())
+    };
+    let plain_backend = open(&locations, Location::Local(plain.path().to_path_buf()), cx)
+        .await
+        .unwrap();
+    match ls_remote(&plain_backend) {
+        Err(BackendError::Git { stderr, .. }) => {
+            assert!(stderr.contains("transport 'file' not allowed"), "{stderr}")
+        }
+        other => panic!("{other:?}"),
+    }
+    // A route's own environment goes over the base's: the fixture's allows a local path.
+    let routed_backend = open(&locations, Location::Local(routed.path().to_path_buf()), cx)
+        .await
+        .unwrap();
+    ls_remote(&routed_backend).expect("the fixture's git reads a local path");
+}

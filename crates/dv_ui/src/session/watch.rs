@@ -282,9 +282,10 @@ impl ReviewSession {
         }
     }
 
-    /// One batch from the watch: an append to this review's log reloads the fold; worktree
-    /// and git changes wait [`REFRESH_DEBOUNCE`] for more, then refresh. Other store paths
-    /// (snapshot caches, the snapshot's temporary index) change nothing here.
+    /// One batch from the watch: an append to this review's log reloads the fold; a PR
+    /// review's mirror rewritten is followed (`pr`); worktree and git changes wait
+    /// [`REFRESH_DEBOUNCE`] for more, then refresh. Other store paths (snapshot caches, the
+    /// snapshot's temporary index) change nothing here.
     pub(super) fn on_watch_event(
         &mut self,
         generation: u64,
@@ -298,6 +299,7 @@ impl ReviewSession {
         if event.rescan || event.store_paths.contains(&log) {
             self.reload_fold(cx);
         }
+        self.follow_mirror(&event.store_paths, cx);
         if event.rescan || !event.worktree_paths.is_empty() {
             cx.emit(super::SessionEvent::WorktreeChanged {
                 paths: event.worktree_paths.iter().cloned().collect(),

@@ -73,7 +73,8 @@ impl Health {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct StatusLine {
     pub health: Health,
-    /// "Local · watching for changes", "Ubuntu · can't be opened", "No repo".
+    /// "Local · watching for changes", "Ubuntu · can't be opened", "Local · api · no review
+    /// open" (a repository that opened, beside the banner of what failed in it), "No repo".
     pub location: String,
     /// "Changes requested · round 2 · 3 open · 1 resolved", with a review open; an interdiff
     /// adds "· since round 1".
@@ -215,10 +216,30 @@ impl Shell {
                 finish: !session.is_read_only(),
             };
         }
-        if let Some((location, _)) = self.banner.as_ref().and_then(|b| b.retry.as_ref()) {
+        // An open that failed: because its repository can't be opened, or inside a
+        // repository that did open (a pull request GitHub wouldn't tell about, a review
+        // that isn't there), which then reads as any repository with no review open.
+        if let Some(location) = self.banner.as_ref().and_then(|b| b.location.as_ref()) {
+            let locations = cx.services().locations.read(cx);
+            let Some(backend) = locations.cached(&locations.canonical(location)) else {
+                return StatusLine {
+                    health: Health::Failing,
+                    location: format!("{} · can't be opened", place(location, cx)),
+                    review: None,
+                    finish: false,
+                };
+            };
+            let (health, state) = locations
+                .connection_for(location)
+                .and_then(|connection| connection_line(&connection.state()))
+                .unwrap_or((Health::Idle, "no review open".to_string()));
             return StatusLine {
-                health: Health::Failing,
-                location: format!("{} · can't be opened", place(location, cx)),
+                health,
+                location: format!(
+                    "{} · {} · {state}",
+                    place(location, cx),
+                    backend.repo().location.short_name()
+                ),
                 review: None,
                 finish: false,
             };

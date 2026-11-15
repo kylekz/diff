@@ -5,7 +5,9 @@
 //! address; only the reviewer resolves and reopens. A write on a thread records where
 //! relocation found it when it moved, or its file's name now when it was renamed (PLAN §8),
 //! exactly as the GUI's writes do, and an agent's
-//! first write on a `changes_requested` review moves it to `in_progress` (PLAN §2.4).
+//! first write on a `changes_requested` review moves it to `in_progress` (PLAN §2.4). A PR
+//! review takes none of an agent's writes: each is exit 1, `not_allowed`, before anything
+//! else about the command is looked at (`crate::pr::refuse_agent`, PLAN §9.10).
 
 use dv_core::diff::{FileDiff, FileEntry, FileStatus};
 use dv_core::review::{
@@ -22,6 +24,7 @@ use crate::error::{CliError, Exit, code};
 use crate::identity;
 use crate::output;
 use crate::placement::{self, Sides};
+use crate::pr::Written;
 use crate::repo::Repo;
 use crate::select;
 
@@ -58,6 +61,7 @@ fn new_thread(
     annotation: bool,
     ctx: &mut Context,
 ) -> Result<Exit, CliError> {
+    crate::pr::refuse_agent(global, ctx, Written::Review(None))?;
     let what = if annotation { "annotation" } else { "comment" };
     let body = body::required(&args.body, what, ctx)?;
     // Checked before the repository is opened, so a reviewer hears at once that it isn't theirs.
@@ -167,6 +171,7 @@ pub(crate) fn edit(
     args: &CommentEditArgs,
     ctx: &mut Context,
 ) -> Result<Exit, CliError> {
+    crate::pr::refuse_agent(global, ctx, Written::Item(&args.item.id))?;
     let body = body::required(&args.body, "comment", ctx)?;
     let repo = Repo::open(global, ctx)?;
     let author = identity::author(global, ctx, repo.backend.as_ref())?;
@@ -202,6 +207,7 @@ pub(crate) fn edit(
 /// `dv comment delete <id>`: deletes a thread or a reply (a tombstone); only its author may
 /// (PLAN §19.1, `ops::delete_item`).
 pub(crate) fn delete(global: &GlobalArgs, id: &str, ctx: &mut Context) -> Result<Exit, CliError> {
+    crate::pr::refuse_agent(global, ctx, Written::Item(id))?;
     let repo = Repo::open(global, ctx)?;
     let author = identity::author(global, ctx, repo.backend.as_ref())?;
     let (review, item) = select::item(&repo, global, id)?;
@@ -272,6 +278,7 @@ pub(crate) fn reply(
     args: &CommentReplyArgs,
     ctx: &mut Context,
 ) -> Result<Exit, CliError> {
+    crate::pr::refuse_agent(global, ctx, Written::Item(&args.thread.id))?;
     let body = body::required(&args.body, "reply", ctx)?;
     let repo = Repo::open(global, ctx)?;
     let author = identity::author(global, ctx, repo.backend.as_ref())?;
@@ -322,6 +329,7 @@ pub(crate) fn set_state(
     note: Option<&Note>,
     ctx: &mut Context,
 ) -> Result<Exit, CliError> {
+    crate::pr::refuse_agent(global, ctx, Written::Item(id))?;
     let note = match note {
         Some(note) => body::note(note, ctx)?,
         None => None,

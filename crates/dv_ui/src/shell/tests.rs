@@ -14,6 +14,7 @@ use crate::test_support::{add_repo, bounds, fixture, open_shell, settle};
 use crate::theme::{ActiveTheme as _, Appearance};
 
 mod pending;
+mod pr;
 
 #[gpui::test]
 fn the_empty_shell_shows_the_no_review_state(cx: &mut TestAppContext) {

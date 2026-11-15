@@ -30,8 +30,9 @@ use dv_core::diff::{DiffLimits, FileDiff, FileEntry, file_diff, file_list, side_
 use dv_core::git::GitRepo;
 use dv_core::review::{
     Anchor, AnchorPlace, AnchorSide, History, Placement, Review, RoundHistory, SideText, Thread,
-    ThreadFile, Went, anchored_entry, entry_for, excerpt, excerpt_lines, is_gone, place_thread,
-    place_unlisted, read_round_history, relocated_anchor, side_lines, thread_file, unlisted_path,
+    ThreadFile, Went, anchored_entry, entry_for, excerpt, excerpt_lines, is_gone, pins,
+    place_thread, place_unlisted, read_round_history, relocated_anchor, side_lines, thread_file,
+    unlisted_path,
 };
 use dv_core::target::DiffSpec;
 
@@ -59,11 +60,13 @@ pub(crate) struct Sides {
 }
 
 impl Sides {
-    /// The file list of `review`'s target as it resolves now (blocking: the target's git calls
-    /// and one file list). A target that no longer resolves is `target` (exit 1).
+    /// The file list of `review`'s two sides as they resolve now, its target's or a PR
+    /// review's pins (`dv_core::review::pins::resolve`; blocking: their git calls and one file
+    /// list). A target that no longer resolves is `target` (exit 1).
     pub fn list(repo: &Repo, review: &Review, ctx: &Context) -> Result<Self, CliError> {
         let repo = repo.for_review(review, ctx)?;
-        let spec = review.target.resolve(&repo.git).map_err(CliError::target)?;
+        let spec =
+            pins::resolve(&repo.git, &review.id, &review.target).map_err(CliError::target)?;
         let entries = file_list(&repo.git, &spec)?;
         Ok(Self {
             git: repo.git,

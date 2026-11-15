@@ -328,15 +328,22 @@ impl ReviewStore {
         Ok(entries)
     }
 
-    /// Deletes a review: its log, its snapshot cache and its round snapshot refs
-    /// (`refs/dv/reviews/<id>/*`, PLAN §7). `false` when there was no log. The log goes first,
-    /// so the review disappears even if a later step fails, and the steps still run without a
-    /// log, so deleting again finishes an interrupted delete. A cache written back by a load
-    /// racing the delete is swept by [`ReviewStore::list`].
+    /// Deletes a review: its log, its snapshot cache and its refs (`refs/dv/reviews/<id>/*`:
+    /// its round snapshots, a PR review's pins, PLAN §7). `false` when there was no log. The
+    /// log goes first, so the review disappears even if a later step fails, and the steps
+    /// still run without a log, so deleting again finishes an interrupted delete. A cache
+    /// written back by a load racing the delete is swept by [`ReviewStore::list`].
+    ///
+    /// What dv keeps for a pull request goes with its last review: the commits fetched under
+    /// `refs/dv/pr/` and the mirror files (`crate::github::forget`), swept best effort once
+    /// the review itself is gone; a sweep that fails is the next deletion's to finish.
     pub fn delete(&self, id: &ReviewId) -> Result<bool, StoreError> {
         let existed = self.backend.store_remove(&log_path(id))?;
         self.backend.store_remove(&snapshot_path(id))?;
         self.delete_refs(id)?;
+        if let Err(error) = crate::github::forget::unreviewed(self) {
+            log::warn!("review {id}: what dv keeps for its pull request wasn't removed: {error}");
+        }
         Ok(existed)
     }
 

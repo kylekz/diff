@@ -1,6 +1,9 @@
-//! Why a GitHub operation failed (docs/PLAN.md §9.1–§9.3).
+//! Why a GitHub operation failed (docs/PLAN.md §9.1–§9.4).
 
+use super::mirror::store::MirrorError;
 use crate::backend::BackendError;
+use crate::review::StoreError;
+use crate::target::TargetError;
 
 /// How much of `gh`'s stderr, and of the response body, a failure keeps (PLAN §9.2).
 pub const KEPT_BYTES: usize = 2048;
@@ -81,9 +84,27 @@ fn kept(text: &str) -> String {
 /// command itself (PLAN §9.2).
 #[derive(Debug, thiserror::Error)]
 pub enum GithubError {
-    /// git failed where the repository lives (reading its remotes).
+    /// git failed where the repository lives (reading its remotes, fetching a pull request).
     #[error(transparent)]
     Backend(#[from] BackendError),
+    /// A pull request's fetched commits don't resolve: one is missing, or its head and its
+    /// base branch share no history, so there is no merge base to compare from (PLAN §9.3).
+    #[error(transparent)]
+    Target(#[from] TargetError),
+    /// The review store couldn't be read or written (the PR's reviews, its mirror).
+    #[error(transparent)]
+    Store(#[from] StoreError),
+    /// The pull request's head moved between what gh reported and what git fetched, twice
+    /// running, or again while its files were read (PLAN §9.3, §9.4): someone is pushing.
+    #[error("#{number} moved while dv was reading it (someone is pushing to it); refresh again")]
+    Moved { number: u64 },
+    /// The pull request's base branch is gone from GitHub, and neither GitHub's record of
+    /// its commit nor an earlier fetch of it is to be had (PLAN §9.3).
+    #[error(
+        "#{number}'s base branch {branch} was deleted on GitHub and its last commit can't be \
+         fetched, so there is nothing to compare the pull request with"
+    )]
+    BaseGone { number: u64, branch: String },
     /// The clone has no GitHub repository dv can pick (PLAN §9.1). `remotes` names the remotes
     /// on GitHub: none of them, or several with nothing to choose between them. `elsewhere`
     /// are the others: local paths, other forges, hosts gh has no login for.
@@ -164,11 +185,66 @@ pub enum GithubError {
 }
 
 impl GithubError {
+    /// The backend's failure under this one, when it is one: git or the store failing where
+    /// the repository lives.
+    fn backend(&self) -> Option<&BackendError> {
+        match self {
+            GithubError::Backend(error)
+            | GithubError::Target(TargetError::Git(crate::git::GitError::Backend(error)))
+            | GithubError::Store(StoreError::Backend(error)) => Some(error),
+            _ => None,
+        }
+    }
+
+    /// Whether the connection to the repository's backend died under the operation (PLAN
+    /// §5.2): nothing about GitHub or the pull request, and what failed is run again once
+    /// the connection is back.
+    pub fn is_disconnected(&self) -> bool {
+        matches!(self.backend(), Some(BackendError::Disconnected { .. }))
+    }
+
+    /// What git itself said when it failed (a fetch, mostly): the first line it wrote to
+    /// stderr, without its `fatal: ` or `error: `. The headline only says which command
+    /// failed and how it ended.
+    pub fn git_said(&self) -> Option<&str> {
+        let Some(BackendError::Git { stderr, .. }) = self.backend() else {
+            return None;
+        };
+        stderr
+            .lines()
+            .map(|line| {
+                let line = line.trim();
+                ["fatal: ", "error: "]
+                    .iter()
+                    .find_map(|lead| line.strip_prefix(lead))
+                    .unwrap_or(line)
+            })
+            .find(|line| !line.is_empty())
+    }
+
+    /// Whether running the operation again can end differently without anything changing
+    /// first on this machine or on GitHub's side of the pull request: not for a reference
+    /// to another repository, a clone with no GitHub repository, a pull request that isn't
+    /// there or one whose base branch is gone.
+    pub fn is_retryable(&self) -> bool {
+        !matches!(
+            self,
+            GithubError::OtherRepository { .. }
+                | GithubError::NoRepository { .. }
+                | GithubError::NotFound { .. }
+                | GithubError::BaseGone { .. }
+        )
+    }
+
     /// The diagnostics behind the headline: gh's command line, its exit code, its stderr and
     /// the response body.
     pub fn detail(&self) -> Option<String> {
         match self {
-            GithubError::Backend(error) => error.detail(),
+            GithubError::Backend(_)
+            | GithubError::Target(TargetError::Git(crate::git::GitError::Backend(_)))
+            | GithubError::Store(StoreError::Backend(_)) => {
+                self.backend().and_then(BackendError::detail)
+            }
             GithubError::NotAuthenticated { failure, .. }
             | GithubError::NotFound { failure }
             | GithubError::RateLimited { failure, .. }
@@ -182,14 +258,21 @@ impl GithubError {
             | GithubError::NotGithub { .. }
             | GithubError::NoRemote { .. }
             | GithubError::OtherRepository { .. }
-            | GithubError::GhMissing { .. } => None,
+            | GithubError::GhMissing { .. }
+            | GithubError::Target(_)
+            | GithubError::Store(_)
+            | GithubError::Moved { .. }
+            | GithubError::BaseGone { .. } => None,
         }
     }
 
     /// The kind as the CLI's JSON names it (PLAN §9.10).
     pub fn kind(&self) -> &'static str {
         match self {
-            GithubError::Backend(_) => "git",
+            GithubError::Backend(_) | GithubError::Target(_) => "git",
+            GithubError::Store(_) => "store",
+            GithubError::Moved { .. } => "moved",
+            GithubError::BaseGone { .. } => "base_gone",
             GithubError::NoRepository { .. } => "no_repository",
             GithubError::UnreadableDefault { .. } => "unreadable_default",
             GithubError::NotGithub { .. } => "not_github",
@@ -227,6 +310,21 @@ impl GithubError {
             }
             _ => None,
         }
+    }
+}
+
+impl From<MirrorError> for GithubError {
+    fn from(error: MirrorError) -> Self {
+        Self::Store(match error {
+            MirrorError::Backend(error) => StoreError::Backend(error),
+            MirrorError::Encode(error) => StoreError::Encode(error),
+        })
+    }
+}
+
+impl From<crate::git::GitError> for GithubError {
+    fn from(error: crate::git::GitError) -> Self {
+        Self::Target(TargetError::Git(error))
     }
 }
 

@@ -27,7 +27,7 @@ fn gui(args: &[&str]) -> (Cli, Option<OpenArgs>) {
 
 fn startup_of(args: &[&str], cwd: &Path) -> Result<Startup, CliError> {
     let (cli, open) = gui(args);
-    startup(&cli, open.as_ref(), cwd, None)
+    startup(&cli, open.as_ref(), cwd, None, &|_| false)
 }
 
 fn cwd() -> PathBuf {
@@ -134,7 +134,7 @@ fn the_detached_copy_runs_in_process_and_names_the_repository_absolutely() {
     };
     let elsewhere = std::env::temp_dir().join("somewhere-else");
     assert_eq!(
-        startup(&cli, Some(open), &elsewhere, None).unwrap(),
+        startup(&cli, Some(open), &elsewhere, None, &|_| false).unwrap(),
         Startup::Review(
             Location::Local(repo.clone()),
             ReviewId::parse(REVIEW).unwrap()
@@ -281,7 +281,14 @@ fn dv_open_names_a_repository_or_a_review() {
 fn inside_a_distro_dv_open_takes_a_windows_drive_as_its_mount() {
     let in_ubuntu = |args: &[&str]| {
         let (cli, open) = gui(args);
-        startup(&cli, open.as_ref(), Path::new("/home/kyle"), Some("Ubuntu")).unwrap()
+        startup(
+            &cli,
+            open.as_ref(),
+            Path::new("/home/kyle"),
+            Some("Ubuntu"),
+            &|_| false,
+        )
+        .unwrap()
     };
     for args in [
         &["open", r"D:\code\api"][..],
@@ -297,26 +304,281 @@ fn inside_a_distro_dv_open_takes_a_windows_drive_as_its_mount() {
 }
 
 #[test]
-fn prs_and_mistakes_are_refused_before_any_window() {
+fn dv_open_takes_a_pull_request() {
+    use dv_core::github::PrRef;
     let cwd = cwd();
-    for pr in [
-        "#482",
-        "https://github.com/kylekz/difftest/pull/7",
-        "http://x/pull/1",
+    let here = Location::Local(cwd.clone());
+    let url = PrRef::Url {
+        host: "github.com".into(),
+        owner: "kylekz".into(),
+        repo: "difftest".into(),
+        number: 7,
+    };
+    for (line, expected) in [
+        (&["open", "#482"][..], PrRef::Hash(482)),
+        (
+            &["open", "kylekz/difftest#7"],
+            PrRef::Short {
+                owner: "kylekz".into(),
+                repo: "difftest".into(),
+                number: 7,
+            },
+        ),
+        (
+            &["open", "https://github.com/kylekz/difftest/pull/7"],
+            url.clone(),
+        ),
+        // As it is pasted: without its scheme, a tab of the pull request, in angle brackets.
+        (
+            &["open", "github.com/kylekz/difftest/pull/7/files"],
+            url.clone(),
+        ),
+        (
+            &["open", "<https://github.com/kylekz/difftest/pull/7>"],
+            url.clone(),
+        ),
     ] {
-        let error = startup_of(&["open", pr], &cwd).unwrap_err();
-        assert_eq!(error.exit, dv_cli::Exit::Usage, "{pr}");
-        assert!(
-            error
-                .message
-                .starts_with("GitHub PRs arrive in a later version")
+        assert_eq!(
+            startup_of(line, &cwd).unwrap(),
+            Startup::Pr(here.clone(), expected),
+            "{line:?}"
         );
     }
-    // `#` alone, or followed by more than digits, is a path.
-    assert!(matches!(
-        startup_of(&["open", "#notes"], &cwd),
-        Ok(Startup::Repo(_))
-    ));
+    // By its flag, which no shell reads as a comment: every form `review new --pr` takes,
+    // a bare number among them.
+    for (reference, expected) in [
+        ("482", PrRef::Number(482)),
+        ("#482", PrRef::Hash(482)),
+        ("https://github.com/kylekz/difftest/pull/7", url.clone()),
+    ] {
+        assert_eq!(
+            startup_of(&["open", "--pr", reference], &cwd).unwrap(),
+            Startup::Pr(here.clone(), expected),
+            "{reference}"
+        );
+    }
+    // Its repository is the working directory's unless the line names another: the flag's
+    // path, `--repo` or `--wsl`, one of them.
+    assert_eq!(
+        startup_of(&["open", "api", "--pr", "482"], &cwd).unwrap(),
+        Startup::Pr(Location::Local(cwd.join("api")), PrRef::Number(482))
+    );
+    assert_eq!(
+        startup_of(&["open", "--pr", "482", "--repo", "api"], &cwd).unwrap(),
+        Startup::Pr(Location::Local(cwd.join("api")), PrRef::Number(482))
+    );
+    let error = startup_of(&["open", "api", "--pr", "482", "--repo", "web"], &cwd).unwrap_err();
+    assert_eq!(error.exit, dv_cli::Exit::Usage);
+    // Beside the flag, an argument is the path however it reads.
+    assert_eq!(
+        startup_of(&["open", "#notes", "--pr", "482"], &cwd).unwrap(),
+        Startup::Pr(Location::Local(cwd.join("#notes")), PrRef::Number(482))
+    );
+    assert_eq!(
+        startup_of(&["open", "#7", "--pr", "482"], &cwd).unwrap(),
+        Startup::Pr(Location::Local(cwd.join("#7")), PrRef::Number(482))
+    );
+    // A flag that names no pull request is refused.
+    let error = startup_of(&["open", "--pr", "seven"], &cwd).unwrap_err();
+    assert_eq!(error.exit, dv_cli::Exit::Usage);
+    assert!(error.message.starts_with("--pr: "), "{}", error.message);
+    assert_eq!(
+        startup_of(&["open", "#482", "--repo", "api"], &cwd).unwrap(),
+        Startup::Pr(Location::Local(cwd.join("api")), PrRef::Hash(482))
+    );
+    assert_eq!(
+        startup_of(&["open", "#482", "--wsl", "Ubuntu:/home/kyle/api"], &cwd).unwrap(),
+        Startup::Pr(
+            Location::Wsl {
+                distro: "Ubuntu".into(),
+                path: "/home/kyle/api".into()
+            },
+            PrRef::Hash(482)
+        )
+    );
+    // A bare number, `#` alone or followed by more than digits, and a URL that isn't a pull
+    // request's are paths, as ever.
+    for path in ["482", "#notes", "#", "https://github.com/kylekz/difftest"] {
+        assert!(
+            matches!(startup_of(&["open", path], &cwd), Ok(Startup::Repo(_))),
+            "{path}"
+        );
+    }
+    // An argument that names a path that is there is that path, whatever it reads as.
+    for path in ["#482", "kylekz/difftest#7"] {
+        let (cli, open) = gui(&["open", path]);
+        let there = cwd.join(path);
+        assert_eq!(
+            startup(&cli, open.as_ref(), &cwd, None, &|asked| asked == there).unwrap(),
+            Startup::Repo(Location::Local(there.clone())),
+            "{path}"
+        );
+    }
+    // A pull request opens its own review.
+    let error = startup_of(&["open", "--pr", "482", "--review", REVIEW], &cwd).unwrap_err();
+    assert_eq!(error.exit, dv_cli::Exit::Usage);
+    let error = startup_of(&["open", "#482", "--review", REVIEW], &cwd).unwrap_err();
+    assert_eq!(error.exit, dv_cli::Exit::Usage);
+    assert!(
+        error
+            .message
+            .starts_with("`dv open` takes a pull request or --review, not both"),
+        "{}",
+        error.message
+    );
+}
+
+#[test]
+fn a_pull_requests_detached_line_names_its_repository_absolutely() {
+    use dv_core::github::PrRef;
+    let cwd = cwd();
+    for (line, reference) in [
+        (&["open", "#482"][..], "#482"),
+        (&["open", "--pr", "482"], "#482"),
+        (&["open", "kylekz/difftest#7"], "kylekz/difftest#7"),
+        (
+            &["open", "github.com/kylekz/difftest/pull/7/files"],
+            "https://github.com/kylekz/difftest/pull/7",
+        ),
+    ] {
+        let detached_line = detached(line, &cwd, false);
+        assert_eq!(
+            detached_line,
+            [
+                OsString::from("--no-detach"),
+                OsString::from("open"),
+                cwd.clone().into_os_string(),
+                OsString::from("--pr"),
+                OsString::from(reference),
+            ],
+            "{line:?}"
+        );
+        // That line parses, runs in process, and opens the same pull request in the same
+        // repository from any folder.
+        let mut words = vec![OsString::from("dv")];
+        words.extend(detached_line);
+        let cli = Cli::try_parse_from(words).unwrap();
+        assert_eq!(launch(&cli, Entry::Console), Launch::InProcess);
+        let Some(Command::Open(open)) = &cli.command else {
+            panic!("{:?}", cli.command);
+        };
+        let elsewhere = std::env::temp_dir().join("somewhere-else");
+        let first = startup_of(line, &cwd).unwrap();
+        let again = startup(&cli, Some(open), &elsewhere, None, &|_| false).unwrap();
+        match (&first, &again) {
+            (Startup::Pr(first_at, first_pr), Startup::Pr(again_at, again_pr)) => {
+                assert_eq!(first_at, again_at);
+                assert_eq!(first_pr.number(), again_pr.number());
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+    // A WSL repository's by its share.
+    assert_eq!(
+        open_pr_args(
+            &Location::Wsl {
+                distro: "Ubuntu".into(),
+                path: "/tmp/x".into()
+            },
+            &PrRef::Number(9)
+        ),
+        words(&["open", r"\\wsl.localhost\Ubuntu\tmp\x", "--pr", "#9"])
+    );
+}
+
+#[test]
+fn a_pull_requests_flag_survives_the_detached_line() {
+    use dv_core::github::PrRef;
+    let cwd = cwd();
+    // A WSL repository's, by its share.
+    let wsl = &["open", "--pr", "482", "--wsl", "Ubuntu:/home/kyle/api"];
+    assert_eq!(
+        detached(wsl, &cwd, false),
+        words(&[
+            "--no-detach",
+            "open",
+            r"\\wsl.localhost\Ubuntu\home\kyle\api",
+            "--pr",
+            "#482",
+        ])
+    );
+    // A GitHub Enterprise host's URL keeps its host there and back.
+    let enterprise = PrRef::Url {
+        host: "ghe.example.com".into(),
+        owner: "acme".into(),
+        repo: "api".into(),
+        number: 9,
+    };
+    let url = "https://ghe.example.com/acme/api/pull/9";
+    let line = &["open", "--pr", "ghe.example.com/acme/api/pull/9/files"];
+    assert_eq!(
+        startup_of(line, &cwd).unwrap(),
+        Startup::Pr(Location::Local(cwd.clone()), enterprise.clone())
+    );
+    let detached_line = detached(line, &cwd, false);
+    assert_eq!(
+        detached_line[1..],
+        [
+            OsString::from("open"),
+            cwd.clone().into_os_string(),
+            OsString::from("--pr"),
+            OsString::from(url),
+        ]
+    );
+    let mut again = vec![OsString::from("dv")];
+    again.extend(detached_line);
+    let cli = Cli::try_parse_from(again).unwrap();
+    let Some(Command::Open(open)) = &cli.command else {
+        panic!("{:?}", cli.command);
+    };
+    let elsewhere = std::env::temp_dir().join("somewhere-else");
+    assert_eq!(
+        startup(&cli, Some(open), &elsewhere, None, &|_| false).unwrap(),
+        Startup::Pr(Location::Local(cwd.clone()), enterprise)
+    );
+    // A flag that names no pull request is refused before any window: nothing, an option's
+    // look, a number no pull request has.
+    for line in [
+        &["open", "--pr", ""][..],
+        &["open", "--pr=-x"],
+        &["open", "--pr", "0"],
+        &["open", "--pr=--repo"],
+    ] {
+        let error = startup_of(line, &cwd).unwrap_err();
+        assert_eq!(error.exit, dv_cli::Exit::Usage, "{line:?}");
+        assert!(
+            error.message.starts_with("--pr: "),
+            "{line:?}: {}",
+            error.message
+        );
+    }
+}
+
+#[test]
+fn a_pull_requests_repository_is_checked_before_detaching() {
+    use dv_core::github::PrRef;
+    let repo = FixtureRepo::new();
+    repo.write("a.txt", "a\n");
+    repo.commit("base");
+    let options = || LocalBackendOptions {
+        env: repo.env_overlay(),
+    };
+    // The repository must open; GitHub is the app's to ask.
+    let here = Startup::Pr(Location::Local(repo.path().to_path_buf()), PrRef::Hash(482));
+    assert!(check(&here, options()).is_ok());
+    let empty = tempfile::tempdir().unwrap();
+    let nowhere = Startup::Pr(
+        Location::Local(empty.path().to_path_buf()),
+        PrRef::Hash(482),
+    );
+    let error = check(&nowhere, options()).unwrap_err();
+    assert_eq!(error.code, "not_a_repository");
+    assert!(!current_is_repo(&here, options()));
+}
+
+#[test]
+fn mistakes_are_refused_before_any_window() {
+    let cwd = cwd();
     let error = startup_of(&["open", "api", "--repo", "web"], &cwd).unwrap_err();
     assert_eq!(error.exit, dv_cli::Exit::Usage);
     let error = startup_of(&["open", "--review", "r-bad"], &cwd).unwrap_err();

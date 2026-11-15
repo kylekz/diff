@@ -11,6 +11,7 @@ use std::fmt;
 
 use dv_core::diff::DiffError;
 use dv_core::git::GitError;
+use dv_core::github::GithubError;
 use dv_core::review::{OpError, SnapshotError, StoreError};
 use dv_core::{BackendError, TargetError};
 
@@ -23,6 +24,10 @@ pub struct Failure {
     pub detail: Option<String>,
     /// The connection to a remote backend died under the call (module docs).
     pub disconnected: bool,
+    /// Whether doing the same again can end differently: `false` for what only a change
+    /// elsewhere puts right (another repository's pull request, one that isn't there), which
+    /// a banner then offers no Retry for.
+    pub retryable: bool,
 }
 
 impl Failure {
@@ -31,6 +36,7 @@ impl Failure {
             message: message.into(),
             detail: None,
             disconnected: false,
+            retryable: true,
         }
     }
 
@@ -47,6 +53,7 @@ impl Failure {
             message,
             detail: backend.and_then(BackendError::detail),
             disconnected: matches!(backend, Some(BackendError::Disconnected { .. })),
+            retryable: true,
         }
     }
 }
@@ -96,6 +103,34 @@ impl From<&StoreError> for Failure {
             _ => None,
         };
         Self::with_backend(error.to_string(), backend)
+    }
+}
+
+/// The headline says what failed and, when a command fixes it, which (`gh auth login`); the
+/// detail is what `gh` ran and printed.
+impl From<&GithubError> for Failure {
+    fn from(error: &GithubError) -> Self {
+        let message = match error.fix() {
+            Some(fix) if !error.to_string().contains(&fix) => format!("{error}: run `{fix}`"),
+            _ => error.to_string(),
+        };
+        match error {
+            GithubError::Backend(backend) => Self::with_backend(message, Some(backend)),
+            GithubError::Target(target) => Self {
+                message,
+                ..Self::from(target)
+            },
+            GithubError::Store(store) => Self {
+                message,
+                ..Self::from(store)
+            },
+            _ => Self {
+                message,
+                detail: error.detail(),
+                disconnected: false,
+                retryable: error.is_retryable(),
+            },
+        }
     }
 }
 
@@ -178,5 +213,22 @@ mod tests {
             reason: "the connection to dv failed: no build".into(),
         };
         assert!(!Failure::from(&unavailable).disconnected);
+    }
+
+    #[test]
+    fn what_a_retry_cant_fix_says_so() {
+        let elsewhere = GithubError::OtherRepository {
+            number: 482,
+            repository: "acme/api".into(),
+        };
+        assert!(!Failure::from(&elsewhere).retryable);
+        let gone = GithubError::BaseGone {
+            number: 9,
+            branch: "stack".into(),
+        };
+        assert!(!Failure::from(&gone).retryable);
+        // Signed out, offline, a push under the read: again may do it.
+        assert!(Failure::from(&GithubError::Moved { number: 7 }).retryable);
+        assert!(Failure::new("anything else").retryable);
     }
 }

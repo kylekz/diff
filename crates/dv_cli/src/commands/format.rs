@@ -6,7 +6,7 @@
 
 use dv_core::review::excerpt::{code_row, hidden_span};
 
-use crate::dto::{ReviewDto, RoundDto, ThreadCountsDto, ThreadDto, TrailDto};
+use crate::dto::{PrDto, ReviewDto, RoundDto, ThreadCountsDto, ThreadDto, TrailDto};
 
 /// What every line someone wrote starts with.
 pub(crate) const BODY_INDENT: &str = "    ";
@@ -21,6 +21,20 @@ pub(crate) fn review_line(review: &ReviewDto) -> String {
         review.round,
         counts(&review.threads)
     )
+}
+
+/// A PR review's pull request: `pull request: https://github.com/acme/api/pull/482  open
+/// head 5746f3c  PR round 2` (the repository and number while its URL isn't known, and no
+/// state before it was read).
+pub(crate) fn pr_line(pr: &PrDto) -> String {
+    let mut fields = vec![match &pr.url {
+        Some(url) => url.clone(),
+        None => format!("{}/{}#{}", pr.owner, pr.repo, pr.number),
+    }];
+    fields.extend(pr.state.map(str::to_string));
+    fields.push(format!("head {}", &pr.head_oid[..pr.head_oid.len().min(7)]));
+    fields.push(format!("PR round {}", pr.pr_round));
+    format!("pull request: {}", fields.join("  "))
 }
 
 /// `1 open, 0 addressed, 2 resolved`, then `, 3 annotations` when there are any (PLAN §19).

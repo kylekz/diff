@@ -7,25 +7,32 @@
 //! once.
 
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use dv_core::backend::{Backend, LocalBackend, LocalBackendOptions};
 use dv_core::git::GitRepo;
+use dv_core::github::Gh;
 use dv_core::label::Labels;
 use dv_core::location::{Location, mount_path};
 use dv_core::review::{Home, HomeError, Review, ReviewStore, home, same_worktree as home_is};
 
 use crate::args::GlobalArgs;
 use crate::context::{Context, Env};
+use crate::dto::ReviewDto;
 use crate::error::{CliError, Exit, code};
 use crate::output::windows_arg;
+use crate::pr::StoredPrs;
 
-/// An open repository: its backend, git queries over it and its review store.
+/// An open repository: its backend, git queries over it, its review store, the `gh` the
+/// command reaches GitHub with (`crate::pr::gh`; nothing runs until a command asks), and
+/// what its PR reviews are printed from, read when the first one is.
 #[derive(Clone)]
 pub(crate) struct Repo {
     pub backend: Arc<dyn Backend>,
     pub git: GitRepo,
     pub store: ReviewStore,
+    pub gh: Arc<Gh>,
+    stored_prs: Arc<OnceLock<StoredPrs>>,
 }
 
 impl Repo {
@@ -53,6 +60,8 @@ impl Repo {
             git: GitRepo::new(backend.clone()),
             store: ReviewStore::new(backend.clone()),
             backend,
+            gh: Arc::new(crate::pr::gh(ctx)),
+            stored_prs: Arc::default(),
         })
     }
 
@@ -149,6 +158,19 @@ impl Repo {
     /// few git calls).
     pub fn labels(&self) -> Labels {
         Labels::read(&self.git)
+    }
+
+    /// The store's PR reviews and where their mirrors are, read the first time a command
+    /// prints a PR review and kept for the rest of it: a command prints its reviews after
+    /// whatever it writes.
+    pub fn stored_prs(&self) -> &StoredPrs {
+        self.stored_prs.get_or_init(|| StoredPrs::read(self))
+    }
+
+    /// `review` as the commands print it, a PR review with its pull request
+    /// (`crate::pr::dto`).
+    pub fn review_dto(&self, review: &Review, labels: &Labels) -> ReviewDto {
+        ReviewDto::new(review, labels, crate::pr::dto(self, review))
     }
 }
 

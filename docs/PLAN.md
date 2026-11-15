@@ -264,7 +264,9 @@ which the walk can't name, so they are offered against the default branch.
 `dv_core::target::Target::resolve` turns a target into a `DiffSpec` of two sides — a commit id, the
 empty tree, the index or the working tree. A target stores its spec *and* the resolved oids at each
 round, so a review never silently changes meaning (the first implementation froze `base` but left
-`head` symbolic).
+`head` symbolic). A review's sides are read through `dv_core::review::pins::resolve`: a PR
+review's are its pins (§9.5), which a refresh moves while its target keeps the commits it was
+made at; any other review's are its target's.
 
 **A review's home worktree** (`dv_core::review::home`) is where its target resolves, whichever
 worktree reads it: a `working` or `staged` review's is the worktree it was made in (its
@@ -454,7 +456,7 @@ Workflow A with target `branch feat vs main` (includes uncommitted changes while
 Finish with `gh pr create`; promotion (§2.6) later.
 
 ### C. A GitHub PR
-1. `dv open #482` / a pasted URL / `Ctrl G`. dv fetches base and head, resumes or creates the PR's draft.
+1. `dv open --pr 482` / a pasted URL / `Ctrl G`. dv fetches base and head, resumes or creates the PR's draft.
 2. GitHub's existing threads appear read-only alongside the reviewer's drafts (paginated, §9.2).
 3. **Finish review** (`Ctrl Enter`) → summary, verdict, the list of comments to post. Each is validated
    against GitHub's hunks; anything outside them offers *Post as file comment* or *Keep local* (§9.3).
@@ -1002,7 +1004,15 @@ so the UI falls back to refreshing those itself instead of also losing review up
   removes that ref again (`git update-ref -d <ref> <its commit>`), so nothing is left pinning
   the snapshot. Deleting the last review of a PR in a store also removes what dv keeps for the
   PR itself: its `refs/dv/pr/<owner>/<repo>/<n>/*` (§9.3) and its mirror files, every login's
-  (§9.4).
+  (§9.4). Every delete sweeps them for every PR no review in the store is of
+  (`dv_core::github::forget`), whichever review went, so a delete interrupted after its log
+  was removed is finished by the next one; the mirror files go first and the refs last, since
+  the refs are what the sweep finds a PR by. The mirror's path starts with its host, which the
+  refs don't name: it is looked for under every host a remote of the clone names (as
+  configured and as git rewrites it) and `github.com`, without asking gh; a mirror under a
+  host no remote names any more stays, a cache nothing reads. The same sweep drops the locks
+  opens left behind under `refs/dv/opening/` (§9.3 step 4), each once its token is more
+  than a minute old.
 
 ## 8. Anchoring and relocation
 
@@ -1354,35 +1364,147 @@ open it from a clone of that repository"). The palette, which knows every reposi
 opened, finds that clone itself (§9.9).
 
 1. **Metadata:** `gh pr view <n> -R … --json id,number,title,body,url,state,isDraft,author,
-   baseRefName,headRefName,headRefOid,headRepositoryOwner,isCrossRepository,updatedAt,
-   reviewDecision,statusCheckRollup,changedFiles,additions,deletions` (a null `statusCheckRollup`
-   and an empty `reviewDecision` are none), and the viewer's login (`gh api user`, once per app
-   session and host).
+   baseRefName,baseRefOid,headRefName,headRefOid,headRepositoryOwner,isCrossRepository,
+   mergeCommit,updatedAt,reviewDecision,statusCheckRollup,changedFiles,additions,deletions` (a
+   null `statusCheckRollup` and an empty `reviewDecision` are none; a fork without an owner is
+   one that was deleted; `baseRefOid` and `mergeCommit` serve steps 2 and 3 alone and aren't
+   kept). The author is gh's `{is_bot, login}`: a bot's login comes as `app/<login>` and is
+   kept without the `app/`; an empty login, or `app/` alone, is a deleted account, `ghost`.
+   `baseRefName` goes into the fetch's refspec, so it is checked first against git's own
+   rules for a branch's name (`git check-ref-format`: not empty, no leading `-`, no `:`,
+   space, `..`, `@{`, `^`, `~`, `?`, `*`, `[`, `\` or control character, no component
+   empty, starting with `.` or ending with `.lock`, no trailing `/` or `.`): one that isn't
+   is `unexpected_output`, and nothing is fetched by it.
+   With it, the viewer's login (`gh api user`, once per
+   `Gh` and host: the app's session, one CLI command; a failure is asked again). The checks
+   are counted as gh's own `pr status` counts them: a completed check run by its conclusion,
+   one still running by its status, a commit status by its state; `SUCCESS`, `NEUTRAL` and
+   `SKIPPED` pass, `FAILURE`, `ERROR`, `CANCELLED`, `TIMED_OUT` and `ACTION_REQUIRED` fail,
+   anything else is pending.
 2. **Fetch** through the repository's backend, into dv's own namespace (§2.4: only `git fetch`
-   and `refs/dv/**`): `git fetch --no-tags --no-write-fetch-head --refmap= <remote>
+   and `refs/dv/**`): `git fetch --no-tags --no-write-fetch-head --no-recurse-submodules
+   --no-auto-maintenance --refmap= -- <remote>
    +refs/pull/<n>/head:refs/dv/pr/<owner>/<repo>/<n>/head
-   +refs/heads/<baseRefName>:refs/dv/pr/<owner>/<repo>/<n>/base` (`--refmap=` keeps git from
-   also moving the remote's tracking branch, `origin/main`, which other reviews' default base
-   reads). `refs/pull/<n>/head` lives on the base repository for a fork's PR too, so one remote
-   always serves. Skipped when both are already there and the head is the one `gh` reported.
+   +refs/heads/<baseRefName>:refs/dv/pr/<owner>/<repo>/<n>/base`. Nothing else of the user's
+   repository is written: `--refmap=` keeps git from also moving the remote's tracking
+   branch, `origin/main`, which other reviews' default base reads; `--no-recurse-submodules`
+   keeps it out of the submodules a new head points into, whose own refs a fetch on demand
+   would move; `--no-auto-maintenance` keeps it from starting a `gc` or a maintenance run
+   there. `refs/pull/<n>/head` lives on the base repository for a fork's PR too, so one remote
+   always serves. It runs on every open and every refresh, never skipped: a PR is retargeted,
+   and its base branch moves, without its head moving. It is the backend's `git`
+   (`Backend::git`, no op of its own), with a 5-minute timeout.
+   Two fetches of one PR at once (the app and the CLI) write the same refs: one that fails
+   on a ref's lock ("cannot lock ref") is run once more.
+   **A base branch that is gone** (deleted once its own PR merged, say) fails that fetch whole
+   (git's "couldn't find remote ref refs/heads/<branch>"). The head is then fetched alone, and
+   the base is GitHub's `baseRefOid`: fetched by its id (`+<oid>:…/base`) when the server
+   hands a commit out by its id, which GitHub is expected to for a commit a PR's history
+   still holds but which isn't verified until the live check (§14.3; dv relies on it nowhere
+   else, §9.5); when that is refused, the same commit when the clone has it already (the
+   base ref is pointed at it); else the base ref an earlier fetch left; with none of them,
+   the open fails as `GithubError::BaseGone`, naming the deleted branch.
    `<owner>` and `<repo>` are spelled as every GitHub name dv keeps something by is
    (`github::spell`, the one rule for these refs and the mirror's path, §9.4): lowercase,
    then `%xx` for whatever isn't safe both as a component of a git ref and as a file name on
    Windows, since GitHub allows names git refuses (`.github`, `x.lock`). The refs go when the
    PR's last review in the store is deleted (§7).
-3. **Verify** that the fetched head is `headRefOid` (a push between the two calls refetches once,
-   then fails with `GithubError::Moved`), then compute the old side locally: `merge-base(base,
-   head)` of the fetched commits. `baseRefOid` isn't used: GitHub doesn't document whether it is
-   the base branch's tip or the merge base. The diff is then GitHub's own "Files changed" diff
-   (three dots), which stays the same when the base branch moves on unless the PR merges it in.
-4. **The review:** the PR's open draft review when it has one (`ops::open_review` by PR, whatever
-   head; at most one, §2.4); else its latest submitted review when that was submitted at the PR's
-   head (nothing new to review, so no new round is offered); else a new draft with the target
-   `pr <owner/repo#n>` at these oids and its `pr_linked` event. Opening also refreshes the PR's
-   mirror (§9.4) and reconciles an interrupted submission (§9.8).
+3. **Verify** that the fetched head is `headRefOid` (a push between the two calls, or a
+   `refs/pull/<n>/head` GitHub hasn't written yet, reads both again once, gh's answer and
+   the fetch, after a 1.5 s pause, then fails with `GithubError::Moved`), then compute the
+   old side locally: `merge-base(base, head)` of the fetched commits. The diff is then
+   GitHub's own "Files changed" diff (three dots), which stays the same when the base branch
+   moves on unless the PR merges it in. A head and a base with no common history fail the
+   open (kind `git`, "main and #482 have no common history").
+   **A merged PR whose head is in its base branch** (merged by a merge commit, or by a
+   fast-forward) has no changes by that rule: the merge base is the head itself. Only then,
+   for a `MERGED` PR, the old side is read from how it was merged: when `mergeCommit` is a
+   merge with the head as a parent, it merged the head into its other parent, and the old
+   side is `merge-base(<the other parent>, head)`; else `baseRefOid`, the base branch before
+   the merge, when that commit is here and doesn't contain the head (`merge-base(baseRefOid,
+   head)`); else the head, an empty diff, which is all dv can tell. `mergeCommit^1` is never
+   taken on trust: a rebase merge's is the last of the rebased commits. A squash or a rebase
+   merge leaves the head outside the base branch and resolves as an open PR does. Beyond
+   these two cases (a base branch that is gone, step 2; a merged PR whose head is in its
+   base branch, here) `baseRefOid` isn't used: GitHub doesn't document whether it is the base
+   branch's tip or the merge base, so an open PR's old side never rests on it.
+4. **The review:** the PR's open draft review when it has one (by PR, whatever head; at most
+   one, §2.4, below); else its latest
+   submitted review when that was submitted at the PR's head (its `pr-head` pin, §9.5; nothing
+   new to review, so no new round is offered); else a new draft with the target `pr
+   <owner/repo#n>` at these oids (the base branch's tip and the head), its pins (§9.5) and its
+   `pr_linked` event. A closed draft is no draft to resume. A draft is the reviewer's whoever
+   opened the PR (§2.4): its author is the repository's `user.name`, also when an agent's
+   command made it. Opening also refreshes the PR's mirror (§9.4) and reconciles an
+   interrupted submission (§9.8).
+   **One draft, however many openers.** The app and the CLI may open the same PR at the same
+   moment, and the store has no lock of its own, so finding or making the draft holds the
+   PR's lock (`dv_core::github::lock`): the ref `refs/dv/opening/<owner>/<repo>/<n>`, which
+   every process of the repository agrees on as they do on the pins' compare-and-swap
+   (§9.5). It points at the holder's own **token**, a blob holding a fresh ULID (`git
+   hash-object -w --stdin`), so no two holders write the same value and the token carries
+   the time it was made.
+   - *Taking* is `git update-ref <lock> <token> <zeros>`: only while no lock stands. git's
+     "reference already exists" is another holder. Any other "cannot lock ref" may be
+     another process at the same ref that instant (a release removes the lock's emptied
+     folders, and a take landing then fails with "unable to create directory") and is tried
+     again, three times at 50 ms; what still fails, and any other failure of git, is the
+     open's.
+   - *Releasing* is `git update-ref -d <lock> <token>`: only the holder's own lock, tried
+     once more when it fails. One taken over meanwhile is left alone.
+   - *Waiting:* an opener that finds the lock taken looks again every 50 ms.
+   - *Taking over* a lock its holder left behind (a process that died, a connection that
+     dropped): **a waiter that has seen the same token for 10 s** deletes it by
+     compare-and-swap (`git update-ref -d <lock> <that token>`) and then takes its turn like
+     any other, so of two waiters on one stale lock one gets it and the other waits for
+     that one. A token that changes under a waiter starts its 10 s over. The rule reads no
+     clock but the waiter's own: the app's and a distro's need not agree.
+   - *Abandoned:* a lock nobody waits for (its PR never opened again) goes with the next
+     sweep (§7: a review deleted), once its token is more than a minute old, or git reads
+     it as something that is no token; again only while it still holds the value the sweep
+     read. A lock git fails to read is left alone.
+   Every opener then returns the one draft, one of them with `created: true`. A released
+   token stays in the object store, an unreachable blob of a few bytes, until git's own
+   garbage collection. Should a store hold several open drafts of a PR all the same (logs
+   copied in by hand), the most recently updated is the one resumed.
 
-`dv open #482` and the PR picker open it in the app; `dv review new --pr 482` makes or resumes
-it from the CLI (§9.10). A closed or merged PR opens like an open one (its state shows, §9.9);
+Steps 1–3 failing (`dv_core::github::open`) make nothing: without GitHub's word and the
+commits there is no review to create. A review of the PR that is already here opens all the
+same, as it stands: its open draft, else its latest submitted review whatever head that was
+submitted at, with the mirror last stored, stale with the failure (`OpenedPr`'s `refreshed`,
+its pins untouched). The CLI warns on stderr and exits 0 (§9.10); the app opens the review
+under the main area's banner, which carries the failure and whose Retry asks GitHub again.
+With no review of the PR here, the failure is the open's, and the open leaves nothing: what
+it fetched of that PR under `refs/dv/pr/<owner>/<repo>/<n>/` goes again, with any mirror of
+it, and nothing of any other PR's (`forget::pull_request`; skipped, as the sweep of §7 is,
+while any log in the store doesn't load). An opener of the same PR racing it finds its
+refs gone between its fetch and its read of them, and fetches once more before it fails;
+no review's sides are read from those refs. The same when
+the draft can't be made after the fetch (a store that can't be written). The mirror's reads
+failing after step 3 leave the review open the same way, its mirror stale with the error.
+A lost connection to the repository's backend (§5.2) is no word about GitHub: it fails the
+open whether or not a review is here, so the app's retry once the connection is back
+(`Failure::disconnected`) runs the open again instead of showing the review as last read.
+
+In the app a failed open is the main area's banner, which names the PR, since it may show
+over another PR's review ("couldn't open #9: gh isn't signed in to github.com: run `gh auth
+login`"; "couldn't read #7 from GitHub: …" over the review opened as it was last read). It
+offers Retry only for what running the open again can fix: not for another repository's PR,
+a clone with no GitHub repository, a PR GitHub doesn't find, or a base branch that is gone
+(`GithubError::is_retryable`, `Failure::retryable`). A PR that didn't open says nothing
+about its repository: the status bar's "can't be opened" is for a location that has no
+backend. With no review open, a failure inside a repository that did open (a PR that
+didn't, a review id that isn't there) leaves the status bar on that repository, idle:
+"Local · api · no review open" (its connection's state in place of the last part while that
+isn't up).
+
+`dv open --pr 482` and the PR picker open it in the app; `dv review new --pr 482` makes or
+resumes it from the CLI (§9.10). `--pr` takes every form above, in the repository `dv open`
+names (its path, `--repo` or `--wsl`, else the working directory's). `dv open`'s own argument
+is read as a PR too when it is `#482` (quoted: an unquoted `#` starts a comment in a POSIX
+shell and in PowerShell), `owner/repo#482` or the URL, and names no path that exists: a path
+that is there is always the path, and a bare number is a folder's name. `--pr` with
+`--review` is exit 2, for `dv open` and for `dv review new`. A closed or merged PR opens like an open one (its state shows, §9.9);
 GitHub accepts review comments on both *(live check)*.
 
 ### 9.4 The PR mirror
@@ -1417,19 +1539,45 @@ another key's (a file copied there by hand). Unknown fields are ignored, so an o
 addition needs no version bump. Nothing in it is authority for dv's own review state. A PR's
 mirror files, every login's, go when its last review in the store is deleted (§7).
 
-**Refresh** reads everything again and fetches a moved head (§9.3 steps 1–3): when a PR review
-opens, on **Refresh** (`Ctrl R`, the PR strip, `dv review refresh`), and after every write dv
-makes to GitHub (a resolve, a submission). There is no background polling: the strip says when
-the mirror was read. A refresh that fails keeps the last mirror, marked stale with the error
-(the strip says so). The app follows a mirror rewritten by the CLI through the store's change
-events (§5.3), as it follows a review's log.
+**Refresh** (`dv_core::github::refresh`) reads everything again and fetches a moved head
+(§9.3 steps 1–3): when a PR review opens, on **Refresh** (`Ctrl R`, the PR strip, `dv review
+refresh`), and after every write dv makes to GitHub (a resolve, a submission). There is no
+background polling: the strip says when the mirror was read. A refresh that fails keeps the
+last mirror, marked stale with the error (the strip says so; `Refreshed { mirror, stale,
+pins, moved_from }`), and a session never replaces the mirror it shows with none. The app
+follows a mirror rewritten by the CLI through the store's change events (§5.3), as it follows
+a review's log: the mirror is read again (it replaces the one shown when it is a newer read
+by the same login), and the pins are resolved again. A draft's pins move just after its
+mirror is written (below) and `refs/dv/**` is no change the watch reports, so when the
+mirror names another head than the pins the session reads the pins again, every 100 ms up
+to a second, before it lists the files. Pins that moved under the session are its
+`moved_from` (the head it showed), as after a refresh of its own, so the strip can say the
+PR moved.
+- **What is asked, in order:** the viewer (`gh api user`); `gh pr view` and the fetch (§9.3
+  steps 1–3, which an open has done already and its refresh doesn't repeat); the threads
+  (§9.6); the viewer's pending review (GraphQL `pullRequest.reviews(
+  states: [PENDING], author: <login>, first: 1) { nodes { id fullDatabaseId body commit { oid
+  } } }`); each file's Viewed state (GraphQL `pullRequest.files`, paged: `path
+  viewerViewedState`); the patches; the head again (`gh pr view <n> --json headRefOid`).
+  Then the mirror is written, and only then a draft's pins move to its head (§9.5): the pins
+  advance only together with a mirror written for that head. A read that fails after the
+  fetch, or a mirror that can't be written, moves nothing: the pins and the stored mirror
+  stay as they were, the result stale (the refs under `refs/dv/pr/` may have moved; no
+  review's sides are read from them).
 - **One head.** A refresh reads the PR's head again after the patches and starts over, once,
-  when it moved meanwhile, so `files` and `pr.head_oid` always describe the same commit.
+  when it moved meanwhile, so `files` and `pr.head_oid` always describe the same commit. Moved
+  again, the refresh fails as `GithubError::Moved` and the last mirror stands.
 - **When the viewer can't be read.** The mirror's path needs the login, which comes from
   `gh api user`. When that call fails (signed out, offline), the refresh shows the PR's most
   recently read mirror among `pr-<n>/*.json`, whichever login read it (by `read_at`,
   `MirrorStore::latest`; a stray file there, one that isn't a mirror or has a name no mirror
-  has, is passed over), marked stale like any failed refresh.
+  has, is passed over), marked stale like any failed refresh. Nothing else is asked then: the
+  viewer is the first question, and a gh that can't answer it can't answer the rest.
+- **When the repository can't be told.** A refresh that can't say which GitHub repository
+  the clone is (§9.1: `gh auth status` failing for an Enterprise host, a remote removed)
+  doesn't know the mirror's host either. It shows the PR's most recently read mirror under
+  any host a remote names, and `github.com` (`MirrorStore::latest_stored`, no `gh`), stale
+  with that error, the pins as they stand.
 - **`synced` survives a refresh.** A refresh carries each file's `synced` (§9.7) over from the
   mirror it replaces. With none to carry (no file, one that doesn't parse, another version)
   it is absent, and the next sync has no base for that file (§9.7).
@@ -1440,11 +1588,28 @@ events (§5.3), as it follows a review's log.
   reviews: the PR round of a review is its place among the PR's reviews in this repository's
   store (`pr_round`, 1 for the first), which the strip and the switcher show ("Round 2").
 - **A draft follows the PR's head, one refresh at a time.** Its target keeps the oids it was
-  created at (§2.2: a target never changes); its sides are its **pins**, `refs/dv/reviews/<id>/pr-head`
-  and `…/pr-base`, which a refresh moves to the fetched head and its merge base (a
-  compare-and-swap; removed with the review, §7). So the draft shows, and submits against, the
+  created at (§2.2: a target never changes); its sides are its **pins**
+  (`dv_core::review::pins`), `refs/dv/reviews/<id>/pr-head` and `…/pr-base`, which a refresh
+  moves to the fetched head and its merge base (a compare-and-swap: both refs in one `git
+  update-ref --stdin` transaction, each only while it still stands where the refresh read it;
+  when another process moved them first nothing is written and its pins stand; removed with
+  the review, §7). Only a draft follows: a closed one and a submitted one keep their pins. A
+  PR review without pins (refs removed by hand, a store copied from another clone) resolves
+  as its target does, at the commits it was made at, and a draft's next refresh pins it
+  again (one pin left alone is replaced with its pair), reporting the head it resolved to
+  as the one it moved from (`moved_from`, `dv review refresh`'s `moved.from`). A target
+  resolves as `merge-base(base_oid, head_oid)` alone, so the review of a PR merged by a merge
+  commit or a fast-forward (§9.3 step 3), made after the merge and then left without pins,
+  shows nothing: accepted, since only refs removed by hand get there, and a draft's next
+  refresh pins it again. So the draft shows, and submits against, the
   head it was last refreshed to, never one a refresh in another process fetched behind its back;
-  the strip says what moved. After a refresh that moved the pins the draft lists again and its
+  the strip says what moved. The pins move only once a mirror read at that head is written
+  (§9.4), so a refresh never leaves a draft at a head its mirror wasn't read for. The
+  converse doesn't hold, and nothing may take the mirror's `pr.head_oid` for the pins' head:
+  a refresh that loses the compare-and-swap leaves the other process's pins beside its own
+  mirror, a pending review stops the pins while the mirror moves on (below), and a submitted
+  review's stay where it was submitted. What a review shows and submits against is always
+  its pins. After a refresh that moved the pins the draft lists again and its
   threads relocate (§8), as a branch review's do after a commit. The pins also keep a review's
   commits after a force-push drops them from GitHub's refs (whether GitHub serves a commit no ref
   reaches isn't documented, so dv never relies on it).
@@ -1638,8 +1803,16 @@ GitHub) thaws the drafts and appends `pr_discarded {}` (§7).
 
 ### 9.10 The CLI and agents
 - **`dv review new --pr <n | #n | owner/repo#n | URL>`** opens the PR as §9.3 (fetch, mirror,
-  review) and prints the review as `review new` does; `dv open <PR>` opens it in the app. A WSL
-  repository's command runs inside its distro (§10.4) with the distro's `gh`.
+  review) and prints the review as `review new` does; `dv open --pr <the same>` opens it in
+  the app. A WSL
+  repository's command runs inside its distro (§10.4) with the distro's `gh`. A mirror that
+  couldn't be read whole leaves the review made (exit 0) with a warning on stderr naming `dv
+  review refresh <id>`; so does a GitHub that couldn't be asked at all when a review of the
+  PR is already here (§9.3), which is then printed as it stands (`created: false`). With no
+  review here, that is exit 5. Either way the document says so: `review new`'s is `{created,
+  review, stale}`, `stale` `null` or `{kind, message}`, the failure as exit 5 words it (the
+  `GithubError` kind and the one-line message below); always `null` for a local review.
+  `--pr` with `--review` is exit 2 (`usage`): a PR opens its own review.
 - **`dv review submit <id> --verdict comment|approve|request-changes [--body …]`** on a PR review
   is the engine of §9.8, run by the reviewer: every comment included; one GitHub can't take where
   it is fails the command (exit 1, `not_postable`, listing each with why) unless `--outside
@@ -1647,21 +1820,67 @@ GitHub) thaws the drafts and appends `pr_discarded {}` (§7).
   dv's is exit 1, `pending_review`. Output: the submission's URL and what was posted.
   `--verdict comment` on a local review stays exit 2.
 - **`dv review refresh [<id>]`** refreshes a PR review (§9.4) and, run by the reviewer, syncs its
-  Viewed marks (§9.7).
+  Viewed marks (§9.7). Without an id (`--review`, `$DV_REVIEW`) it means the repository's one
+  open PR review; none, or several, is exit 2 (`no_review`, `ambiguous_review`) with them as
+  candidates, and a local review named is exit 2 (`usage`): a PR review is the same from every
+  worktree, so §10.2's context names none. It prints `{review, moved}`, `moved` `{from, to}`
+  (the head the draft showed and the one it shows now; for a draft whose pins were missing,
+  the head its target resolved to, §9.5) or `null`; a refresh that fails is exit 5, the last
+  mirror kept, so its document needs no `stale`.
 - **Reading.** `dv review show`, `dv comment list` and `dv comment show` on a PR review include
   GitHub's threads (`id` `gh:<node id>`, `author.kind` `github`, `github: {url, resolved,
   outdated}`); `ReviewDto` gains `pr {owner, repo, number, url, state, head_oid, pr_round}` and
-  `submissions [{github_review_id, url, event, at}]` (schema 1 grows).
+  `submissions [{github_review_id, url, event, at}]` (schema 1 grows). `pr` is `null` for a
+  local review; its `state` and its `url` are the mirror's (`open`, `draft`, `merged`,
+  `closed`; the most recently read one, whichever login's and under whichever host a remote
+  names) and `null` before the PR was read here, its `head_oid` the review's `pr-head` pin.
+  **A command that only reads never starts `gh`**: `status`, `review list`, `review show`,
+  `review wait`, `comment list` and `comment show` build `pr` from what is stored (the
+  review's link and pins; the store's listing, read once per command however many PR reviews
+  it prints; and each PR's mirror, read once per command however many reviews of that PR it
+  prints), so they work offline and signed out, and cost no `gh auth
+  status`. Only `review new --pr` and `review refresh` (and, later, `review submit`) run it.
+- **`dv review wait`** on a PR review is §10.1's: it returns at once on `submitted` (and
+  `closed`), and a draft blocks until the reviewer submits it or the timeout runs out (exit
+  3). An agent has nothing to hand back on a PR review, so the skill never waits on one.
 - **Agents read, never write, a PR review** (the owner's choice, 2026-10-19): every write an
-  agent's identity makes on a PR review (`comment add`, `annotate`, `reply`, `address`, `review done`) is
+  agent's identity makes on a PR review (`comment add`, `annotate`, `reply`, `address`,
+  `edit`, `delete`, `review done`, and `review submit`, which the reviewer hears arrives in a
+  later version, §9.12) is
   exit 1 `not_allowed` ("PR reviews are the reviewer's; read the threads with `dv comment
-  list`"), as is any write to a `gh:` thread. The skill (§10.5) says so and shows reading a PR's
-  feedback to fix it locally.
+  list`"), as is any write to a `gh:` thread; `review::ops` refuses them (edits and deletes
+  too), and the CLI first of all (`pr::refuse_agent`): once the actor is an agent and the
+  review the command means is a PR review (the one named, the working directory's, or the
+  one holding the thread; `--review` names it for a thread command), it is refused before
+  the command's text, file, lines or thread id are looked at, so the answer is the same
+  whatever else is wrong with the command (an empty `--body`, an id that is no thread's, a
+  thread that isn't there). What keeps the review from being told (no repository, no such
+  review) is the command's own error. An agent may run `review new --pr` and `review
+  refresh`: both read GitHub and write nothing a reviewer wrote. The skill (§10.5) says so
+  (`target.kind` `pr`: read-only, what is refused, what an agent can still do) and shows
+  reading a PR's feedback to fix it locally.
+- **Known limits**, not handled: an older GitHub Enterprise Server may lack `fullDatabaseId`
+  or `subjectType`, which the thread queries ask for (§9.6), and fails them as `graphql`.
+  The fetch uses the clone's own remote and its credentials: an ssh remote whose key needs a
+  passphrase with no agent running, or a credential helper that wants a window, holds the
+  fetch until its 5-minute timeout. Deleting an earlier review of a PR renumbers the
+  `pr_round` of its later ones, which is a place in the store's listing, not a stored
+  number. The mirror files go with a PR's last review but their empty `pr-<n>/` folders
+  stay under `<git-common-dir>/dv/github/…`: the backend's store removes files, not
+  folders.
 - **Exit 5** (`GitHub error`) gets its error code, `github`, with `gh`'s message and the
   `GithubError` kind (`GithubError::kind`: `no_repository`, `no_remote`, `unreadable_default`,
   `not_github`, `other_repository`, `gh_missing`, `not_authenticated`, `not_found`, `rate_limited`, `validation`, `graphql`,
-  `unavailable`, `gh`, `unexpected_output`, and `git` when git failed where the repository
-  lives) in `detail`.
+  `unavailable`, `gh`, `unexpected_output`, `moved` when the PR's head kept moving under the
+  read, `base_gone` when the PR's base branch was deleted and its last commit can't be
+  fetched, and `git` when git failed where the repository lives: the fetch, or a head and a
+  base without a common history) in `detail`: its first line is the kind, and what gh ran and
+  printed follows it. The message is one line: what failed, what git itself said when git
+  failed (the first line of its stderr: "git fetch failed (exit code 128): couldn't find
+  remote ref refs/pull/9/head"), and the command that fixes it when there is one ("gh isn't
+  signed in to github.com: run `gh auth login`"). The warning of an open that went on
+  without GitHub, and its `stale.message`, carry the same line. The review store failing under a
+  GitHub operation keeps its own code (exit 1).
 
 ### 9.11 Testing
 - **The fixture GitHub** (`dv_test_support::FixtureGithub`): a bare repository standing in for
@@ -1672,7 +1891,11 @@ GitHub) thaws the drafts and appends `pr_discarded {}` (§7).
   reaches the fixture; it starts as a fresh clone does (`main` tracking `origin/main`,
   `origin/HEAD` set), without the PRs' commits until they are fetched. The fixture's commits
   have fixed identities and dates, so their oids are stable and recorded responses can name
-  them.
+  them. `FixtureGithub::persistent(path)` builds the clone at a given path and keeps it, its
+  GitHub side beside it (`<path>.fixture/github/`, found again with `GithubOrigin::reopen`),
+  for the automation host's seeded repos (§14.2). `dv_test_support::fixture_gh` (`GhPr`)
+  writes the `mock_gh` entries that answer everything dv asks about one PR, in the shapes
+  §9.3 and §9.4 name, so a test states a PR once.
 - **`mock_gh`** answers every call with recorded responses (scrubbed from `kylekz/difftest`,
   §14.2), told apart by their arguments and, for GraphQL, by `stdin_contains` on the request
   (`addPullRequestReviewThread`, a thread's marker, a page's `"cursor":"…"`); sequences
@@ -1704,19 +1927,25 @@ Two cuts. **The read side** (steps 1–4) opens a PR and shows everything GitHub
 its one write to GitHub is Resolve / Unresolve. **The write side** (steps 5–7) is everything
 that exists to be posted. Between the two, a PR review takes the reviewer's comments as any
 review does (they are local threads), `Ctrl Enter` on one says "Submitting to GitHub arrives in
-a later version" in place of the sheet, and `dv review submit` on one is refused the same way
-(exit 2).
+a later version" in place of the sheet (the main area's banner, `Shell::open_sheet`), and `dv
+review submit` on one is refused the same way (exit 2, `unsupported`).
 
 1. **GitHub plumbing** (`dv_core::github`): §9.1's remote rules, §9.2's runner, errors and
    pagination, the PR reference parser, the mirror's format and store; the fixture GitHub.
    Unit tests only.
 2. **Opening a PR** (§9.3, §9.5): fetch, verify, the pins and refresh, `review new --pr`, `review
-   refresh` (reading; its Viewed sync is step 6), `dv open <PR>`, the DTO additions and the
-   agents' refusals.
+   refresh` (reading; its Viewed sync is step 6), `dv open --pr`, the DTO additions and the
+   agents' refusals; the app opens a PR as a review through the automation's `open_pr` and
+   refreshes it with `pr_refresh` (e2e: `tests/e2e/pr_open.jsonl`, and `pr_open_loopback.jsonl`
+   through `dv backend --stdio`), with the strip, the picker and `Ctrl R` still to come
+   (steps 3 and 4). Until the strip, a refresh that failed shows only in the automation's
+   `state` (`session.pr.stale`), and an open that couldn't read GitHub in the banner (§9.3).
 3. **GitHub's threads** (§9.6): `GithubThread` and `ThreadKey`, placement, the cards (DESIGN
    §4.5), counts, the comments list, Copy as prompt, Resolve / Unresolve, the CLI's reading.
 4. **The PR in the app** (§9.9): the picker, the palette's PR row with the known repositories'
-   GitHub names, the switcher's section, the strip; then the read side end to end (e2e,
+   GitHub names, the switcher's section, the strip, which shows a stale mirror and the
+   refresh that failed with its error (§9.4: `Refreshed::stale`, the session's
+   `pr().stale`) beside when the mirror was read; then the read side end to end (e2e,
    `tests/e2e/pr_read.jsonl` and friends: a pasted URL in `Ctrl K` that moves to another
    repository, `Ctrl G`, GitHub's threads placed, a resolve, a refresh that moves the head, the
    failure states of opening) and a capstone review over the read side.
@@ -1736,7 +1965,7 @@ a later version" in place of the sheet, and `dv review submit` on one is refused
 
 ```
 dv                                 open the GUI on the current repo
-dv open [<path> | <PR-url> | #<n>] [--review <id>]
+dv open [<path> | <PR>] [--pr <PR>] [--review <id>]
                                    the ONLY GUI entry points; every other command is headless
 
 dv status                          repo, open reviews, the current one, its round and thread counts
@@ -1940,7 +2169,17 @@ Global flags: `--repo <path>` (also `\\wsl.localhost\<distro>\<path>`), `--wsl <
   0 at once; the app starts it (inside a distro, and as the tests' loopback). `dv backend` without
   `--stdio` is exit 2 (`usage`).
 - **PRs** (`review new --pr`, `review submit` and `review refresh` of a PR review, `dv open` of a
-  PR): §9.10.
+  PR): §9.10. `dv open --pr <n | #n | owner/repo#n | URL>` opens the PR, in the repository
+  the line names (`dv open`'s path, `--repo` or `--wsl`, one of them), else the working
+  directory's (`Startup::Pr`): `dv open --pr 482`, `dv open ../api --pr 482`. The flag is the
+  form to teach, because `#482` unquoted is a comment to a shell. Without the flag, `dv
+  open`'s argument is a PR when it reads as one other than a bare number (`"#482"`,
+  `owner/repo#482`, the URL as people paste it, §9.3) and names no path that exists
+  (`OpenArgs::pr`): an argument that is a path is always the path. A `--pr` that names no PR,
+  and a PR with `--review`, are exit 2. The repository is checked before detaching, as for a
+  path; GitHub is asked by the app, where a failure is the main area's banner. The detached
+  line is `open <absolute path> --pr <reference>`. A build without the app says `dv open
+  <path> --pr <reference>` to run from Windows (`"#482"` quoted).
 - **`dv` and `dv open`** start the GUI detached (§13.1) and return 0 at once; `--automation`
   and `--no-detach` run it in the same process. It opens on the repository named (the path,
   `--repo` or `--wsl`; `dv open` alone: the working directory's): the repository becomes a known
@@ -1996,7 +2235,7 @@ doesn't. A deleted thread is not found.
   `label`; a `working` or `staged` target is labelled with the `HEAD` of the worktree the review
   was made in, `dv_core::label::Labels`, as the GUI's switcher labels it), `status`, `round`, `rounds` (`{n, verdict, body, closed_at}`), `threads` (`{open,
   addressed, resolved, annotation}`, §19), `worktree`, `created_at`, `updated_at`, `status_note` (the note the last
-  status change carried, `{status, note, author, at}`, or `null`). A thread: `id`, `review_id`,
+  status change carried, `{status, note, author, at}`, or `null`), `pr` and `submissions` (§9.10). A thread: `id`, `review_id`,
   `annotation` (`true` for one an agent opened as an annotation, which it stays once a reply
   opened it, §19), `state` (`open`, `addressed`, `resolved`, `annotation`), `placement` (`unchanged`; `moved` — relocated now, or standing where an earlier
   write recorded its move, `review::shows_moved`; `edited` — standing where it was written, its
@@ -2018,7 +2257,7 @@ doesn't. A deleted thread is not found.
   `before_line` now, `code` and `excerpt` `null`; else `null`; `placement` stays `outdated`),
   `body`, `author: {kind, name, model}` (`model` the one an agent named, else `null`, §2.5), `created_at`, `note` (the last state change's), `replies: [{id,
   author, body, created_at}]`. The writes print: `review new` `{created, review}`; `review done` and `close`
-  `{changed, review}`; `review submit` `{review, round}`; `review delete` `{deleted}`; `comment
+  `{changed, review}`; `review refresh` `{review, moved}` (§9.10); `review submit` `{review, round}`; `review delete` `{deleted}`; `comment
   add`, `comment annotate` and `comment edit` `{thread}` (an edited reply: `{reply, thread}`);
   `comment delete` `{deleted, thread}` (`thread` `null` once the thread itself is deleted); `comment reply` `{reply, thread}`; `comment address | resolve | reopen`
   `{changed, thread}`; `setup agents` `{agents: [{agent, path, action: installed | updated |
@@ -2185,7 +2424,10 @@ they replied (`review wait`'s text sets such questions apart from the threads to
 `threads.open` counts them). It says what `target.kind` means for where the agent's fixes show: a `working` review
 is the files on disk (work in its `worktree`), a `branch` one too in whichever worktree has the
 branch checked out (its tip when none has), a `staged` one what is staged (fixes show only once staged: ask the user before `git
-add`), and a `commit` or `range` one fixed history (tell the user rather than hand back). Its
+add`), a `commit` or `range` one fixed history (tell the user rather than hand back), and a
+`pr` one a GitHub pull request's review, the reviewer's own and read-only for an agent (§9.10:
+every write is `not_allowed` and there is no round to hand back or wait for; it may read it,
+and open or refresh it when the user asks). Its
 rules: threads read as dv prints them, `--json` when parsing (`status`, `review show`,
 `review wait`, whose ids and round numbers the agent keeps), `--author <agent>` on every write, `<agent>` being the agent's own
 name, which every example writes as that placeholder (Claude Code is recognised by `CLAUDECODE`
@@ -2196,7 +2438,8 @@ quotes (double quotes run backticks in a POSIX shell, and a backtick is PowerShe
 disagreement is a reply with reasons and still an address with a note saying so;
 and what each exit code means (1 `finished`: stop; 1 `unseen_round`: read the round, then `done
 --round`; 2 with candidates: pick with `--review`, with none: tell the user; 4: dv couldn't
-reach the WSL distro the repository is in, so tell the user what the message says is missing).
+reach the WSL distro the repository is in, so tell the user what the message says is missing;
+5: GitHub couldn't be read for a pull request's review, so tell the user).
 Its **Handing work over** section (§19.2) is the start of the loop when the user asks the agent
 to put its work up for review in dv (or the project's instructions say to): `dv review new
 --json` (keep `review.id`), annotations with `dv comment annotate` and what makes a good one,
@@ -2272,8 +2515,10 @@ one, its row, any refresh of it and its entry in `known_repos.json` going, nothi
 touched, and never the open review's, whose targets the source picker lists; repos compare with the distro folded
 (`Location::same_place`), so a spelling WSL couldn't confirm never makes a second row; so the switcher shows each target beside its open
 review by the rule `open_review` resumes by (`review::ops::is_review_of`); it watches nothing
-itself), `ReviewUi` (what the reviewer chose per review: split or unified), `GitHub` (gh calls, the
-PR mirrors' refresh and the picker's lists, §9), `Settings` (material, mode, panel width, and the language servers' `lsp`, which the
+itself), `ReviewUi` (what the reviewer chose per review: split or unified), `GitHub` (the app's one
+`gh` runner, built as the setup checks' is, so an automation run without `DV_GH` has none;
+it opens PRs for `Reviews` (`OpenRequest::Pr`, §9.3) and refreshes them for their sessions
+off the UI thread, and holds the picker's lists, §9), `Settings` (material, mode, panel width, and the language servers' `lsp`, which the
 reviewer writes by hand and which is read again on **Check again** and when the window comes
 back to the front, §18.5), `LanguageServers` (every worktree's language servers, shared by the
 reviews open on it, §18.5). The **system seam**
@@ -2358,6 +2603,16 @@ one write per file at a time, so quick presses never ask for the same state twic
 generation counter on the session is the only stale-completion guard needed, because the target
 never mutates: a list result applies only if no newer refresh started, and each file load carries a
 token a refresh replaces.
+
+**A PR review's session** (`session::pr`) keeps what the last refresh read (`PrRead`: the
+mirror, why it is stale, the pins and where they moved from). An open by the PR's reference
+hands it over; a PR review opened by its id is refreshed as its session starts; **Refresh**
+runs one more (`ReviewSession::refresh_pr`). The sides are resolved from the pins
+(`review::pins::resolve`), so a refresh that moved them lists the files again and the threads
+relocate; a mirror another process rewrote is followed through the store's watch (§9.4). The
+title bar names a PR review `#482 Title` and the stream's sides by the PR's base and head
+branches once it was read. "Start a new review" on a finished PR review opens the PR again
+(`OpenRequest::Pr`), never a copy of its target.
 
 Comment bodies render through `dv_ui::markdown` (gpui-component's `TextView` over the sanitiser of
 §15: no image or raw HTML survives to be fetched; links open through the system seam).
@@ -2485,7 +2740,13 @@ Keyboard map and states: DESIGN §5.
    repository (`git config --global --includes`, then `--system`, which is skipped when the
    checks run with `GIT_CONFIG_NOSYSTEM`, as a test's and an automation run's do); the fix is the
    `git config --global …` command to run.
-6. **GitHub** (`gh`): `gh` there (`DV_GH`) and `gh auth status` ok, asked through §9.2's
+6. **GitHub** (`gh`): `gh` there (`DV_GH`), new enough and `gh auth status` ok. dv needs gh
+   2.48.0 or later (`dv_core::github::MIN_VERSION`): `gh api --slurp`, which a REST list is
+   read whole with (§9.2), came with it *(assumed from gh's release notes as remembered, not
+   checked against a changelog: the gh installed here, 2.103, has the flag, which says
+   nothing of when it arrived)*; an older one (`gh --version`) is out of date, naming both
+   versions, with no command to run (gh is updated as it was installed), and a gh that
+   doesn't say its version is asked the rest as it is. All of it is asked through §9.2's
    runner (`dv_core::github::Gh::auth_status`: its environment, `GH_PROMPT_DISABLED=1`
    included, its words for a `gh` that isn't installed, its reading of "not signed in"),
    naming the account (gh's `auth status` may refresh a stored token that is about to
@@ -2843,7 +3104,8 @@ pushes a tag or approves a deployment.
 ### 14.1 Principles
 Hermetic by default: every test and scenario uses its own data dir, its own fixture repos, `mock_gh`,
 and a local backend. Nothing touches `%APPDATA%\dv` or GitHub unless an owner-only live switch is
-set. Nothing touches a real distro but the real-WSL tests, which `DV_TEST_WSL_DISTRO` turns on and
+set, through `gh` or through git: an automated run's git takes no transport but a local path
+(`GIT_ALLOW_PROTOCOL=file`, §14.2). Nothing touches a real distro but the real-WSL tests, which `DV_TEST_WSL_DISTRO` turns on and
 which work only in a scratch home under the distro's `/tmp` (`DV_WSL_HOME`, §14.2), and the
 owner's live check (§14.3).
 
@@ -2854,6 +3116,18 @@ owner's live check (§14.3).
   it (its `HOME` and side directories in `<path>.fixture/`), for the automation host's seeded repos,
   which outlive the call that built them; `FixtureRepo::reopen(path)` finds one again (a later
   process, after a scenario's `restart`).
+- **No network through git.** dv fetches a PR from the clone's own remote (§9.3), so a test
+  repository whose remote names a real host would reach it. Every automated git therefore
+  runs with `GIT_ALLOW_PROTOCOL=file`: git then fetches, clones and pushes only from and to a
+  local path (a `file://` URL too) and refuses any other transport before it connects
+  ("transport 'https' not allowed"), whatever `protocol.*.allow` says. It is set where each
+  run already sets git's environment: `FixtureRepo::env_overlay` (every crate's tests, the
+  CLI's test `Context`, the binary tests, the automation host's seeded repos), the e2e
+  runner's environment for every launch, and under `--automation` the app's own backends,
+  whatever repository they open (`Locations::set_base_env`), and its `cli` children. The
+  fixture GitHub's clone still fetches: its `origin` is a GitHub URL that its configuration
+  rewrites to the bare repository's `file://` URL. A test that means another transport sets
+  the variable itself; a scenario can't (the runner's is reserved, as `DV_GH` is).
 - **`mock_gh`** — reads a scenario file (`argv` pattern, `stdin_contains` → stdout/stderr/exit,
   `times`, `delay_ms`), serves responses recorded from `kylekz/difftest` (scrubbed), and appends
   every call + stdin to a log tests assert on ("exactly these 5 comments were posted with
@@ -2946,12 +3220,15 @@ with and without its bytes, only looked at, read past what was asked, a director
   `wait_for`/`assert` JSON-pointer checks, background runs that never take focus, per-scenario output
   dir with numbered screenshots and `failure.png`. dv adds custom commands `set_setting` (window
   material and mode), `seed_repo` / `repo_edit` (fixture repos at `<data_dir>/repos/<name>`, built
-  and edited with `FixtureRepo` steps, a `write` step's `repeat` making a large file in one line,
+  and edited with `FixtureRepo` steps; with `github`, the clone of a fixture GitHub
+  (`FixtureGithub::persistent`, §9.11) whose own steps, `pr` and `publish` among them, make
+  and move its PRs, while the header's `gh` answers about them, a `write` step's `repeat` making a large file in one line,
   a `worktree` step adding a linked worktree; their environment overlays are registered with
   `Locations` for the work tree and each of its linked worktrees, wherever they are,
   and found again with `FixtureRepo::reopen` after a restart, so scenarios never depend on the
   owner's git configuration), `open` (adds a repo and opens the switcher on it, as `dv open`
-  does), `open_review`, `review_op` (an agent's reply, address or "done" straight through
+  does), `open_review`, `open_pr` (a PR's review, as `dv open --pr` opens it) and `pr_refresh`
+  (the open PR review's Refresh), `review_op` (an agent's reply, address or "done" straight through
   `review::ops`, without the CLI's rules), and `cli` / `cli_spawn` / `cli_join`, which play the
   agent through the real CLI: the same `dv` executable started as a child process with a
   headless command (never one that opens a window), off the UI thread, in the seeded repo's
@@ -2960,7 +3237,10 @@ with and without its bytes, only looked at, read past what was asked, a director
   app's own setup checks use the same home, §12.2), the user `Path`'s stand-in
   (`DV_USER_PATH_FILE` = `<data_dir>/user-path.txt`: `dv setup path` never writes the
   registry), `DV_ONLY_DISTROS` (the sandbox's distro, else none: `dv doctor` and `dv setup`
-  reach no other), and without the
+  reach no other), a `DV_GH` that names a program that isn't there when the app's own
+  environment names none or an empty one, which the runner reads as unset (the e2e runner's
+  is `mock_gh`; an automation run started without the runner never lets a child run the
+  real `gh`, as the app itself doesn't), `GIT_ALLOW_PROTOCOL=file` (above), and without the
   inherited `CLAUDECODE`, `DV_AUTHOR`, `DV_MODEL` and `DV_REVIEW` (a scenario sets them on purpose); `cli`
   runs one to its end and replies `{exit, stdout, stderr, json}`, `cli_spawn` starts one that
   blocks (`dv review wait`) and `cli_join` collects it, and a child still running when the app
@@ -2975,7 +3255,8 @@ with and without its bytes, only looked at, read past what was asked, a director
   runner gives every launch `DV_DATA_DIR` = the scenario's data dir and no inherited `DV_`
   variable (no `DV_WSL_HOME`: only a header's `env` names one, so dv reaches WSL through its
   stand-in; no `DV_LSP_<ID>`). `dv_e2e`'s fixture wires `mock_gh` and `mock_lsp`: every launch
-  gets `DV_GH` = `mock_gh` and `GIT_CEILING_DIRECTORIES` = the scenario's output dir, a scenario
+  gets `DV_GH` = `mock_gh`, `GIT_CEILING_DIRECTORIES` = the scenario's output dir and
+  `GIT_ALLOW_PROTOCOL` = `file`, a scenario
   header's `gh` names the `mock_gh` scenario file (`DV_MOCK_GH`) and its `lsp` the `mock_lsp`
   scenario for a language server (`DV_LSP_<ID>`), and `{"gh_log": {}}` and `{"lsp_log": {}}`
   lines assert on their logs (tests/e2e/README.md). On Linux the runner starts

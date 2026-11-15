@@ -96,6 +96,32 @@ fn pr_dir(host: &str, owner: &str, repo: &str, number: u64) -> String {
     )
 }
 
+/// [`pr_dir`] of a pull request whose owner and repository are already spelled, as its refs
+/// under `refs/dv/pr/` name them.
+pub(super) fn spelled_pr_dir(host: &str, owner: &str, repo: &str, number: u64) -> String {
+    format!("github/{}/{owner}/{repo}/pr-{number}", spell(host))
+}
+
+/// Whether `path`, a store path, is a mirror of pull request `number` of `owner/repo`, on
+/// whichever host and for whichever login: what a review of that pull request follows in
+/// the store's change events (PLAN §9.4).
+pub fn is_mirror_of(path: &str, owner: &str, repo: &str, number: u64) -> bool {
+    let mut parts = path.split('/');
+    let dir = [
+        parts.next(),
+        parts.next(),
+        parts.next(),
+        parts.next(),
+        parts.next(),
+    ];
+    matches!(
+        dir,
+        [Some("github"), Some(_), Some(o), Some(r), Some(pr)]
+            if o == spell(owner) && r == spell(repo) && pr == format!("pr-{number}")
+    ) && parts.next().is_some_and(|file| file.ends_with(".json"))
+        && parts.next().is_none()
+}
+
 /// Everything GitHub holds about a pull request that dv shows or checks against (PLAN §9.4).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Mirror {

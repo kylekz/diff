@@ -16,10 +16,12 @@
 //! - `set_setting {key, value}` changes `material` (`mica`, `acrylic`, `opaque`) or `mode`
 //!   (`system`, `dark`, `light`) through the settings service, exactly as the UI would: it saves
 //!   to the data dir and the window repaints in the new theme before the reply.
-//! - `seed_repo {name, steps, backend?}` builds a fixture repo at `<data_dir>/repos/<name>` and
-//!   `repo_edit {name, steps}` changes one ("the agent edits"; [`repos`]). With `"backend":
-//!   "loopback"` the repo opens through the loopback connection `loopback`: this executable's
-//!   `backend --stdio` as a child, as a WSL repo opens through its distro's (PLAN §5.2).
+//! - `seed_repo {name, steps, backend?, github?}` builds a fixture repo at
+//!   `<data_dir>/repos/<name>` and `repo_edit {name, steps, github?}` changes one ("the agent
+//!   edits"; [`repos`]). With `"backend": "loopback"` the repo opens through the loopback
+//!   connection `loopback`: this executable's `backend --stdio` as a child, as a WSL repo opens
+//!   through its distro's (PLAN §5.2). With `github` it is the clone of a fixture GitHub with
+//!   pull requests (PLAN §9.11), which the scenario header's `gh` (`mock_gh`) answers about.
 //! - `backend_kill {name}` kills a connection's server as a crash would, `backend_block
 //!   {name, blocked}` makes the loopback's respawns fail (to reach `failed`) or start again,
 //!   `backend_hold {name, held}` makes its starts wait (a start in progress) or go on, and
@@ -27,7 +29,8 @@
 //!   (to reach `stopped`) ([`backends`]); `wsl_distros {distros}` tells the stand-in for WSL
 //!   which distros there are and which run, in a run without `DV_WSL_HOME`
 //!   (`dv_ui::services::WslAccess`).
-//! - `open {path}`, `open_review {path, target?}` and `review_op {op, thread, …}` ([`commands`]).
+//! - `open {path}`, `open_review {path, target?}`, `open_pr {path, pr}`, `pr_refresh` and
+//!   `review_op {op, thread, …}` ([`commands`]).
 //! - `update_ready {version}` makes an update of dv ready through the seam (the status bar's
 //!   Restart to update, which records the restart, [`commands`]).
 //! - `home_file {path, contents}` writes a file in the run's scratch home (`<data_dir>/home`,
@@ -55,7 +58,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use anyhow::{Context as _, Result, anyhow, bail};
-use dv_test_support::FixtureRepo;
+use dv_test_support::{FixtureRepo, GithubOrigin};
 use dv_ui::services::locations::EnvOverlay;
 use dv_ui::services::{Mode, Route};
 use dv_ui::theme::Palette;
@@ -81,6 +84,8 @@ pub enum SeededBackend {
 pub struct DvAutomation {
     shell: Entity<Shell>,
     seeded: HashMap<String, (Seeded, SeededBackend)>,
+    /// The fixture GitHub's side of the repos seeded with one ([`repos`]), by the repo's name.
+    origins: HashMap<String, Arc<Mutex<GithubOrigin>>>,
     /// The switches of the loopback connections this host made ([`backends`]).
     switches: HashMap<String, backends::Switches>,
     /// How the loopback's server starts and respawns ([`backends::Loopback`]).
@@ -111,31 +116,37 @@ impl DvAutomation {
         let mut host = Self {
             shell,
             seeded: HashMap::new(),
+            origins: HashMap::new(),
             switches: HashMap::new(),
             loopback: backends::Loopback::default(),
             children,
             cli_exe: std::env::current_exe().ok(),
             _quit: quit,
         };
-        for (name, fixture, backend) in repos::reopen_seeded(cx.services().data_dir()) {
+        for (name, fixture, backend, origin) in repos::reopen_seeded(cx.services().data_dir()) {
             let roots = repos::roots(&fixture);
-            host.register(name, fixture, backend, roots, cx);
+            host.register(name, fixture, backend, origin, roots, cx);
         }
         host
     }
 
-    /// Keeps `fixture` as the seeded repo `name` and has every backend opened for it, or for
-    /// one of its linked worktrees (`roots`, [`repos::roots`]), use its environment, through
-    /// `backend`.
+    /// Keeps `fixture` as the seeded repo `name` (with `origin`, its fixture GitHub's side,
+    /// when it has one) and has every backend opened for it, or for one of its linked
+    /// worktrees (`roots`, [`repos::roots`]), use its environment, through `backend`.
     fn register(
         &mut self,
         name: String,
         fixture: FixtureRepo,
         backend: SeededBackend,
+        origin: Option<GithubOrigin>,
         roots: Vec<PathBuf>,
         cx: &mut App,
     ) {
         self.register_roots(roots, fixture.env_overlay(), backend, cx);
+        if let Some(origin) = origin {
+            self.origins
+                .insert(name.clone(), Arc::new(Mutex::new(origin)));
+        }
         self.seeded
             .insert(name, (Arc::new(Mutex::new(fixture)), backend));
     }
@@ -225,6 +236,7 @@ impl AutomationHost for DvAutomation {
             "backend_hold" => Some(self.backend_hold(args)),
             "wsl_distros" => Some(backends::wsl_distros(args, cx)),
             "home_file" => Some(commands::home_file(&args, cx)),
+            "pr_refresh" => Some(commands::pr_refresh(&self.shell, &args, cx)),
             "update_ready" => Some(commands::update_ready(&args, cx)),
             _ => None,
         }
@@ -242,6 +254,7 @@ impl AutomationHost for DvAutomation {
             "repo_edit" => self.repo_edit(args, cx),
             "open" => commands::open(self.shell.clone(), args, window, cx),
             "open_review" => commands::open_review(self.shell.clone(), args, window, cx),
+            "open_pr" => commands::open_pr(self.shell.clone(), args, window, cx),
             "review_op" => commands::review_op(self.shell.clone(), args, cx),
             "cli" => self.cli(args, cx),
             "cli_spawn" => self.cli_spawn(args, cx),
@@ -270,6 +283,8 @@ const COMMANDS: &[&str] = &[
     "repo_edit",
     "open",
     "open_review",
+    "open_pr",
+    "pr_refresh",
     "review_op",
     "cli",
     "cli_spawn",
@@ -338,6 +353,15 @@ pub fn start(
     pipe: Option<String>,
     cx: &mut App,
 ) -> Result<()> {
+    // No backend of an automation run fetches from anywhere but a local path (PLAN §14.2),
+    // seeded or not.
+    let locations = cx.services().locations.clone();
+    locations.update(cx, |locations, _| {
+        locations.set_base_env(vec![(
+            agent_cli::GIT_LOCAL_ONLY.0.into(),
+            Some(agent_cli::GIT_LOCAL_ONLY.1.into()),
+        )])
+    });
     let host = cx.new(|cx| DvAutomation::new(shell, cx));
     let options = gpui_automation::Options {
         pipe,

@@ -8,6 +8,7 @@ pub mod branches;
 pub mod command;
 pub(crate) mod temp_index;
 
+use std::collections::HashMap;
 use std::fmt;
 use std::str::FromStr;
 use std::sync::Arc;
@@ -432,6 +433,21 @@ impl GitRepo {
                 detail: stderr.trim_end().to_string(),
             })
         }
+    }
+
+    /// The object each of the refs `names` (full names) points at; a ref that doesn't exist is
+    /// left out (one `git for-each-ref`).
+    pub fn ref_oids(&self, names: &[&str]) -> Result<HashMap<String, Oid>, GitError> {
+        let mut args = vec!["for-each-ref", "--format=%(refname) %(objectname)"];
+        args.extend_from_slice(names);
+        let output = self.git(&args, &[0])?;
+        // A name also matches as a directory of refs: only the refs asked for are kept.
+        Ok(stdout_text("for-each-ref", &output)?
+            .lines()
+            .filter_map(|line| line.split_once(' '))
+            .filter(|(name, _)| names.contains(name))
+            .filter_map(|(name, oid)| Some((name.to_string(), Oid::parse(oid)?)))
+            .collect())
     }
 
     /// Whether the full ref name `name` resolves to a commit.

@@ -3,9 +3,8 @@
 
 use crate::error::CliError;
 
-/// `dv review new --pr`, a PR target for `dv open` (PLAN §9).
-pub(crate) fn github_prs() -> CliError {
-    CliError::unsupported(
-        "GitHub PRs arrive in a later version; review local work with `dv review new`",
-    )
+/// `dv review submit` on a PR review, between phase 8's two cuts (PLAN §9.12): the review
+/// takes the reviewer's comments, and posting them is the write side.
+pub(crate) fn pr_submit() -> CliError {
+    CliError::unsupported("Submitting to GitHub arrives in a later version")
 }

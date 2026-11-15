@@ -463,7 +463,7 @@ fn a_git_that_fails_is_a_backend_error() {
     let repo = FixtureRepo::new();
     let backend = open(&repo);
     std::fs::write(repo.path().join(".git/config"), "[remote \"origin\n").unwrap();
-    let error = configured_remotes(&backend).unwrap_err();
+    let error = GithubError::from(configured_remotes(&backend).unwrap_err());
     assert!(
         matches!(
             &error,
@@ -630,4 +630,21 @@ fn a_repository_is_the_same_however_its_names_are_spelled() {
         assert_ne!(repo, other);
         assert!(!by_repo.contains_key(&other), "{other:?}");
     }
+}
+
+#[test]
+fn every_host_a_remote_names_may_hold_a_mirror() {
+    use crate::github::repo::remote_hosts;
+    let repo = FixtureRepo::new();
+    assert_eq!(remote_hosts(&open(&repo)).unwrap(), ["github.com"]);
+    repo.config("remote.origin.url", "git@github.com:acme/api.git")
+        .config("remote.work.url", "https://GHE.example.com/acme/api")
+        .config("remote.mirror.url", "https://ghe.example.com/acme/api.git")
+        .config("remote.local.url", "../elsewhere")
+        // A shorthand git rewrites to a host of its own.
+        .config("url.https://tenant.ghe.com/.insteadOf", "t:")
+        .config("remote.short.url", "t:acme/api");
+    let mut hosts = remote_hosts(&open(&repo)).unwrap();
+    hosts.sort();
+    assert_eq!(hosts, ["ghe.example.com", "github.com", "tenant.ghe.com"]);
 }

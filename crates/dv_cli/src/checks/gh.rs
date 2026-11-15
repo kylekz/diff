@@ -1,5 +1,6 @@
 //! GitHub's CLI (docs/PLAN.md D7, §12.2 item 6): `gh` there (`DV_GH` names another program,
-//! `mock_gh` in tests) and signed in (`gh auth status`). It is asked through the runner
+//! `mock_gh` in tests), new enough for what dv asks of it (`gh --version`, at least
+//! `dv_core::github::MIN_VERSION`) and signed in (`gh auth status`). It is asked through the runner
 //! everything else reaches GitHub with (`dv_core::github::Gh`, PLAN §9.2): the same
 //! environment, the same words for a `gh` that isn't installed, the same reading of "not
 //! signed in". dv never signs in itself: the fix is `gh auth login`. Inside a WSL distro this
@@ -7,7 +8,7 @@
 
 use std::time::Duration;
 
-use dv_core::github::{Gh, GhOptions, GithubError, says_signed_out};
+use dv_core::github::{Gh, GhOptions, GithubError, MIN_VERSION, says_signed_out};
 
 use super::{Check, Fix, Seams, State, id};
 
@@ -22,6 +23,20 @@ pub(super) fn check(seams: &Seams) -> Check {
         timeout: TIMEOUT,
         ..GhOptions::new(seams.gh.clone())
     });
+    // A gh that doesn't say its version is asked the rest as it is.
+    if let Ok(Some(version)) = gh.version()
+        && version < MIN_VERSION
+    {
+        return Check::new(
+            id::GH,
+            TITLE,
+            State::OutOfDate,
+            format!(
+                "gh {version} is older than dv needs (gh {MIN_VERSION} or later): update it \
+                 (https://cli.github.com)"
+            ),
+        );
+    }
     match gh.auth_status() {
         Err(error @ GithubError::GhMissing { .. }) => {
             Check::new(id::GH, TITLE, State::Missing, error.to_string())

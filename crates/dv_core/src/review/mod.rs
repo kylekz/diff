@@ -16,6 +16,7 @@
 //! - [`identity`]: the reviewer's name (PLAN §2.5).
 //! - [`home`]: the worktree a review's target resolves in, whichever worktree reads it
 //!   (PLAN §2.2, §2.4).
+//! - [`pins`]: the commits a PR review shows, and every review's two sides (PLAN §9.5).
 //! - [`ops`]: checked changes — what the UI and the CLI call.
 //!
 //! Many writers (the GUI, the CLI, any number of agents, in Windows and inside WSL) append to
@@ -32,6 +33,7 @@ pub mod id;
 pub mod identity;
 pub mod model;
 pub mod ops;
+pub mod pins;
 pub mod relocate;
 pub mod snapshot;
 pub mod store;
@@ -53,6 +55,7 @@ pub use model::{
     Round, StateChange, StatusChange, Submission, Thread, ThreadCounts, ThreadState, Verdict,
 };
 pub use ops::{FinishedRound, OpError, Opened};
+pub use pins::Pins;
 pub use relocate::{
     FuzzyLines, MoveKind, Placement, Relocation, SideLines, SideText, ThreadFile, anchored_entry,
     entry_for, has_side, is_gone, place_thread, place_unlisted, relocate, relocate_with,

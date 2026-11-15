@@ -20,7 +20,7 @@ use dv_core::review::{AuthorKind, Review, ReviewStatus, StoreError, ThreadState}
 use super::format;
 use crate::args::{GlobalArgs, ReviewWaitArgs};
 use crate::context::Context;
-use crate::dto::{ReviewDto, RoundDto, ThreadCountsDto, WaitDoc, WaitTimeoutDoc};
+use crate::dto::{RoundDto, ThreadCountsDto, WaitDoc, WaitTimeoutDoc};
 use crate::error::{CliError, Exit};
 use crate::output;
 use crate::repo::Repo;
@@ -63,7 +63,7 @@ pub(crate) fn wait(
         Waited::Woke(review) => {
             let doc = WaitDoc {
                 outcome: review.status.as_str(),
-                review: ReviewDto::new(&review, &labels),
+                review: repo.review_dto(&review, &labels),
                 round: review.last_round().map(RoundDto::from),
                 threads: ThreadCountsDto::of(&review),
             };

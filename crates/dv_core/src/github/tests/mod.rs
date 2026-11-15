@@ -3,6 +3,7 @@
 //! (`gh/tests`).
 
 mod mirror;
+mod pr;
 mod pr_ref;
 mod repo;
 mod spelling;

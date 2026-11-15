@@ -35,7 +35,7 @@ pub(crate) fn list(
     let doc = ReviewListDoc {
         reviews: reviews
             .iter()
-            .map(|review| ReviewDto::new(review, &labels))
+            .map(|review| repo.review_dto(review, &labels))
             .collect(),
         unreadable: listing.unreadable,
     };
@@ -72,7 +72,7 @@ pub(crate) fn show(
     let repo = Repo::open(global, ctx)?;
     let review = select::review(&repo, global, ctx, id)?;
     let doc = ReviewShowDoc {
-        review: ReviewDto::new(&review, &repo.labels()),
+        review: repo.review_dto(&review, &repo.labels()),
     };
     if global.json {
         output::json(ctx, &doc)?;
@@ -90,6 +90,15 @@ fn show_text(review: &ReviewDto) -> Vec<String> {
         format!("threads: {}", format::counts(&review.threads)),
         format!("worktree: {}", review.worktree),
     ];
+    if let Some(pr) = &review.pr {
+        lines.push(format::pr_line(pr));
+    }
+    lines.extend(review.submissions.iter().map(|submission| {
+        format!(
+            "submitted to GitHub: {}  {}",
+            submission.event, submission.url
+        )
+    }));
     if let Some(note) = &review.status_note {
         let by = note
             .author

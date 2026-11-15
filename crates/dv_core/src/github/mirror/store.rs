@@ -14,7 +14,8 @@ use serde::{Deserialize, Serialize};
 
 use super::{MIRROR_VERSION, Mirror, MirrorKey, pr_dir};
 use crate::backend::{Backend, BackendError};
-use crate::github::repo::GithubRepo;
+use crate::github::repo::{GithubRepo, remote_hosts};
+use crate::review::PrLink;
 
 /// What reading a mirror found.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -100,7 +101,46 @@ impl MirrorStore {
     /// (PLAN §9.4). Files that aren't this build's mirrors of that pull request are passed
     /// over.
     pub fn latest(&self, repo: &GithubRepo, number: u64) -> Result<Option<Mirror>, BackendError> {
-        let dir = pr_dir(&repo.host, &repo.owner, &repo.repo, number);
+        self.latest_on(&repo.host, &repo.owner, &repo.repo, number)
+    }
+
+    /// The hosts a mirror of this clone's pull requests may be kept under: every host a
+    /// remote names, and `github.com` (a few git calls, no `gh`).
+    pub fn hosts(&self) -> Result<Vec<String>, BackendError> {
+        remote_hosts(self.backend.as_ref())
+    }
+
+    /// [`MirrorStore::latest`] of `link`'s pull request without knowing which host the clone's
+    /// repository is on, which only `gh` can tell for a GitHub Enterprise host: looked for
+    /// under each of `hosts` ([`MirrorStore::hosts`]). What a command that only reads shows
+    /// (PLAN §9.10), and what stands in when the repository can't be told.
+    pub fn latest_stored(
+        &self,
+        hosts: &[String],
+        link: &PrLink,
+    ) -> Result<Option<Mirror>, BackendError> {
+        let mut latest: Option<Mirror> = None;
+        for host in hosts {
+            if let Some(mirror) = self.latest_on(host, &link.owner, &link.repo, link.number)?
+                && latest
+                    .as_ref()
+                    .is_none_or(|latest| latest.read_at < mirror.read_at)
+            {
+                latest = Some(mirror);
+            }
+        }
+        Ok(latest)
+    }
+
+    /// The most recently read mirror of pull request `number` of `owner/repo` on `host`.
+    fn latest_on(
+        &self,
+        host: &str,
+        owner: &str,
+        repo: &str,
+        number: u64,
+    ) -> Result<Option<Mirror>, BackendError> {
+        let dir = pr_dir(host, owner, repo, number);
         let mut latest: Option<Mirror> = None;
         for name in self.backend.store_list(&dir)? {
             let bytes = match self.backend.store_read(&format!("{dir}/{name}")) {
@@ -115,7 +155,9 @@ impl MirrorStore {
             };
             let key = &mirror.key;
             if key.number == number
-                && repo.is(&key.host, &key.owner, &key.repo)
+                && key.host.eq_ignore_ascii_case(host)
+                && key.owner.eq_ignore_ascii_case(owner)
+                && key.repo.eq_ignore_ascii_case(repo)
                 && latest
                     .as_ref()
                     .is_none_or(|latest| latest.read_at < mirror.read_at)

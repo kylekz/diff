@@ -30,7 +30,9 @@
 //! reads it), so a command for a WSL repository stops at exit 4
 //! rather than run inside a distro's real home (PLAN §10.4, CLAUDE.md), `DV_ONLY_DISTROS`
 //! naming the only distro its setup checks reach (the sandbox's `DV_TEST_WSL_DISTRO`, else
-//! none), then `env`
+//! none), `GIT_ALLOW_PROTOCOL=file` (git reaches nothing but a local path), `DV_GH` naming a program that isn't there when the app's own environment names
+//! none (the app's `gh` then is that program too: an automation run started without the e2e
+//! runner, which sets `DV_GH` to `mock_gh`, never lets a child run the real `gh`), then `env`
 //! (`{"NAME": "value"}` sets, `{"NAME": null}` removes; the runner's own variables,
 //! `DV_LINUX_DIR`, `DV_WSL_HOME`, `DV_ONLY_DISTROS` and `DV_USER_PATH_FILE` can't be changed). `stdin` is written to the child's stdin,
 //! which is then closed; without it stdin is empty.
@@ -63,6 +65,12 @@ pub type EnvOverlay = Vec<(OsString, Option<OsString>)>;
 /// The variables the e2e runner sets for every launch (tests/e2e/README.md, "Runner"); `env`
 /// can't change them, so a child stays as hermetic as the app.
 const RUNNER_VARS: &[&str] = &["DV_DATA_DIR", "DV_GH", "DV_MOCK_GH", "DV_MOCK_GH_LOG"];
+
+/// `GIT_ALLOW_PROTOCOL=file`, which every child gets, in a seeded repository or not (its
+/// `env` may set another on purpose): its git fetches only from a local path, so no command
+/// a scenario runs reaches the network through git (PLAN §14.2). The app's own backends
+/// get the same (`crate::automation::start`).
+pub const GIT_LOCAL_ONLY: (&str, &str) = ("GIT_ALLOW_PROTOCOL", "file");
 
 /// The variables that decide whether a child's CLI reaches into a WSL distro, and whose home
 /// it uses there (PLAN §10.4): `env` can't change them, so a scenario's commands reach WSL
@@ -263,12 +271,14 @@ pub fn overlay_for(cwd: &Path, roots: Vec<(PathBuf, EnvOverlay)>) -> Option<EnvO
 }
 
 /// The changes a child's environment gets over the app's, in order (module docs); `sandboxed`
-/// when the app runs with a `DV_WSL_HOME` of its own.
+/// when the app runs with a `DV_WSL_HOME` of its own, `has_gh` when its environment names the
+/// program to run as `gh` (`DV_GH`, the e2e runner's `mock_gh`).
 pub fn child_env(
     overlay: Option<EnvOverlay>,
     data_dir: &Path,
     env: &[(String, Option<String>)],
     sandboxed: bool,
+    has_gh: bool,
 ) -> EnvOverlay {
     let home = data_dir.join(crate::app::AUTOMATION_HOME);
     let mut changes: EnvOverlay = HOME_VARS
@@ -280,6 +290,7 @@ pub fn child_env(
         Some(home.join(".codex").into_os_string()),
     ));
     changes.extend(overlay.unwrap_or_default());
+    changes.push((GIT_LOCAL_ONLY.0.into(), Some(GIT_LOCAL_ONLY.1.into())));
     changes.push(("DV_DATA_DIR".into(), Some(data_dir.as_os_str().to_owned())));
     changes.push((
         USER_PATH_VAR.into(),
@@ -301,6 +312,12 @@ pub fn child_env(
         String::new()
     };
     changes.push((ONLY_DISTROS_VAR.into(), Some(only.into())));
+    if !has_gh {
+        changes.push((
+            dv_cli::checks::GH_VAR.into(),
+            Some(dv_ui::services::setup::NO_GH.into()),
+        ));
+    }
     changes.extend(
         env.iter()
             .map(|(name, value)| (name.into(), value.as_ref().map(OsString::from))),
@@ -649,7 +666,15 @@ impl Start {
         // `DV_WSL_HOME` means what dv_backend's one check says it does: blank or not a POSIX
         // path is no sandbox, never the distro user's own home.
         let sandboxed = dv_backend::wsl::is_sandbox(dv_backend::wsl::home_var());
-        let env = child_env(overlay, &self.data_dir, &self.request.env, sandboxed);
+        let has_gh =
+            dv_ui::services::setup::names_gh(std::env::var_os(dv_cli::checks::GH_VAR).as_deref());
+        let env = child_env(
+            overlay,
+            &self.data_dir,
+            &self.request.env,
+            sandboxed,
+            has_gh,
+        );
         Running::start(&self.exe, &self.request, &env)
     }
 }

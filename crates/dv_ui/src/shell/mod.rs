@@ -74,6 +74,7 @@ mod tests;
 
 use anyhow::{Context as _, Result};
 use dv_backend::ConnectionState;
+use dv_core::github::PrRef;
 use dv_core::review::{Author, ReviewId, ReviewStatus, ThreadState};
 use dv_core::{Location, Target};
 use futures::channel::oneshot;
@@ -202,12 +203,20 @@ pub struct BackendDown {
     pub stopped: bool,
 }
 
+/// What `Ctrl Enter` says on a PR review until its submission to GitHub is built (PLAN
+/// §9.12), as `dv review submit` does.
+pub const SUBMITTING_LATER: &str = "Submitting to GitHub arrives in a later version";
+
 /// A failure the main area's banner shows, and how to retry it.
 #[derive(Clone, Debug)]
 pub struct MainBanner {
     pub failure: Failure,
-    /// The open that failed, which Retry runs again.
+    /// The open that failed, or that opened a pull request's review as it was last read
+    /// because GitHub couldn't be (PLAN §9.3), which Retry runs again.
     pub retry: Option<(Location, OpenRequest)>,
+    /// The repository the open that failed was of, whether or not it offers Retry: with no
+    /// review open, the status bar says how that repository stands (`status_bar`).
+    pub location: Option<Location>,
     /// Whether its detail is disclosed.
     pub expanded: bool,
     /// It reports the pending pick ([`pending`]), which its Dismiss drops too.
@@ -779,13 +788,34 @@ impl Shell {
                     review: opened.loaded.review.id.clone(),
                     created: opened.created,
                 };
+                // A pull request whose review opened although GitHub couldn't be read (PLAN
+                // §9.3): the review shows as it was last read, and the banner says why.
+                let unread = match (&request, &opened.pr) {
+                    (OpenRequest::Pr(reference), Some(read)) => {
+                        read.stale.as_ref().map(|stale| Failure {
+                            message: format!(
+                                "couldn't read #{} from GitHub: {}",
+                                reference.number(),
+                                stale.message
+                            ),
+                            ..stale.clone()
+                        })
+                    }
+                    _ => None,
+                };
                 let same = self
                     .session
                     .as_ref()
                     .is_some_and(|session| session.read(cx).review_id() == &result.review);
                 if same {
                     if let Some(session) = &self.session {
-                        session.update(cx, |session, cx| session.reload_fold(cx));
+                        session.update(cx, |session, cx| {
+                            session.reload_fold(cx);
+                            // A pull request opened again was refreshed by the open.
+                            if let Some(read) = opened.pr {
+                                session.apply_pr_read(read, cx);
+                            }
+                        });
                     }
                 } else {
                     let session = cx.new(|cx| ReviewSession::new(opened, cx));
@@ -795,6 +825,15 @@ impl Shell {
                 // a menu open while a pending pick ran again by itself.
                 if self.sheet.is_none() && self.switcher.is_none() && self.source_picker.is_none() {
                     self.main_focus(cx).focus(window, cx);
+                }
+                if let Some(failure) = unread {
+                    self.banner = Some(MainBanner {
+                        location: Some(location.clone()),
+                        retry: failure.retryable.then_some((location, request)),
+                        failure,
+                        expanded: false,
+                        pick: false,
+                    });
                 }
                 Ok(result)
             }
@@ -887,12 +926,25 @@ impl Shell {
     }
 
     /// Opens the "Finish round" sheet over the open review (DESIGN §4.2), in place of an open
-    /// menu; nothing happens with no review open, a finished one, or a sheet already open.
+    /// menu; nothing happens with no review open, a finished one, or a sheet already open. A
+    /// PR review has no round to finish here: it is submitted to GitHub, which arrives with
+    /// the write side (PLAN §9.12), and the main area's banner says so in the sheet's place.
     pub fn open_sheet(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(session) = self.session.clone() else {
             return;
         };
         if session.read(cx).is_read_only() || self.sheet.is_some() {
+            return;
+        }
+        if session.read(cx).review().is_pr_review() {
+            self.banner = Some(MainBanner {
+                failure: Failure::new(SUBMITTING_LATER),
+                retry: None,
+                location: None,
+                expanded: false,
+                pick: false,
+            });
+            cx.notify();
             return;
         }
         let return_focus = self.take_menu().unwrap_or_else(|| window.focused(cx));
@@ -914,15 +966,24 @@ impl Shell {
         let Some(session) = &self.session else {
             return;
         };
-        let (location, target) = {
+        let (location, request) = {
             let session = session.read(cx);
+            let review = session.review();
             (
                 session.backend().repo().location.clone(),
-                session.review().target.clone(),
+                // A pull request's next review is made as any of its reviews is: from what
+                // GitHub holds now (PLAN §9.3).
+                match review.pr_target() {
+                    Some(link) => OpenRequest::Pr(PrRef::Short {
+                        owner: link.owner.clone(),
+                        repo: link.repo.clone(),
+                        number: link.number,
+                    }),
+                    None => OpenRequest::Target(review.target.clone()),
+                },
             )
         };
-        self.open(location, OpenRequest::Target(target), window, cx)
-            .detach();
+        self.open(location, request, window, cx).detach();
     }
 
     fn on_sheet_event(
@@ -1059,6 +1120,7 @@ impl Shell {
                         this.banner = Some(MainBanner {
                             failure: Failure::new(format!("the folder picker failed: {error}")),
                             retry: None,
+                            location: None,
                             expanded: false,
                             pick: false,
                         });
@@ -1101,6 +1163,7 @@ impl Shell {
                             this.banner = Some(MainBanner {
                                 failure: failure.clone(),
                                 retry: None,
+                                location: None,
                                 expanded: false,
                                 pick: false,
                             });

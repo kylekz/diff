@@ -521,6 +521,80 @@ fn viewed_files_belong_to_the_round_in_progress() {
 }
 
 #[test]
+fn an_agent_writes_nothing_to_a_pr_review() {
+    // PR reviews are the reviewer's alone (PLAN §2.4, §9.10), draft, closed or submitted.
+    let (_repo, store) = fixture_store();
+    // A PR review with a thread and a reply, the reviewer's.
+    let review = |head: char| {
+        let id = open_review(&store, pr_target(head), reviewer())
+            .unwrap()
+            .review
+            .id;
+        let thread = add_thread(&store, &id, anchor("src/lib.rs", 1), "Nit", reviewer()).unwrap();
+        let reply_id = reply(&store, &id, &thread, "More", reviewer(), None).unwrap();
+        (id, thread, reply_id)
+    };
+    let refused = "an agent can't write to a PR review: PR reviews are the reviewer's; read the \
+                   threads with `dv comment list`";
+    let check = |(id, thread, reply_id): &(ReviewId, ThreadId, CommentId)| {
+        let events = store.events(id).unwrap().events.len();
+        let attempts: Vec<Result<(), OpError>> = vec![
+            add_thread(&store, id, anchor("src/lib.rs", 1), "x", agent()).map(drop),
+            crate::review::ops::annotate(&store, id, anchor("src/lib.rs", 1), "x", agent())
+                .map(drop),
+            reply(&store, id, thread, "x", agent(), None).map(drop),
+            set_thread_state(
+                &store,
+                id,
+                thread,
+                ThreadState::Addressed,
+                Some("done"),
+                agent(),
+                None,
+            )
+            .map(drop),
+            set_thread_state(
+                &store,
+                id,
+                thread,
+                ThreadState::Resolved,
+                None,
+                agent(),
+                None,
+            )
+            .map(drop),
+            crate::review::ops::hand_back(&store, id, &agent(), Some("done"), None).map(drop),
+            set_status(&store, id, ReviewStatus::Ready, &agent(), None).map(drop),
+            set_status(&store, id, ReviewStatus::InProgress, &agent(), None).map(drop),
+            edit_body(&store, id, &ItemId::Thread(thread.clone()), "x", &agent()),
+            delete_item(&store, id, &ItemId::Comment(reply_id.clone()), &agent()),
+        ];
+        for (index, attempt) in attempts.into_iter().enumerate() {
+            assert_eq!(not_allowed(attempt), refused, "attempt {index}");
+        }
+        assert_eq!(store.events(id).unwrap().events.len(), events);
+        assert!(!start_work(&store, id, &agent()).unwrap());
+    };
+    let draft = review('b');
+    check(&draft);
+    // The reviewer still writes.
+    reply(&store, &draft.0, &draft.1, "Still mine", reviewer(), None).unwrap();
+    set_status(&store, &draft.0, ReviewStatus::Closed, &reviewer(), None).unwrap();
+    check(&draft);
+
+    let submitted = review('c');
+    record_submission(
+        &store,
+        &submitted.0,
+        900,
+        "https://x.invalid/900",
+        Verdict::Comment,
+    )
+    .unwrap();
+    check(&submitted);
+}
+
+#[test]
 fn pr_links_and_submissions() {
     let (_repo, store, id) = with_review();
     let pr = PrLink {
@@ -568,7 +642,7 @@ fn pr_links_and_submissions() {
 
     // Read-only from here on (PLAN §2.4).
     assert_eq!(
-        rejected(reply(&store, &id, &thread, "late", agent(), None)),
+        rejected(reply(&store, &id, &thread, "late", reviewer(), None)),
         Rejection::Submitted
     );
     assert_eq!(

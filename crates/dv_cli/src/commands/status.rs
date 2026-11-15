@@ -5,7 +5,7 @@
 use super::format;
 use crate::args::GlobalArgs;
 use crate::context::Context;
-use crate::dto::{AuthorDto, BuildDto, RepoDto, ReviewDto, StatusDoc};
+use crate::dto::{AuthorDto, BuildDto, RepoDto, StatusDoc};
 use crate::error::{CliError, Exit};
 use crate::identity;
 use crate::output;
@@ -29,10 +29,10 @@ pub(crate) fn status(global: &GlobalArgs, ctx: &mut Context) -> Result<Exit, Cli
         author: (&author).into(),
         current: current
             .as_ref()
-            .map(|review| ReviewDto::new(review, &labels)),
+            .map(|review| repo.review_dto(review, &labels)),
         reviews: reviews
             .iter()
-            .map(|review| ReviewDto::new(review, &labels))
+            .map(|review| repo.review_dto(review, &labels))
             .collect(),
         unreadable: listing.unreadable,
     };

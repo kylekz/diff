@@ -20,7 +20,8 @@
 //! since the next call starts it; one that went down again keeps it waiting). Its banner's
 //! Retry is the user's own pick and runs at once. A pick whose open kills its connection every
 //! time runs again by itself at most [`AUTOMATIC_RUNS`] times; then it fails as any open does,
-//! in the main area's banner. Any other failure of an open is that banner too.
+//! in the main area's banner. Any other failure of an open is that banner too, with Retry
+//! unless running it again can't end differently (`Failure::retryable`).
 
 use std::sync::Arc;
 
@@ -87,9 +88,13 @@ impl Shell {
                 .zip(locations.key_for(&location))
                 .filter(|_| runs < AUTOMATIC_RUNS)
         };
+        // Retry is offered for what running the open again can fix.
         let banner = |pick| MainBanner {
             failure: failure.clone(),
-            retry: Some((location.clone(), request.clone())),
+            retry: failure
+                .retryable
+                .then(|| (location.clone(), request.clone())),
+            location: Some(location.clone()),
             expanded: false,
             pick,
         };

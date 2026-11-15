@@ -15,12 +15,14 @@ use dv_core::location::{drive_path, mount_path};
 use crate::cli::OpenArgs;
 
 /// The error `dv` or `dv open` (`open`'s arguments) exits with when run in `cwd`, inside the
-/// WSL distro `distro` when that is set.
+/// WSL distro `distro` when that is set; `exists` tells an argument that is a path from one
+/// that is a pull request ([`OpenArgs::pr`]).
 pub fn refusal(
     global: &GlobalArgs,
     open: Option<&OpenArgs>,
     cwd: &Path,
     distro: Option<&str>,
+    exists: &dyn Fn(&Path) -> bool,
 ) -> CliError {
     let distro = distro.map(str::trim).filter(|distro| !distro.is_empty());
     let Some(distro) = distro else {
@@ -30,13 +32,21 @@ pub fn refusal(
         );
     };
     let named = open
-        .and_then(|open| open.target.as_deref())
+        .and_then(|open| open.path(cwd, exists))
         .or(global.repo.as_deref());
     let path = windows_path(&cwd.to_string_lossy(), named, global.wsl.as_deref(), distro);
+    // A pull request opens in its repository: where that is, then the reference as given.
+    let what = match open.and_then(|open| open.pr(cwd, exists)) {
+        Some(reference) => format!(
+            "{} --pr {}",
+            windows_arg(&path),
+            windows_arg(reference.trim())
+        ),
+        None => windows_arg(&path),
+    };
     CliError::unsupported(format!(
         "this is dv's Linux build without a window; open the repository from Windows: \
-         `dv open {}`",
-        windows_arg(&path)
+         `dv open {what}`"
     ))
 }
 
@@ -122,8 +132,9 @@ mod tests {
         };
         let open = OpenArgs {
             target: target.map(str::to_string),
+            pr: None,
         };
-        let error = refusal(&global, Some(&open), Path::new(cwd), distro);
+        let error = refusal(&global, Some(&open), Path::new(cwd), distro, &|_| false);
         assert_eq!(error.exit, Exit::Usage);
         assert_eq!(error.code, "unsupported");
         error.message
@@ -233,6 +244,22 @@ mod tests {
                 "/home/kyle",
                 r"`dv open E:\x`",
             ),
+            // A pull request, in the repository it is of (`#` starts a comment in
+            // PowerShell, so it is quoted).
+            (
+                Some("#482"),
+                None,
+                None,
+                "/home/kyle/api",
+                r##"`dv open \\wsl.localhost\Ubuntu\home\kyle\api --pr "#482"`"##,
+            ),
+            (
+                Some("https://github.com/acme/api/pull/482"),
+                Some("/mnt/d/code/api"),
+                None,
+                "/home/kyle",
+                r"`dv open D:\code\api --pr https://github.com/acme/api/pull/482`",
+            ),
             // Anything else under `/mnt` is the distro's.
             (
                 None,
@@ -297,7 +324,57 @@ mod tests {
             assert!(text.starts_with("this build of dv has no window"), "{text}");
         }
         // Bare `dv` reads the same.
-        let error = refusal(&GlobalArgs::default(), None, Path::new("/x"), None);
+        let error = refusal(&GlobalArgs::default(), None, Path::new("/x"), None, &|_| {
+            false
+        });
         assert!(error.message.starts_with("this build of dv has no window"));
+    }
+
+    #[test]
+    fn a_pull_request_is_named_by_its_flag() {
+        let suggestion = |open: OpenArgs, exists: &dyn Fn(&Path) -> bool| {
+            refusal(
+                &GlobalArgs::default(),
+                Some(&open),
+                Path::new("/home/kyle/api"),
+                Some("Ubuntu"),
+                exists,
+            )
+            .message
+        };
+        let lead = "this is dv's Linux build without a window; open the repository from \
+                    Windows: ";
+        // `--pr` as given, beside the path the line names or the working directory.
+        assert_eq!(
+            suggestion(
+                OpenArgs {
+                    target: None,
+                    pr: Some("482".into()),
+                },
+                &|_| false
+            ),
+            format!(r"{lead}`dv open \\wsl.localhost\Ubuntu\home\kyle\api --pr 482`")
+        );
+        assert_eq!(
+            suggestion(
+                OpenArgs {
+                    target: Some("../web".into()),
+                    pr: Some("#7".into()),
+                },
+                &|_| false
+            ),
+            format!(r##"{lead}`dv open \\wsl.localhost\Ubuntu\home\kyle\web --pr "#7"`"##)
+        );
+        // A folder named as a pull request is written is the folder.
+        assert_eq!(
+            suggestion(
+                OpenArgs {
+                    target: Some("#482".into()),
+                    pr: None,
+                },
+                &|path| path == Path::new("/home/kyle/api/#482")
+            ),
+            format!(r##"{lead}`dv open "\\wsl.localhost\Ubuntu\home\kyle\api\#482"`"##)
+        );
     }
 }

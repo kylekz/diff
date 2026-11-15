@@ -14,6 +14,7 @@ mod hand_back;
 mod history;
 mod home;
 mod placement;
+mod pr;
 mod reexec;
 mod review;
 mod review_write;

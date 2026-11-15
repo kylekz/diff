@@ -117,6 +117,8 @@ fn every_launch_reaches_mock_gh_and_stops_git_at_the_output_dir() {
             .map(PathBuf::from),
         Some(out.clone())
     );
+    // git reaches nothing but a local path.
+    assert_eq!(envs["GIT_ALLOW_PROTOCOL"].as_deref(), Some("file"));
     assert!(
         !envs.keys().any(|name| name.starts_with("DV_LSP_")),
         "no language server without an lsp header: {envs:?}"

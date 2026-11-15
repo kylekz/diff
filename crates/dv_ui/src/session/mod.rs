@@ -38,6 +38,10 @@
 //! backend's connection. A call that fails because the connection was lost raises nothing (the
 //! status bar says "reconnecting…"); the reconnect's synthetic rescan reads everything again.
 //!
+//! **A PR review** (PLAN §9.4, §9.5, `pr`): its sides are its pins, which a refresh of its
+//! pull request moves; it is refreshed as it opens and when the reviewer asks, and follows a
+//! refresh made by another process.
+//!
 //! **Comparison** (PLAN §2.3, `comparison`): what the files and diffs are, the interdiff since
 //! a closed round or all changes. Switching ([`ReviewSession::set_comparison`]) lists again
 //! from scratch under a new generation, the diffs shown meanwhile staying on screen until
@@ -58,6 +62,7 @@ mod connection;
 mod history;
 mod load;
 mod placement;
+mod pr;
 mod side;
 mod watch;
 mod writes;
@@ -195,6 +200,9 @@ pub enum SessionEvent {
     /// The agent's annotations were shown or hidden (`A`, PLAN §19.3): which cards the stream
     /// draws changed, nothing else.
     AnnotationsShown,
+    /// What is known of the review's pull request changed: a refresh landed, or another
+    /// process's was read (`pr`).
+    PrChanged,
 }
 
 /// One open review (see the module docs).
@@ -310,6 +318,8 @@ pub struct ReviewSession {
     /// ([`ReviewSession::shows_card`]): a question being written about an annotation never
     /// loses its card to `A` or to the agent rewriting its code.
     replying_to: Option<ThreadId>,
+    /// A PR review's pull request as last refreshed (`pr`).
+    pr: pr::PrState,
 }
 
 impl EventEmitter<SessionEvent> for ReviewSession {}
@@ -325,6 +335,7 @@ impl ReviewSession {
             reviewer,
             labels,
             connection,
+            pr,
             ..
         } = opened;
         let comparison = default_comparison(&loaded.review);
@@ -386,12 +397,19 @@ impl ReviewSession {
             link: connection::Link::new(connection),
             annotations_shown: true,
             replying_to: None,
+            pr: pr::PrState::default(),
         };
         session.follow_connection(cx);
         // The watch first, so it is registered as early as possible; what the first list reads
         // before then is read again once it is (`watch`).
         session.ensure_watch(cx);
         session.refresh(Batch::everything(), cx);
+        // A PR review is refreshed as it opens (PLAN §9.4): an open by the pull request's
+        // reference did that already.
+        match pr {
+            Some(read) => session.pr.read = Some(read),
+            None => session.refresh_pr(cx),
+        }
         session
     }
 
@@ -432,15 +450,17 @@ impl ReviewSession {
         &self.reviewer
     }
 
-    /// The target as the title bar names it ("working tree vs main").
+    /// The target as the title bar names it ("working tree vs main"; a pull request by its
+    /// number and title, "#482 Fix the cache").
     pub fn target_label(&self) -> String {
-        target_label(&self.review.target, &self.labels)
+        pr::label(&self.review, self.pr.read.as_ref())
+            .unwrap_or_else(|| target_label(&self.review.target, &self.labels))
     }
 
     /// What the stream's side labels call the old and the new side (`main` / `working tree`;
     /// `round 1` / `working tree` in an interdiff, DESIGN §4.1).
     pub fn side_labels(&self) -> (String, String) {
-        let (old, new) = side_labels(&self.review.target, &self.labels);
+        let (old, new) = self.target_side_labels();
         match self.comparison {
             Comparison::SinceRound(n) => (format!("round {n}"), new),
             Comparison::All => (old, new),
@@ -448,9 +468,15 @@ impl ReviewSession {
     }
 
     /// What the review's own sides are called (all changes, whichever comparison shows):
-    /// `main` / `working tree`, for the file view (PLAN §18.1).
+    /// `main` / `working tree`, for the file view (PLAN §18.1); a pull request's base and
+    /// head branches once it was read.
     pub fn target_side_labels(&self) -> (String, String) {
-        side_labels(&self.review.target, &self.labels)
+        match self.pr.read.as_ref().and_then(|read| read.mirror.as_ref()) {
+            Some(mirror) if self.review.is_pr_review() => {
+                (mirror.pr.base_ref.clone(), mirror.pr.head_ref.clone())
+            }
+            _ => side_labels(&self.review.target, &self.labels),
+        }
     }
 
     /// The spec the files were listed with at the last refresh (an interdiff's, in one);
@@ -709,6 +735,7 @@ impl ReviewSession {
             && !self.review_texts.values().any(ReviewText::is_loading)
             && !self.histories_loading()
             && !self.side_reads_loading()
+            && self.pr.is_settled()
             && wanted_landed
     }
 

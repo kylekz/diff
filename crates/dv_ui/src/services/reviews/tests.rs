@@ -150,7 +150,8 @@ fn services_with(
     distros: Vec<Distro>,
 ) -> (Entity<Locations>, Entity<Reviews>) {
     let locations = cx.new(|cx| Locations::new(WslAccess::scripted(distros), cx));
-    let reviews = cx.new(|cx| Reviews::new(locations.clone(), data_dir, cx));
+    let github = cx.new(|_| crate::services::GitHub::without_gh());
+    let reviews = cx.new(|cx| Reviews::new(locations.clone(), github, data_dir, cx));
     (locations, reviews)
 }
 

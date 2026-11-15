@@ -18,7 +18,8 @@
 //! Inside, `repo` finds and opens the repository, `reexec` runs a command for a repository
 //! inside a WSL distro there (on Windows, PLAN §10.4), `select` picks the review a command
 //! means (PLAN §10.2), `identity` who it acts as (PLAN §2.5), `placement` where threads stand
-//! now and where a write records them (PLAN §8), `body` reads a command's text (`--body`,
+//! now and where a write records them (PLAN §8), `pr` a command's `gh` and what a PR review
+//! adds to it (PLAN §9.10), `body` reads a command's text (`--body`,
 //! `--body-file`, stdin), and `commands` does the work.
 
 pub mod args;
@@ -32,6 +33,7 @@ mod executable;
 mod identity;
 pub mod output;
 mod placement;
+mod pr;
 mod reexec;
 mod repo;
 mod select;

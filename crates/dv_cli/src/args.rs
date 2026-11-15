@@ -95,8 +95,11 @@ pub enum ReviewCommand {
     List(ReviewListArgs),
 
     /// Start a review (or resume the open one) of the working tree, the index, a branch, a
-    /// commit or a range
+    /// commit, a range or a GitHub pull request
     New(ReviewNewArgs),
+
+    /// A PR review: fetch the pull request again and read what GitHub holds about it
+    Refresh(PrReviewIdArg),
 
     /// A review: its target, status, rounds and thread counts
     Show(ReviewIdArg),
@@ -169,8 +172,8 @@ pub struct ReviewNewArgs {
     #[arg(long, value_name = "A..B", value_parser = parse_range)]
     pub range: Option<RangeArg>,
 
-    /// A GitHub pull request (a later version)
-    #[arg(long, value_name = "N")]
+    /// A GitHub pull request of this repository: 482, #482, owner/repo#482 or its URL
+    #[arg(long, value_name = "PR")]
     pub pr: Option<String>,
 }
 
@@ -205,6 +208,14 @@ fn parse_range(text: &str) -> Result<RangeArg, String> {
 pub struct ReviewIdArg {
     /// The review [default: --review, $DV_REVIEW, else the one open review of the work checked
     /// out here]
+    #[arg(value_name = "ID")]
+    pub id: Option<String>,
+}
+
+/// A PR review's id, which may be left out when the repository has one open PR review.
+#[derive(Args, Debug, Clone, PartialEq, Eq)]
+pub struct PrReviewIdArg {
+    /// The review [default: --review, $DV_REVIEW, else the one open PR review]
     #[arg(value_name = "ID")]
     pub id: Option<String>,
 }

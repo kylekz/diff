@@ -204,6 +204,9 @@ pub struct Locations {
     backends: HashMap<Location, Cached>,
     /// Routes by the root they apply to (a path and everything below it).
     routes: Vec<(PathBuf, Route)>,
+    /// Laid over the environment of every git a backend opened from now on runs, under its
+    /// route's own ([`Locations::set_base_env`]).
+    base_env: EnvOverlay,
     connections: Connections,
     wsl: WslAccess,
     /// The connections whose state changes repaint this service's observers.
@@ -237,6 +240,7 @@ impl Locations {
         Self {
             backends: HashMap::new(),
             routes: Vec::new(),
+            base_env: Vec::new(),
             connections: Connections::new(),
             wsl,
             followed: HashMap::new(),
@@ -271,6 +275,13 @@ impl Locations {
                 connection: None,
             },
         );
+    }
+
+    /// Has every backend opened from now on run its git with `env` laid over the inherited
+    /// environment, whatever its root; a route's own environment goes over it. An automation
+    /// run's: git that reaches nothing but a local path (PLAN §14.2).
+    pub fn set_base_env(&mut self, env: EnvOverlay) {
+        self.base_env = env;
     }
 
     /// The app's connections (automation kills and blocks them).
@@ -485,6 +496,7 @@ impl Locations {
             location: location.clone(),
             cached: cached.clone(),
             routes: self.routes.clone(),
+            base_env: self.base_env.clone(),
             distro,
             connections: self.connections.clone(),
             wsl: self.wsl.clone(),
@@ -633,6 +645,7 @@ struct OpenJob {
     location: Location,
     cached: Option<Cached>,
     routes: Vec<(PathBuf, Route)>,
+    base_env: EnvOverlay,
     /// A WSL location's connection, when there is one to go through.
     distro: Option<Arc<Connection>>,
     connections: Connections,
@@ -688,16 +701,18 @@ impl OpenJob {
         match &self.location {
             Location::Local(path) => {
                 let route = route.unwrap_or_default();
+                // The route's own variables go over the base's.
+                let env: EnvOverlay = self.base_env.iter().cloned().chain(route.env).collect();
                 match &route.connection {
                     Some(connection) => {
                         let text = path.to_str().ok_or_else(|| BackendError::Unavailable {
                             location: path.display().to_string(),
                             reason: "its path isn't Unicode, which dv's protocol needs".into(),
                         })?;
-                        self.through(connection, text, route.env.clone())
+                        self.through(connection, text, env)
                     }
                     None => {
-                        let options = LocalBackendOptions { env: route.env };
+                        let options = LocalBackendOptions { env };
                         Ok(Cached {
                             backend: Arc::new(LocalBackend::open_with(path, options)?),
                             connection: None,
@@ -710,7 +725,7 @@ impl OpenJob {
                     Some(connection) => connection.clone(),
                     None => self.running(distro)?,
                 };
-                self.through(&connection, path, Vec::new())
+                self.through(&connection, path, self.base_env.clone())
             }
         }
     }

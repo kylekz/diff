@@ -7,7 +7,7 @@ use std::collections::{BTreeSet, HashMap};
 use std::sync::Arc;
 
 use dv_core::diff::{DiffLimits, FileDiff, FileEntry, FileStatus, file_diff, file_list};
-use dv_core::review::{AnchorSide, LoadedReview, Round};
+use dv_core::review::{AnchorSide, LoadedReview, ReviewId, Round, pins};
 use dv_core::{DiffSpec, GitRepo, Side, Target, TargetError};
 use gpui::{AppContext as _, Context, Task};
 
@@ -93,23 +93,23 @@ pub(super) struct Listed {
     fallback: Option<Failure>,
 }
 
-/// Resolves `target` and lists its files (blocking): all its changes, or with `since` the
-/// interdiff since that round (PLAN §2.3) and the target's own files beside it (the review's
-/// files, which threads belong to), unless the round's snapshot is missing from the
-/// repository, when it lists all changes and says why. The branch labels name HEAD and the
-/// default branch, which only the git state moves: they are read again when `read_labels` (a
-/// git change, a rescan, the first list) or when the target resolved elsewhere than
-/// `previous`, never for a batch of worktree paths alone.
+/// Resolves the sides of `review`, a review of `target` (its target's, or a PR review's
+/// pins: `dv_core::review::pins::resolve`), and lists its files (blocking): all its changes,
+/// or with `since` the interdiff since that round (PLAN §2.3) and the target's own files
+/// beside it (the review's files, which threads belong to), unless the round's snapshot is
+/// missing from the repository, when it lists all changes and says why. The branch labels
+/// name HEAD and the default branch, which only the git state moves: they are read again
+/// when `read_labels` (a git change, a rescan, the first list) or when the target resolved
+/// elsewhere than `previous`, never for a batch of worktree paths alone.
 fn list_blocking(
     repo: &GitRepo,
+    review: &ReviewId,
     target: &Target,
     since: Option<&Round>,
     previous: Option<&DiffSpec>,
     read_labels: bool,
 ) -> Result<Listed, Failure> {
-    let resolved = target
-        .resolve(repo)
-        .map_err(|error| Failure::from(&error))?;
+    let resolved = pins::resolve(repo, review, target).map_err(|error| Failure::from(&error))?;
     let (spec, comparison, fallback) = match since {
         None => (resolved.clone(), Comparison::All, None),
         Some(round) => match resolved.since_checked(repo, round) {
@@ -228,6 +228,7 @@ impl ReviewSession {
         let generation = self.generation;
         self.watch.note_list();
         let (repo, target) = (self.repo.clone(), self.review.target.clone());
+        let review = self.review.id.clone();
         let since = self
             .asked
             .round()
@@ -238,6 +239,7 @@ impl ReviewSession {
         let job = cx.background_spawn(async move {
             list_blocking(
                 &repo,
+                &review,
                 &target,
                 since.as_ref(),
                 previous.as_ref(),

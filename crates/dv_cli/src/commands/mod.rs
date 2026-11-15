@@ -1,7 +1,8 @@
 //! Each command's work (docs/PLAN.md §10.1): [`run`] dispatches.
 //!
 //! - Reading: [`status`], [`review`] (`list`, `show`) and [`comment`] (`list`, `show`).
-//! - Writing: [`review_write`] (`new`, `done`, `submit`, `close`, `delete`) and
+//! - Writing: [`review_write`] (`new`, `done`, `submit`, `close`, `delete`), [`pr`] (`new
+//!   --pr`, `refresh`: a GitHub pull request's review, PLAN §9.10) and
 //!   [`comment_write`] (`add`, `annotate`, `reply`, `address`, `resolve`, `reopen`, `edit`,
 //!   `delete`).
 //! - Waiting for the reviewer: [`wait`].
@@ -19,6 +20,7 @@ pub(crate) mod comment_write;
 pub(crate) mod doctor;
 mod format;
 mod later;
+mod pr;
 mod review;
 pub(crate) mod review_write;
 pub(crate) mod setup;
@@ -48,8 +50,11 @@ pub(crate) fn run(
         Command::Review(command) => match command {
             ReviewCommand::List(args) => review::list(global, &args, ctx),
             ReviewCommand::Show(args) => review::show(global, args.id.as_deref(), ctx),
-            ReviewCommand::New(args) if args.pr.is_some() => Err(later::github_prs()),
-            ReviewCommand::New(args) => review_write::new(global, &args, ctx),
+            ReviewCommand::New(args) => match &args.pr {
+                Some(reference) => pr::new(global, reference, ctx),
+                None => review_write::new(global, &args, ctx),
+            },
+            ReviewCommand::Refresh(args) => pr::refresh(global, args.id.as_deref(), ctx),
             ReviewCommand::Wait(args) => wait::wait(global, &args, ctx),
             ReviewCommand::Done(args) => review_write::done(global, &args, ctx),
             ReviewCommand::Submit(args) => review_write::submit(global, &args, ctx),

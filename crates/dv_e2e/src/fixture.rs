@@ -29,6 +29,11 @@ pub const MOCK_GH_LOG_VAR: &str = "DV_MOCK_GH_LOG";
  */
 pub const GIT_CEILING_VAR: &str = "GIT_CEILING_DIRECTORIES";
 
+/// The transports git may use. Every launch sets it to `file`: the app's git, and every
+/// command it starts, fetches only from a local path, so a scenario whose repository has a
+/// remote on a real host fails at once instead of reaching the network (PLAN §14.2).
+pub const GIT_PROTOCOL_VAR: &str = "GIT_ALLOW_PROTOCOL";
+
 /**
  * What dv runs in place of a language server's resolvers (PLAN §18.4): `DV_LSP_<ID>`, with
  * `DV_LSP_<ID>_ARGS`. The runner removes every inherited `DV_` variable, so a scenario reaches
@@ -52,7 +57,13 @@ pub const VARS: &[&str] = &[
 ];
 
 /// The environment the fixture sets, which a header's `env` may not.
-pub const RESERVED_ENV: &[&str] = &[GH_VAR, MOCK_GH_VAR, MOCK_GH_LOG_VAR, GIT_CEILING_VAR];
+pub const RESERVED_ENV: &[&str] = &[
+    GH_VAR,
+    MOCK_GH_VAR,
+    MOCK_GH_LOG_VAR,
+    GIT_CEILING_VAR,
+    GIT_PROTOCOL_VAR,
+];
 
 /// dv's header keys: `{"scenario": {"gh": "fixtures/gh/pr.json", "lsp": {"typescript": …}}}`.
 #[derive(Debug, Default, Deserialize)]
@@ -209,6 +220,7 @@ impl Fixture<DvAction> for DvFixture {
                 self.gh_scenario.clone().map(OsString::from),
             ),
             (GIT_CEILING_VAR.into(), Some(self.out_dir.clone().into())),
+            (GIT_PROTOCOL_VAR.into(), Some("file".into())),
         ];
         for (id, path) in &self.lsp_scenarios {
             let var = format!(

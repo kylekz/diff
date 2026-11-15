@@ -26,22 +26,51 @@ pub const GITHUB_OWNER: &str = "dv-fixture";
 
 /// A stand-in GitHub repository and a clone of it (module docs).
 pub struct FixtureGithub {
+    origin: GithubOrigin,
+    clone: FixtureRepo,
+}
+
+/// The fixture GitHub's own side of a [`FixtureGithub`]: the author's repository, where
+/// commits are made, and the bare one standing in for GitHub, which they are pushed to.
+pub struct GithubOrigin {
     name: String,
     author: FixtureRepo,
     bare: PathBuf,
-    clone: FixtureRepo,
 }
+
+/// Where a persistent fixture keeps its GitHub side, beside the clone's own directories
+/// (`<clone>.fixture/`).
+const ORIGIN_DIR: &str = "github";
 
 impl FixtureGithub {
     /// The repository `dv-fixture/<name>` with one commit on `main` (a `README.md`), and its
     /// clone.
     pub fn new(name: &str) -> Self {
-        let author = FixtureRepo::new();
+        Self::build(name, FixtureRepo::new(), FixtureRepo::new())
+    }
+
+    /// [`FixtureGithub::new`] whose clone is built at `path`, its work tree, named by the
+    /// path's last component, and kept when the value is dropped
+    /// ([`FixtureRepo::persistent`]): for the repositories the automation host seeds for a
+    /// scenario (PLAN §14.2). Its GitHub side goes beside the clone's own directories, in
+    /// `<path>.fixture/github/`, and is found again with [`GithubOrigin::reopen`].
+    pub fn persistent(path: impl AsRef<Path>) -> Self {
+        let path = path.as_ref();
+        let name = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or_else(|| panic!("{} has no UTF-8 file name", path.display()))
+            .to_string();
+        let clone = FixtureRepo::persistent(path);
+        let author = FixtureRepo::persistent(clone.outside_dir(ORIGIN_DIR).join("author"));
+        Self::build(&name, author, clone)
+    }
+
+    fn build(name: &str, author: FixtureRepo, clone: FixtureRepo) -> Self {
         author.write("README.md", format!("# {name}\n"));
         author.commit("Initial commit");
         let bare = author.bare_clone("github.git");
 
-        let clone = FixtureRepo::new();
         let url = origin_url(name);
         clone
             .config("remote.origin.url", &url)
@@ -51,32 +80,40 @@ impl FixtureGithub {
         clone.git(&["remote", "set-head", "origin", "main"]);
         clone.git(&["checkout", "-q", "-B", "main", "--track", "origin/main"]);
         Self {
-            name: name.to_string(),
-            author,
-            bare,
+            origin: GithubOrigin {
+                name: name.to_string(),
+                author,
+                bare,
+            },
             clone,
         }
     }
 
+    /// The clone and the GitHub side, each on its own: what holds one of them for longer
+    /// than the other (the automation host's seeded repositories).
+    pub fn into_parts(self) -> (FixtureRepo, GithubOrigin) {
+        (self.clone, self.origin)
+    }
+
     /// The repository's name on GitHub; its owner is [`GITHUB_OWNER`].
     pub fn name(&self) -> &str {
-        &self.name
+        self.origin.name()
     }
 
     /// `origin`'s URL in the clone.
     pub fn url(&self) -> String {
-        origin_url(&self.name)
+        origin_url(self.name())
     }
 
     /// The author's repository: commits made here reach GitHub through
     /// [`FixtureGithub::publish`] and [`FixtureGithub::open_pr`].
     pub fn author(&self) -> &FixtureRepo {
-        &self.author
+        self.origin.author()
     }
 
     /// The bare repository standing in for GitHub.
     pub fn bare(&self) -> &Path {
-        &self.bare
+        self.origin.bare()
     }
 
     /// The clone: the repository under review.
@@ -87,8 +124,56 @@ impl FixtureGithub {
     /// Pushes the author's `branch` to GitHub as it stands, forced: a base branch that moved
     /// on, or was rewritten.
     pub fn publish(&self, branch: &str) -> &Self {
-        self.push(&format!("+refs/heads/{branch}:refs/heads/{branch}"));
+        self.origin.publish(branch);
         self
+    }
+
+    /// Makes `rev` of the author's repository the head of pull request `number`
+    /// ([`GithubOrigin::open_pr`]) and returns its commit id.
+    pub fn open_pr(&self, number: u64, rev: &str) -> String {
+        self.origin.open_pr(number, rev)
+    }
+}
+
+impl GithubOrigin {
+    /// The GitHub side of the persistent fixture whose clone is at `path`
+    /// ([`FixtureGithub::persistent`]), found again by a later process; `None` when the
+    /// repository there has none.
+    pub fn reopen(path: impl AsRef<Path>) -> Option<Self> {
+        let path = path.as_ref();
+        let name = path.file_name()?.to_str()?.to_string();
+        let side = path
+            .with_file_name(format!("{name}.fixture"))
+            .join(ORIGIN_DIR);
+        let (author, bare) = (
+            side.join("author"),
+            side.join("author.fixture").join("github.git"),
+        );
+        (author.join(".git").is_dir() && bare.is_dir()).then(|| Self {
+            name,
+            author: FixtureRepo::reopen(author),
+            bare,
+        })
+    }
+
+    /// The repository's name on GitHub; its owner is [`GITHUB_OWNER`].
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    /// The author's repository.
+    pub fn author(&self) -> &FixtureRepo {
+        &self.author
+    }
+
+    /// The bare repository standing in for GitHub.
+    pub fn bare(&self) -> &Path {
+        &self.bare
+    }
+
+    /// Pushes the author's `branch` to GitHub as it stands, forced.
+    pub fn publish(&self, branch: &str) {
+        self.push(&format!("+refs/heads/{branch}:refs/heads/{branch}"));
     }
 
     /// Makes `rev` of the author's repository the head of pull request `number`
@@ -119,8 +204,8 @@ impl FixtureGithub {
 impl std::fmt::Debug for FixtureGithub {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("FixtureGithub")
-            .field("name", &self.name)
-            .field("bare", &self.bare)
+            .field("name", &self.origin.name)
+            .field("bare", &self.origin.bare)
             .field("clone", &self.clone.path())
             .finish()
     }

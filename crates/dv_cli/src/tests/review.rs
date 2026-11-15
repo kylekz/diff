@@ -59,6 +59,8 @@ fn list_shows_the_open_reviews_or_all() {
             "created_at": working.created_at,
             "updated_at": working.updated_at,
             "status_note": null,
+            "pr": null,
+            "submissions": [],
         })
     );
     assert_eq!(json["unreadable"], json!([]));

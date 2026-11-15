@@ -26,7 +26,7 @@ fn strings(args: &[&str]) -> Vec<String> {
 
 /// `request` started with `exe` and the environment a child gets, no seeded repo involved.
 fn start(exe: &Path, request: &Request) -> Running {
-    let env = child_env(None, &base(), &request.env, false);
+    let env = child_env(None, &base(), &request.env, false, true);
     Running::start(exe, request, &env).expect("the child starts")
 }
 
@@ -52,7 +52,7 @@ fn git(repo: &FixtureRepo, args: &[&str], stdin: Option<&str>, env: &[(&str, &st
             .map(|(name, value)| (name.to_string(), Some(value.to_string())))
             .collect(),
     };
-    let env = child_env(Some(repo.env_overlay()), &base(), &request.env, false);
+    let env = child_env(Some(repo.env_overlay()), &base(), &request.env, false, true);
     let mut running = Running::start(Path::new("git"), &request, &env).expect("git starts");
     finish(&mut running)
 }
@@ -249,6 +249,7 @@ fn the_child_environment_is_the_fixtures_without_the_agents_variables() {
             ("RUST_LOG".into(), None),
         ],
         false,
+        false,
     );
     let set = |name: &str, value: &str| (OsString::from(name), Some(OsString::from(value)));
     let unset = |name: &str| (OsString::from(name), None);
@@ -266,6 +267,8 @@ fn the_child_environment_is_the_fixtures_without_the_agents_variables() {
             ),
             set("HOME", "/fixture/home"),
             unset("GIT_DIR"),
+            // Its git reaches nothing but a local path, in a seeded repository or not.
+            set("GIT_ALLOW_PROTOCOL", "file"),
             set("DV_DATA_DIR", "/data"),
             // The user Path's stand-in, the app's own.
             set(
@@ -283,16 +286,38 @@ fn the_child_environment_is_the_fixtures_without_the_agents_variables() {
             ),
             // The setup checks reach no distro.
             set("DV_ONLY_DISTROS", ""),
+            // The app's environment names no `gh`: a program that isn't there, as the app's.
+            set("DV_GH", "dv-sandbox-has-no-gh"),
             // `env` comes last, so a scenario can make the child Claude Code on purpose.
             set("CLAUDECODE", "1"),
             unset("RUST_LOG"),
         ]
     );
     // An app sandboxed by its own `DV_WSL_HOME` passes it, and the Linux build, on.
-    let sandboxed = child_env(Some(overlay), Path::new("/data"), &[], true);
+    let sandboxed = child_env(Some(overlay), Path::new("/data"), &[], true, false);
     assert!(
         !sandboxed.iter().any(|(name, _)| name == "DV_LINUX_DIR"),
         "{sandboxed:?}"
+    );
+    // The e2e runner's `DV_GH` (`mock_gh`) is the app's and stays the children's: nothing
+    // is set over it, and `env` can't change it.
+    let with_gh = child_env(None, Path::new("/data"), &[], false, true);
+    assert!(
+        !with_gh.iter().any(|(name, _)| name == "DV_GH"),
+        "{with_gh:?}"
+    );
+    // An empty `DV_GH` names none: the runner would take it for the real `gh`.
+    use dv_ui::services::setup::names_gh;
+    assert!(names_gh(Some("mock_gh".as_ref())));
+    assert!(!names_gh(Some("".as_ref())));
+    assert!(!names_gh(None));
+    let without = child_env(None, Path::new("/data"), &[], false, false);
+    assert_eq!(
+        without.last(),
+        Some(&(
+            OsString::from("DV_GH"),
+            Some(OsString::from(dv_ui::services::setup::NO_GH))
+        ))
     );
 }
 

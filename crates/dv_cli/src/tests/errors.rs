@@ -178,15 +178,6 @@ fn later_commands_are_refused_with_what_to_do() {
             .unwrap()
             .to_string()
     };
-    let message = refused(
-        &["review", "new", "--pr", "482"],
-        Exit::Usage,
-        "unsupported",
-    );
-    assert!(
-        message.starts_with("GitHub PRs arrive in a later version"),
-        "{message}"
-    );
     // `dv backend` runs only as the app starts it.
     refused(&["backend"], Exit::Usage, "usage");
 }

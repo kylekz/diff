@@ -357,7 +357,7 @@ fn a_pr_review_is_submitted_in_a_later_version() {
             .error(Exit::Usage, "unsupported");
         assert_eq!(
             error["message"],
-            "submitting a PR review to GitHub arrives in a later version"
+            "Submitting to GitHub arrives in a later version"
         );
     }
     assert_eq!(fixture.events(&pr.id).len(), 1);

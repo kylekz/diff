@@ -9,6 +9,12 @@
 //!   `"working"`; any target in its stored shape, e.g. `"staged"` or
 //!   `{"branch": {"branch": "feat", "base": null}}`) and shows it, through the shell as the
 //!   switcher would. Replies `{review_id, created}`; `settle` then waits for its file list.
+//! - `open_pr {path, pr}`: opens the pull request `pr` names (`7`, `#7`, `owner/repo#7` or its
+//!   URL) in the repository at `path` as a review, through the shell as `dv open --pr` does
+//!   (PLAN §9.3: its open draft, its review submitted at the head, or a new draft). Replies
+//!   `{review_id, created}`; an open that fails is an error and the main area's banner.
+//! - `pr_refresh {}`: starts a refresh of the open PR review (PLAN §9.4), as the reviewer's
+//!   Refresh does; `settle` then waits for it, and `state.session.pr` says how it went.
 //! - `review_op {op, thread, body?, note?, author?}`: an agent's change to the open review
 //!   straight through `dv_core::review::ops`, without the CLI's own rules (scenarios that play
 //!   the agent through the real CLI use `cli`, `agent_cli`): `reply` (with `body`), `address`
@@ -20,6 +26,7 @@
 //!   the seam, with a stand-in for the install ([`update_ready`]).
 
 use anyhow::{Context as _, Result, anyhow, bail};
+use dv_core::github::PrRef;
 use dv_core::review::{Author, ReviewStatus, ThreadId, ThreadState, ops};
 use dv_core::{Location, Target};
 use dv_ui::Shell;
@@ -97,6 +104,42 @@ pub fn open_review(
         let opened = opening.await.map_err(|failure| anyhow!("{failure}"))?;
         Ok(json!({"review_id": opened.review, "created": opened.created}))
     }))
+}
+
+/// `open_pr {path, pr}`.
+pub fn open_pr(
+    shell: Entity<Shell>,
+    args: Value,
+    window: &mut Window,
+    cx: &mut Context<DvAutomation>,
+) -> Result<Task<Result<Value>>> {
+    let args = object("open_pr", args, &["path", "pr"])?;
+    let location = Location::parse(string("open_pr", &args, "path")?)?;
+    let reference: PrRef = string("open_pr", &args, "pr")?.parse()?;
+    let opening = shell.update(cx, |shell, cx| {
+        shell.open(location, OpenRequest::Pr(reference), window, cx)
+    });
+    Ok(cx.background_spawn(async move {
+        let opened = opening.await.map_err(|failure| anyhow!("{failure}"))?;
+        Ok(json!({"review_id": opened.review, "created": opened.created}))
+    }))
+}
+
+/// `pr_refresh {}`: `ReviewSession::refresh_pr` on the open PR review.
+pub fn pr_refresh(
+    shell: &Entity<Shell>,
+    args: &Value,
+    cx: &mut Context<DvAutomation>,
+) -> Result<Value> {
+    object("pr_refresh", args.clone(), &[])?;
+    let session = shell
+        .read(cx)
+        .session()
+        .cloned()
+        .filter(|session| session.read(cx).review().is_pr_review())
+        .context("pr_refresh needs an open PR review (open_pr first)")?;
+    session.update(cx, |session, cx| session.refresh_pr(cx));
+    Ok(json!({"refreshing": session.read(cx).is_refreshing_pr()}))
 }
 
 /// `review_op {op, thread, body?, note?, author?}`.

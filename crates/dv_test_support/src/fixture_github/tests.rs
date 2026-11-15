@@ -142,3 +142,45 @@ fn file_urls_are_what_git_fetches_from() {
         "file:///C:/Users/dv/github.git"
     );
 }
+
+#[test]
+fn a_persistent_fixture_is_kept_and_its_github_side_found_again() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("repos").join("api");
+    let head = {
+        let github = FixtureGithub::persistent(&path);
+        assert_eq!(github.name(), "api");
+        let head = feature_commit(&github);
+        github.open_pr(7, "feat");
+        head
+    };
+    // The same script, the same commits, wherever the fixture is built.
+    assert_eq!(head, "5746f3cb7598128a528c413ffe03e23666d1e9d6");
+
+    // A later process finds both sides again and goes on from where they stand.
+    let clone = FixtureRepo::reopen(&path);
+    let origin = GithubOrigin::reopen(&path).unwrap();
+    assert_eq!(origin.name(), "api");
+    let refs = clone.git(&["ls-remote", "origin"]);
+    assert!(
+        refs.contains(&format!("{head}\trefs/pull/7/head")),
+        "{refs}"
+    );
+    origin
+        .author()
+        .checkout("feat")
+        .write("src/lib.rs", "pub fn answer() -> u32 {\n    43\n}\n");
+    let next = origin.author().commit("Change the answer");
+    assert_eq!(origin.open_pr(7, "feat"), next);
+    clone.git(&["fetch", "-q", "origin", "+refs/pull/7/head:refs/dv/pr/7"]);
+    assert_eq!(clone.git(&["rev-parse", "refs/dv/pr/7"]).trim(), next);
+
+    // The parts come apart for whoever holds them separately.
+    let (clone, origin) =
+        FixtureGithub::persistent(dir.path().join("repos").join("web")).into_parts();
+    assert_eq!(origin.name(), "web");
+    assert!(clone.path().ends_with("repos/web"));
+    // A repository seeded without a GitHub side has none to find.
+    let plain = FixtureRepo::persistent(dir.path().join("repos").join("plain"));
+    assert!(GithubOrigin::reopen(plain.path()).is_none());
+}

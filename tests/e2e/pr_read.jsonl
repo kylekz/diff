@@ -1,0 +1,265 @@
+{"scenario": {"window_size": "1440x900", "gh": "../fixtures/gh/pr_read.json", "description": "The read side of a GitHub pull request end to end (PLAN §9.9, §9.12 step 4; DESIGN §4.5) against three fixture GitHub clones and mock_gh: each known repository's GitHub name is read beside its listing with no gh call; Ctrl G lists the repository in view's open pull requests (the one asking for the viewer's review first), typing filters and parses a reference without asking gh anything (in the picker and in Ctrl K, the log read before and after), and Enter opens pull request 7; the PR strip shows it (number, title, author, branches, state, checks, round, when it was read), its checks and Open on GitHub go through the system seam to dv's own addresses; GitHub's thread is placed and Resolve resolves it; a push and Ctrl R move the review (\"Updated to 1 new commit\"); a refresh GitHub fails shows in the strip (\"Couldn't refresh · details\"), whole in the main area's banner once asked, and Retry clears it; a pull request's URL typed into Ctrl K is its first row and moves the window to that repository's clone; a reference to a repository dv knows no clone of asks for its folder (cancelled, another repository's clone, no repository, one without GitHub: each says why and adds nothing; then its clone, which opens the pull request and becomes a known repository); the picker says why it has no list (gh not signed in, no open pull requests, a repository that isn't on GitHub) and its field still opens; an open gh refuses is the main area's banner; the switcher lists each repository's PR reviews under \"Pull requests\", and one opened from there shows what was last read of its pull request while GitHub is slow to answer (\"Reading from GitHub…\"); at the window's least width the strip of a pull request with a long title, login and branch, three kinds of checks, a head the closed review didn't follow and a refresh that failed keeps its number, state, checks, round and buttons whole while the rest gives way in order, and the title bar's PRs button is its glyph alone; a list that fails to be read again shows the one read before under why; and after a restart the remembered names match a pasted URL before anything is listed."}}
+{"cmd": "wait_ready", "timeout_ms": 20000}
+{"cmd": "set_setting", "key": "mode", "value": "dark"}
+{"cmd": "settle"}
+
+// Three clones of fixture GitHub repositories, each with one pull request, and a repository
+// that isn't on GitHub.
+{"cmd": "seed_repo", "name": "api", "github": [{"branch": "feat"}, {"checkout": "feat"}, {"write": "src/lib.rs", "text": "pub fn answer() -> u32 {\n    42\n}\n"}, {"commit": "Add the answer"}, {"pr": [7, "feat"]}], "save": {"head": "/github/prs/7"}, "expect_result": {"pointer": "/github/prs/7", "equals": "5746f3cb7598128a528c413ffe03e23666d1e9d6"}}
+{"cmd": "seed_repo", "name": "web", "github": [{"branch": "fix"}, {"checkout": "fix"}, {"write": "src/app.ts", "text": "export const port = 8080;\n"}, {"commit": "Serve on 8080"}, {"pr": [3, "fix"]}], "expect_result": {"pointer": "/github/prs/3", "equals": "797f864d54c21b95b3eddbfc15fa58c34bb2d559"}}
+{"cmd": "seed_repo", "name": "docs", "github": [{"branch": "guide"}, {"checkout": "guide"}, {"write": "guide.md", "text": "# Guide\n\nStart here.\n"}, {"commit": "Add the guide"}, {"pr": [2, "guide"]}], "expect_result": {"pointer": "/github/prs/2", "equals": "214a26838092107cd57cf3d667b4dfdbc0a7920e"}}
+{"cmd": "seed_repo", "name": "plain", "steps": [{"write": "a.txt", "text": "a\n"}, {"commit": "base"}, {"write": "a.txt", "text": "b\n"}]}
+
+// api's working review is open: api is the repository in view. web is a known repository too.
+{"cmd": "open_review", "path": "${data_dir}/repos/api"}
+{"cmd": "settle", "timeout_ms": 20000, "expect": [{"pointer": "/shell/repo_in_view", "equals": "${data_dir}/repos/api"}, {"pointer": "/pr_strip", "equals": null}, {"pointer": "/pr_picker/open", "equals": false}]}
+{"cmd": "open", "path": "${data_dir}/repos/web"}
+{"cmd": "settle", "timeout_ms": 20000, "expect": {"pointer": "/switcher/open", "equals": true}}
+{"cmd": "key", "keystroke": "escape"}
+// Each clone's GitHub name was read beside its listing, from its remotes alone.
+{"cmd": "settle", "expect": [{"pointer": "/repos", "len": 2}, {"pointer": "/repos", "contains": {"name": "api", "github": {"host": "github.com", "owner": "dv-fixture", "repo": "api"}}}, {"pointer": "/repos", "contains": {"name": "web", "github": {"host": "github.com", "owner": "dv-fixture", "repo": "web"}}}]}
+{"gh_log": {}, "expect_result": {"pointer": "", "len": 0}}
+
+// Ctrl G: api's open pull requests, the one asking for the viewer's review first.
+{"cmd": "key", "keystroke": "secondary-g"}
+{"cmd": "settle", "timeout_ms": 20000, "expect": [{"pointer": "/pr_picker/open", "equals": true}, {"pointer": "/pr_picker/focused", "equals": true}, {"pointer": "/pr_picker/repo", "equals": "${data_dir}/repos/api"}, {"pointer": "/pr_picker/github", "equals": "dv-fixture/api"}, {"pointer": "/pr_picker/list", "equals": "listed"}, {"pointer": "/pr_picker/loading", "equals": false}, {"pointer": "/pr_picker/listed", "equals": 4}, {"pointer": "/pr_picker/failure", "equals": null}, {"pointer": "/pr_picker/selected", "equals": "pr/7"}]}
+{"cmd": "state", "expect": [{"pointer": "/pr_picker/rows", "len": 4}, {"pointer": "/pr_picker/rows/0", "contains": {"key": "pr/7", "kind": "listed", "number": 7, "title": "Add the answer", "author": "octocat", "draft": false, "review_requested": true}}, {"pointer": "/pr_picker/rows/1", "contains": {"key": "pr/12", "review_requested": false}}, {"pointer": "/pr_picker/rows/2", "contains": {"key": "pr/9", "draft": true}}, {"pointer": "/pr_picker/rows/3", "contains": {"key": "pr/4", "author": "dependabot"}}]}
+// The picker hangs 8 under the PRs button, from its right edge (DESIGN §4.5): on macOS, where
+// nothing stands right of the button but the menu, both end at 1404.
+{"cmd": "bounds", "target": "titlebar/prs", "expect_result": [{"pointer": "/visible/w", "gte": 70}, {"pointer": "/visible/w", "lte": 130}, {"pointer": "/visible/h", "equals": 28}]}
+{"cmd": "bounds", "target": "pr_picker", "expect_result": [{"pointer": "/visible/y", "equals": 42}, {"pointer": "/visible/w", "equals": 560}]}
+{"cmd": "bounds", "target": "pr_picker", "platforms": ["macos"], "expect_result": {"pointer": "/visible/x", "equals": 844}}
+{"cmd": "bounds", "target": "titlebar/prs", "platforms": ["macos"], "expect_result": [{"pointer": "/visible/x", "equals": 1312}, {"pointer": "/visible/w", "equals": 92}]}
+{"cmd": "screenshot", "name": "pr-picker"}
+{"gh_log": {}, "expect_result": [{"pointer": "", "len": 2}, {"pointer": "/0/argv/0", "equals": "pr"}, {"pointer": "/0/argv/1", "equals": "list"}, {"pointer": "/1/argv/3", "equals": "review-requested:@me"}]}
+// Typing filters what is held, and a reference is read as it is typed: the pull request it
+// names first, in the repository in view, in a known clone of another, or through the folder
+// of one dv doesn't know.
+{"cmd": "type", "text": "config", "expect": [{"pointer": "/pr_picker/rows", "len": 1}, {"pointer": "/pr_picker/rows/0/key", "equals": "pr/12"}]}
+{"cmd": "keys", "keys": "backspace backspace backspace backspace backspace backspace"}
+{"cmd": "type", "text": "#9", "expect": [{"pointer": "/pr_picker/rows", "len": 1}, {"pointer": "/pr_picker/rows/0", "equals": {"key": "open/api", "kind": "reference", "name": "dv-fixture/api#9", "title": "Stream the response body instead of buffering all of it in memory first", "clone": null, "repo": "${data_dir}/repos/api"}}]}
+{"cmd": "keys", "keys": "backspace backspace"}
+{"cmd": "type", "text": "dv-fixture/web#3", "expect": [{"pointer": "/pr_picker/rows", "len": 1}, {"pointer": "/pr_picker/rows/0", "contains": {"key": "open/web", "kind": "reference", "name": "dv-fixture/web#3", "clone": "web"}}]}
+{"cmd": "screenshot", "name": "pr-picker-other-repository"}
+{"cmd": "keys", "keys": "backspace backspace backspace backspace backspace backspace backspace backspace backspace backspace backspace backspace backspace backspace backspace backspace"}
+{"cmd": "type", "text": "nothing like it", "expect": [{"pointer": "/pr_picker/rows", "len": 0}, {"pointer": "/pr_picker/list", "equals": "no_match"}]}
+{"cmd": "keys", "keys": "backspace backspace backspace backspace backspace backspace backspace backspace backspace backspace backspace backspace backspace backspace backspace"}
+{"cmd": "settle", "expect": [{"pointer": "/pr_picker/query", "equals": ""}, {"pointer": "/pr_picker/rows", "len": 4}, {"pointer": "/pr_picker/selected", "equals": "pr/7"}]}
+{"gh_log": {}, "expect_result": {"pointer": "", "len": 2}}
+
+// The palette reads a reference the same way, from what dv holds: a pull request's URL typed
+// into Ctrl K names its clone's row with the log as it was. (The runner reads the log whole
+// and can't hold one reading against another, so both proofs are made here, where the log
+// is the list's two calls and nothing else.)
+{"cmd": "key", "keystroke": "escape", "expect": {"pointer": "/pr_picker/open", "equals": false}}
+{"cmd": "key", "keystroke": "secondary-k"}
+{"cmd": "type", "text": "https://github.com/dv-fixture/web/pull/3/files"}
+{"cmd": "settle", "expect": [{"pointer": "/palette/rows", "len": 1}, {"pointer": "/palette/rows/0", "equals": {"key": "pr/web", "section": "pull_request", "label": "Open pull request dv-fixture/web#3"}}, {"pointer": "/palette/selected", "equals": "pr/web"}]}
+{"gh_log": {}, "expect_result": {"pointer": "", "len": 2}}
+{"cmd": "key", "keystroke": "escape", "expect": {"pointer": "/palette/open", "equals": false}}
+// The picker again: the list read before shows at once, and is read again (two more calls).
+{"cmd": "key", "keystroke": "secondary-g", "expect": [{"pointer": "/pr_picker/open", "equals": true}, {"pointer": "/pr_picker/rows", "len": 4}]}
+{"cmd": "settle", "timeout_ms": 20000, "expect": [{"pointer": "/pr_picker/list", "equals": "listed"}, {"pointer": "/pr_picker/loading", "equals": false}, {"pointer": "/pr_picker/selected", "equals": "pr/7"}]}
+{"gh_log": {}, "expect_result": {"pointer": "", "len": 4}}
+
+// Enter opens the selected pull request in the repository in view: its draft, under the strip.
+{"cmd": "key", "keystroke": "enter"}
+{"cmd": "wait_for", "pointer": "/session/pr/number", "equals": 7, "timeout_ms": 20000}
+{"cmd": "settle", "timeout_ms": 20000, "expect": [{"pointer": "/pr_picker/open", "equals": false}, {"pointer": "/shell/banner", "equals": null}, {"pointer": "/session/status", "equals": "draft"}, {"pointer": "/session/target_label", "equals": "#7 Add the answer"}, {"pointer": "/session/pr/pins/head", "equals": "${head}"}]}
+{"cmd": "state", "expect": [{"pointer": "/pr_strip/number", "equals": 7}, {"pointer": "/pr_strip/title", "equals": "Add the answer"}, {"pointer": "/pr_strip/author", "equals": "octocat"}, {"pointer": "/pr_strip/branches", "equals": "main ← feat"}, {"pointer": "/pr_strip/state", "equals": "Open"}, {"pointer": "/pr_strip/checks", "equals": {"passing": 1, "failing": 1, "pending": 1}}, {"pointer": "/pr_strip/round", "equals": 1}, {"pointer": "/pr_strip/moved", "equals": null}, {"pointer": "/pr_strip/read/kind", "equals": "read"}, {"pointer": "/pr_strip/read/failure", "equals": null}, {"pointer": "/pr_strip/refreshing", "equals": false}, {"pointer": "/pr_strip/error_open", "equals": false}, {"pointer": "/pr_strip/url", "equals": "https://github.com/dv-fixture/api/pull/7"}, {"pointer": "/pr_strip/checks_url", "equals": "https://github.com/dv-fixture/api/pull/7/checks"}]}
+{"cmd": "bounds", "target": "pr_strip", "expect_result": [{"pointer": "/visible/h", "equals": 34}, {"pointer": "/visible/y", "equals": 40}]}
+{"cmd": "screenshot", "name": "pr-strip"}
+// Its checks and Open on GitHub open dv's own addresses, through the system seam.
+{"cmd": "click", "target": "pr_strip/checks"}
+{"cmd": "click", "target": "pr_strip/open"}
+{"cmd": "state", "expect": [{"pointer": "/system/requests", "len": 2}, {"pointer": "/system/requests/0", "equals": {"kind": "open_url", "url": "https://github.com/dv-fixture/api/pull/7/checks"}}, {"pointer": "/system/requests/1", "equals": {"kind": "open_url", "url": "https://github.com/dv-fixture/api/pull/7"}}]}
+
+// GitHub's thread is placed where GitHub has it, and Resolve resolves it on GitHub.
+{"cmd": "state", "expect": [{"pointer": "/session/github_threads", "len": 1}, {"pointer": "/session/github_threads/0/id", "equals": "gh:PRRT_kwDOfixture1"}, {"pointer": "/session/github_threads/0/standing", "equals": "anchored"}, {"pointer": "/session/github_threads/0/lines", "equals": {"start": 2, "end": 2}}, {"pointer": "/session/github_threads/0/resolved", "equals": false}]}
+{"cmd": "click", "target": "thread/gh:PRRT_kwDOfixture1/resolve"}
+{"cmd": "wait_for", "pointer": "/session/github_threads/0/resolved", "equals": true, "timeout_ms": 20000}
+{"cmd": "settle", "timeout_ms": 20000, "expect": [{"pointer": "/pr_strip/read/kind", "equals": "read"}, {"pointer": "/pr_strip/refreshing", "equals": false}]}
+{"gh_log": {"stdin_contains": "ReviewThread(input"}, "expect_result": {"pointer": "", "len": 1}}
+
+// A push to the pull request, then Ctrl R: the review moves to the new head, and the strip
+// says how far.
+{"cmd": "repo_edit", "name": "api", "github": [{"write": "src/lib.rs", "text": "// The answer.\n\npub fn answer() -> u32 {\n    42\n}\n"}, {"commit": "Say what it is"}, {"pr": [7, "feat"]}], "save": {"pushed": "/github/prs/7"}, "expect_result": {"pointer": "/github/prs/7", "equals": "d6a2122275d9bc53a045b9dbdbc5838db7cc3d41"}}
+{"cmd": "key", "keystroke": "secondary-r"}
+{"cmd": "wait_for", "pointer": "/session/pr/pins/head", "equals": "${pushed}", "timeout_ms": 20000}
+{"cmd": "settle", "timeout_ms": 20000, "expect": [{"pointer": "/pr_strip/refreshing", "equals": false}, {"pointer": "/pr_strip/read/kind", "equals": "read"}, {"pointer": "/pr_strip/moved", "equals": {"kind": "followed", "from": "${head}", "to": "${pushed}", "commits": 1, "text": "Updated to 1 new commit"}}, {"pointer": "/pr_strip/checks", "equals": {"passing": 2, "failing": 0, "pending": 0}}, {"pointer": "/session/github_threads/0/lines", "equals": {"start": 4, "end": 4}}]}
+{"cmd": "screenshot", "name": "pr-strip-moved"}
+
+// A refresh GitHub fails (the fixture's 502): the strip says so and keeps what was read; a
+// click on it shows the failure whole in the main area, and Retry reads again.
+{"cmd": "key", "keystroke": "secondary-r"}
+{"cmd": "wait_for", "pointer": "/pr_strip/read/kind", "equals": "stale", "timeout_ms": 20000}
+{"cmd": "settle", "timeout_ms": 20000, "expect": [{"pointer": "/pr_strip/read/text", "equals": "Couldn't refresh · details"}, {"pointer": "/pr_strip/read/failure/message", "contains": "GitHub answered HTTP 502"}, {"pointer": "/pr_strip/title", "equals": "Add the answer"}, {"pointer": "/pr_strip/refreshing", "equals": false}, {"pointer": "/pr_strip/error_open", "equals": false}, {"pointer": "/shell/banner", "equals": null}, {"pointer": "/session/pr/pins/head", "equals": "${pushed}"}]}
+{"cmd": "bounds", "target": "banner/pr", "expect_error": "banner/pr"}
+{"cmd": "click", "target": "pr_strip/status", "expect": {"pointer": "/pr_strip/error_open", "equals": true}}
+{"cmd": "bounds", "target": "banner/pr", "expect_result": {"pointer": "/visible/y", "equals": 86}}
+{"cmd": "click", "target": "banner/pr/details"}
+{"cmd": "screenshot", "name": "pr-refresh-failed"}
+{"cmd": "click", "target": "banner/pr/retry"}
+{"cmd": "wait_for", "pointer": "/pr_strip/read/kind", "equals": "read", "timeout_ms": 20000}
+{"cmd": "settle", "timeout_ms": 20000, "expect": [{"pointer": "/pr_strip/error_open", "equals": false}, {"pointer": "/session/pr/stale", "equals": null}]}
+{"cmd": "bounds", "target": "banner/pr", "expect_error": "banner/pr"}
+
+// Ctrl K with a pull request's URL, as pasted from a browser tab: its row comes first, decided
+// from the remembered names alone, and Enter moves the window to that repository's clone.
+{"cmd": "key", "keystroke": "secondary-k"}
+{"cmd": "type", "text": "https://github.com/dv-fixture/web/pull/3/files"}
+{"cmd": "settle", "expect": [{"pointer": "/palette/rows", "len": 1}, {"pointer": "/palette/rows/0", "equals": {"key": "pr/web", "section": "pull_request", "label": "Open pull request dv-fixture/web#3"}}, {"pointer": "/palette/selected", "equals": "pr/web"}, {"pointer": "/palette/notice", "equals": null}]}
+{"cmd": "screenshot", "name": "palette-pr-url"}
+{"cmd": "key", "keystroke": "enter"}
+{"cmd": "wait_for", "pointer": "/session/pr/number", "equals": 3, "timeout_ms": 20000}
+{"cmd": "settle", "timeout_ms": 20000, "expect": [{"pointer": "/palette/open", "equals": false}, {"pointer": "/shell/banner", "equals": null}, {"pointer": "/shell/repo_in_view", "equals": "${data_dir}/repos/web"}, {"pointer": "/pr_strip/number", "equals": 3}, {"pointer": "/pr_strip/title", "equals": "Serve on 8080"}, {"pointer": "/pr_strip/author", "equals": "mona"}, {"pointer": "/pr_strip/branches", "equals": "main ← fix"}, {"pointer": "/pr_strip/checks", "equals": {"passing": 0, "failing": 0, "pending": 0}}, {"pointer": "/pr_strip/round", "equals": 1}]}
+// `#n` names the repository in view; a bare number is a search.
+{"cmd": "key", "keystroke": "secondary-k"}
+{"cmd": "type", "text": "#3", "expect": [{"pointer": "/palette/rows/0", "equals": {"key": "pr/web", "section": "pull_request", "label": "Open pull request dv-fixture/web#3"}}]}
+{"cmd": "keys", "keys": "backspace backspace"}
+{"cmd": "type", "text": "3", "expect": {"pointer": "/palette/rows", "not_equals": [{"key": "pr/web", "section": "pull_request", "label": "Open pull request dv-fixture/web#3"}]}}
+{"cmd": "state", "expect": {"pointer": "/palette/rows/0/section", "not_equals": "pull_request"}}
+{"cmd": "key", "keystroke": "backspace"}
+
+// A pull request of a repository dv knows no clone of: its folder is asked for. A picker
+// cancelled, another repository's clone, a folder that is no repository and a repository
+// without GitHub each leave the palette open, say why, and add nothing.
+{"cmd": "type", "text": "dv-fixture/docs#2", "expect": [{"pointer": "/palette/rows", "len": 1}, {"pointer": "/palette/rows/0", "equals": {"key": "pr/choose_folder", "section": "pull_request", "label": "dv-fixture/docs isn't open in dv yet"}}]}
+{"cmd": "key", "keystroke": "enter"}
+{"cmd": "settle", "expect": [{"pointer": "/palette/open", "equals": true}, {"pointer": "/palette/notice", "equals": null}, {"pointer": "/system/requests/2", "equals": {"kind": "pick_folder", "prompt": "Choose its folder"}}]}
+{"cmd": "folder_answer", "path": "${data_dir}/repos/api", "expect_result": {"pointer": "/answers_left", "equals": 1}}
+{"cmd": "key", "keystroke": "enter"}
+{"cmd": "settle", "timeout_ms": 20000, "expect": [{"pointer": "/palette/open", "equals": true}, {"pointer": "/palette/notice", "equals": "`${data_dir}/repos/api` is dv-fixture/api, not dv-fixture/docs"}, {"pointer": "/repos", "len": 2}]}
+{"cmd": "screenshot", "name": "palette-folder-refused"}
+{"cmd": "folder_answer", "path": "${data_dir}"}
+{"cmd": "key", "keystroke": "enter"}
+{"cmd": "settle", "timeout_ms": 20000, "expect": {"pointer": "/palette/notice", "equals": "`${data_dir}` isn't a git repository"}}
+{"cmd": "folder_answer", "path": "${data_dir}/repos/plain"}
+{"cmd": "key", "keystroke": "enter"}
+{"cmd": "settle", "timeout_ms": 20000, "expect": [{"pointer": "/palette/notice", "equals": "`${data_dir}/repos/plain`: this repository has no remotes"}, {"pointer": "/repos", "len": 2}, {"pointer": "/session/pr/number", "equals": 3}]}
+// Its clone: the pull request opens there, and the clone is a known repository from now on.
+{"cmd": "folder_answer", "path": "${data_dir}/repos/docs"}
+{"cmd": "key", "keystroke": "enter"}
+{"cmd": "wait_for", "pointer": "/session/pr/number", "equals": 2, "timeout_ms": 20000}
+{"cmd": "settle", "timeout_ms": 20000, "expect": [{"pointer": "/palette/open", "equals": false}, {"pointer": "/shell/banner", "equals": null}, {"pointer": "/shell/repo_in_view", "equals": "${data_dir}/repos/docs"}, {"pointer": "/pr_strip/title", "equals": "Add the guide"}, {"pointer": "/pr_strip/state", "equals": "Draft PR"}, {"pointer": "/repos", "len": 3}, {"pointer": "/repos", "contains": {"name": "docs", "github": {"host": "github.com", "owner": "dv-fixture", "repo": "docs"}}}]}
+
+// The picker says why it has no list: here gh isn't signed in (the fixture's answer for
+// docs). Its field works all the same: pull request 9 is asked for, and gh refusing it is the
+// open's failure, in the main area's banner, the open review left as it is.
+{"cmd": "key", "keystroke": "secondary-g"}
+{"cmd": "settle", "timeout_ms": 20000, "expect": [{"pointer": "/pr_picker/list", "equals": "failed"}, {"pointer": "/pr_picker/listed", "equals": null}, {"pointer": "/pr_picker/failure/kind", "equals": "signed_out"}, {"pointer": "/pr_picker/failure/message", "equals": "gh isn't signed in to github.com: run `gh auth login`"}, {"pointer": "/pr_picker/rows", "len": 0}]}
+{"cmd": "screenshot", "name": "pr-picker-signed-out"}
+{"cmd": "type", "text": "9", "expect": [{"pointer": "/pr_picker/rows", "len": 1}, {"pointer": "/pr_picker/rows/0", "contains": {"key": "open/docs", "kind": "reference", "name": "dv-fixture/docs#9"}}]}
+{"cmd": "key", "keystroke": "enter"}
+{"cmd": "wait_for", "pointer": "/shell/banner/message", "equals": "couldn't open #9: gh isn't signed in to github.com: run `gh auth login`", "timeout_ms": 20000}
+{"cmd": "settle", "timeout_ms": 20000, "expect": [{"pointer": "/pr_picker/open", "equals": false}, {"pointer": "/shell/banner/retry", "equals": true}, {"pointer": "/session/pr/number", "equals": 2}, {"pointer": "/shell/repo_in_view", "equals": "${data_dir}/repos/docs"}]}
+{"cmd": "screenshot", "name": "pr-open-refused"}
+{"cmd": "click", "target": "banner/main/dismiss"}
+
+// A repository with no open pull requests, and one that isn't on GitHub.
+{"cmd": "open_pr", "path": "${data_dir}/repos/web", "pr": "#3", "expect_result": {"pointer": "/created", "equals": false}}
+{"cmd": "settle", "timeout_ms": 20000}
+{"cmd": "key", "keystroke": "secondary-g"}
+{"cmd": "settle", "timeout_ms": 20000, "expect": [{"pointer": "/pr_picker/github", "equals": "dv-fixture/web"}, {"pointer": "/pr_picker/list", "equals": "empty"}, {"pointer": "/pr_picker/listed", "equals": 0}, {"pointer": "/pr_picker/failure", "equals": null}]}
+{"cmd": "key", "keystroke": "escape", "expect": {"pointer": "/pr_picker/open", "equals": false}}
+{"cmd": "open_review", "path": "${data_dir}/repos/plain"}
+{"cmd": "settle", "timeout_ms": 20000, "expect": [{"pointer": "/pr_strip", "equals": null}, {"pointer": "/shell/repo_in_view", "equals": "${data_dir}/repos/plain"}]}
+{"cmd": "click", "target": "titlebar/prs"}
+{"cmd": "settle", "timeout_ms": 20000, "expect": [{"pointer": "/pr_picker/open", "equals": true}, {"pointer": "/pr_picker/github", "equals": "plain"}, {"pointer": "/pr_picker/list", "equals": "failed"}, {"pointer": "/pr_picker/failure/kind", "equals": "not_on_github"}, {"pointer": "/pr_picker/failure/message", "equals": "this repository has no remotes"}]}
+{"cmd": "screenshot", "name": "pr-picker-not-on-github"}
+{"cmd": "click", "target": "titlebar/prs", "expect": {"pointer": "/pr_picker/open", "equals": false}}
+
+// The switcher lists each repository's PR reviews under "Pull requests", by number and title.
+{"cmd": "key", "keystroke": "secondary-o"}
+{"cmd": "settle", "timeout_ms": 20000, "expect": [{"pointer": "/switcher/items", "contains": {"kind": "pr", "label": "#7 Add the answer", "review": {"round": 1}, "repo": "${data_dir}/repos/api"}}, {"pointer": "/switcher/items", "contains": {"kind": "pr", "label": "#3 Serve on 8080", "review": {"round": 1}, "repo": "${data_dir}/repos/web"}}, {"pointer": "/switcher/items", "contains": {"kind": "pr", "label": "#2 Add the guide", "review": {"round": 1}, "repo": "${data_dir}/repos/docs"}}]}
+{"cmd": "screenshot", "name": "switcher-pull-requests"}
+// Typing its number and Enter opens that review. GitHub is slow to answer (the fixture's
+// delayed answer): the review shows what was last read of its pull request meanwhile (the
+// stored mirror: the strip, the title, GitHub's thread), and the strip says it is reading.
+{"cmd": "type", "text": "#7", "expect": [{"pointer": "/switcher/items", "len": 2}, {"pointer": "/switcher/items/0/kind", "equals": "pr"}]}
+{"cmd": "key", "keystroke": "enter"}
+{"cmd": "wait_for", "pointer": "/pr_strip/title", "equals": "Add the answer", "timeout_ms": 20000}
+{"cmd": "wait_for", "pointer": "/session/github_threads/0/standing", "equals": "anchored", "timeout_ms": 20000}
+{"cmd": "state", "expect": [{"pointer": "/pr_strip/number", "equals": 7}, {"pointer": "/pr_strip/read/kind", "equals": "reading"}, {"pointer": "/pr_strip/read/text", "equals": "Reading from GitHub…"}, {"pointer": "/pr_strip/refreshing", "equals": true}, {"pointer": "/pr_strip/branches", "equals": "main ← feat"}, {"pointer": "/session/target_label", "equals": "#7 Add the answer"}, {"pointer": "/session/github_threads/0/resolved", "equals": true}]}
+{"cmd": "screenshot", "name": "pr-strip-reading"}
+{"cmd": "wait_for", "pointer": "/pr_strip/read/kind", "equals": "read", "timeout_ms": 20000}
+{"cmd": "settle", "timeout_ms": 20000, "expect": [{"pointer": "/pr_strip/title", "equals": "Add the answer"}, {"pointer": "/pr_strip/refreshing", "equals": false}, {"pointer": "/session/pr/pins/head", "equals": "${pushed}"}]}
+
+// The strip at the window's least width (DESIGN §4.5), at its worst: pull request 12 has a
+// long title, login and branch and three kinds of checks; its review is closed, so it stays
+// at its head when the pull request moves on; and the refresh after that fails.
+{"cmd": "repo_edit", "name": "api", "github": [{"checkout": "main"}, {"branch": "cache"}, {"checkout": "cache"}, {"write": "src/config.rs", "text": "pub fn config() -> u32 {\n    1\n}\n"}, {"commit": "Cache the config"}, {"pr": [12, "cache"]}], "save": {"cache": "/github/prs/12"}, "expect_result": {"pointer": "/github/prs/12", "equals": "295b0f6d20624fd69b34778efd752fa98450720d"}}
+{"cmd": "open_pr", "path": "${data_dir}/repos/api", "pr": "#12", "save": {"review12": "/review_id"}, "expect_result": {"pointer": "/created", "equals": true}}
+{"cmd": "settle", "timeout_ms": 20000, "expect": [{"pointer": "/pr_strip/number", "equals": 12}, {"pointer": "/pr_strip/checks", "equals": {"passing": 12, "failing": 1, "pending": 2}}, {"pointer": "/pr_strip/moved", "equals": null}]}
+{"cmd": "cli", "cwd": "repos/api", "args": ["review", "close", "${review12}", "--json"], "expect_result": {"pointer": "/exit", "equals": 0}}
+{"cmd": "wait_for", "pointer": "/session/status", "equals": "closed", "timeout_ms": 20000}
+{"cmd": "repo_edit", "name": "api", "github": [{"write": "src/config.rs", "text": "// Cached.\npub fn config() -> u32 {\n    1\n}\n"}, {"commit": "Say that it is cached"}, {"pr": [12, "cache"]}], "save": {"cached": "/github/prs/12"}, "expect_result": {"pointer": "/github/prs/12", "equals": "15d2055096e2bc2d31cc1d505f61bc4200bb7a41"}}
+{"cmd": "key", "keystroke": "secondary-r"}
+{"cmd": "wait_for", "pointer": "/pr_strip/moved/kind", "equals": "ahead", "timeout_ms": 20000}
+{"cmd": "settle", "timeout_ms": 20000, "expect": [{"pointer": "/pr_strip/moved", "equals": {"kind": "ahead", "from": "${cache}", "to": "${cached}", "commits": 1, "text": "1 new commit since this review's head"}}, {"pointer": "/pr_strip/read/kind", "equals": "read"}, {"pointer": "/session/pr/pins/head", "equals": "${cache}"}]}
+{"cmd": "key", "keystroke": "secondary-r"}
+{"cmd": "wait_for", "pointer": "/pr_strip/read/kind", "equals": "stale", "timeout_ms": 20000}
+{"cmd": "settle", "timeout_ms": 20000, "expect": [{"pointer": "/pr_strip/moved/text", "equals": "1 new commit since this review's head"}, {"pointer": "/pr_strip/read/text", "equals": "Couldn't refresh · details"}, {"pointer": "/pr_strip/refreshing", "equals": false}]}
+{"cmd": "screenshot", "name": "pr-strip-wide-worst"}
+{"cmd": "resize", "w": 1100, "h": 700}
+{"cmd": "settle"}
+// What never gives way: the number, the state, the checks, the round, the line that says the
+// refresh failed and the two buttons, each at its own width and inside the window (Open on
+// GitHub ends 12 short of its right edge). What does: how far it moved, then the author and the
+// branches, each down to the 36 that keeps an ellipsis under the pointer, then the title.
+// Widths that depend on a platform's text are held to a range.
+{"cmd": "bounds", "target": "pr_strip/number", "expect_result": [{"pointer": "/visible/x", "equals": 12}, {"pointer": "/visible/w", "gte": 18}, {"pointer": "/visible/w", "lte": 30}]}
+{"cmd": "bounds", "target": "pr_strip/state", "expect_result": [{"pointer": "/visible/w", "gte": 36}, {"pointer": "/visible/w", "lte": 52}]}
+{"cmd": "bounds", "target": "pr_strip/checks", "expect_result": [{"pointer": "/visible/w", "gte": 80}, {"pointer": "/visible/w", "lte": 120}]}
+{"cmd": "bounds", "target": "pr_strip/round", "expect_result": [{"pointer": "/visible/w", "gte": 38}, {"pointer": "/visible/w", "lte": 58}]}
+{"cmd": "bounds", "target": "pr_strip/refresh", "expect_result": [{"pointer": "/visible/x", "gte": 920}, {"pointer": "/visible/x", "lte": 990}, {"pointer": "/visible/w", "gte": 70}, {"pointer": "/visible/w", "lte": 136}]}
+{"cmd": "bounds", "target": "pr_strip/open", "expect_result": [{"pointer": "/visible/x", "equals": 1064}, {"pointer": "/visible/w", "equals": 24}]}
+{"cmd": "bounds", "target": "pr_strip/title", "expect_result": [{"pointer": "/visible/x", "gte": 34}, {"pointer": "/visible/x", "lte": 50}, {"pointer": "/visible/w", "gte": 200}]}
+{"cmd": "bounds", "target": "pr_strip/branches", "expect_result": [{"pointer": "/visible/w", "equals": 36}]}
+{"cmd": "bounds", "target": "pr_strip/author", "expect_result": [{"pointer": "/visible/w", "equals": 36}]}
+{"cmd": "bounds", "target": "pr_strip/moved", "expect_result": [{"pointer": "/visible/w", "equals": 36}]}
+{"cmd": "bounds", "target": "pr_strip/status", "expect_result": [{"pointer": "/visible/w", "gte": 130}, {"pointer": "/visible/w", "lte": 230}]}
+// The title bar names the review by at most 48 characters of `#12 Title` (DESIGN §4.1), so the
+// title leaves the command field where a long branch's name would. With the caption buttons
+// at its right (Windows, Linux) the PRs button is its glyph alone at this width; on macOS it
+// keeps its words. (`review_chrome` holds the glyph alone on every platform, under a long
+// repository name.)
+{"cmd": "bounds", "target": "titlebar/prs", "platforms": ["windows", "linux"], "expect_result": [{"pointer": "/visible/w", "lte": 40}, {"pointer": "/visible/h", "equals": 28}]}
+{"cmd": "bounds", "target": "titlebar/prs", "platforms": ["macos"], "expect_result": [{"pointer": "/visible/w", "gte": 70}, {"pointer": "/visible/h", "equals": 28}]}
+{"cmd": "state", "expect": [{"pointer": "/shell/title_target", "equals": "#12 Cache the parsed config between requests so…"}, {"pointer": "/session/target_label", "contains": "validates every file again"}]}
+{"cmd": "screenshot", "name": "pr-strip-narrow"}
+{"cmd": "set_setting", "key": "mode", "value": "light"}
+{"cmd": "settle"}
+{"cmd": "screenshot", "name": "pr-strip-narrow-light"}
+{"cmd": "set_setting", "key": "mode", "value": "dark"}
+{"cmd": "resize", "w": 1440, "h": 900}
+{"cmd": "settle"}
+{"cmd": "open_pr", "path": "${data_dir}/repos/api", "pr": "#7", "expect_result": {"pointer": "/created", "equals": false}}
+{"cmd": "settle", "timeout_ms": 20000, "expect": [{"pointer": "/pr_strip/number", "equals": 7}, {"pointer": "/pr_strip/read/kind", "equals": "read"}]}
+
+// Light.
+{"cmd": "set_setting", "key": "mode", "value": "light"}
+{"cmd": "settle"}
+{"cmd": "screenshot", "name": "pr-strip-light"}
+{"cmd": "key", "keystroke": "secondary-g"}
+{"cmd": "settle", "timeout_ms": 20000, "expect": {"pointer": "/pr_picker/listed", "equals": 4}}
+{"cmd": "screenshot", "name": "pr-picker-light"}
+{"cmd": "key", "keystroke": "escape"}
+// The list read again, GitHub out of reach (the fixture's 502 for the fourth read of api's
+// list): the list read before stays, under a line that says why.
+{"cmd": "key", "keystroke": "secondary-g"}
+{"cmd": "settle", "timeout_ms": 20000, "expect": [{"pointer": "/pr_picker/list", "equals": "listed"}, {"pointer": "/pr_picker/listed", "equals": 4}, {"pointer": "/pr_picker/rows", "len": 4}, {"pointer": "/pr_picker/failure/kind", "equals": "other"}, {"pointer": "/pr_picker/failure/message", "contains": "GitHub answered HTTP 502"}]}
+{"cmd": "bounds", "target": "pr_picker/stale", "expect_result": {"pointer": "/visible/h", "equals": 24}}
+{"cmd": "screenshot", "name": "pr-picker-stale-light"}
+{"cmd": "key", "keystroke": "escape"}
+
+// After a restart the names are remembered (known_repos.json): a pasted URL finds its clone
+// before any repository is listed again.
+{"restart": {}}
+{"cmd": "state", "expect": [{"pointer": "/repos", "len": 4}, {"pointer": "/repos", "contains": {"name": "docs", "github": {"host": "github.com", "owner": "dv-fixture", "repo": "docs"}}}, {"pointer": "/repos", "contains": {"name": "plain", "github": null}}]}
+{"cmd": "key", "keystroke": "secondary-k"}
+{"cmd": "type", "text": "github.com/dv-fixture/docs/pull/2", "expect": {"pointer": "/palette/rows/0", "equals": {"key": "pr/docs", "section": "pull_request", "label": "Open pull request dv-fixture/docs#2"}}}
+{"cmd": "key", "keystroke": "enter"}
+{"cmd": "wait_for", "pointer": "/session/pr/number", "equals": 2, "timeout_ms": 20000}
+{"cmd": "settle", "timeout_ms": 20000, "expect": [{"pointer": "/shell/banner", "equals": null}, {"pointer": "/pr_strip/title", "equals": "Add the guide"}]}
+{"cmd": "quit"}

@@ -49,6 +49,31 @@ pub mod shell {
             TogglePalette,
             /// Add a repository through the folder picker (the switcher's "Open folder…").
             OpenFolder,
+            /// Open the PR picker, or close it (`Ctrl G`, DESIGN §4.5).
+            TogglePrPicker,
+            /// Refresh the open PR review from GitHub (`Ctrl R`, PLAN §9.4); nothing on a
+            /// local review.
+            RefreshPr,
+        ]
+    );
+}
+
+/// The PR picker (`Ctrl G`, DESIGN §4.5), dispatched in the `PrPicker` key context while it
+/// is open.
+pub mod pr_picker {
+    use gpui::actions;
+
+    actions!(
+        pr_picker,
+        [
+            /// Select the next row (`↓`), wrapping to the first.
+            SelectNext,
+            /// Select the previous row (`↑`), wrapping to the last.
+            SelectPrevious,
+            /// Open the selected row's pull request (`Enter`).
+            Confirm,
+            /// Close without opening anything (`Esc`).
+            Dismiss,
         ]
     );
 }

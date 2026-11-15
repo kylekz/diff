@@ -41,7 +41,9 @@ impl Shell {
         // Over the "Finish round" sheet the review's commands and files would act under it (a
         // file view opening beneath it): the palette offers the rest.
         let session = self.session.clone().filter(|_| self.sheet.is_none());
-        let view = cx.new(|cx| Palette::new(reviews, session, window, cx));
+        let github = cx.services().github.clone();
+        let in_view = self.repo_in_view(cx);
+        let view = cx.new(|cx| Palette::new(reviews, github, in_view, session, window, cx));
         let subscription = cx.subscribe_in(&view, window, Self::on_palette_event);
         view.update(cx, |palette, cx| palette.focus(window, cx));
         self.palette = Some(Overlay {
@@ -54,7 +56,7 @@ impl Shell {
 
     fn on_palette_event(
         &mut self,
-        _: &Entity<Palette>,
+        palette: &Entity<Palette>,
         event: &PaletteEvent,
         window: &mut Window,
         cx: &mut Context<Self>,
@@ -67,6 +69,10 @@ impl Shell {
                 self.close_menu(window, cx);
                 self.open(location.clone(), request.clone(), window, cx)
                     .detach();
+            }
+            PaletteEvent::ChooseFolder(reference) => {
+                let asker = super::pr::FolderAsker::Palette(palette.entity_id());
+                self.choose_pr_folder(reference.clone(), asker, window, cx);
             }
             PaletteEvent::OpenFile(path) => {
                 // The keyboard goes to the file view, not back where the palette opened from.

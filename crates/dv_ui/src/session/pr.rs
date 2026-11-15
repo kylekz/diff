@@ -3,6 +3,9 @@
 //!
 //! A PR review is refreshed when it opens (an open by the pull request's reference already
 //! did, and hands over what it read) and whenever the reviewer asks; nothing polls. A
+//! review opened by its id shows its stored mirror meanwhile (`show_stored_pr`): the pull
+//! request as it was last read, its threads placed, while the strip says it is reading; a
+//! refresh that then fails leaves that mirror, stale. A
 //! refresh that moves the review's pins lists the files again: the sides are resolved from
 //! the pins (`dv_core::review::pins::resolve`), so the stream shows the new head and the
 //! threads relocate, as a branch review's do after a commit. A refresh another process made
@@ -16,13 +19,23 @@
 //! for while a Resolve runs waits for that one's own refresh. So no read that began before
 //! a change can land after it and show the thread as it was (PLAN §9.6). Another process
 //! refreshing at that moment isn't waited for: the next refresh puts it right.
+//!
+//! **What the strip says beside the mirror** ([`PrFacts`], DESIGN §4.5) is read in the
+//! background whenever what was read of the pull request changes: the review's PR round
+//! (its place among the pull request's reviews in the store, PLAN §9.5) and how far the
+//! pull request moved ([`PrMove`]): GitHub's head against the head the review shows, which
+//! are the mirror's and the pins' and need not be the same commit (PLAN §9.5), else the
+//! head the last refresh moved the review from.
 
 use std::collections::VecDeque;
 use std::sync::Arc;
 use std::time::Duration;
 
-use dv_core::github::{MirrorStore, is_mirror_of};
-use dv_core::review::{Review, ReviewStatus, pins};
+use dv_core::git::Oid;
+use dv_core::github::{MirrorStore, PrRef, is_mirror_of};
+use dv_core::location::Location;
+use dv_core::review::{ListEntry, Review, ReviewStatus, pins};
+use futures::channel::oneshot;
 use gpui::{AppContext as _, Context, Task};
 
 use super::{Batch, ReviewSession, SessionEvent};
@@ -48,12 +61,62 @@ pub(super) struct PrState {
     waiting: VecDeque<PrOp>,
     /// A mirror another process wrote is being read.
     reading: Option<Task<()>>,
+    /// What the strip says beside the mirror (module docs).
+    facts: PrFacts,
+    /// The read of `facts` that is running; a newer one replaces it.
+    reading_facts: Option<Task<()>>,
+    /// Who waits for the refreshes asked for to be done ([`ReviewSession::refresh_pr_then`]).
+    refreshed: Vec<oneshot::Sender<()>>,
 }
 
 impl PrState {
     pub(super) fn is_settled(&self) -> bool {
-        self.running.is_none() && self.waiting.is_empty() && self.reading.is_none()
+        self.running.is_none()
+            && self.waiting.is_empty()
+            && self.reading.is_none()
+            && self.reading_facts.is_none()
     }
+}
+
+/// How two commits of a pull request differ in history.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Commits {
+    /// The newer one holds the older one and this many commits more.
+    New(u32),
+    /// Each holds commits the other doesn't: history was rewritten (a force-push).
+    Rewritten,
+    /// The older one holds the newer one: the pull request was put back at an earlier
+    /// commit, or what was read of it is older than the head the review shows.
+    Earlier,
+}
+
+/// Why the head a PR review shows isn't, or wasn't, the pull request's.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MoveKind {
+    /// GitHub's head, as last read, is another commit than the one the review shows: the
+    /// pull request moved on and the review didn't follow (a submitted or closed review,
+    /// pins another process moved).
+    Ahead,
+    /// The last refresh moved the review to the pull request's head.
+    Followed,
+}
+
+/// How far a pull request moved, from the commit `from` to `to` (module docs).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PrMove {
+    pub kind: MoveKind,
+    pub from: Oid,
+    pub to: Oid,
+    /// `None` until it is counted, and when it can't be (a commit that isn't in the clone).
+    pub commits: Option<Commits>,
+}
+
+/// What the strip says beside the mirror (module docs).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct PrFacts {
+    /// The review's PR round; `None` until the store was listed.
+    pub round: Option<u32>,
+    pub moved: Option<PrMove>,
 }
 
 /// One thing a session asks GitHub about its pull request.
@@ -75,6 +138,147 @@ impl ReviewSession {
         self.pr.read.as_ref()
     }
 
+    /// What the strip says beside the mirror (module docs).
+    pub fn pr_facts(&self) -> &PrFacts {
+        &self.pr.facts
+    }
+
+    /// Reads [`PrFacts`] again for what is known of the pull request now (module docs); the
+    /// commits of a move already counted aren't counted again.
+    pub(super) fn read_pr_facts(&mut self, cx: &mut Context<Self>) {
+        let Some(link) = self.review.pr_target().cloned() else {
+            return;
+        };
+        let read = self.pr.read.as_ref();
+        let shown = read
+            .and_then(|read| read.pins.as_ref())
+            .map(|pins| &pins.head);
+        let github = read
+            .and_then(|read| read.mirror.as_ref())
+            .map(|mirror| &mirror.pr.head_oid);
+        let moved_from = read
+            .and_then(|read| read.moved_from.as_ref())
+            .map(|pins| &pins.head);
+        let moved = match (shown, github, moved_from) {
+            (Some(shown), Some(github), _) if shown != github => {
+                Some((MoveKind::Ahead, shown.clone(), github.clone()))
+            }
+            (Some(shown), _, Some(from)) if from != shown => {
+                Some((MoveKind::Followed, from.clone(), shown.clone()))
+            }
+            _ => None,
+        };
+        let counted = self.pr.facts.moved.take().filter(|known| {
+            moved.as_ref().is_some_and(|(kind, from, to)| {
+                known.kind == *kind && &known.from == from && &known.to == to
+            })
+        });
+        let count = moved
+            .as_ref()
+            .filter(|_| counted.as_ref().is_none_or(|known| known.commits.is_none()))
+            .map(|(_, from, to)| (from.clone(), to.clone()));
+        self.pr.facts.moved = counted.or(moved.map(|(kind, from, to)| PrMove {
+            kind,
+            from,
+            to,
+            commits: None,
+        }));
+        let (store, repo, id) = (
+            self.store.clone(),
+            self.repo.clone(),
+            self.review.id.clone(),
+        );
+        let job = cx.background_spawn(async move {
+            let round = store.list().ok().map(|entries| {
+                let reviews: Vec<_> = entries
+                    .into_iter()
+                    .filter_map(|entry| match entry {
+                        ListEntry::Ok(summary) => Some((summary.id, summary.target)),
+                        ListEntry::Err { .. } => None,
+                    })
+                    .collect();
+                link.round_of(&id, reviews.iter().map(|(id, target)| (id, target)))
+            });
+            let commits = count.and_then(|(from, to)| {
+                let counted = repo.commits_apart(&from, &to).ok()?;
+                Some(match counted {
+                    (0, ahead) => Commits::New(ahead),
+                    (_, 0) => Commits::Earlier,
+                    _ => Commits::Rewritten,
+                })
+            });
+            (round, commits)
+        });
+        self.pr.reading_facts = Some(cx.spawn(async move |this, cx| {
+            let (round, commits) = job.await;
+            this.update(cx, |this, cx| {
+                this.pr.reading_facts = None;
+                if round.is_some() {
+                    this.pr.facts.round = round;
+                }
+                if let (Some(moved), Some(commits)) = (&mut this.pr.facts.moved, commits) {
+                    moved.commits = Some(commits);
+                }
+                // The strip alone shows them: nothing the stream draws changed.
+                cx.notify();
+            })
+            .ok();
+        }));
+        cx.notify();
+    }
+
+    /// Shows what was last read of the review's pull request, from its stored mirror, until
+    /// this session's first refresh lands (module docs): read in the background, and dropped
+    /// when the refresh landed first with a mirror of its own (one that failed before it
+    /// read the store hands none back, and what is stored then shows, stale). Nothing for a local review, or a pull request never
+    /// read here.
+    pub(super) fn show_stored_pr(&mut self, cx: &mut Context<Self>) {
+        let Some(link) = self.review.pr_target().cloned() else {
+            return;
+        };
+        let (repo, backend, id) = (
+            self.repo.clone(),
+            self.backend.clone(),
+            self.review.id.clone(),
+        );
+        let job = cx.background_spawn(async move {
+            let mirrors = MirrorStore::new(backend);
+            let stored = mirrors
+                .hosts()
+                .and_then(|hosts| mirrors.latest_stored(&hosts, &link))
+                .ok()
+                .flatten();
+            (stored, pins::read(&repo, &id).ok().flatten())
+        });
+        self.pr.reading = Some(cx.spawn(async move |this, cx| {
+            let (stored, pinned) = job.await;
+            this.update(cx, |this, cx| {
+                this.pr.reading = None;
+                // Taken while nothing shows of the pull request: before the refresh
+                // lands, or after one that failed without a mirror to hand back.
+                let shown = match (&mut this.pr.read, stored) {
+                    (None, Some(mirror)) => {
+                        this.pr.read = Some(PrRead::stored(mirror, pinned));
+                        true
+                    }
+                    (Some(read), Some(mirror)) if read.mirror.is_none() => {
+                        read.mirror = Some(Arc::new(mirror));
+                        read.pins = read.pins.take().or(pinned);
+                        true
+                    }
+                    _ => false,
+                };
+                if shown {
+                    this.read_github(cx);
+                    this.read_pr_facts(cx);
+                    cx.emit(SessionEvent::PrChanged);
+                }
+                cx.notify();
+            })
+            .ok();
+        }));
+    }
+
     /// Whether a refresh of the pull request was asked for and isn't done: running, or
     /// waiting its turn behind a Resolve.
     pub fn is_refreshing_pr(&self) -> bool {
@@ -93,6 +297,51 @@ impl ReviewSession {
         if self.review.is_pr_review() && !covered {
             self.ask_pr(PrOp::Refresh, cx);
         }
+    }
+
+    /// [`ReviewSession::refresh_pr`], and a receiver that hears once no refresh is running
+    /// or waiting any more (at once when there is nothing to refresh).
+    pub fn refresh_pr_then(&mut self, cx: &mut Context<Self>) -> oneshot::Receiver<()> {
+        let (sender, receiver) = oneshot::channel();
+        self.refresh_pr(cx);
+        if self.is_refreshing_pr() {
+            self.pr.refreshed.push(sender);
+        } else {
+            let _ = sender.send(());
+        }
+        receiver
+    }
+
+    /// Whether opening `reference` from `location` would resume this very review (PLAN §9.3):
+    /// it is open, was opened from there, and its pull request is the one named: its
+    /// target's owner, repository and number, and, when the reference names a host and the
+    /// pull request was read here, the host it was read from (a review's target names none,
+    /// §2.2; before a mirror there is none to hold against, and the refresh itself checks
+    /// the clone, §9.4). The shell then refreshes it here, in its turn (module docs, "One at
+    /// a time"), rather than open it again beside what the session is asking GitHub.
+    pub fn is_open_pr(&self, location: &Location, reference: &PrRef) -> bool {
+        let Some(link) = self.review.pr_target() else {
+            return false;
+        };
+        let named = |owner: &str, repo: &str| {
+            link.owner.eq_ignore_ascii_case(owner) && link.repo.eq_ignore_ascii_case(repo)
+        };
+        self.review.status.is_open()
+            && self.origin == *location
+            && link.number == reference.number()
+            && match reference {
+                PrRef::Number(_) | PrRef::Hash(_) => true,
+                PrRef::Short { owner, repo, .. } => named(owner, repo),
+                PrRef::Url {
+                    host, owner, repo, ..
+                } => {
+                    named(owner, repo)
+                        && self
+                            .pr()
+                            .and_then(|read| read.mirror.as_ref())
+                            .is_none_or(|mirror| mirror.key.host.eq_ignore_ascii_case(host))
+                }
+            }
     }
 
     /// Runs `op` now, or once what is running and what was asked before it are done (module
@@ -130,6 +379,11 @@ impl ReviewSession {
         if let Some(op) = self.pr.waiting.pop_front() {
             self.start_pr(op, cx);
         }
+        if !self.is_refreshing_pr() {
+            for waiting in self.pr.refreshed.drain(..) {
+                let _ = waiting.send(());
+            }
+        }
         cx.notify();
     }
 
@@ -163,6 +417,7 @@ impl ReviewSession {
                 .is_some_and(|pins| listed.is_some_and(|listed| *listed != pins.spec()));
         self.pr.read = Some(read);
         self.read_github(cx);
+        self.read_pr_facts(cx);
         if moved {
             self.refresh(
                 Batch {
@@ -246,6 +501,7 @@ impl ReviewSession {
                     cx.emit(SessionEvent::PrChanged);
                 }
                 this.read_github(cx);
+                this.read_pr_facts(cx);
                 // The sides are the pins as they stand now.
                 this.refresh(
                     Batch {
@@ -263,11 +519,12 @@ impl ReviewSession {
 }
 
 /// The label of a PR review's target as the title bar shows it: `#482 Fix the cache` once
-/// the pull request was read, `#482` before.
+/// the pull request was read, `#482` before, as the switcher names it.
 pub(super) fn label(review: &Review, read: Option<&PrRead>) -> Option<String> {
     let link = review.pr_target()?;
-    Some(match read.and_then(|read| read.mirror.as_ref()) {
-        Some(mirror) => format!("#{} {}", link.number, mirror.pr.title),
-        None => format!("#{}", link.number),
-    })
+    Some(crate::switcher::items::pr_label(
+        link.number,
+        read.and_then(|read| read.mirror.as_ref())
+            .map(|mirror| mirror.pr.title.as_str()),
+    ))
 }

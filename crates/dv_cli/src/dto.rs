@@ -28,16 +28,22 @@
 //! | `setup wsl` | [`SetupWslDoc`]: `distro`, `arch`, `build`, `installed`, `linked`, `path` |
 //! | any, failing | [`ErrorDoc`]: `error: {code, message, detail?, candidates?}` |
 //!
-//! A review ([`ReviewDto`]): `id`, `target` (`kind` and the spec's fields, plus `label`, e.g.
+//! A review ([`ReviewDto`]): `id`, `target` (`kind` and the spec's fields, a `pr` target's
+//! `base_oid` and `head_oid` the two commits the review shows now, the merge base and the
+//! head: its pins, or for a review without pins its target as it resolves, PLAN §9.5;
+//! `base_oid` `null` when those commits aren't in the clone; plus `label`, e.g.
 //! "working tree vs main", a `working` or `staged` review named by the `HEAD` of the worktree
 //! it was made in), `status`, `round` (the round in progress; a finished review's last),
 //! `rounds` (the closed ones: `{n, verdict, body, closed_at}`), `threads` (`{open, addressed,
 //! resolved, annotation}`, `annotation` the agent's annotations nobody asked about, PLAN §19), `worktree`, `created_at`, `updated_at`, `status_note` (the note the last status
 //! change carried, e.g. `dv review done --note`, or `null`), `pr` (a PR review's pull request,
-//! PLAN §9.10: `{owner, repo, number, url, state, head_oid, pr_round}`, `state` `open`, `draft`,
-//! `merged` or `closed` as GitHub last said, `url` and `state` `null` while the pull request
-//! was never read here or the clone's GitHub repository can't be told, `head_oid` the head
-//! the review shows, `pr_round` its place among the pull request's reviews in this
+//! PLAN §9.10: `{owner, repo, number, url, state, head_oid, github_head_oid, read_at,
+//! pr_round}`, `state` `open`, `draft`, `merged` or `closed` as GitHub last said, `url` the
+//! pull request's page as dv builds it from the stored mirror's key, both `null` while the
+//! pull request was never read here, `head_oid` the head the review shows,
+//! `github_head_oid` the head GitHub had when it was last read and `read_at` when that was
+//! (ms since the Unix epoch; both `null` while it never was), `pr_round` its place among the
+//! pull request's reviews in this
 //! repository, 1 for the first, `threads` GitHub's own threads on the pull request, counted
 //! apart from the review's: `{open, resolved}` as the stored mirror has them, `null` while
 //! the pull request was never read here; `null` for a local review) and `submissions` (the
@@ -86,11 +92,12 @@
 //! commented lines of its diff hunk), `placement`, `anchor.current`, `current_code` and
 //! `excerpt` where it stands in the diff the review shows, as for any thread, `replies` its
 //! later comments (`id` `gh:<comment's node id>`, `pending` `true` for one of the viewer's
-//! own that isn't submitted yet), and `github: {url, resolved, outdated, pending, diff_hunk}`:
-//! the thread on GitHub, GitHub's own word that it is resolved and that its code changed
-//! since (`outdated`: such a thread has a place in the diff only when the review shows the
-//! commit it was made on), whether it is the viewer's own unsubmitted comment, and the diff
-//! hunk GitHub shows above it.
+//! own that isn't submitted yet), and `github: {url, resolved, outdated, standing, pending,
+//! diff_hunk}`: the thread on GitHub, GitHub's own word that it is resolved and that its
+//! code changed since (`outdated`: such a thread has a place in the diff only when the
+//! review shows the commit it was made on), where dv could put it (`standing`: `placed`,
+//! `outdated_on_github` or `unplaced`, PLAN §9.6), whether it is the viewer's own
+//! unsubmitted comment, and the diff hunk GitHub shows above it.
 //!
 //! Within a schema a document only grows: readers ignore keys they don't know; a key removed,
 //! renamed or retyped, or a value whose meaning changes, is a new schema number (PLAN §10.3).
@@ -168,7 +175,9 @@ pub enum TargetSpecDto {
         owner: String,
         repo: String,
         number: u64,
-        base_oid: String,
+        /// The old side the review shows, the merge base; `null` when the review's sides
+        /// don't resolve in this clone. Never the base branch's tip the stored target keeps.
+        base_oid: Option<String>,
         head_oid: String,
     },
 }
@@ -196,13 +205,15 @@ impl From<&Target> for TargetSpecDto {
                 owner,
                 repo,
                 number,
-                base_oid,
                 head_oid,
+                ..
             } => Self::Pr {
                 owner: owner.clone(),
                 repo: repo.clone(),
                 number: *number,
-                base_oid: base_oid.to_string(),
+                // The stored `base_oid` is the base branch's tip, not a side of the review:
+                // `ReviewDto::new` fills in the one the review shows.
+                base_oid: None,
                 head_oid: head_oid.to_string(),
             },
         }
@@ -290,7 +301,9 @@ pub struct PrDto {
     pub owner: String,
     pub repo: String,
     pub number: u64,
-    /// The pull request on GitHub, when the clone's GitHub repository can be told.
+    /// The pull request's page on GitHub, built from the host and names it was read under
+    /// (`MirrorKey::pr_url`), never an address GitHub's answer holds; `null` before the pull
+    /// request was read here.
     pub url: Option<String>,
     /// `open`, `draft`, `merged` or `closed`, as GitHub last said; `null` before the pull
     /// request was read here.
@@ -298,6 +311,17 @@ pub struct PrDto {
     /// The head the review shows: a draft's as last refreshed, a submitted review's as
     /// submitted.
     pub head_oid: String,
+    /// The old side the review shows with it, the merge base (its `pr-base` pin, or without
+    /// pins the merge base of the commits the review was made at), for the review's
+    /// `target`; `None` when the review's sides don't resolve in this clone.
+    #[serde(skip)]
+    pub base_oid: Option<String>,
+    /// The pull request's head on GitHub as last read, which need not be the head the
+    /// review shows (PLAN §9.5); `null` before the pull request was read here.
+    pub github_head_oid: Option<String>,
+    /// When the pull request was last read from GitHub, in ms since the Unix epoch; `null`
+    /// before it was.
+    pub read_at: Option<u64>,
     /// The review's place among the pull request's reviews in this repository, 1 for the
     /// first (PLAN §9.5).
     pub pr_round: u32,
@@ -374,9 +398,23 @@ impl ReviewDto {
     /// `review` as printed; `pr` is its pull request, read by the caller when it is a PR
     /// review (`crate::pr::dto`).
     pub fn new(review: &Review, labels: &Labels, pr: Option<PrDto>) -> Self {
+        let mut target = TargetDto::new(&review.target, &review.worktree, labels);
+        // A PR review's target is printed at the two commits the review shows now (PLAN
+        // §9.5, §10.3): the stored target keeps the head it was made at, which a refresh
+        // leaves behind, and the base branch's tip, which is no side of the review.
+        if let (
+            TargetSpecDto::Pr {
+                base_oid, head_oid, ..
+            },
+            Some(pr),
+        ) = (&mut target.spec, &pr)
+        {
+            head_oid.clone_from(&pr.head_oid);
+            base_oid.clone_from(&pr.base_oid);
+        }
         Self {
             id: review.id.to_string(),
-            target: TargetDto::new(&review.target, &review.worktree, labels),
+            target,
             status: review.status.as_str(),
             round: review.shown_round(),
             rounds: review.rounds.iter().map(RoundDto::from).collect(),
@@ -406,7 +444,12 @@ pub struct CandidateDto {
     pub id: String,
     pub label: String,
     pub status: &'static str,
+    /// The review's own round, as a review's document has it.
     pub round: u32,
+    /// The round the text output prints, as every text line prints a review's
+    /// (`dv_core::review::displayed_round`): a PR review's is its PR round.
+    #[serde(skip)]
+    pub shown_round: u32,
     pub worktree: String,
 }
 
@@ -493,6 +536,12 @@ pub struct GithubDto {
     pub pending: bool,
     /// The diff hunk GitHub shows above the thread, ending at its last line.
     pub diff_hunk: String,
+    /// Where dv could put it (PLAN §9.6): `placed` (its code was read from a commit, and
+    /// `placement` says where that stands in the diff shown), `outdated_on_github` (GitHub
+    /// calls it outdated and it was made on another commit than the review shows) or
+    /// `unplaced` (dv can't tell which code it is on). The last two have no place in the
+    /// diff: `placement` is `outdated` for both, and `diff_hunk` is the code they were on.
+    pub standing: &'static str,
 }
 
 /// Where a thread shows now, as [`crate::placement`] found it.
@@ -758,6 +807,11 @@ impl ThreadDto {
                 resolved: thread.resolved,
                 outdated: thread.outdated,
                 pending: thread.is_pending(),
+                standing: match anchored.standing {
+                    Standing::Anchored => "placed",
+                    Standing::OutdatedOnGithub => "outdated_on_github",
+                    Standing::Unplaced => "unplaced",
+                },
                 diff_hunk: first
                     .map(|first| first.diff_hunk.clone())
                     .unwrap_or_default(),

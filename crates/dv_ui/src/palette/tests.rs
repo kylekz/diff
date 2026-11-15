@@ -6,6 +6,7 @@ use dv_core::Target;
 use gpui::{Entity, TestAppContext, VisualTestContext};
 use pretty_assertions::assert_eq;
 
+use super::commands::Scope;
 use super::*;
 use crate::file_finder::candidates;
 use crate::services::review_ui::ViewMode;
@@ -19,14 +20,19 @@ fn keys(rows: &[Row]) -> Vec<&str> {
 #[test]
 fn commands_needing_a_review_list_only_with_one_open() {
     let listing = items::Listing::default();
-    let without = build("", false, &listing, &[]);
+    let without = build("", Scope::Always, &listing, &[], None);
     assert!(without.iter().all(|row| row.section == Section::Commands));
     assert!(keys(&without).contains(&"command/shell::ToggleSwitcher"));
     assert!(!keys(&without).contains(&"command/diff_pane::NextFile"));
     assert!(!keys(&without).contains(&"command/shell::FindFile"));
 
-    let with = build("", true, &listing, &[]);
-    assert_eq!(with.len(), COMMANDS.len());
+    let with = build("", Scope::Review, &listing, &[], None);
+    // Every command but a pull request's own.
+    assert_eq!(with.len(), COMMANDS.len() - 1);
+    assert!(!keys(&with).contains(&"command/shell::RefreshPr"));
+    let with_pr = build("", Scope::PrReview, &listing, &[], None);
+    assert_eq!(with_pr.len(), COMMANDS.len());
+    assert!(keys(&with_pr).contains(&"command/shell::RefreshPr"));
     assert_eq!(with[0].key, "command/shell::FindFile");
 }
 
@@ -38,17 +44,17 @@ fn every_word_must_be_in_a_command_and_files_list_only_for_a_filter() {
 
     // An empty filter lists no files.
     assert!(
-        build("", true, &listing, &files)
+        build("", Scope::Review, &listing, &files, None)
             .iter()
             .all(|row| row.section != Section::Files)
     );
     // Its words in a command's title or its other words, ignoring case; then the files.
     assert_eq!(
-        keys(&build("NEXT file", true, &listing, &files)),
+        keys(&build("NEXT file", Scope::Review, &listing, &files, None)),
         ["command/diff_pane::NextFile"]
     );
     assert_eq!(
-        keys(&build("next", true, &listing, &files)),
+        keys(&build("next", Scope::Review, &listing, &files, None)),
         [
             "command/diff_pane::NextFile",
             "command/diff_pane::NextChange",
@@ -57,11 +63,111 @@ fn every_word_must_be_in_a_command_and_files_list_only_for_a_filter() {
         ]
     );
     assert_eq!(
-        keys(&build("theme", false, &listing, &files)),
+        keys(&build("theme", Scope::Always, &listing, &files, None)),
         ["command/shell::ToggleSettings"]
     );
     // No review open: no files either.
-    assert!(build("readme", false, &listing, &files).is_empty());
+    assert!(build("readme", Scope::Always, &listing, &files, None).is_empty());
+}
+
+#[test]
+fn a_pull_request_reference_lists_first_and_a_bare_number_is_a_search() {
+    use crate::pr_picker::reference::CloneOffer;
+
+    assert_eq!(pr_reference("482"), None);
+    assert_eq!(pr_reference(" 482 "), None);
+    assert_eq!(pr_reference("fix the cache"), None);
+    assert_eq!(pr_reference(" #482 "), Some(PrRef::Hash(482)));
+    assert!(matches!(
+        pr_reference("acme/frontend#482"),
+        Some(PrRef::Short { number: 482, .. })
+    ));
+    // As pasted: a tab's URL with its trailing path, without its scheme, in angle brackets.
+    for pasted in [
+        "https://github.com/acme/frontend/pull/482/files#diff-1",
+        "github.com/acme/frontend/pull/482",
+        "<https://github.com/acme/frontend/pull/482>",
+    ] {
+        assert!(
+            matches!(pr_reference(pasted), Some(PrRef::Url { number: 482, .. })),
+            "{pasted}"
+        );
+    }
+
+    let listing = items::Listing::default();
+    let reference = PrRef::parse("acme/frontend#482").unwrap();
+    let clone = |key: &str, title: Option<&str>| CloneOffer {
+        location: Location::Local(format!("/code/{key}").into()),
+        key: key.to_string(),
+        name: key.to_string(),
+        title: title.map(str::to_string),
+    };
+    // One clone: no name beside it. The commands that match the words follow.
+    let one = PrOffer::Clones {
+        reference: reference.clone(),
+        name: "acme/frontend#482".to_string(),
+        clones: vec![clone("frontend", Some("Fix the cache"))],
+    };
+    let rows = build(
+        "acme/frontend#482",
+        Scope::Always,
+        &listing,
+        &[],
+        Some(&one),
+    );
+    assert_eq!(keys(&rows), ["pr/frontend"]);
+    assert_eq!(rows[0].section, Section::PullRequest);
+    assert_eq!(
+        rows[0].kind,
+        RowKind::Pr {
+            name: "acme/frontend#482".to_string(),
+            title: Some("Fix the cache".to_string()),
+            clone: None,
+            location: Location::Local("/code/frontend".into()),
+            reference: reference.clone(),
+        }
+    );
+    assert_eq!(rows[0].label(), "Open pull request acme/frontend#482");
+    // Several: each named, in the order offered (the most recently used first).
+    let two = PrOffer::Clones {
+        reference: reference.clone(),
+        name: "acme/frontend#482".to_string(),
+        clones: vec![clone("frontend-wt", None), clone("frontend", None)],
+    };
+    let rows = build(
+        "acme/frontend#482",
+        Scope::Always,
+        &listing,
+        &[],
+        Some(&two),
+    );
+    assert_eq!(keys(&rows), ["pr/frontend-wt", "pr/frontend"]);
+    assert!(rows.iter().all(|row| matches!(
+        &row.kind,
+        RowKind::Pr { clone: Some(clone), .. } if row.key == format!("pr/{clone}")
+    )));
+    // None known: its folder is asked for.
+    let unknown = PrOffer::Unknown {
+        reference: reference.clone(),
+        repository: "acme/frontend".to_string(),
+    };
+    let rows = build(
+        "acme/frontend#482",
+        Scope::Always,
+        &listing,
+        &[],
+        Some(&unknown),
+    );
+    assert_eq!(keys(&rows), ["pr/choose_folder"]);
+    assert_eq!(rows[0].label(), "acme/frontend isn't open in dv yet");
+    // A row that also matches what is typed comes after it.
+    let hash = PrOffer::Clones {
+        reference: PrRef::Hash(482),
+        name: "#482".to_string(),
+        clones: vec![clone("api", None)],
+    };
+    let rows = build("#482", Scope::Review, &listing, &[], Some(&hash));
+    assert_eq!(rows[0].key, "pr/api");
 }
 
 fn palette(shell: &Entity<Shell>, cx: &mut VisualTestContext) -> Option<Entity<Palette>> {
@@ -160,9 +266,9 @@ fn over_the_sheet_the_reviews_commands_and_files_stay_out(cx: &mut TestAppContex
     let view = palette(&shell, cx).expect("Ctrl K opens the palette over the sheet");
     view.read_with(cx, |palette, _| {
         assert!(palette.rows().iter().all(|row| match &row.kind {
-            RowKind::Command(command) => !command.needs_review,
+            RowKind::Command(command) => command.needs == Scope::Always,
             RowKind::Review { .. } => true,
-            RowKind::File { .. } => false,
+            RowKind::File { .. } | RowKind::Pr { .. } | RowKind::ChooseFolder { .. } => false,
         }));
         assert!(!keys(palette.rows()).is_empty());
     });

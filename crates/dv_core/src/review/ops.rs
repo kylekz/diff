@@ -524,7 +524,7 @@ pub fn link_pr(store: &ReviewStore, review: &ReviewId, pr: PrLink) -> Result<boo
     Ok(outcome == Outcome::Changed)
 }
 
-/// Records that a draft PR review was posted to GitHub (PLAN §9.3). The review is read-only
+/// Records that a draft PR review was posted to GitHub (PLAN §9.8). The review is read-only
 /// from then on.
 pub fn record_submission(
     store: &ReviewStore,

@@ -6,12 +6,14 @@
 //!   saved in the data dir as they change.
 //! - [`Locations`] (`locations`): the one backend per repository, opened off the UI thread,
 //!   and the connections to the `dv backend --stdio` servers remote ones go through (PLAN §5).
-//! - [`Reviews`] (`reviews`): the known repositories (`known_repos.json`) and, per repository,
-//!   its reviews and uncommitted changes, as the switcher lists them.
+//! - [`Reviews`] (`reviews`): the known repositories (`known_repos.json`, each with the GitHub
+//!   repository its clone is) and, per repository, its reviews and uncommitted changes, as
+//!   the switcher lists them.
 //! - [`ReviewUi`] (`review_ui`): what the reviewer chose per review (`review_ui.json`: split or
 //!   unified).
-//! - [`GitHub`] (`github`): the app's `gh` runner, and the pull requests it opens and
-//!   refreshes off the UI thread (PLAN §9).
+//! - [`GitHub`] (`github`): the app's `gh` runner, the pull requests it opens and refreshes
+//!   off the UI thread, and each repository's list of open pull requests for the PR picker
+//!   (PLAN §9).
 //! - [`LanguageServers`] (`language_servers`): the language servers of every worktree a review
 //!   is open on (`crate::intel::servers`, PLAN §18.5), with `settings.json`'s `lsp`.
 //! - [`Setup`] (`setup`): every environment's setup checks, the first-run marker and the

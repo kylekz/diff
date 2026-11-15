@@ -3,8 +3,14 @@
 //! under the command field over the scrim, in the file finder's look.
 //!
 //! **Rows**, in sections and in this order ([`build`]):
+//! - **Pull request**, when what is typed is a pull request's URL or `owner/repo#n`, or `#n`
+//!   for the repository in view (a bare number stays a search; PLAN §9.9, DESIGN §4.5): a
+//!   row per known clone of its repository, the most recently used first, or, when dv knows
+//!   none, one row that asks for its folder. Decided from what dv holds
+//!   (`crate::pr_picker::reference`): no `gh` runs for what is typed.
 //! - **Commands** ([`commands::COMMANDS`]): the shell's and the stream's actions by name, with
-//!   their keycaps; the stream's only while a review is open.
+//!   their keycaps; the stream's only while a review is open, a pull request's only while a
+//!   PR review is ([`commands::Scope`]).
 //! - **Reviews**: every known repository's targets and open reviews as the switcher lists them
 //!   (`crate::switcher::items::build`, the switcher's own filter: repository, label, status).
 //! - **Files**: with a review open and something typed, the file finder's first
@@ -36,11 +42,15 @@ use gpui::{
 use gpui_component::input::{InputEvent, InputState};
 
 use crate::actions::palette::{Confirm, Dismiss, SelectNext, SelectPrevious};
+use dv_core::github::PrRef;
+
 use crate::file_finder::Candidate;
+use crate::pr_picker::reference::{PrOffer, offer};
+use crate::services::github::GitHub;
 use crate::services::reviews::{OpenRequest, Reviews};
 use crate::session::ReviewSession;
 use crate::switcher::items::{self, ItemKind, ReviewBadge, TargetKind};
-use commands::{COMMANDS, Command};
+use commands::{COMMANDS, Command, Scope};
 
 /// The panel's width (the switcher's and the file finder's).
 pub const PALETTE_WIDTH: gpui::Pixels = gpui::px(560.);
@@ -54,6 +64,7 @@ pub const STATE_ROWS: usize = 40;
 /// The palette's sections, in order.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Section {
+    PullRequest,
     Commands,
     Reviews,
     Files,
@@ -63,15 +74,18 @@ impl Section {
     /// Its label over its rows.
     pub fn title(self) -> &'static str {
         match self {
+            Self::PullRequest => "Pull request",
             Self::Commands => "Commands",
             Self::Reviews => "Reviews",
             Self::Files => "Files",
         }
     }
 
-    /// `"commands"`, `"reviews"` or `"files"`, for keys and automation state.
+    /// `"pull_request"`, `"commands"`, `"reviews"` or `"files"`, for keys and automation
+    /// state.
     pub fn key(self) -> &'static str {
         match self {
+            Self::PullRequest => "pull_request",
             Self::Commands => "commands",
             Self::Reviews => "reviews",
             Self::Files => "files",
@@ -82,6 +96,24 @@ impl Section {
 /// What a row does.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum RowKind {
+    /// Open the pull request the query names in a known clone of its repository.
+    Pr {
+        /// `acme/frontend#482`, or `#482`.
+        name: String,
+        /// Its title, when a list read this session holds it.
+        title: Option<String>,
+        /// The clone's name, shown when the pull request's repository has several.
+        clone: Option<String>,
+        location: Location,
+        reference: PrRef,
+    },
+    /// The pull request the query names is in a repository dv knows no clone of: ask for
+    /// its folder.
+    ChooseFolder {
+        /// `acme/frontend`.
+        repository: String,
+        reference: PrRef,
+    },
     Command(Command),
     /// Open one of a repository's targets, or resume an open review.
     Review {
@@ -106,7 +138,8 @@ pub enum RowKind {
 /// One pickable row.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Row {
-    /// A stable name: `command/<action>` (`command/diff_pane::NextFile`), `review/<the
+    /// A stable name: `pr/<the clone's key>` (the switcher's repository key) or
+    /// `pr/choose_folder`, `command/<action>` (`command/diff_pane::NextFile`), `review/<the
     /// switcher's key>` (`review/api-server/working`) or `file/<path>`.
     pub key: String,
     pub section: Section,
@@ -117,6 +150,10 @@ impl Row {
     /// What the row reads.
     pub fn label(&self) -> String {
         match &self.kind {
+            RowKind::Pr { name, .. } => format!("Open pull request {name}"),
+            RowKind::ChooseFolder { repository, .. } => {
+                format!("{repository} isn't open in dv yet")
+            }
             RowKind::Command(command) => command.title.to_string(),
             RowKind::Review { repo, label, .. } => format!("{repo} · {label}"),
             RowKind::File { path, .. } => path.clone(),
@@ -124,33 +161,74 @@ impl Row {
     }
 }
 
-/// The rows for `query` (module docs, "Rows"): `commands` filtered by it (those needing a review
-/// left out unless `review_open`), the reviews `listing` lists for it, and the first of `files`
-/// passing it (only with a review open and `query` non-empty).
+/// The pull request `query` names, when it is a reference the palette takes for one (module
+/// docs): a bare number is a search.
+pub fn pr_reference(query: &str) -> Option<PrRef> {
+    PrRef::parse(query).filter(|reference| !matches!(reference, PrRef::Number(_)))
+}
+
+/// The rows for `query` (module docs, "Rows"): the pull request it names as `offered`
+/// resolved it, `commands` filtered by it (those needing a review, or a PR review, only when
+/// what is `open` has), the reviews `listing` lists for it, and the first of `files` passing
+/// it (only with a review open and `query` non-empty).
 pub fn build(
     query: &str,
-    review_open: bool,
+    open: Scope,
     listing: &items::Listing,
     files: &[Candidate],
+    offered: Option<&PrOffer>,
 ) -> Vec<Row> {
     let words: Vec<String> = query.split_whitespace().map(str::to_lowercase).collect();
-    let mut rows: Vec<Row> = COMMANDS
-        .iter()
-        .filter(|command| review_open || !command.needs_review)
-        .filter(|command| {
-            let text = command.text();
-            words.iter().all(|word| text.contains(word.as_str()))
-        })
-        .map(|command| Row {
-            key: format!("command/{}", command.name()),
-            section: Section::Commands,
-            kind: RowKind::Command(*command),
-        })
-        .collect();
+    let mut rows: Vec<Row> = match offered {
+        Some(PrOffer::Clones {
+            reference,
+            name,
+            clones,
+        }) => clones
+            .iter()
+            .map(|clone| Row {
+                key: format!("pr/{}", clone.key),
+                section: Section::PullRequest,
+                kind: RowKind::Pr {
+                    name: name.clone(),
+                    title: clone.title.clone(),
+                    clone: (clones.len() > 1).then(|| clone.name.clone()),
+                    location: clone.location.clone(),
+                    reference: reference.clone(),
+                },
+            })
+            .collect(),
+        Some(PrOffer::Unknown {
+            reference,
+            repository,
+        }) => vec![Row {
+            key: "pr/choose_folder".to_string(),
+            section: Section::PullRequest,
+            kind: RowKind::ChooseFolder {
+                repository: repository.clone(),
+                reference: reference.clone(),
+            },
+        }],
+        None => Vec::new(),
+    };
+    rows.extend(
+        COMMANDS
+            .iter()
+            .filter(|command| command.needs <= open)
+            .filter(|command| {
+                let text = command.text();
+                words.iter().all(|word| text.contains(word.as_str()))
+            })
+            .map(|command| Row {
+                key: format!("command/{}", command.name()),
+                section: Section::Commands,
+                kind: RowKind::Command(*command),
+            }),
+    );
     for (ix, item) in listing.items.iter().enumerate() {
         let target = match &item.kind {
             ItemKind::Target(offer) => Some(offer.kind),
-            ItemKind::Review { .. } => None,
+            ItemKind::Review { .. } | ItemKind::Pr { .. } => None,
             // The branch picker is the switcher's: the palette lists the reviews it opens.
             ItemKind::Start { .. }
             | ItemKind::Retry { .. }
@@ -178,7 +256,7 @@ pub fn build(
             },
         });
     }
-    if review_open && !words.is_empty() {
+    if open >= Scope::Review && !words.is_empty() {
         rows.extend(
             crate::file_finder::filter(files, query)
                 .into_iter()
@@ -211,6 +289,9 @@ pub enum PaletteEvent {
     },
     /// Show this file of the open review in the file view.
     OpenFile(String),
+    /// Ask for the folder of the repository this pull request is in, then open it there.
+    /// The palette stays open meanwhile.
+    ChooseFolder(PrRef),
     /// Closed without picking (`Esc`).
     Dismiss,
 }
@@ -218,6 +299,11 @@ pub enum PaletteEvent {
 /// The palette (see the module docs).
 pub struct Palette {
     reviews: Entity<Reviews>,
+    github: Entity<GitHub>,
+    /// The repository in view, which `#n` names.
+    in_view: Option<Location>,
+    /// Why the folder chosen for a pull request wasn't taken.
+    notice: Option<String>,
     session: Option<Entity<ReviewSession>>,
     input: Entity<InputState>,
     query: String,
@@ -236,9 +322,13 @@ impl EventEmitter<PaletteEvent> for Palette {}
 
 impl Palette {
     /// A palette over the known repositories' reviews and, with `session`, the open review's
-    /// commands and files (its side's paths read if they aren't).
+    /// commands and files (its side's paths read if they aren't). `in_view` is the
+    /// repository `#n` names; `github` holds the titles of the pull requests the picker
+    /// listed this session.
     pub fn new(
         reviews: Entity<Reviews>,
+        github: Entity<GitHub>,
+        in_view: Option<Location>,
         session: Option<Entity<ReviewSession>>,
         window: &mut Window,
         cx: &mut Context<Self>,
@@ -251,6 +341,7 @@ impl Palette {
                 }
             }),
             cx.observe(&reviews, |this, _, cx| this.rebuild(cx)),
+            cx.observe(&github, |this, _, cx| this.rebuild(cx)),
         ];
         if let Some(session) = &session {
             session.update(cx, |session, cx| session.ensure_side_paths(cx));
@@ -264,6 +355,9 @@ impl Palette {
         }
         let mut this = Self {
             reviews,
+            github,
+            in_view,
+            notice: None,
             session,
             input,
             query: String::new(),
@@ -322,9 +416,43 @@ impl Palette {
         ));
     }
 
+    /// Whether the palette still offers to choose the folder of `reference`'s repository:
+    /// what an answer to that choice is checked against (`Shell::choose_pr_folder`).
+    pub fn asks_folder_for(&self, reference: &PrRef) -> bool {
+        self.rows.iter().any(|row| {
+            matches!(&row.kind, RowKind::ChooseFolder { reference: asked, .. } if asked == reference)
+        })
+    }
+
+    /// Why the folder chosen for a pull request wasn't taken, until something else is typed.
+    pub fn notice(&self) -> Option<&str> {
+        self.notice.as_deref()
+    }
+
+    /// The folder chosen for the pull request isn't its repository's: the palette stays open
+    /// and says why under the row.
+    pub fn folder_refused(&mut self, why: String, cx: &mut Context<Self>) {
+        self.notice = Some(why);
+        cx.notify();
+    }
+
     fn build(&self, cx: &gpui::App) -> Vec<Row> {
-        let listing = items::build(&self.reviews.read(cx).rows(), &self.query);
-        build(&self.query, self.session.is_some(), &listing, &self.files)
+        let reviews = self.reviews.read(cx);
+        let listing = items::build(&reviews.rows(), &self.query);
+        let offered = pr_reference(&self.query).and_then(|reference| {
+            offer(
+                &reference,
+                self.in_view.as_ref(),
+                reviews,
+                self.github.read(cx),
+            )
+        });
+        let open = match &self.session {
+            None => Scope::Always,
+            Some(session) if session.read(cx).review().is_pr_review() => Scope::PrReview,
+            Some(_) => Scope::Review,
+        };
+        build(&self.query, open, &listing, &self.files, offered.as_ref())
     }
 
     /// Lists the rows again (the reviews or the files changed), keeping the selected row when
@@ -349,6 +477,7 @@ impl Palette {
             return;
         }
         self.query = query;
+        self.notice = None;
         self.rows = self.build(cx);
         self.selected = 0;
         self.scroll_to_selected();
@@ -406,6 +535,17 @@ impl Palette {
         };
         self.selected = ix;
         let event = match &row.kind {
+            RowKind::Pr {
+                location,
+                reference,
+                ..
+            } => PaletteEvent::Open {
+                location: location.clone(),
+                request: OpenRequest::Pr(reference.clone()),
+            },
+            RowKind::ChooseFolder { reference, .. } => {
+                PaletteEvent::ChooseFolder(reference.clone())
+            }
             RowKind::Command(command) => PaletteEvent::Run(*command),
             RowKind::Review {
                 location, request, ..

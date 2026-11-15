@@ -130,15 +130,28 @@
 {"cmd": "seed_repo", "name": "customer-portal-frontend-service", "steps": [{"write": "a.txt", "text": "a\n"}, {"commit": "base"}, {"write": "a.txt", "text": "b\n"}], "save": {"long": "/path"}}
 {"cmd": "open_review", "path": "${long}"}
 {"cmd": "settle", "timeout_ms": 20000}
-// The field moves right as far as the long label needs (at most 650, 12 short of the caption
-// buttons), the source picker staying clear of it. On macOS, with no caption buttons, the field
+// The field moves right as far as the long label needs (at most 584: 12 short of the PRs
+// glyph, the ⋯ and the caption buttons), the source picker staying clear of it. On macOS, with no caption buttons, the field
 // may go further: it stops where the group (70 further right) needs it, and the source picker
 // (48 wide) ends 12 or more before it.
 {"cmd": "bounds", "target": "titlebar/command", "platforms": ["windows", "linux"], "expect_result": [{"pointer": "/x", "gte": 560}, {"pointer": "/x", "lte": 650}]}
 {"cmd": "bounds", "target": "titlebar/source", "platforms": ["windows", "linux"], "expect_result": {"pointer": "/x", "lte": 584}}
 {"cmd": "bounds", "target": "titlebar/command", "platforms": ["macos"], "expect_result": [{"pointer": "/x", "gte": 640}, {"pointer": "/x", "lte": 670}]}
 {"cmd": "bounds", "target": "titlebar/source", "platforms": ["macos"], "expect_result": [{"pointer": "/x", "gte": 580}, {"pointer": "/x", "lte": 593}]}
+// The PRs button gives up its words before the label gives up anything: beside the caption
+// buttons it is its glyph alone here; on macOS, which has that room, it keeps them.
+{"cmd": "bounds", "target": "titlebar/prs", "platforms": ["windows", "linux"], "expect_result": [{"pointer": "/visible/w", "lte": 40}, {"pointer": "/visible/h", "equals": 28}]}
+{"cmd": "bounds", "target": "titlebar/prs", "platforms": ["macos"], "expect_result": [{"pointer": "/visible/w", "gte": 70}, {"pointer": "/visible/h", "equals": 28}]}
 {"cmd": "screenshot", "name": "long-name-1100x700"}
+// A name longer still: the glyph alone on every platform, the label truncating before the
+// field, the glyph and the ⋯ whole at the bar's right.
+{"cmd": "seed_repo", "name": "customer-portal-frontend-service-for-the-whole-enterprise", "steps": [{"write": "a.txt", "text": "a\n"}, {"commit": "base"}, {"write": "a.txt", "text": "b\n"}], "save": {"longer": "/path"}}
+{"cmd": "open_review", "path": "${longer}"}
+{"cmd": "settle", "timeout_ms": 20000}
+{"cmd": "bounds", "target": "titlebar/prs", "expect_result": [{"pointer": "/visible/w", "lte": 40}, {"pointer": "/visible/h", "equals": 28}]}
+{"cmd": "screenshot", "name": "prs-glyph-1100x700"}
+{"cmd": "open_review", "path": "${long}"}
+{"cmd": "settle", "timeout_ms": 20000}
 
 // A repository whose .git goes away while its review is open: the switcher says why and
 // offers no rows to open there (DESIGN §4.1), rather than a review that would write a store

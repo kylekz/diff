@@ -21,6 +21,7 @@ use crate::keymap;
 use crate::services::ActiveServices as _;
 use crate::session::{Comparison, ReviewSession};
 use crate::theme::{ActiveTheme as _, DvTheme, StyledText as _};
+use crate::thread::one_line;
 
 /// The narrowest panel (DESIGN §2: 220–420) whose comparison control has room for "Since
 /// round n" and "All changes" in full beside its keycap.
@@ -355,7 +356,10 @@ fn file_row(
     let letter = status_letter(entry.status);
     let (letter_fg, letter_bg) = letter.colors(theme);
     let path = entry.path.clone();
-    let (dir, name) = split_path(&entry.path);
+    // The path as one line (git allows a path any character but NUL): borrowed as it is
+    // unless it holds one that would break or reorder the row.
+    let shown = one_line(&entry.path);
+    let (dir, name) = split_path(&shown);
     let name_color = if state.viewed { c.fg3 } else { c.fg };
     // The element takes the name's weight: truncation measures every character in it, so the
     // heaviest run's keeps the current file's name from overflowing (DESIGN §4.1).
@@ -364,7 +368,7 @@ fn file_row(
     } else {
         FontWeight::NORMAL
     };
-    let text = StyledText::new(SharedString::from(entry.path.clone())).with_highlights([
+    let text = StyledText::new(SharedString::from(shown.to_string())).with_highlights([
         (
             0..dir.len(),
             HighlightStyle {

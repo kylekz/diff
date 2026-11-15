@@ -110,7 +110,7 @@ impl Backend for FetchFails {
             return Err(failure);
         }
         let output = self.inner.git(args, opts)?;
-        if args.first() == Some(&"fetch") {
+        if args.contains(&"fetch") {
             for name in self.vanishing.lock().unwrap().drain(..) {
                 self.inner
                     .git(&["update-ref", "-d", &name], &GitOpts::new())?;
@@ -163,7 +163,7 @@ impl Backend for FetchFails {
 }
 
 fn is_fetch(args: &[&str]) -> bool {
-    args.first() == Some(&"fetch")
+    args.contains(&"fetch")
 }
 
 /// A take of a pull request's lock: `update-ref <lock> <token> <zeros>`.
@@ -640,4 +640,58 @@ fn refs_that_vanish_under_the_fetch_are_fetched_once_more() {
     assert!(opened.created);
     assert_eq!(fixture.pins(&opened.review).head, fixture.head());
     assert_eq!(fixture.refs("refs/dv/pr/").len(), 2);
+}
+
+#[test]
+fn a_draft_whose_pins_cant_be_written_is_left_and_the_error_says_so() {
+    let fixture = PrFixture::new();
+    // The pins' transaction fails once (the disk, a hook): the draft is already made.
+    fn is_pin(args: &[&str]) -> bool {
+        args == ["update-ref", "--stdin"]
+    }
+    let failed = BackendError::Git {
+        args: vec!["update-ref".to_string(), "--stdin".to_string()],
+        code: Some(128),
+        stderr: "fatal: unable to write new index file\n".to_string(),
+    };
+    let backend = FetchFails::failing_at(fixture.github.checkout(), is_pin, vec![failed]);
+    let error = open(&backend, &fixture.mock.gh, &PrRef::Hash(NUMBER), reviewer).unwrap_err();
+    let GithubError::DraftLeft { review, source } = &error else {
+        panic!("{error:?}");
+    };
+    assert_eq!(source.kind(), "git");
+    assert_eq!(error.kind(), "git");
+    let message = error.to_string();
+    assert!(
+        message.starts_with(&format!("a draft was made ({review})")),
+        "{message}"
+    );
+    assert!(
+        message.contains(&format!("`dv review delete {review}`")),
+        "{message}"
+    );
+    // The one line says what git said where it says what failed, before what to do.
+    let line = error.one_line();
+    let (said, advice) = (
+        line.find("unable to write new index file")
+            .expect("git's words"),
+        line.find("; open the pull request again")
+            .expect("the advice"),
+    );
+    assert!(said < advice, "{line}");
+    assert!(
+        line.ends_with(&format!("`dv review delete {review}`")),
+        "{line}"
+    );
+    // Nothing was swept: the draft is the pull request's review, and its commits stay.
+    let reviews = fixture.store().list().unwrap();
+    assert_eq!(reviews.len(), 1);
+    assert_eq!(fixture.refs("refs/dv/pr/").len(), 2);
+    // Opening again resumes that draft, and its refresh pins it.
+    let opened = fixture.open();
+    assert!(!opened.created);
+    assert_eq!(opened.review.id.to_string(), *review);
+    assert_eq!(fixture.store().list().unwrap().len(), 1);
+    assert_eq!(opened.refreshed.stale.as_ref().map(|e| e.to_string()), None);
+    assert_eq!(fixture.pins(&opened.review).head, fixture.head());
 }

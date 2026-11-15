@@ -57,6 +57,7 @@ pub use key::{GITHUB_PREFIX, ThreadKey};
 pub use model::{
     Anchor, AnchorSide, Author, AuthorKind, Comment, PrLink, Review, ReviewStatus, ReviewSummary,
     Round, StateChange, StatusChange, Submission, Thread, ThreadCounts, ThreadState, Verdict,
+    displayed_round,
 };
 pub use ops::{FinishedRound, OpError, Opened};
 pub use pins::Pins;

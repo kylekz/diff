@@ -283,7 +283,8 @@ impl ReviewSession {
     }
 
     /// One batch from the watch: an append to this review's log reloads the fold; a PR
-    /// review's mirror rewritten is followed (`pr`); worktree and git changes wait
+    /// review's mirror rewritten is followed (`pr`), and its round read again when another
+    /// review's log came or went; worktree and git changes wait
     /// [`REFRESH_DEBOUNCE`] for more, then refresh. Other store paths (snapshot caches, the
     /// snapshot's temporary index) change nothing here.
     pub(super) fn on_watch_event(
@@ -300,6 +301,15 @@ impl ReviewSession {
             self.reload_fold(cx);
         }
         self.follow_mirror(&event.store_paths, cx);
+        // A PR review's round is its place among its pull request's reviews in the store
+        // (PLAN §9.5): another review made or deleted may change it.
+        let reviews_changed = event
+            .store_paths
+            .iter()
+            .any(|path| path.starts_with("reviews/") && path.ends_with(".jsonl") && *path != log);
+        if self.review.is_pr_review() && (event.rescan || reviews_changed) {
+            self.read_pr_facts(cx);
+        }
         if event.rescan || !event.worktree_paths.is_empty() {
             cx.emit(super::SessionEvent::WorktreeChanged {
                 paths: event.worktree_paths.iter().cloned().collect(),

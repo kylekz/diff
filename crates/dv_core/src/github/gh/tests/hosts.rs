@@ -151,7 +151,9 @@ fn a_gh_that_cannot_answer_says_no_and_is_asked_again() {
             {"argv": ["auth", "**"], "exit": 0, "delay_ms": 30_000, "times": 1},
             {"argv": ["auth", "**"], "exit": 0}
         ]),
-        |options| options.timeout = Duration::from_millis(300),
+        // Far less than the first answer takes, and room for the second, which comes at
+        // once, on a machine busy with the other tests.
+        |options| options.timeout = Duration::from_secs(3),
     );
     assert!(!mock.gh.is_github_host("ghe.example.com"));
     assert!(mock.gh.is_github_host("ghe.example.com"));

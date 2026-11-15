@@ -741,6 +741,30 @@ async fn a_distros_connection_is_named_as_wsl_spells_it(cx: &mut TestAppContext)
     });
 }
 
+/// PLAN §14.2: in this crate's tests every backend's git reaches nothing but a local path,
+/// a fixture's repository or not.
+#[gpui::test]
+async fn a_tests_git_reaches_only_local_paths(cx: &mut TestAppContext) {
+    let plain = FixtureRepo::new();
+    plain.write("a.txt", "a\n");
+    plain.commit("base");
+    let locations = locations(cx, Vec::new());
+    let backend = open(&locations, Location::Local(plain.path().to_path_buf()), cx)
+        .await
+        .unwrap();
+    let opts = dv_core::backend::GitOpts::new();
+    // A local path is read; a host is refused before git connects to anything.
+    backend
+        .git(&["ls-remote", &backend.repo().toplevel], &opts)
+        .expect("a local path");
+    match backend.git(&["ls-remote", "https://dv-test.invalid/x.git"], &opts) {
+        Err(BackendError::Git { stderr, .. }) => {
+            assert!(stderr.contains("transport 'https' not allowed"), "{stderr}")
+        }
+        other => panic!("{other:?}"),
+    }
+}
+
 #[gpui::test]
 async fn the_base_environment_reaches_every_backends_git(cx: &mut TestAppContext) {
     // Two repositories: one with a route of its own (a seeded repo's), one without.

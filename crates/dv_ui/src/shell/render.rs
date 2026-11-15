@@ -58,6 +58,7 @@ impl Render for Shell {
             || self.source_picker.is_some()
             || self.file_finder.is_some()
             || self.palette.is_some()
+            || self.pr_picker.is_some()
             || self.settings.is_some()
             || self.sheet.is_some();
         // The first-run screen stands in for the columns and the status bar (`setup`).
@@ -71,6 +72,8 @@ impl Render for Shell {
             .on_action(cx.listener(Self::toggle_file_finder))
             .on_action(cx.listener(Self::toggle_palette))
             .on_action(cx.listener(Self::open_folder))
+            .on_action(cx.listener(Self::toggle_pr_picker))
+            .on_action(cx.listener(Self::refresh_pr))
             .on_action(cx.listener(Self::on_go_back))
             .on_action(cx.listener(Self::on_go_forward))
             .on_action(cx.listener(Self::copy_field))
@@ -106,18 +109,19 @@ impl Render for Shell {
                 if first_run {
                     this.child(self.render_first_run(&theme, window, cx))
                 } else {
-                    this.child(
-                        div()
-                            .flex_1()
-                            .min_h_0()
-                            .flex()
-                            .flex_row()
-                            .when(self.panel_visible, |this| {
-                                this.child(self.render_panel(&theme, cx))
-                            })
-                            .child(self.render_main(&theme, cx)),
-                    )
-                    .child(self.render_status_bar(&theme, cx))
+                    this.children(self.render_pr_strip(&theme, cx))
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_h_0()
+                                .flex()
+                                .flex_row()
+                                .when(self.panel_visible, |this| {
+                                    this.child(self.render_panel(&theme, cx))
+                                })
+                                .child(self.render_main(&theme, cx)),
+                        )
+                        .child(self.render_status_bar(&theme, cx))
                 }
             })
             .when(overlay_open, |this| {
@@ -260,6 +264,8 @@ impl Shell {
                 handler(cx, |this, _, cx| this.dismiss_banner(cx)),
             ))
         });
+        // A PR review's refresh that failed, opened from the strip (`pr_strip`).
+        let pr_banner = self.pr_banner(cx);
         // The connection failed for good, or found its distro stopped (DESIGN §4.4): its
         // banner says all there is, so the review's own refresh banner stays down.
         let backend_down = self.backend_down(cx);
@@ -401,6 +407,7 @@ impl Shell {
             .bg(c.code)
             .debug_selector(|| "main".into())
             .children(banner)
+            .children(pr_banner)
             .children(backend_banner)
             .children(session_banner)
             .children(viewed_banner)
@@ -443,6 +450,7 @@ impl Shell {
             || self.source_picker.is_some()
             || self.file_finder.is_some()
             || self.palette.is_some()
+            || self.pr_picker.is_some()
             || self.settings.is_some();
         let priority = if menu_open && self.sheet.is_some() {
             SCRIM_OVER_SHEET_PRIORITY

@@ -410,7 +410,7 @@ fn a_5xx_or_a_network_failure_is_unavailable() {
     }
     assert_eq!(
         errors[0].to_string(),
-        "GitHub can't be reached: GitHub answered HTTP 502"
+        "GitHub answered HTTP 502, a server error"
     );
     assert_eq!(
         errors[2].to_string(),

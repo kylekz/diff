@@ -37,8 +37,20 @@
 //! ([`Reviews::resolved`]): its row and `known_repos.json` are re-keyed, or it goes when the
 //! root is known already. Locations are compared with the distro folded
 //! (`Location::same_place`), so a spelling WSL couldn't confirm never adds a second row.
+//!
+//! **A repository's GitHub name** (PLAN §9.1, §9.9) is read beside its listing, in a job of
+//! its own after the row lands ([`Reviews::read_github`]: the clone's remotes through its
+//! backend, and `gh` only for a host that isn't plainly GitHub's, whose answer stands for a
+//! minute, [`hosts`]), and remembered in `known_repos.json` when it differs. A clone with no
+//! remote on GitHub is remembered as having none, except when a remote still points at the
+//! host of the name remembered and only `gh`'s word for that host is missing (`gh` signed
+//! out of a GitHub Enterprise host, or not there): the name stays. The palette matches a pasted pull request against
+//! what is remembered ([`Reviews::clones_of`]), so a repository that can't be reached now, a
+//! stopped distro's, still matches, and nothing is opened or asked to tell.
 
+pub mod hosts;
 pub mod known_repos;
+mod scan;
 
 #[cfg(test)]
 mod tests;
@@ -48,13 +60,12 @@ use std::path::Path;
 use std::sync::Arc;
 
 use dv_backend::{Connection, ConnectionKey};
-use dv_core::diff::file_list;
 use dv_core::git::branches::Branch;
-use dv_core::github::PrRef;
-use dv_core::label::{LabelContext, Labels};
+use dv_core::github::{GithubError, GithubRepo, PrRef, RepoUrl};
+use dv_core::label::LabelContext;
 use dv_core::review::{
-    Author, Home, HomeError, ListEntry, LoadedReview, ReviewId, ReviewStatus, ReviewStore,
-    ReviewSummary, home, ops, reviewer_identity,
+    Author, Home, HomeError, LoadedReview, ReviewId, ReviewStatus, ReviewStore, ReviewSummary,
+    home, ops, reviewer_identity,
 };
 use dv_core::{Backend, BackendError, GitRepo, Location, Target};
 use futures::channel::oneshot;
@@ -67,6 +78,7 @@ use super::locations::{Locations, LocationsEvent, Reach};
 use super::persist::{JsonFile, ReadObject, read_object};
 use crate::failure::Failure;
 pub use known_repos::{KNOWN_REPOS_FILE, KnownRepo, KnownReposFile};
+use scan::{Scan, scan};
 
 /// What [`Reviews`] tells its subscribers.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -90,6 +102,8 @@ pub enum ReviewRow {
         summary: Box<ReviewSummary>,
         /// `dv_core::label::target_label` of its target.
         label: String,
+        /// A PR review's pull request, as the switcher names it.
+        pr: Option<PrRow>,
     },
     /// A log that didn't load (PLAN §7: one bad file never hides the others).
     Err { id: ReviewId, error: Failure },
@@ -102,6 +116,18 @@ impl ReviewRow {
             Self::Err { id, .. } => id,
         }
     }
+}
+
+/// A PR review's pull request in a repository's row (PLAN §9.9): what the switcher's "Pull
+/// requests" section shows beside the review's status.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PrRow {
+    pub number: u64,
+    /// The pull request's title as its stored mirror has it (whichever login read it last);
+    /// `None` before it was read here.
+    pub title: Option<String>,
+    /// The review's place among the pull request's reviews in the store (PLAN §9.5).
+    pub round: u32,
 }
 
 /// A known repository as the switcher lists it.
@@ -144,6 +170,8 @@ pub struct RepoRow {
     pub branches: Vec<Branch>,
     /// When it was last used, for the order rows are listed in.
     pub last_used: u64,
+    /// Its repository on GitHub as last read (`known_repos.json`'s `github`).
+    pub github: Option<RepoUrl>,
 }
 
 impl RepoRow {
@@ -189,29 +217,8 @@ impl RepoRow {
             labels: LabelContext::default(),
             branches: Vec::new(),
             last_used: repo.last_used(),
+            github: repo.github.as_ref().map(|github| github.repo.clone()),
         }
-    }
-}
-
-/// What a background scan of a repository found.
-struct Scan {
-    working: Result<WorkingSummary, Failure>,
-    reviews: Result<Vec<ReviewRow>, Failure>,
-    labels: LabelContext,
-    /// Empty when they couldn't be read: the picker then offers none, the row the rest.
-    branches: Vec<Branch>,
-    toplevel: String,
-    /// The repository's location as its backend resolved it: its worktree root.
-    root: Location,
-}
-
-impl Scan {
-    /// The connection died under the scan: what it read is the reconnect's to read again.
-    fn lost_connection(&self) -> bool {
-        [self.working.as_ref().err(), self.reviews.as_ref().err()]
-            .into_iter()
-            .flatten()
-            .any(|failure| failure.disconnected)
     }
 }
 
@@ -303,6 +310,10 @@ pub struct Reviews {
     /// Refreshes running, by repository, with the generation each started at.
     refreshing: HashMap<Location, (u64, Task<()>)>,
     generation: u64,
+    /// The reads of a repository's GitHub name running, by repository (module docs).
+    naming: HashMap<Location, Task<()>>,
+    /// What `gh` said about hosts, for those reads.
+    hosts: Arc<hosts::HostAnswers>,
     /// `add_repo` and `open_review` calls running.
     opening: usize,
     _locations: Subscription,
@@ -369,6 +380,8 @@ impl Reviews {
             file,
             rows,
             refreshing: HashMap::new(),
+            naming: HashMap::new(),
+            hosts: Arc::default(),
             generation: 0,
             opening: 0,
             _locations: subscription,
@@ -397,7 +410,10 @@ impl Reviews {
 
     /// Nothing is refreshing, opening or waiting to be saved: automation's `settled`.
     pub fn is_settled(&self, cx: &App) -> bool {
-        self.refreshing.is_empty() && self.opening == 0 && self.file.read(cx).is_settled()
+        self.refreshing.is_empty()
+            && self.naming.is_empty()
+            && self.opening == 0
+            && self.file.read(cx).is_settled()
     }
 
     /// Adds the repository at `location` (like `dv open <path>`), opened explicitly (a WSL
@@ -655,7 +671,7 @@ impl Reviews {
         let mut resolved = None;
         match refreshed {
             Refreshed::Scanned(scan) => {
-                resolved = Some(scan.root);
+                resolved = Some((scan.root, scan.backend));
                 row.labels = scan.labels;
                 row.branches = scan.branches;
                 row.unreachable = None;
@@ -696,11 +712,182 @@ impl Reviews {
             }
         }
         // The listing resolved the repository: known by its root from now on (module docs).
-        if let Some(root) = resolved {
+        if let Some((root, backend)) = resolved {
             self.resolved(location, &root, cx);
+            self.read_github(root, backend, cx);
         }
         cx.emit(ReviewsEvent::Changed);
         cx.notify();
+    }
+
+    /// Reads which repository on GitHub the clone at `location` is, through `backend`
+    /// (module docs), and remembers it when it differs. A clone with none is remembered as
+    /// having none; a read that couldn't be made (git failing, the connection lost) leaves
+    /// what is remembered.
+    fn read_github(
+        &mut self,
+        location: Location,
+        backend: Arc<dyn Backend>,
+        cx: &mut Context<Self>,
+    ) {
+        let gh = self.github.read(cx).gh();
+        let hosts = self.hosts.clone();
+        let job = cx.background_spawn(async move {
+            GithubRepo::of_hosts(backend.as_ref(), |host| {
+                hosts.is_github(host, std::time::Instant::now(), || gh.is_github_host(host))
+            })
+        });
+        let task = cx.spawn({
+            let location = location.clone();
+            async move |this, cx| {
+                let read = job.await;
+                this.update(cx, |this, cx| {
+                    this.naming.remove(&location);
+                    cx.notify();
+                    let remembered = this
+                        .known
+                        .get(&location)
+                        .and_then(|repo| repo.github.as_ref());
+                    let github = match read {
+                        Ok(repo) => Some(RepoUrl::from(&repo)),
+                        // No remote counts as GitHub's, but one is still on the remembered
+                        // name's host: gh no longer vouches for that host, which says
+                        // nothing about the repository (module docs).
+                        Err(GithubError::NoRepository { remotes, elsewhere })
+                            if remotes.is_empty()
+                                && remembered.is_some_and(|known| {
+                                    elsewhere.iter().any(|remote| {
+                                        remote.host.as_deref().is_some_and(|host| {
+                                            host.eq_ignore_ascii_case(&known.host)
+                                        })
+                                    })
+                                }) =>
+                        {
+                            return;
+                        }
+                        Err(
+                            GithubError::NoRepository { .. }
+                            | GithubError::NoRemote { .. }
+                            | GithubError::UnreadableDefault { .. },
+                        ) => None,
+                        Err(error) => {
+                            log::debug!("{location}: its GitHub repository wasn't read: {error}");
+                            return;
+                        }
+                    };
+                    if this.known.set_github(&location, github.clone()) {
+                        if let Some(row) = this.rows.get_mut(&location) {
+                            row.github = github;
+                        }
+                        this.save(cx);
+                        cx.emit(ReviewsEvent::Changed);
+                    }
+                })
+                .ok();
+            }
+        });
+        self.naming.insert(location, task);
+    }
+
+    /// The known clones of the GitHub repository `owner/repo` (on `host`, or on any host
+    /// when the reference names none), most recently used first, from what is remembered
+    /// alone: nothing is opened and `gh` isn't asked (module docs).
+    pub fn clones_of(&self, host: Option<&str>, owner: &str, repo: &str) -> Vec<&RepoRow> {
+        self.rows()
+            .into_iter()
+            .filter(|row| {
+                row.github
+                    .as_ref()
+                    .is_some_and(|github| github.is(host, owner, repo))
+            })
+            .collect()
+    }
+
+    /// Whether the folder at `location` is a clone of the repository `reference` names (the
+    /// palette's "Choose its folder", PLAN §9.9): the folder is opened as any picked folder
+    /// is, an explicit open, and its GitHub repository read (PLAN §9.1). Resolves to its
+    /// worktree root, which opening the pull request there then makes a known repository;
+    /// or to why not, in one line that names the folder: another repository's clone, no
+    /// git repository, one without a GitHub repository. Nothing is added either way, and a
+    /// folder that isn't taken leaves nothing open: the backend opened to look at it is let
+    /// go of (`Locations::forget`), unless it is a known repository's.
+    pub fn pr_folder(
+        &mut self,
+        location: Location,
+        reference: PrRef,
+        cx: &mut Context<Self>,
+    ) -> Task<Result<Location, Failure>> {
+        self.opening += 1;
+        let gh = self.github.read(cx).gh();
+        let open = self
+            .locations
+            .update(cx, |locations, cx| locations.open(location.clone(), cx));
+        detached(cx, async move |this, cx| {
+            let folder = location.display_name();
+            let (root, checked) = match open.await {
+                Ok(backend) => {
+                    let root = backend.repo().location.clone();
+                    let checked = cx
+                        .background_spawn({
+                            let root = root.clone();
+                            async move {
+                                let repo =
+                                    GithubRepo::of(backend.as_ref(), &gh).map_err(|error| {
+                                        let failure = Failure::from(&error);
+                                        Failure {
+                                            message: format!("`{folder}`: {}", failure.message),
+                                            ..failure
+                                        }
+                                    })?;
+                                match reference.in_repo(&repo) {
+                                    Ok(_) => Ok(root),
+                                    Err(GithubError::OtherRepository { repository, .. }) => {
+                                        Err(Failure::new(format!(
+                                            "`{folder}` is {}, not {repository}",
+                                            repo.name_with_owner()
+                                        )))
+                                    }
+                                    Err(error) => Err(Failure::from(&error)),
+                                }
+                            }
+                        })
+                        .await;
+                    (Some(root), checked)
+                }
+                Err(error) => (
+                    None,
+                    Err(match &*error {
+                        BackendError::NotARepository { .. } => {
+                            Failure::new(format!("`{folder}` isn't a git repository"))
+                        }
+                        other => Failure::from(other),
+                    }),
+                ),
+            };
+            this.update(cx, |this, cx| {
+                this.opening -= 1;
+                // A folder that isn't taken stays unopened.
+                if let (Some(root), Err(_)) = (&root, &checked) {
+                    this.pr_folder_dropped(&location, root, cx);
+                }
+                cx.notify();
+            })
+            .ok();
+            checked
+        })
+    }
+
+    /// The folder at `given`, whose repository is at `root`, was looked at for a pull
+    /// request ([`Reviews::pr_folder`]) and isn't opened after all (refused, or accepted for
+    /// a menu that has gone since): the backend opened to look at it is let go of, unless
+    /// it is a known repository's.
+    pub fn pr_folder_dropped(&mut self, given: &Location, root: &Location, cx: &mut Context<Self>) {
+        if self.known.find_place(root).is_none() {
+            self.locations.update(cx, |locations, _| {
+                locations.forget(given);
+                locations.forget(root);
+            });
+        }
     }
 
     /// **Start** on a repository whose host isn't running, or **Retry** on one whose
@@ -1131,57 +1318,5 @@ fn sibling(location: &Location, root: &str) -> Location {
             distro: distro.clone(),
             path: root.to_string(),
         },
-    }
-}
-
-/// Reads a repository's row (blocking): its reviews, its uncommitted changes and its labels.
-fn scan(backend: Arc<dyn Backend>) -> Scan {
-    let toplevel = backend.repo().toplevel.clone();
-    let root = backend.repo().location.clone();
-    let repo = GitRepo::new(backend.clone());
-    // Another worktree's `working` or `staged` review is named by that worktree's HEAD.
-    let all_labels = Labels::read(&repo);
-    let labels = all_labels.here.clone();
-    let store = ReviewStore::new(backend);
-    let reviews = store
-        .list()
-        .map(|entries| {
-            entries
-                .into_iter()
-                .map(|entry| match entry {
-                    ListEntry::Ok(summary) => ReviewRow::Ok {
-                        label: all_labels.label(&summary.target, &summary.worktree),
-                        summary,
-                    },
-                    ListEntry::Err { id, error } => ReviewRow::Err {
-                        id,
-                        error: Failure::from(&error),
-                    },
-                })
-                .collect()
-        })
-        .map_err(|error| Failure::from(&error));
-    let working = Target::Working
-        .resolve(&repo)
-        .map_err(|error| Failure::from(&error))
-        .and_then(|spec| file_list(&repo, &spec).map_err(|error| Failure::from(&error)))
-        .map(|files| WorkingSummary {
-            files: files.len(),
-            additions: files.iter().map(|file| u64::from(file.additions)).sum(),
-            deletions: files.iter().map(|file| u64::from(file.deletions)).sum(),
-        });
-    let branches = repo
-        .branches(labels.default_base.as_deref())
-        .unwrap_or_else(|error| {
-            log::warn!("couldn't list the branches of {toplevel}: {error}");
-            Vec::new()
-        });
-    Scan {
-        working,
-        reviews,
-        labels,
-        branches,
-        toplevel,
-        root,
     }
 }

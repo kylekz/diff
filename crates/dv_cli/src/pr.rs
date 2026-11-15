@@ -14,7 +14,7 @@ use dv_core::github::{Gh, GhOptions, Mirror, MirrorStore, PrState, program};
 use dv_core::review::{
     AuthorKind, GITHUB_PREFIX, ListEntry, OpError, PrLink, Review, ReviewId, ops, pins,
 };
-use dv_core::target::Target;
+use dv_core::target::{DiffSpec, Side, Target};
 
 use crate::args::GlobalArgs;
 use crate::checks::GH_VAR;
@@ -128,6 +128,12 @@ pub(crate) struct StoredPrs {
 }
 
 impl StoredPrs {
+    /// The PR round of the review `id` of `link`'s pull request (PLAN §9.5): its place
+    /// among that pull request's reviews in the store.
+    pub(crate) fn round_of(&self, link: &PrLink, id: &ReviewId) -> u32 {
+        link.round_of(id, self.reviews.iter().map(|(id, target)| (id, target)))
+    }
+
     /// Read from `repo`'s store and its clone's remotes (blocking: one listing, a few git
     /// calls). What can't be read is left out, as in [`dto`].
     pub fn read(repo: &Repo) -> Self {
@@ -216,29 +222,30 @@ const ID_SHOWN: usize = 80;
 /// The `pr` document of `review`, a PR review; `None` for a local one (blocking: the
 /// review's pins and, once per command, [`StoredPrs`] and the pull request's stored mirror).
 /// Only what is stored is read, never `gh`. What can't be read is left out rather than
-/// failing the command: the head falls back to the one the review was made at, the URL and
-/// the state, which only a mirror has, to `null`.
+/// failing the command: the head falls back to the one the review was made at and the old
+/// side to none when the review's two sides don't resolve, the URL and the state, which
+/// only a mirror has, to `null`.
 pub(crate) fn dto(repo: &Repo, review: &Review) -> Option<PrDto> {
     let (link, Target::Pr { head_oid, .. }) = (review.pr_target()?, &review.target) else {
         return None;
     };
-    let head = match pins::read(&repo.git, &review.id) {
-        Ok(Some(pins)) => pins.head.to_string(),
-        _ => head_oid.to_string(),
+    // The two sides the review shows: its pins, or without them its target as it resolves,
+    // the merge base of the commits it was made at and that head (PLAN §9.5).
+    let (head, base) = match pins::resolve(&repo.git, &review.id, &review.target) {
+        Ok(DiffSpec {
+            old: Side::Commit(base),
+            new: Side::Commit(head),
+        }) => (head.to_string(), Some(base.to_string())),
+        _ => (head_oid.to_string(), None),
     };
     let stored = repo.stored_prs();
-    let round = stored
-        .reviews
-        .iter()
-        .filter(|(_, target)| link.is_target(target))
-        .position(|(id, _)| *id == review.id)
-        .map_or(1, |index| index + 1);
+    let round = stored.round_of(link, &review.id);
     let mirror = stored.mirror(repo, link);
     Some(PrDto {
         owner: link.owner.clone(),
         repo: link.repo.clone(),
         number: link.number,
-        url: mirror.as_ref().map(|mirror| mirror.pr.url.clone()),
+        url: mirror.as_ref().and_then(|mirror| mirror.key.pr_url()),
         state: mirror.as_ref().map(|mirror| match mirror.pr.state {
             PrState::Open => "open",
             PrState::Draft => "draft",
@@ -246,7 +253,10 @@ pub(crate) fn dto(repo: &Repo, review: &Review) -> Option<PrDto> {
             PrState::Closed => "closed",
         }),
         head_oid: head,
-        pr_round: u32::try_from(round).unwrap_or(u32::MAX),
+        base_oid: base,
+        github_head_oid: mirror.as_ref().map(|mirror| mirror.pr.head_oid.to_string()),
+        read_at: mirror.as_ref().map(|mirror| mirror.read_at),
+        pr_round: round,
         threads: mirror.as_deref().map(GithubCountsDto::of),
     })
 }

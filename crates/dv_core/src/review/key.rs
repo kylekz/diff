@@ -60,10 +60,6 @@ impl ThreadKey {
             Self::Github(node) => Some(node),
         }
     }
-
-    pub fn is_github(&self) -> bool {
-        matches!(self, Self::Github(_))
-    }
 }
 
 impl fmt::Display for ThreadKey {

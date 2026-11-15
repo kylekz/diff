@@ -1,0 +1,39 @@
+{"scenario": {"window_size": "1440x900", "gh": "../fixtures/gh/pr_read.json", "description": "The read side of a pull request in a repository reached through `dv backend --stdio` (PLAN §9.9, §5.1), as a WSL repository's is: the clone's GitHub name is read from its remotes over the connection, beside its listing, and remembered; Ctrl G lists its open pull requests (gh on the app's side, the remotes read where the repository lives) and Enter opens pull request 7; the strip counts the commits a refresh moved the review by (`git rev-list` over the wire) and its PR round from the store there; a pull request's URL typed into Ctrl K finds the clone from the remembered name alone."}}
+{"cmd": "wait_ready", "timeout_ms": 20000}
+{"cmd": "seed_repo", "name": "api", "backend": "loopback", "github": [{"branch": "feat"}, {"checkout": "feat"}, {"write": "src/lib.rs", "text": "pub fn answer() -> u32 {\n    42\n}\n"}, {"commit": "Add the answer"}, {"pr": [7, "feat"]}], "save": {"head": "/github/prs/7"}, "expect_result": {"pointer": "/github/prs/7", "equals": "5746f3cb7598128a528c413ffe03e23666d1e9d6"}}
+{"cmd": "open_review", "path": "${data_dir}/repos/api"}
+{"cmd": "settle", "timeout_ms": 20000, "expect": [{"pointer": "/backends/0/name", "equals": "loopback"}, {"pointer": "/backends/0/state", "equals": "connected"}, {"pointer": "/shell/repo_in_view", "equals": "${data_dir}/repos/api"}, {"pointer": "/repos/0/github", "equals": {"host": "github.com", "owner": "dv-fixture", "repo": "api"}}]}
+{"gh_log": {}, "expect_result": {"pointer": "", "len": 0}}
+
+// Ctrl G: the list, then pull request 7 opened from it.
+{"cmd": "key", "keystroke": "secondary-g"}
+{"cmd": "settle", "timeout_ms": 20000, "expect": [{"pointer": "/pr_picker/github", "equals": "dv-fixture/api"}, {"pointer": "/pr_picker/list", "equals": "listed"}, {"pointer": "/pr_picker/listed", "equals": 4}, {"pointer": "/pr_picker/selected", "equals": "pr/7"}]}
+// A pasted URL finds the clone from what is remembered: the log is the list's two calls before
+// and after it is typed.
+{"gh_log": {}, "expect_result": {"pointer": "", "len": 2}}
+{"cmd": "key", "keystroke": "escape", "expect": {"pointer": "/pr_picker/open", "equals": false}}
+{"cmd": "key", "keystroke": "secondary-k"}
+{"cmd": "type", "text": "https://github.com/dv-fixture/api/pull/7", "expect": [{"pointer": "/palette/rows/0", "equals": {"key": "pr/api", "section": "pull_request", "label": "Open pull request dv-fixture/api#7"}}]}
+{"cmd": "settle"}
+{"gh_log": {}, "expect_result": {"pointer": "", "len": 2}}
+{"cmd": "key", "keystroke": "escape", "expect": {"pointer": "/palette/open", "equals": false}}
+{"cmd": "key", "keystroke": "secondary-g"}
+{"cmd": "settle", "timeout_ms": 20000, "expect": [{"pointer": "/pr_picker/list", "equals": "listed"}, {"pointer": "/pr_picker/loading", "equals": false}, {"pointer": "/pr_picker/selected", "equals": "pr/7"}]}
+{"cmd": "key", "keystroke": "enter"}
+{"cmd": "wait_for", "pointer": "/session/pr/number", "equals": 7, "timeout_ms": 20000}
+{"cmd": "settle", "timeout_ms": 20000, "expect": [{"pointer": "/shell/banner", "equals": null}, {"pointer": "/shell/backend_banner", "equals": null}, {"pointer": "/pr_strip/title", "equals": "Add the answer"}, {"pointer": "/pr_strip/branches", "equals": "main ← feat"}, {"pointer": "/pr_strip/round", "equals": 1}, {"pointer": "/pr_strip/read/kind", "equals": "read"}, {"pointer": "/session/pr/pins/head", "equals": "${head}"}, {"pointer": "/session/github_threads/0/standing", "equals": "anchored"}]}
+
+// Resolve, then a push and Ctrl R: the strip counts the commits between the two heads.
+{"cmd": "click", "target": "thread/gh:PRRT_kwDOfixture1/resolve"}
+{"cmd": "wait_for", "pointer": "/session/github_threads/0/resolved", "equals": true, "timeout_ms": 20000}
+{"cmd": "settle", "timeout_ms": 20000}
+{"cmd": "repo_edit", "name": "api", "github": [{"write": "src/lib.rs", "text": "// The answer.\n\npub fn answer() -> u32 {\n    42\n}\n"}, {"commit": "Say what it is"}, {"pr": [7, "feat"]}], "save": {"pushed": "/github/prs/7"}}
+{"cmd": "key", "keystroke": "secondary-r"}
+{"cmd": "wait_for", "pointer": "/session/pr/pins/head", "equals": "${pushed}", "timeout_ms": 20000}
+{"cmd": "settle", "timeout_ms": 20000, "expect": [{"pointer": "/pr_strip/moved", "equals": {"kind": "followed", "from": "${head}", "to": "${pushed}", "commits": 1, "text": "Updated to 1 new commit"}}, {"pointer": "/pr_strip/read/kind", "equals": "read"}, {"pointer": "/shell/backend_banner", "equals": null}]}
+
+// The pasted URL names the open review's own clone.
+{"cmd": "key", "keystroke": "secondary-k"}
+{"cmd": "type", "text": "https://github.com/dv-fixture/api/pull/7", "expect": [{"pointer": "/palette/rows/0", "equals": {"key": "pr/api", "section": "pull_request", "label": "Open pull request dv-fixture/api#7"}}]}
+{"cmd": "screenshot", "name": "pr-read-loopback"}
+{"cmd": "quit"}

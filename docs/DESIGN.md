@@ -127,7 +127,7 @@ lines) and on light and dark taskbars alike. The source is `crates/dv/resources/
 ```
 ┌ title bar (chrome, 40) ─────────────────────────────────────────────────────────────────────┐
 │ dv  [repo · review ▾  Ctrl O] [source ▾]   [ Go to file, review or command   Ctrl K ]  PRs Ctrl G  ⋯  – □ × │
-├ PR strip (chrome, PR reviews only) ─────────────────────────────────────────────────────────┤
+├ PR strip (chrome, 34, PR reviews only) ─────────────────────────────────────────────────────┤
 ├ panel 280 ─────────────┬ diff stream (code) ────────────────────────────────────────────────┤
 │ Changes  4/7 viewed    │ ▸ file header (codeHead, pinned): status · path · ±  Split|Unified ✓ │
 │ [ Filter files       ] │   hunk header                                                       │
@@ -167,7 +167,7 @@ lines) and on light and dark taskbars alike. The source is `crates/dv/resources/
 | Title bar, status bar, PR strip | `chrome` translucent | solid |
 | Panel | `panel` translucent | solid |
 | Diff surface, thread cards | near-opaque (`code` ≥ 94%, `thread` ≥ 98%) | solid |
-| Sheets, palette, switcher, file finder | `overlay` ≥ 96.5% over `scrim`; no blur | solid over `scrim` |
+| Sheets, palette, switcher, file finder, PR picker | `overlay` ≥ 96.5% over `scrim`; no blur | solid over `scrim` |
 | Popovers with no scrim (hover card, menus, find bar, a server's details) | `popover`: solid, so the code under them never shows through | solid |
 
 GPUI blurs only what is behind the window, so in-app overlays never "frost" app content (PLAN D8).
@@ -186,15 +186,20 @@ inactive: material falls back to its inactive appearance (OS-managed); dv dims n
 - **Title bar:** dv mark; switcher button "`api-server` · working tree vs main" (the repo's name at
   600, the target label with its "vs" in `fg3`) with the location chip (`Ubuntu`, WSL repos only) and
   its `Ctrl O` keycap; source picker (`⇄ ▾`); centred command field (`Ctrl K`; a click opens the
-  palette, its outline `line2` on hover); `PRs Ctrl G`;
+  palette, its outline `line2` on hover); `PRs Ctrl G` (a ghost button: the pull-request
+  glyph, "PRs" in `fg2` and its keycap; a click opens the PR picker, §4.5, or closes it; in a
+  narrow window, where the left group would otherwise have to truncate, its glyph alone, the
+  words in its tooltip);
   overflow (`⋯`, a 28-square ghost button with the ellipsis in `fg2`: Settings, `Ctrl ,`, §4.3);
   caption buttons (Windows; Linux while dv draws the decorations, §2) / traffic lights (macOS,
   left: the native ones in a transparent titlebar, centred on the bar at 12 from its left edge,
   dv's mark 84 in, after the lights' 60 and the spacing scale's 12; nothing at the right). The
   field is centred on the
   window unless the left group needs more than the half that leaves it: then the field moves
-  right as far as the group needs (12 between them), never closer than 12 to the `⋯` and the
-  caption buttons. The left group never runs under the field: once the field can't move further the
+  right as far as the group needs (12 between them), never closer than 12 to `PRs`, the `⋯`
+  and the caption buttons. A PR review's label, `#482 Title`, shows 48 characters at most,
+  then "…" (the strip under the bar has the title whole): a title is as long as its author
+  likes, and capped it moves the field no further than a long branch's name does. The left group never runs under the field: once the field can't move further the
   target label truncates at its end, and once it has no room left the repo's name does. With no
   review open the
   button reads "No review open"; while one opens, "`repo` · opening…", then the full label at once
@@ -227,7 +232,8 @@ inactive: material falls back to its inactive appearance (OS-managed); dv dims n
   changes** and, with a branch other than the default checked out, **Branch `feat` vs `main`**, each
   beside its open review (status chip, "round n", open-comment badge; "New review" on the selected row
   without one), then the repo's other open reviews by their target label, then, when it has a branch
-  other than the default one, **Compare branches…** (arrows glyph). Picking a row opens or
+  other than the default one, **Compare branches…** (arrows glyph), then its PR reviews under
+  a "Pull requests" label (§4.5). Picking a row opens or
   resumes that review (PLAN §2.4). A repo that can't be opened offers no rows. A header's menu
   (a right-click on it, or its `⋯`, a 22-square ghost button at the end of its first line shown
   under the pointer and while its menu is open; the menu panel at the pointer, as the comments
@@ -506,7 +512,8 @@ inactive: material falls back to its inactive appearance (OS-managed); dv dims n
   review or command"). Its rows sit under section labels (12/600 in `fg3`, the first 22 high, the
   rest 30, bottom-aligned), in this order: **Commands**, the shell's and the stream's actions by
   name (a `chevron-right` glyph, the title, the action's keycap at the right), the stream's only
-  while a review is open; **Reviews**, every repository's targets and open reviews as the
+  while a review is open, **Open a pull request…** (`Ctrl G`) always and **Refresh pull
+  request** (`Ctrl R`) only while a PR review is open; **Reviews**, every repository's targets and open reviews as the
   switcher lists them (the switcher's glyph, the repository's name at 500, the label in `fg2`,
   an open review's status chip and "round n" in `fg3`); **Files**, once something is typed with
   a review open, the file finder's first five matches as its rows show them. A query that is a
@@ -883,34 +890,108 @@ Setup unchanged.
 
 ### 4.5 Pull requests (PLAN §9)
 - **PR picker** (`Ctrl G`, the title bar's **PRs**): an overlay like the switcher (same width,
-  surface and rows), for the repository in view. A field, "PR number, #n, owner/repo#n or URL",
-  then the repository's open PRs, those requesting your review first with a "Review requested"
-  chip (accent), each row: `#482` in `fg3` mono, the title, the author's login in `fg3`, a
-  `draft` chip when it is one, and "2h" for when it was updated. Typing filters by number and
-  title; a reference the field parses opens directly on `Enter`. While the list loads it shows
-  the session's last list, else a shimmer row; a failure shows the setup check's words ("Sign in
-  to GitHub: `gh auth login`") in place of the list, the field still working.
+  surface and rows), hung 8 under the **PRs** button from its right edge, for the repository
+  in view (PLAN §9.9). A field (46 high, the pull-request glyph), "PR number, #n,
+  owner/repo#n or URL", then a 28-high line naming the repository (GitHub's mark in `fg3`
+  (a folder glyph and the folder's name until a read told which repository it is),
+  `acme/api` at 600 in `fg2`, "4 open pull requests" in `fg3`, and at its right "Reading the
+  list again…" while the list read before shows), then the repository's open PRs, those
+  requesting your review first with a "Review requested" chip (accent), each row: `#482` in
+  `fg3` mono, the title, the author's login in `fg3` (cut at 120), a `draft` chip (grey, with
+  an edge) when it is one, and "2h ago" for when it was updated. The title truncates; the
+  chips and the time never move. Typing filters by number, title and author; a reference the
+  field parses is the first row, as the palette's (below), and opens on `Enter`: a number or
+  `#n` in the repository in view (the list's other rows whose number holds those digits
+  after it), `owner/repo#n` or a URL in that repository's known clones (each named at its
+  right when it isn't the repository in view) or through **Choose its folder**. While the
+  field names another repository than the one in view, the line naming the repository and
+  whatever stands in the list's place are hidden: the rows are that other repository's, and
+  nothing of the one in view stands over them. A list whose review requests couldn't be
+  read shows every open pull request without the chip, under a line at 12 in `fg3` below
+  the repository's ("Couldn't read which pull requests ask for your review", gh's reason
+  its tooltip). The footer
+  holds the keys (`↑` `↓` move, `Enter` open, `Esc` close). **In the list's place**, centred,
+  a line in `fg2` over one in `fg3` at 12 (which wraps), the field still working:
+  - the first read: four skeleton bars, never a spinner;
+  - "No repository is open" · "Open one with `Ctrl O`, or paste a pull request's URL: dv finds
+    its clone.";
+  - "This repository isn't on GitHub" · why, in PLAN §9.1's words ("this repository has no
+    remotes", "none of this repository's remotes is on GitHub: origin is on …");
+  - "GitHub's CLI isn't installed", "Not signed in to GitHub" · the one line with the command
+    that fixes it ("gh isn't signed in to github.com: run `gh auth login`");
+  - "The repository can't be reached" (a stopped distro, a lost connection), "Couldn't list
+    the pull requests" (anything else) · the failure's one line;
+  - "No open pull requests" · "A closed or merged one opens by its number or URL.";
+  - "No open pull request matches “x”" · "Every word must be in its number, title or author."
+  A read that fails after a list was read keeps that list under a line in `yellow` (a
+  triangle, "Showing the list read before: …").
 - **The palette's PR row** (`Ctrl K`, §4.1; PLAN §9.9): a query that is a PR's URL or
   `owner/repo#n` (`#n` for the repository in view) puts a **Pull request** section first, there
   as soon as the text is. A row per known clone of that repository, the most recently opened
   first: GitHub's mark (`fg2`), "Open pull request" at 500, `acme/frontend#482` in mono `fg2`,
-  the PR's title in `fg2` when the session's PR list has it, and at the right the clone's name
-  in `fg3` as the switcher names it, only when there are several rows. No clone known: one row,
-  a `folder` glyph, "acme/frontend isn't open in dv yet" and **Choose its folder** in accent;
-  `Enter` opens the folder picker, and a folder that isn't that repository leaves the palette
-  open with why in `red` under the row ("`~/code/web` is acme/web, not acme/frontend"). `Enter`
-  on a clone's row closes the palette and opens the PR, the window moving to that repository;
-  an open that fails shows where a review's does.
-- **PR strip** (§2: under the title bar, `chrome`, 34 high, PR reviews only): `#482` mono `fg3`,
-  the title `fg1` 13 semibold (truncated), the author, `base ← head` in mono 12 (`owner:head` for
-  a fork), the PR's state chip (Open accent, Draft grey, Merged violet, Closed red), the checks as
-  small counts (`✓ 12` green, `✗ 1` red, `● 2` yellow; a click opens the PR's checks page), then
-  on the right the round ("Round 2 · since your last review") and what moved in `fg2` ("2 new
-  commits since this draft's head", "Read 3 min ago"; in yellow "The PR moved: 2 new commits"
-  while a pending review holds the draft, and "Couldn't refresh · details" when the mirror is
-  stale), and the buttons **Refresh**
-  (`Ctrl R`, spinning while it runs), **Start round 3** (accent, only when the latest review is
-  submitted and the PR has newer commits) and **Open on GitHub** (an icon button).
+  the PR's title in `fg2` when the session's PR list has it (it truncates), and at the right
+  the clone's name in `fg3` as the switcher names it, only when there are several rows. No
+  clone known: one row, a `folder` glyph, "acme/frontend isn't open in dv yet" and **Choose
+  its folder** in accent; `Enter` opens the folder picker, and a folder that isn't that
+  repository leaves the palette open with why in `red` under the row, a triangle and the
+  line at 12, wrapping ("`~/code/web` is acme/web, not acme/frontend"), until something else
+  is typed. `Enter` on a clone's row closes the palette and opens the PR, the window moving
+  to that repository; an open that fails shows where a review's does.
+- **PR strip** (§2: under the title bar, `chrome` with a `line` hairline under it, 34 high, PR
+  reviews only; the scrim covers it with everything else below the title bar): `#482` mono
+  `fg3`, the title `fg1` 13 semibold (truncated), the author in `fg2` at 12 (cut at 140),
+  `base ← head` in mono 12 (`owner:head` for a fork; cut at 280), the PR's state chip (Open
+  green, "Draft PR" grey with an edge, Merged accent, Closed red: GitHub's own colours for
+  them, in dv's tokens; "Draft PR" and not "Draft", which is the review's own status in the
+  status bar below), the checks as small counts, the ones that aren't zero (`✓ 12` green, `✗ 1`
+  red, `○ 2` yellow; a click opens the PR's checks page, their tooltip "Checks: 12 passing, 1
+  failing, 2 pending · open on GitHub"), then on the right, at 12, the round ("Round 2" in
+  `fg3`), how far the PR moved (below), when the mirror was read in `fg3` ("Read 3m ago",
+  "Read just now"; "Reading from GitHub…" while this window's first read of it runs, over
+  nothing or over what was read of it before the review opened; "Not read from GitHub yet"
+  when there is nothing and nothing is being read), and the buttons **Refresh** (a small
+  button with its `Ctrl R` keycap; "Refreshing…", dimmed and inert, from when a refresh is
+  asked for until it is done) and **Open on GitHub** (a small icon button, the external-link
+  glyph; none before the pull request was read).
+  - *How far it moved*, in `yellow` while GitHub's head as last read is another commit than
+    the one the review shows ("this draft's head"; "this review's head" on a review that
+    doesn't follow the pull request), in `fg2` once a refresh moved the review:
+
+    | The pull request's head, against the review's | not followed | followed by a refresh |
+    |---|---|---|
+    | holds it and n commits more | "2 new commits since this draft's head" ("1 new commit …") | "Updated to 2 new commits" ("Updated to 1 new commit") |
+    | each holds commits the other doesn't | "Force-pushed since this draft's head" | "Updated to a force-pushed head" |
+    | is held by it (an earlier commit) | "GitHub has an earlier commit than this draft's head" | "Updated to an earlier commit" |
+    | can't be counted (a commit the clone doesn't hold) | "The pull request moved since this draft's head" | "Updated to a new head" |
+  - *When the window is narrow* the strip is one row whose parts give way in a fixed order,
+    each only once the ones before it have nothing left to give: how far it moved first,
+    then the author and the branches, then the title (which the title bar names too). Each
+    of the first three gives way down to 36, which keeps an ellipsis under the pointer with
+    its whole text as its tooltip, never to nothing; the title takes what is left. The
+    number, the state chip, the checks, the round, when it was read and the two buttons are
+    never squeezed or pushed out, by layout: they take no part in the shrinking. "Couldn't
+    refresh · details" is the line that says what shows is stale, so it is never the one
+    cut.
+  - *A refresh that read the pull request and then couldn't move the draft to its head*
+    reads "Couldn't move the review · details" in `yellow`, and its banner "couldn't move
+    the review to the head of #482: …": what shows of GitHub is what it holds now, so
+    "Couldn't refresh" would be untrue.
+  - *One failure, one banner.* While the open's own banner about the review is up
+    ("couldn't read #482 from GitHub: …", §4.4), the strip's words show as open and a click
+    on them hides that banner: no second one stacks under it. It goes by itself once the
+    pull request is read.
+  - *A refresh that failed* (the mirror is stale, PLAN §9.4) reads "Couldn't refresh ·
+    details" in `yellow` in place of when the mirror was read: the failure's one line is its
+    tooltip, and a click shows the failure whole as a banner at the top of the main area
+    (§4.4: "couldn't refresh #482: gh isn't signed in to github.com: run `gh auth login`",
+    Retry, Dismiss, Details with what `gh` ran and printed, Copy diagnostics), the words on
+    `control_hover` while it shows; a click again, or Dismiss, hides it, and a refresh that
+    works takes it away (left open, it shows again for the next refresh of that review that
+    fails).
+  - *With the write side* (PLAN §9.12): "Round 2 · since your last review", in yellow "The PR
+    moved: 2 new commits" while a pending review holds the draft, and **Start round 3**
+    (accent, only when the latest review is submitted and the PR has newer commits). None of
+    them is drawn before then.
 - **GitHub's threads** use the thread card (§4.1) with: GitHub's mark as the avatar (round, `fg2`
   on `layerStrong`), the login as the name, an "on GitHub" tag, the time, and no state chip but
   **Resolved** (green), and in yellow, for one without a line in the diff shown, why it has
@@ -960,6 +1041,31 @@ Setup unchanged.
     them, as Markdown does (fenced and indented code keeps its lines either way). Raw HTML
     in a body shows as the text it is, an address inside it is no link, and an image is
     the words `[image: alt]`: no body makes dv fetch anything (PLAN §11, the sanitiser).
+  - *A link says where it goes.* In any comment's body (and the hover card's
+    documentation), every link to the web is followed by the host it opens in brackets, as
+    plain text in the body's own colour: "the docs (docs.rs)", "https://github.com/login
+    (evil.example)", and a link written as its own address too, "https://docs.rs/x
+    (docs.rs)". The host is lowercase, without a login or a port, and a character that
+    isn't a letter, a digit, `.` or `-` is spelled out (`pay{U+005F}pal.com`). It stands
+    directly after the link's text, on the line the link starts on (a line break inside a
+    link's text draws as a space). An address written as a link's text is plain text
+    there: the link opens its own address, the one its host names. A link that opens
+    nothing (a `mailto:`, a path, an address whose host part two programs would read two
+    ways, `https://github.com\@evil.example/`, `https://[github.com]/`) shows as it is,
+    without a host, and opens nothing. The host is an aid, drawn inside text a stranger
+    wrote: text the commenter put at the end of the link's own text stands before it, so
+    the last bracket after a link is the one to read (PLAN §11, known limits).
+  - *Text written right to left holds no link.* A body that holds both a link to the web
+    and anything that runs right to left (Hebrew or Arabic letters, their numbers, a
+    right-to-left mark) is drawn as plain text, with no Markdown: the link shows as it was
+    typed, "[text](https://…)", its address there to read and nothing to click. Such text
+    would let a line draw in another order than it is written and put another host beside
+    a link. Without a link to the web, a body written right to left is drawn as Markdown
+    like any other.
+  - *Nothing in a body reorders or hides its text.* The explicit bidirectional controls
+    (embeddings, overrides, isolates) and the tag characters show spelled out, `\u{202e}`,
+    in prose and in code (PLAN §10.3); text written right to left without them reads as it
+    is written, as Markdown or, beside a link to the web, as plain text (above).
 - **Not in the diff** (§4.1) lists GitHub's threads without a place in the diff: those
   GitHub calls outdated, made on another commit than the review shows (chip "Outdated on
   GitHub"; the section's bar says "outdated on GitHub"), and those dv can't place (chip
@@ -993,10 +1099,21 @@ Setup unchanged.
   unresolved ones that have a place in that file's diff, as it counts the review's own (a
   thread in "Not in the diff" is in no file's badge); the status bar and the "On GitHub"
   group count all of GitHub's unresolved ones, apart ("2 open · 5 on GitHub").
-- **Switcher:** a repository's PR reviews in a "Pull requests" section, `#482 Title` with the
-  status chip (`draft` accent, `submitted` green); the title bar names a PR review the same way.
-- **After submitting:** the banner "Submitted to GitHub · View on GitHub" (§4.4) and, when the
-  PR has newer commits, **Start round n+1** beside it.
+- **Switcher:** a repository's PR reviews, drafts and submitted ones, after its other rows
+  under a "Pull requests" label (12/600 in `fg3`, 26 high, at the rows' glyphs): the
+  pull-request glyph, `#482 Title` (one line whatever the title holds, truncated; `#482`
+  before the PR was read here), the status chip (`draft` accent, `submitted` green), "round
+  2" in `fg3` (its PR round) and, for a draft, the open-comment badge and the row's menu
+  (**Close review**). The filter matches the number and the title. The title bar names a PR
+  review the same way.
+- **"round"** is written one way: lowercase wherever it follows something in its row or
+  sentence (the switcher's and the palette's "round 2" after the status chip, the status
+  bar's "Draft · round 2", "since round 1"), capital only where it is the first word of its
+  text (the strip's "Round 2", which opens the strip's right-hand side). The number is the
+  same everywhere (PLAN §9.9, "The round a review shows").
+- **After submitting** *(the write side, PLAN §9.12: not built)*: the banner "Submitted to
+  GitHub · View on GitHub" (§4.4) and, when the PR has newer commits, **Start round n+1**
+  beside it.
 
 ---
 
@@ -1025,8 +1142,8 @@ Setup unchanged.
 | `Ctrl O` | switch repo / review (the switcher; again, or `Esc`, closes it) |
 | `Ctrl Shift Backspace` | in the switcher: remove the selected row's repo from the list (not the open review's, §4.1) |
 | `Ctrl Shift W` | in the switcher: ask to close the selected row's review; `Enter` then closes it for good, `Esc` keeps it (§4.1) |
-| `Ctrl G` | the PR picker (§4.5) |
-| `Ctrl R` | on a PR review: refresh it from GitHub (fetch, threads, checks, Viewed; PLAN §9.4) |
+| `Ctrl G` | the PR picker (§4.5; again, or `Esc`, closes it) |
+| `Ctrl R` | on a PR review: refresh it from GitHub (the fetch, the threads, the checks, and Viewed once dv syncs it; PLAN §9.4), from a text field too; nothing on a local review |
 | `Ctrl B` | toggle panel |
 | `Ctrl ,` | Settings: Appearance and Setup (§4.3); again, or `Esc`, closes it |
 | `Enter` | on the first-run screen: Continue |
@@ -1040,11 +1157,11 @@ Setup unchanged.
 | `Shift F12` | find the references of the symbol at the caret: the panel's References tab |
 | `Ctrl F` | the find bar, its field focused (the selected text in it when that is one line); again, the field focused with its text selected (§4.1 "Find") |
 | `Enter` / `Shift Enter`, `Esc` | in the find bar: the next / previous match, wrapping; close it (the keyboard back to the stream) |
-| `↑` / `↓`, `Enter` | in the switcher, the source picker, the file finder and the palette: move (wrapping), open |
+| `↑` / `↓`, `Enter` | in the switcher, the source picker, the file finder, the palette and the PR picker: move (wrapping), open |
 | `Enter` / `Esc` | in the file filter: show the first file left / clear the filter (both return to the diff) |
 | `Ctrl Enter` / `Esc` | in the composer: post / discard (both return to the diff; `Enter` is a newline) |
 | `↑` / `↓`, `1` / `2`, `Tab` | in the "Finish round" sheet: choose the verdict (Approve, Request changes) / move between the verdicts and the summary; `Ctrl Enter` finishes the round, `Esc` closes |
-| `1` / `2` / `3`, `Tab`, `Space`, `F`, `L`, `U` | in the PR "Finish review" sheet: the verdict (Comment, Approve, Request changes) / move between the summary, the verdicts and the comments / in the comments: include, post as file comment, keep local, undo (§4.2); `Ctrl Enter` submits, `Esc` closes |
+| `1` / `2` / `3`, `Tab`, `Space`, `F`, `L`, `U` | *(the write side, PLAN §9.12: not built; on a PR review `Ctrl Enter` says submitting arrives in a later version)* in the PR "Finish review" sheet: the verdict (Comment, Approve, Request changes) / move between the summary, the verdicts and the comments / in the comments: include, post as file comment, keep local, undo (§4.2); `Ctrl Enter` submits, `Esc` closes |
 
 macOS uses `Cmd` for every `Ctrl` above (`⌘`+click for `Ctrl`+click; gpui's `secondary`
 modifier, which every row of `dv_ui::keymap` names). Single-letter keys are inactive while a text

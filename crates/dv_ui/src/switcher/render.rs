@@ -164,6 +164,7 @@ impl Switcher {
                     .items
                     .get(ix)
                     .map(|item| self.render_item(ix, item, theme, cx)),
+                Entry::Section(title) => Some(section_label(title, theme)),
             })
             .collect();
         list.children(lines).into_any_element()
@@ -186,6 +187,7 @@ impl Switcher {
                 TargetKind::Branch => DvIcon::GitBranch,
             },
             ItemKind::Review { .. } => DvIcon::GitCommit,
+            ItemKind::Pr { .. } => DvIcon::GitPullRequest,
             ItemKind::Start { .. } => DvIcon::Play,
             ItemKind::Retry { .. } => DvIcon::RotateCw,
             ItemKind::OpenFolder => DvIcon::FolderOpen,
@@ -210,8 +212,10 @@ impl Switcher {
                     .child(status_chip(badge.status, theme))
                     .child(
                         div()
+                            .flex_none()
                             .text_spec(&theme.text.secondary)
                             .text_color(c.fg3)
+                            // A PR review's is its pull request's (`ReviewBadge`).
                             .child(format!("round {}", badge.round)),
                     )
                     .when(badge.open_threads > 0, |this| {
@@ -248,7 +252,7 @@ impl Switcher {
         };
         // A row beside an open review has a menu (module docs): a right-click, or its `⋯`.
         let group = SharedString::from(format!("switcher-item-{}", item.key));
-        let more = item.review().is_some().then(|| {
+        let more = item.open_review().is_some().then(|| {
             let key = item.key.clone();
             more_button(
                 ElementId::Name(format!("switcher-item-more-{}", item.key).into()),
@@ -272,7 +276,7 @@ impl Switcher {
         div()
             .id(ElementId::NamedInteger("switcher-item".into(), ix as u64))
             .group(group)
-            .when(item.review().is_some(), |this| {
+            .when(item.open_review().is_some(), |this| {
                 let key = item.key.clone();
                 this.on_mouse_down(
                     MouseButton::Right,
@@ -673,5 +677,22 @@ fn problem(text: &str, hue: gpui::Hsla, theme: &DvTheme) -> AnyElement {
                 .text_color(theme.colors.fg2)
                 .child(SharedString::from(text.to_string())),
         )
+        .into_any_element()
+}
+
+/// A section's label inside a repository's rows ("Pull requests", DESIGN §4.5): 12/600 in
+/// `fg3`, 26 high, where the rows' glyphs start.
+fn section_label(title: &'static str, theme: &DvTheme) -> AnyElement {
+    div()
+        .flex_none()
+        .flex()
+        .items_end()
+        .h(px(26.))
+        .pb(px(4.))
+        .pl(px(30.))
+        .text_spec(&theme.text.secondary)
+        .font_weight(FontWeight::SEMIBOLD)
+        .text_color(theme.colors.fg3)
+        .child(title)
         .into_any_element()
 }

@@ -28,6 +28,7 @@ pub const GHOST: &str = "ghost";
 #[serde(rename_all = "camelCase")]
 struct View {
     id: String,
+    number: u64,
     title: String,
     body: Option<String>,
     url: String,
@@ -54,8 +55,9 @@ struct View {
     deletions: u32,
 }
 
+/// An account as gh's own commands write one (`author`, `headRepositoryOwner`).
 #[derive(Deserialize)]
-struct Login {
+pub(super) struct Login {
     login: Option<String>,
     #[serde(default)]
     is_bot: bool,
@@ -64,7 +66,7 @@ struct Login {
 impl Login {
     /// The login, when the account still has one: a bot's without gh's `app/` before it,
     /// and none for the empty login (or the bare `app/`) a deleted account leaves.
-    fn name(login: Option<Login>) -> Option<String> {
+    pub(super) fn name(login: Option<Login>) -> Option<String> {
         let Login { login, is_bot } = login?;
         let login = login?;
         let name = match login.strip_prefix("app/") {
@@ -117,6 +119,13 @@ pub(super) fn view(gh: &Gh, repo: &GithubRepo, number: u64) -> Result<Viewed, Gi
     let text = answer.to_string();
     let wrong = |detail: &str| unexpected("pr view", detail, &text);
     let view: View = serde_json::from_value(answer).map_err(|error| wrong(&error.to_string()))?;
+    // Everything dv keeps of this answer it keeps under the number it asked for.
+    if view.number != number {
+        return Err(wrong(&format!(
+            "pull request {}, asked for {number}",
+            view.number
+        )));
+    }
     let state = match (view.state.as_str(), view.is_draft) {
         ("MERGED", _) => PrState::Merged,
         ("CLOSED", _) => PrState::Closed,
@@ -129,7 +138,8 @@ pub(super) fn view(gh: &Gh, repo: &GithubRepo, number: u64) -> Result<Viewed, Gi
         Some("APPROVED") => Some(ReviewDecision::Approved),
         Some("CHANGES_REQUESTED") => Some(ReviewDecision::ChangesRequested),
         Some("REVIEW_REQUIRED") => Some(ReviewDecision::ReviewRequired),
-        Some(other) => return Err(wrong(&format!("an unknown reviewDecision, {other:?}"))),
+        // Nothing dv shows rests on it: one it doesn't know is kept as GitHub sent it.
+        Some(other) => Some(ReviewDecision::Other(other.to_string())),
     };
     let updated_at = parse_timestamp(&view.updated_at)
         .ok_or_else(|| wrong(&format!("updatedAt isn't a time: {:?}", view.updated_at)))?;

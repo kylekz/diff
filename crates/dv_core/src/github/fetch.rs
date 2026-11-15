@@ -98,6 +98,10 @@ pub(super) fn fetch(
     let base_branch = &viewed.pr.base_ref;
     let fetch = |refspecs: &[String]| {
         let mut args = vec![
+            // Whatever the user's configuration says, the fetch writes no commit-graph:
+            // only the refs and their objects (PLAN §2.4).
+            "-c",
+            "fetch.writeCommitGraph=false",
             "fetch",
             "--no-tags",
             "--no-write-fetch-head",

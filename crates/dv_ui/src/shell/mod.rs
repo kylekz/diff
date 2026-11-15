@@ -26,6 +26,10 @@
 //! field land here (`actions::field`, ahead of the field's own) and go through the clipboard
 //! seam ([`crate::system::write_clipboard`]), so an automation run never touches the clipboard.
 //!
+//! **Pull requests** ([`pr`], [`pr_strip`]; PLAN §9.9). While a PR review is open, the PR
+//! strip sits between the title bar and the columns; the title bar's **PRs** (`Ctrl G`) opens
+//! the PR picker, a menu like the switcher, and `Ctrl R` refreshes the review.
+//!
 //! **Overlays.** The switcher (`Ctrl O`) and the source picker are menus that hang under their
 //! title-bar buttons over the scrim (DESIGN §3); the "Finish round" sheet (`Ctrl Enter`, DESIGN
 //! §4.2) is centred over it. One menu is open at a time. The sheet holds the reviewer's unsaved
@@ -64,6 +68,8 @@ mod frame;
 pub mod intel;
 mod palette;
 pub mod pending;
+pub mod pr;
+pub mod pr_strip;
 mod render;
 mod setup;
 mod status_bar;
@@ -221,6 +227,18 @@ pub struct MainBanner {
     pub expanded: bool,
     /// It reports the pending pick ([`pending`]), which its Dismiss drops too.
     pub pick: bool,
+    /// The PR review it is over, shown as last read because GitHub couldn't be read (PLAN
+    /// §9.3): the banner goes once that failed read is no longer how the review's pull
+    /// request stands (`shell::pr`).
+    pub unread: Option<Unread>,
+}
+
+/// What an open's banner over a PR review shown as last read is about.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Unread {
+    pub review: ReviewId,
+    /// The session's failed read the banner says, as the session holds it.
+    pub stale: Failure,
 }
 
 /// What [`Shell::open_repo`] shows when the location doesn't open.
@@ -278,6 +296,13 @@ pub struct Shell {
     /// The file finder (`Ctrl P`), a menu like the switcher.
     file_finder: Option<Overlay<FileFinder>>,
     palette: Option<Overlay<Palette>>,
+    /// The PR picker (`Ctrl G`, `pr`), a menu like the switcher.
+    pr_picker: Option<Overlay<crate::pr_picker::PrPicker>>,
+    /// Whether the PR strip's failed refresh shows whole, and its detail (`pr_strip`).
+    pr_error_open: bool,
+    pr_banner_expanded: bool,
+    /// A pull request's folder is being chosen or checked (`pr`): one at a time.
+    choosing_pr_folder: bool,
     switcher: Option<Overlay<Switcher>>,
     source_picker: Option<Overlay<SourcePicker>>,
     /// The "Finish round" sheet (DESIGN §4.2).
@@ -420,6 +445,10 @@ impl Shell {
             _intel_subscriptions: Vec::new(),
             file_finder: None,
             palette: None,
+            pr_picker: None,
+            pr_error_open: false,
+            pr_banner_expanded: false,
+            choosing_pr_folder: false,
             switcher: None,
             source_picker: None,
             sheet: None,
@@ -547,6 +576,9 @@ impl Shell {
                 },
             ),
             cx.subscribe(&session, move |this, session, event: &SessionEvent, cx| {
+                if matches!(event, SessionEvent::PrChanged) {
+                    this.pr_changed(&session, cx);
+                }
                 if !matches!(event, SessionEvent::ReviewChanged) {
                     return;
                 }
@@ -562,9 +594,15 @@ impl Shell {
                 }
             }),
         ];
+        // A PR review's strip says how long ago its pull request was read (`pr_strip`).
+        if session.read(cx).review().is_pr_review() {
+            self._session_subscriptions.push(pr_strip::tick(cx));
+        }
         self.session = Some(session.clone());
         self.session_banner_expanded = false;
         self.backend_banner_expanded = false;
+        self.pr_error_open = false;
+        self.pr_banner_expanded = false;
         self.reset_ready_note(handoff(session.read(cx).review()));
         // A sheet over the review that was open goes with it.
         self.sheet = None;
@@ -733,28 +771,73 @@ impl Shell {
     ) -> Task<Result<Opened, Failure>> {
         self.open_generation += 1;
         let generation = self.open_generation;
+        // The pull request that is open already (pasted again, a Retry) is refreshed by its
+        // session, in its turn among what the session asks GitHub (PLAN §9.6): an open of
+        // its own would read the pull request beside a Resolve that is running.
+        let shown = match &request {
+            OpenRequest::Pr(reference) => {
+                // The repository `location` is in, when it opened before: a subfolder or
+                // another spelling names the same one.
+                let root = cx
+                    .services()
+                    .locations
+                    .read(cx)
+                    .cached(&location)
+                    .map_or_else(
+                        || location.clone(),
+                        |backend| backend.repo().location.clone(),
+                    );
+                self.session
+                    .clone()
+                    .filter(|session| session.read(cx).is_open_pr(&root, reference))
+                    .map(|session| (session, root))
+            }
+            _ => None,
+        };
         self.opening = Some(Opening {
-            location: location.clone(),
+            // The open review's own repository when it is the one refreshed, so the stream
+            // stays as it is meanwhile (`render`'s `reopening`), whichever folder was named.
+            location: shown
+                .as_ref()
+                .map_or_else(|| location.clone(), |(_, root)| root.clone()),
             request: request.clone(),
             generation,
             runs,
         });
         self.banner = None;
-        let reviews = cx.services().reviews.clone();
-        let opening = reviews.update(cx, |reviews, cx| {
-            reviews.open(location.clone(), request.clone(), cx)
-        });
         let (sender, receiver) = oneshot::channel();
-        cx.spawn_in(window, async move |this, cx| {
-            let opened = opening.await;
-            let result = this
-                .update_in(cx, |this, window, cx| {
-                    this.finish_open(generation, location, request, opened, window, cx)
-                })
-                .unwrap_or_else(|_| Err(Failure::new("dv is closing")));
-            let _ = sender.send(result);
-        })
-        .detach();
+        if let Some((session, _)) = shown {
+            let refreshed = session.update(cx, |session, cx| {
+                session.reload_fold(cx);
+                session.refresh_pr_then(cx)
+            });
+            cx.spawn_in(window, async move |this, cx| {
+                // A session that went away meanwhile has nothing left to wait for.
+                let _ = refreshed.await;
+                let result = this
+                    .update_in(cx, |this, window, cx| {
+                        this.finish_refresh(generation, location, request, &session, window, cx)
+                    })
+                    .unwrap_or_else(|_| Err(Failure::new("dv is closing")));
+                let _ = sender.send(result);
+            })
+            .detach();
+        } else {
+            let reviews = cx.services().reviews.clone();
+            let opening = reviews.update(cx, |reviews, cx| {
+                reviews.open(location.clone(), request.clone(), cx)
+            });
+            cx.spawn_in(window, async move |this, cx| {
+                let opened = opening.await;
+                let result = this
+                    .update_in(cx, |this, window, cx| {
+                        this.finish_open(generation, location, request, opened, window, cx)
+                    })
+                    .unwrap_or_else(|_| Err(Failure::new("dv is closing")));
+                let _ = sender.send(result);
+            })
+            .detach();
+        }
         cx.notify();
         cx.background_spawn(async move {
             receiver
@@ -790,17 +873,8 @@ impl Shell {
                 };
                 // A pull request whose review opened although GitHub couldn't be read (PLAN
                 // §9.3): the review shows as it was last read, and the banner says why.
-                let unread = match (&request, &opened.pr) {
-                    (OpenRequest::Pr(reference), Some(read)) => {
-                        read.stale.as_ref().map(|stale| Failure {
-                            message: format!(
-                                "couldn't read #{} from GitHub: {}",
-                                reference.number(),
-                                stale.message
-                            ),
-                            ..stale.clone()
-                        })
-                    }
+                let unread = match &request {
+                    OpenRequest::Pr(_) => opened.pr.as_ref().and_then(|read| read.stale.clone()),
                     _ => None,
                 };
                 let same = self
@@ -811,9 +885,11 @@ impl Shell {
                     if let Some(session) = &self.session {
                         session.update(cx, |session, cx| {
                             session.reload_fold(cx);
-                            // A pull request opened again was refreshed by the open.
-                            if let Some(read) = opened.pr {
-                                session.apply_pr_read(read, cx);
+                            // What an open read of the pull request beside the session isn't
+                            // taken: the session reads it again in its own turn, so nothing
+                            // read before a Resolve lands after it (PLAN §9.6).
+                            if opened.pr.is_some() {
+                                session.refresh_pr(cx);
                             }
                         });
                     }
@@ -826,14 +902,8 @@ impl Shell {
                 if self.sheet.is_none() && self.switcher.is_none() && self.source_picker.is_none() {
                     self.main_focus(cx).focus(window, cx);
                 }
-                if let Some(failure) = unread {
-                    self.banner = Some(MainBanner {
-                        location: Some(location.clone()),
-                        retry: failure.retryable.then_some((location, request)),
-                        failure,
-                        expanded: false,
-                        pick: false,
-                    });
+                if let Some(stale) = unread {
+                    self.show_unread(location, request, result.review.clone(), stale);
                 }
                 Ok(result)
             }
@@ -943,6 +1013,7 @@ impl Shell {
                 location: None,
                 expanded: false,
                 pick: false,
+                unread: None,
             });
             cx.notify();
             return;
@@ -1046,6 +1117,7 @@ impl Shell {
             self.source_picker.take().map(|menu| menu.return_focus),
             self.file_finder.take().map(|menu| menu.return_focus),
             self.palette.take().map(|menu| menu.return_focus),
+            self.pr_picker.take().map(|menu| menu.return_focus),
             self.settings.take().map(|menu| menu.return_focus),
         ]
         .into_iter()
@@ -1123,6 +1195,7 @@ impl Shell {
                             location: None,
                             expanded: false,
                             pick: false,
+                            unread: None,
                         });
                     }
                 }
@@ -1166,6 +1239,7 @@ impl Shell {
                                 location: None,
                                 expanded: false,
                                 pick: false,
+                                unread: None,
                             });
                         }
                         Err(failure) => log::info!("nothing to open: {}", failure.message),

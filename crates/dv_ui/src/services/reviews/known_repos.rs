@@ -1,5 +1,8 @@
 //! The repositories dv knows (PLAN §11 `Reviews`): `<data dir>/known_repos.json`,
-//! `{"v": 1, "repos": [{"location", "added_at", "opened_at"}]}`, times in ms since the Unix epoch.
+//! `{"v": 1, "repos": [{"location", "added_at", "opened_at", "github"}]}`, times in ms since
+//! the Unix epoch; `github` is the repository on GitHub its clone is, `{"host", "owner",
+//! "repo"}` as last read (PLAN §9.1), absent when it has none or was never read. The palette
+//! matches a pasted pull request against it without opening the repository (PLAN §9.9).
 //!
 //! Deliberately not the first implementation's `repos.json`, which sits in the same default
 //! data dir with another shape. Read leniently ([`super::super::persist`]): unknown keys, at the
@@ -9,7 +12,8 @@
 //! takes distro names so).
 
 use dv_core::Location;
-use serde::{Deserialize, Serialize};
+use dv_core::github::RepoUrl;
+use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::{Map, Value};
 
 /// The file in the data dir.
@@ -28,6 +32,13 @@ pub struct KnownRepo {
     /// When a review of it was last opened.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub opened_at: Option<u64>,
+    /// Its repository on GitHub, as last read beside its listing.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "lenient_github"
+    )]
+    pub github: Option<KnownGithub>,
     /// Keys this version doesn't know.
     #[serde(flatten)]
     pub extra: Map<String, Value>,
@@ -39,6 +50,7 @@ impl KnownRepo {
             location,
             added_at: now,
             opened_at: None,
+            github: None,
             extra: Map::new(),
         }
     }
@@ -49,10 +61,40 @@ impl KnownRepo {
     }
 }
 
+/// A known repository's `github`: the repository's name, and the keys this version doesn't
+/// know, kept and written back as an entry's are.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct KnownGithub {
+    #[serde(flatten)]
+    pub repo: RepoUrl,
+    #[serde(flatten)]
+    extra: Map<String, Value>,
+}
+
+impl std::ops::Deref for KnownGithub {
+    type Target = RepoUrl;
+
+    fn deref(&self) -> &RepoUrl {
+        &self.repo
+    }
+}
+
+/// An entry's `github`, read leniently: anything that isn't a host, an owner and a
+/// repository's name as GitHub has them (another shape, a name no repository has, a file
+/// edited by hand) reads as none, and the next listing writes what the clone says.
+fn lenient_github<'de, D: Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<KnownGithub>, D::Error> {
+    let value = Value::deserialize(deserializer)?;
+    Ok(serde_json::from_value::<KnownGithub>(value)
+        .ok()
+        .filter(|github| github.is_well_formed()))
+}
+
 /// An entry of the file, as read.
 #[derive(Clone, Debug, PartialEq)]
 enum Entry {
-    Known(KnownRepo),
+    Known(Box<KnownRepo>),
     /// An entry this version can't read, written back as it was.
     Kept(Value),
 }
@@ -90,7 +132,7 @@ impl KnownReposFile {
         for (index, value) in entries.into_iter().enumerate() {
             match serde_json::from_value::<KnownRepo>(value.clone()) {
                 Ok(repo) if file.find_place(&repo.location).is_none() => {
-                    file.entries.push(Entry::Known(repo))
+                    file.entries.push(Entry::Known(Box::new(repo)))
                 }
                 Ok(repo) => problems.push(format!(
                     "repos[{index}] repeats {}; reading it once",
@@ -109,7 +151,7 @@ impl KnownReposFile {
     /// The repos this version can read, in file order.
     pub fn repos(&self) -> impl Iterator<Item = &KnownRepo> {
         self.entries.iter().filter_map(|entry| match entry {
-            Entry::Known(repo) => Some(repo),
+            Entry::Known(repo) => Some(repo.as_ref()),
             Entry::Kept(_) => None,
         })
     }
@@ -126,7 +168,7 @@ impl KnownReposFile {
 
     fn get_mut(&mut self, location: &Location) -> Option<&mut KnownRepo> {
         self.entries.iter_mut().find_map(|entry| match entry {
-            Entry::Known(repo) if &repo.location == location => Some(repo),
+            Entry::Known(repo) if &repo.location == location => Some(repo.as_mut()),
             _ => None,
         })
     }
@@ -138,7 +180,7 @@ impl KnownReposFile {
             return false;
         }
         self.entries
-            .push(Entry::Known(KnownRepo::new(location, now)));
+            .push(Entry::Known(Box::new(KnownRepo::new(location, now))));
         true
     }
 
@@ -151,6 +193,31 @@ impl KnownReposFile {
             }
             None => false,
         }
+    }
+
+    /// Remembers `github` as the repository on GitHub `location`'s clone is (`None`: it has
+    /// none); `true` when that changed what is remembered, a name's spelling included.
+    pub fn set_github(&mut self, location: &Location, github: Option<RepoUrl>) -> bool {
+        let Some(repo) = self.get_mut(location) else {
+            return false;
+        };
+        let same = match (&repo.github, &github) {
+            (Some(known), Some(read)) => {
+                known.host == read.host && known.owner == read.owner && known.repo.repo == read.repo
+            }
+            (None, None) => true,
+            _ => false,
+        };
+        if !same {
+            // The keys this version doesn't know stay with the entry's `github`.
+            let extra = repo
+                .github
+                .take()
+                .map(|known| known.extra)
+                .unwrap_or_default();
+            repo.github = github.map(|repo| KnownGithub { repo, extra });
+        }
+        !same
     }
 
     /// Knows `old` as `new` from now on (the worktree root it resolved to, or WSL's spelling of

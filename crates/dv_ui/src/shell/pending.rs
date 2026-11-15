@@ -97,6 +97,7 @@ impl Shell {
             location: Some(location.clone()),
             expanded: false,
             pick,
+            unread: None,
         };
         let Some((connection, key)) = waits else {
             self.banner = Some(banner(false));

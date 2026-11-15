@@ -4,7 +4,8 @@
 //! A repository that opens offers its targets — uncommitted changes, staged changes and, when a
 //! branch other than the default one is checked out, that branch against the default — each
 //! beside its open review when it has one (picking it resumes that review, PLAN §2.4), then its
-//! other open reviews. A repository that can't be opened lists none and says why; one whose
+//! other open reviews, and under a "Pull requests" label its PR reviews, drafts and
+//! submitted ones, each by its pull request's number and title (PLAN §9.9). A repository that can't be opened lists none and says why; one whose
 //! distro isn't running offers one row, **Start Ubuntu**, and one whose connection failed one
 //! row, **Retry**, each of which connects and then lists the repository as usual (PLAN §5.2);
 //! while it does, the row stays, inert ([`Item::is_starting`]), so the selection stays on it
@@ -14,7 +15,7 @@
 //! The filter keeps the rows whose repository name, path and label hold every word typed,
 //! ignoring case; a repository whose header matches but offers nothing still shows its header.
 
-use dv_core::review::{ReviewId, ReviewStatus, ReviewSummary};
+use dv_core::review::{ReviewId, ReviewStatus, ReviewSummary, displayed_round};
 use dv_core::{Location, Target};
 
 use crate::components::status_label;
@@ -112,6 +113,10 @@ pub enum ItemKind {
     Target(TargetOffer),
     /// Resume an open review of another target.
     Review { label: String, badge: ReviewBadge },
+    /// Open a PR review, a draft or a submitted one (PLAN §9.9): `label` is `#482 Title`
+    /// (`#482` before the pull request was read here), as drawn whatever the title holds;
+    /// its badge's round is the pull request's (`dv_core::review::displayed_round`).
+    Pr { label: String, badge: ReviewBadge },
     /// Start the WSL distro the repository is in, which isn't running; `starting` while that
     /// start runs.
     Start { label: String, starting: bool },
@@ -142,7 +147,7 @@ pub enum ItemKind {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Item {
     /// A stable name for the row: `<repo>/working`, `<repo>/staged`, `<repo>/branch`,
-    /// `<repo>/review/<id>`, `<repo>/start`, `<repo>/retry`, `<repo>/compare` or
+    /// `<repo>/review/<id>`, `<repo>/pr/<id>`, `<repo>/start`, `<repo>/retry`, `<repo>/compare` or
     /// `open_folder`, where `<repo>` is the repository's name (its full path when two known
     /// repositories share a name); in the branch picker `<repo>/pick/<branch>` and
     /// `<repo>/base/<branch>`.
@@ -157,7 +162,9 @@ impl Item {
     pub fn label(&self) -> &str {
         match &self.kind {
             ItemKind::Target(offer) => &offer.label,
-            ItemKind::Review { label, .. } | ItemKind::Start { label, .. } => label,
+            ItemKind::Review { label, .. }
+            | ItemKind::Pr { label, .. }
+            | ItemKind::Start { label, .. } => label,
             ItemKind::Retry { .. } => "Retry",
             ItemKind::OpenFolder => "Open folder…",
             ItemKind::CompareBranches => "Compare branches…",
@@ -184,11 +191,12 @@ impl Item {
         )
     }
 
-    /// The open review the row stands for or resumes.
+    /// The review the row stands for or resumes: an open one, or a PR review that was
+    /// submitted.
     pub fn review(&self) -> Option<&ReviewBadge> {
         match &self.kind {
             ItemKind::Target(offer) => offer.review.as_ref(),
-            ItemKind::Review { badge, .. } => Some(badge),
+            ItemKind::Review { badge, .. } | ItemKind::Pr { badge, .. } => Some(badge),
             ItemKind::Branch { review, .. } => review.as_ref(),
             ItemKind::Base { offer, .. } => offer.review.as_ref(),
             ItemKind::Start { .. }
@@ -198,12 +206,18 @@ impl Item {
         }
     }
 
-    /// `"target"`, `"review"`, `"start"`, `"retry"`, `"open_folder"`, `"compare"`, `"branch"`
+    /// [`Item::review`] while it is open: what **Close review** closes.
+    pub fn open_review(&self) -> Option<&ReviewBadge> {
+        self.review().filter(|badge| badge.status.is_open())
+    }
+
+    /// `"target"`, `"review"`, `"pr"`, `"start"`, `"retry"`, `"open_folder"`, `"compare"`, `"branch"`
     /// or `"base"`, for automation state.
     pub fn kind_key(&self) -> &'static str {
         match self.kind {
             ItemKind::Target(_) => "target",
             ItemKind::Review { .. } => "review",
+            ItemKind::Pr { .. } => "pr",
             ItemKind::Start { .. } => "start",
             ItemKind::Retry { .. } => "retry",
             ItemKind::OpenFolder => "open_folder",
@@ -254,6 +268,8 @@ pub struct RepoHeader {
 pub enum Entry {
     Repo(usize),
     Item(usize),
+    /// A label over the rows that follow it, inside a repository's.
+    Section(&'static str),
 }
 
 /// What the switcher shows for a filter.
@@ -287,7 +303,9 @@ impl Listing {
         let location = self.repos.get(item.repo?)?.location.clone();
         let request = match &item.kind {
             ItemKind::Target(offer) => OpenRequest::Target(offer.target.clone()),
-            ItemKind::Review { badge, .. } => OpenRequest::Review(badge.id.clone()),
+            ItemKind::Review { badge, .. } | ItemKind::Pr { badge, .. } => {
+                OpenRequest::Review(badge.id.clone())
+            }
             ItemKind::Base { offer, .. } => OpenRequest::Target(offer.target.clone()),
             ItemKind::Start { .. }
             | ItemKind::Retry { .. }
@@ -366,8 +384,21 @@ impl Listing {
     }
 }
 
+/// The label over a repository's PR reviews.
+pub const PULL_REQUESTS: &str = "Pull requests";
+
+/// A pull request as a row and the title bar name it (PLAN §9.9): `#482 Title`, or `#482`
+/// before it was read here. The title is its author's text, so it is drawn as one line of
+/// bounded length whatever it holds (`crate::thread::drawn`).
+pub fn pr_label(number: u64, title: Option<&str>) -> String {
+    match title.map(str::trim).filter(|title| !title.is_empty()) {
+        Some(title) => format!("#{number} {}", crate::thread::drawn(title)),
+        None => format!("#{number}"),
+    }
+}
+
 /// The `key` of every row of `rows`: their names, or their paths where names repeat.
-pub(super) fn repo_keys(rows: &[&RepoRow]) -> Vec<String> {
+pub(crate) fn repo_keys(rows: &[&RepoRow]) -> Vec<String> {
     rows.iter()
         .map(|row| {
             let shared = rows.iter().filter(|other| other.name == row.name).count() > 1;
@@ -482,10 +513,11 @@ pub fn build(rows: &[&RepoRow], query: &str) -> Listing {
             &[]
         };
         for review in reviews {
-            let ReviewRow::Ok { summary, label } = review else {
+            let ReviewRow::Ok { summary, label, pr } = review else {
                 continue;
             };
-            if !summary.status.is_open() || offered.contains(&summary.id) {
+            // A pull request's reviews have their own section, below.
+            if pr.is_some() || !summary.status.is_open() || offered.contains(&summary.id) {
                 continue;
             }
             items.push(Item {
@@ -505,6 +537,35 @@ pub fn build(rows: &[&RepoRow], query: &str) -> Listing {
                 kind: ItemKind::CompareBranches,
             });
         }
+        // Its PR reviews (PLAN §9.9), newest first as the store lists them: the drafts and
+        // the submitted ones; a closed one is listed nowhere.
+        for review in reviews {
+            let ReviewRow::Ok {
+                summary,
+                pr: Some(pr),
+                ..
+            } = review
+            else {
+                continue;
+            };
+            if !matches!(
+                summary.status,
+                ReviewStatus::Draft | ReviewStatus::Submitted
+            ) {
+                continue;
+            }
+            items.push(Item {
+                key: format!("{key}/pr/{}", summary.id),
+                repo: None,
+                kind: ItemKind::Pr {
+                    label: pr_label(pr.number, pr.title.as_deref()),
+                    badge: ReviewBadge {
+                        round: displayed_round(summary.current_round, Some(pr.round)),
+                        ..ReviewBadge::of(summary)
+                    },
+                },
+            });
+        }
         items.retain(|item| {
             let status = item
                 .review()
@@ -519,8 +580,15 @@ pub fn build(rows: &[&RepoRow], query: &str) -> Listing {
         let repo = listing.repos.len();
         listing.repos.push(header(row, key));
         listing.entries.push(Entry::Repo(repo));
+        let mut in_prs = false;
         for mut item in items {
             item.repo = Some(repo);
+            // The label over a repository's first PR review.
+            let pr = matches!(item.kind, ItemKind::Pr { .. });
+            if pr && !in_prs {
+                listing.entries.push(Entry::Section(PULL_REQUESTS));
+            }
+            in_prs = pr;
             listing.entries.push(Entry::Item(listing.items.len()));
             listing.items.push(item);
         }

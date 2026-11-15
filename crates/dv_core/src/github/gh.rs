@@ -33,7 +33,7 @@
 mod pages;
 mod response;
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::ffi::OsString;
 use std::sync::{Mutex, PoisonError};
 use std::time::{Duration, Instant};
@@ -202,8 +202,6 @@ pub struct Gh {
     pace: Mutex<Option<Instant>>,
     /// The hosts gh said it holds a login for.
     logins: Mutex<HashSet<String>>,
-    /// The login gh is signed in as, by host ([`Gh::viewer`]).
-    viewers: Mutex<HashMap<String, String>>,
 }
 
 impl Gh {
@@ -212,29 +210,21 @@ impl Gh {
             options,
             pace: Mutex::new(None),
             logins: Mutex::new(HashSet::new()),
-            viewers: Mutex::new(HashMap::new()),
         }
     }
 
-    /// The login gh is signed in as on `host` (`gh api user`): the viewer, whose Viewed
-    /// state, pending review and permissions a pull request's mirror holds (PLAN §9.4). Asked
-    /// once per host and remembered (PLAN §9.3); a failure is asked again the next time.
+    /// The login gh is signed in as on `host` now (`gh api user`): the viewer, whose Viewed
+    /// state, pending review and permissions a pull request's mirror holds (PLAN §9.4).
+    /// Asked by every operation that names a mirror (an open, a refresh) and kept by none
+    /// beyond it: after `gh auth switch` the next refresh reads, and writes, as the account
+    /// gh has then (PLAN §9.3).
     pub fn viewer(&self, host: &str) -> Result<String, GithubError> {
-        if let Some(login) = self.known_viewer(host) {
-            return Ok(login);
-        }
         let user = self.rest(host, "user")?;
-        let login = user
-            .get("login")
+        user.get("login")
             .and_then(Value::as_str)
             .filter(|login| !login.is_empty())
-            .ok_or_else(|| unexpected("api user", "the answer has no login", &user.to_string()))?
-            .to_string();
-        self.viewers
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .insert(host.to_string(), login.clone());
-        Ok(login)
+            .map(str::to_string)
+            .ok_or_else(|| unexpected("api user", "the answer has no login", &user.to_string()))
     }
 
     /// `gh auth status`: whether gh is signed in, over every host it knows. An error only
@@ -264,15 +254,6 @@ impl Gh {
             stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
             stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
         })
-    }
-
-    /// The viewer on `host` when [`Gh::viewer`] has read it already: asks nothing.
-    pub fn known_viewer(&self, host: &str) -> Option<String> {
-        self.viewers
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .get(host)
-            .cloned()
     }
 
     /// Waits [`GhOptions::settle`]: before a pull request is read again.

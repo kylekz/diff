@@ -14,8 +14,8 @@
 //! 3. **The review**: the pull request's open draft when it has one, whatever head it was
 //!    fetched at (at most one, PLAN §2.4); else its latest submitted review when that was
 //!    submitted at this head (nothing new to review); else a new draft, its target the pull
-//!    request at these commits, its pins at the head and the merge base (PLAN §9.5), and its
-//!    `pr_linked` event. Finding or making it holds the pull request's lock
+//!    request at these commits (which links it to the pull request) and its pins at the
+//!    head and the merge base (PLAN §9.5). Finding or making it holds the pull request's lock
 //!    (`super::lock`), so two openers at once (the app and the CLI) end with the one draft.
 //! 4. **The mirror** is refreshed (`refresh`), which also moves a resumed draft's pins to
 //!    the head. A failure there leaves the review open and its mirror stale.
@@ -25,6 +25,7 @@
 
 use std::sync::Arc;
 
+use super::MirrorStore;
 use super::error::GithubError;
 use super::lock::{LOCK_WAIT, locked};
 use super::pr_ref::PrRef;
@@ -34,9 +35,7 @@ use super::{Gh, forget};
 use crate::backend::Backend;
 use crate::git::{GitRepo, Oid};
 use crate::review::pins;
-use crate::review::{
-    Author, EventBody, ListEntry, PrLink, Review, ReviewStatus, ReviewStore, ReviewSummary,
-};
+use crate::review::{Author, ListEntry, PrLink, Review, ReviewStatus, ReviewStore, ReviewSummary};
 use crate::target::Target;
 
 /// What [`open`] found or made.
@@ -61,6 +60,21 @@ pub fn open(
     let link = reference.in_repo(&repo)?;
     let git = GitRepo::new(backend.clone());
     let store = ReviewStore::new(backend.clone());
+    // Read here from another host (PLAN §9.4): said once `gh` has named the repository,
+    // before the pull request is asked about and before anything is fetched or made. A
+    // review of it that is here opens as it stands.
+    if let Some(error) =
+        refresh::read_on_another_host(&MirrorStore::new(backend.clone()), &repo, &link)
+    {
+        return match existing(&store, &git, &link, None)? {
+            Some(review) => Ok(OpenedPr {
+                refreshed: refresh::unread(backend, &review, &link, error),
+                review,
+                created: false,
+            }),
+            None => Err(error),
+        };
+    }
     let seen = match refresh::see(&git, gh, &repo, link.number) {
         Ok(seen) => seen,
         Err(error) if error.is_disconnected() => return Err(error),
@@ -147,7 +161,11 @@ fn existing(
     })
 }
 
-/// A new draft of `link`'s pull request at the commits `seen` fetched, by `author`.
+/// A new draft of `link`'s pull request at the commits `seen` fetched, by `author`: the
+/// review, whose target names the pull request (which is what makes it a PR review: the
+/// fold links it from its target), then its pins. Nothing is rolled back: pins that can't
+/// be written leave the draft, and the error says so ([`GithubError::DraftLeft`]); the
+/// next open resumes it, and a draft's refresh pins it (PLAN §9.5).
 fn create(
     store: &ReviewStore,
     git: &GitRepo,
@@ -157,22 +175,19 @@ fn create(
 ) -> Result<Review, GithubError> {
     let review = store.create(
         Target::Pr {
-            owner: link.owner.clone(),
-            repo: link.repo.clone(),
+            owner: link.owner,
+            repo: link.repo,
             number: link.number,
             base_oid: seen.fetched.base.clone(),
             head_oid: seen.fetched.head.clone(),
         },
         author,
     )?;
-    pins::advance(git, &review.id, None, &seen.fetched.pins())?;
-    store.append(
-        &review.id,
-        EventBody::PrLinked {
-            owner: link.owner,
-            repo: link.repo,
-            number: link.number,
-        },
-    )?;
+    pins::advance(git, &review.id, None, &seen.fetched.pins()).map_err(|error| {
+        GithubError::DraftLeft {
+            review: review.id.to_string(),
+            source: Box::new(error.into()),
+        }
+    })?;
     Ok(review)
 }

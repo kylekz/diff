@@ -17,7 +17,7 @@ use std::hash::{Hash, Hasher};
 
 use serde::{Deserialize, Serialize};
 
-use super::repo::{GithubRepo, hash_folded};
+use super::repo::{GithubRepo, RepoUrl, hash_folded};
 use super::spelling::spell;
 use crate::git::Oid;
 use crate::review::AnchorSide;
@@ -61,6 +61,29 @@ impl MirrorKey {
             pr_dir(&self.host, &self.owner, &self.repo, self.number),
             spell(&self.login)
         )
+    }
+
+    /// The pull request's page on GitHub, `https://<host>/<owner>/<repo>/pull/<n>`, built
+    /// from the key alone: what the app opens for a pull request is never an address
+    /// GitHub's answer holds (PLAN §9.9). `None` for a key whose host or names can't be a
+    /// GitHub host's and names (a mirror file edited by hand).
+    pub fn pr_url(&self) -> Option<String> {
+        let repo = RepoUrl {
+            host: self.host.clone(),
+            owner: self.owner.clone(),
+            repo: self.repo.clone(),
+        };
+        repo.is_well_formed().then(|| {
+            format!(
+                "https://{}/{}/{}/pull/{}",
+                self.host, self.owner, self.repo, self.number
+            )
+        })
+    }
+
+    /// The pull request's checks page, [`MirrorKey::pr_url`]`/checks`.
+    pub fn checks_url(&self) -> Option<String> {
+        self.pr_url().map(|url| format!("{url}/checks"))
     }
 }
 
@@ -146,9 +169,31 @@ pub struct Mirror {
     pub files: Vec<FilePatch>,
     /// The viewer's Viewed state of each file, by path (PLAN §9.7).
     pub viewed: BTreeMap<String, ViewedFile>,
+    /// The parts the refresh that wrote this mirror couldn't read, each with why in one
+    /// line (PLAN §9.4, "Best effort"): that part is then empty here, which says nothing
+    /// about GitHub. Absent in a mirror that read them all.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub unread: BTreeMap<MirrorPart, String>,
+}
+
+/// A part of the mirror a refresh reads best effort: nothing the read side shows rests on
+/// it, so its failure doesn't cost the mirror (PLAN §9.4).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MirrorPart {
+    /// [`Mirror::pending_review`].
+    PendingReview,
+    /// [`Mirror::viewed`].
+    Viewed,
 }
 
 impl Mirror {
+    /// Why `part` wasn't read, when it wasn't: what it holds then says nothing (no pending
+    /// review isn't "none pending", no Viewed state isn't "unviewed").
+    pub fn unread(&self, part: MirrorPart) -> Option<&str> {
+        self.unread.get(&part).map(String::as_str)
+    }
+
     /// The comments of the viewer's pending review, with their threads: the ones whose review
     /// it is.
     pub fn pending_comments(&self) -> impl Iterator<Item = (&GithubThread, &GithubComment)> {
@@ -212,12 +257,15 @@ pub enum HeadRepo {
 }
 
 /// What the pull request's reviews add up to.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ReviewDecision {
     Approved,
     ChangesRequested,
     ReviewRequired,
+    /// A decision this build doesn't know, as GitHub sent it.
+    #[serde(untagged)]
+    Other(String),
 }
 
 /// The checks on the head commit, summarised. All zero when it has none.
@@ -316,8 +364,9 @@ pub struct ThreadStart {
 pub struct GithubComment {
     /// GitHub's node id.
     pub id: String,
-    /// GitHub's database id (`fullDatabaseId`), which REST and the comment's URL use.
-    pub database_id: u64,
+    /// GitHub's database id (`fullDatabaseId`), which REST and the comment's URL use;
+    /// `None` when GitHub gave none.
+    pub database_id: Option<u64>,
     /// The author's login; `ghost` for a deleted account.
     pub author: String,
     /// Markdown.
@@ -352,14 +401,15 @@ impl GithubComment {
 pub struct CommentReview {
     /// GitHub's node id.
     pub id: String,
-    /// GitHub's database id (`fullDatabaseId`), which a submission is recorded by (PLAN §7).
-    pub database_id: u64,
+    /// GitHub's database id (`fullDatabaseId`), which a submission is recorded by (PLAN
+    /// §7); `None` when GitHub gave none.
+    pub database_id: Option<u64>,
     pub state: ReviewState,
 }
 
 /// A GitHub review's state. Another user's `Pending` review is never visible; the viewer's
 /// own is.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ReviewState {
     Pending,
@@ -367,6 +417,9 @@ pub enum ReviewState {
     Approved,
     ChangesRequested,
     Dismissed,
+    /// A state this build doesn't know, as GitHub sent it.
+    #[serde(untagged)]
+    Other(String),
 }
 
 /// The viewer's pending review on GitHub: dv's own while a submission is under way, or one
@@ -399,7 +452,7 @@ pub struct FilePatch {
 }
 
 /// How a pull request changes a file, as GitHub's REST API names it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum FileStatus {
     Added,
@@ -409,10 +462,13 @@ pub enum FileStatus {
     Copied,
     Changed,
     Unchanged,
+    /// A status this build doesn't know, as GitHub sent it.
+    #[serde(untagged)]
+    Other(String),
 }
 
 /// A file's Viewed state (PLAN §9.7).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ViewedFile {
     /// What GitHub holds for the viewer.
     pub state: ViewedState,
@@ -422,11 +478,14 @@ pub struct ViewedFile {
 }
 
 /// GitHub's `viewerViewedState`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ViewedState {
     Viewed,
     Unviewed,
     /// Viewed, then the file changed.
     Dismissed,
+    /// A state this build doesn't know, as GitHub sent it.
+    #[serde(untagged)]
+    Other(String),
 }

@@ -15,6 +15,11 @@
 //!   `{review_id, created}`; an open that fails is an error and the main area's banner.
 //! - `pr_refresh {}`: starts a refresh of the open PR review (PLAN §9.4), as the reviewer's
 //!   Refresh does; `settle` then waits for it, and `state.session.pr` says how it went.
+//! - `folder_answer {path}`: queues the answer to the next folder picker the app opens
+//!   ("Open folder…", a pull request's "Choose its folder"), which an automation run records
+//!   instead of showing (`dv_ui::system`): the folder at `path`, or with `"path": null` a
+//!   picker cancelled, which is also what one with no answer queued gets. Replies
+//!   `{answers_left}`.
 //! - `review_op {op, thread, body?, note?, author?}`: an agent's change to the open review
 //!   straight through `dv_core::review::ops`, without the CLI's own rules (scenarios that play
 //!   the agent through the real CLI use `cli`, `agent_cli`): `reply` (with `body`), `address`
@@ -140,6 +145,18 @@ pub fn pr_refresh(
         .context("pr_refresh needs an open PR review (open_pr first)")?;
     session.update(cx, |session, cx| session.refresh_pr(cx));
     Ok(json!({"refreshing": session.read(cx).is_refreshing_pr()}))
+}
+
+/// `folder_answer {path}`: [`dv_ui::system::queue_answer`].
+pub fn folder_answer(args: &Value, cx: &mut Context<DvAutomation>) -> Result<Value> {
+    let args = object("folder_answer", args.clone(), &["path"])?;
+    let answer = match args.get("path") {
+        None | Some(Value::Null) => None,
+        Some(Value::String(path)) => Some(std::path::PathBuf::from(path)),
+        Some(other) => bail!("folder_answer needs a string \"path\", or null, not {other}"),
+    };
+    dv_ui::system::queue_answer(answer, cx)?;
+    Ok(json!({"answers_left": dv_ui::system::requests(cx).1}))
 }
 
 /// `review_op {op, thread, body?, note?, author?}`.

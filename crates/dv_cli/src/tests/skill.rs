@@ -178,7 +178,14 @@ fn the_skill_is_named_and_says_when_to_use_it() {
         "gh:PRRT_",
         "github <login>:",
         "(outdated on GitHub, was <lines>)",
-        "`github` is `{url, resolved, outdated, pending, diff_hunk}`",
+        "`github` is `{url, resolved, outdated, standing, pending, diff_hunk}`",
+        "`outdated_on_github`",
+        "`unplaced`",
+        // What `review new --pr` and `review refresh` answer, and how old the mirror is.
+        "answers `stale`",
+        "answers `moved`",
+        "`pr.read_at`",
+        "`pr.github_head_oid`",
         "every command that writes to a `gh:`",
     ] {
         assert!(SKILL_MD.contains(rule), "{rule:?}");

@@ -4,6 +4,7 @@
 //! its file scrolls; the menu holds View file (the file view, PLAN §18.1) and Comment on file
 //! (PLAN §8), then Copy path and Reveal in folder, through the system seam.
 
+use std::ops::Range;
 use std::path::PathBuf;
 
 use dv_core::diff::{FileEntry, FileStatus};
@@ -24,6 +25,7 @@ use crate::icons::DvIcon;
 use crate::keymap;
 use crate::services::ViewMode;
 use crate::theme::{DvTheme, StyledText as _};
+use crate::thread::one_line;
 
 /// The menu's paint order: over the stream, like the title bar's overlays (which never show
 /// with it: the menu only shows while the main area has the keyboard).
@@ -369,7 +371,7 @@ impl DiffPane {
 }
 
 /// The header's path: the directory in `fg3` and the name at 600 (`fg3` once viewed); a
-/// renamed file shows where it came from.
+/// renamed file shows where it came from ([`header_path_text`]).
 fn header_path(entry: &FileEntry, viewed: bool, theme: &DvTheme) -> StyledText {
     let c = &theme.colors;
     let dim = HighlightStyle {
@@ -377,27 +379,42 @@ fn header_path(entry: &FileEntry, viewed: bool, theme: &DvTheme) -> StyledText {
         font_weight: Some(FontWeight::MEDIUM),
         ..Default::default()
     };
-    let mut text = String::new();
-    let mut highlights = Vec::new();
-    if let Some(old) = &entry.old_path {
-        text.push_str(old);
-        text.push_str(" → ");
-        highlights.push((0..text.len(), dim));
-    }
-    let (dir, name) = split_path(&entry.path);
-    let start = text.len();
-    text.push_str(&entry.path);
-    highlights.push((start..start + dir.len(), dim));
-    highlights.push((
-        start + dir.len()..start + dir.len() + name.len(),
-        HighlightStyle {
-            font_weight: Some(FontWeight::SEMIBOLD),
-            color: viewed.then_some(c.fg3),
-            ..Default::default()
-        },
-    ));
+    let (text, from, dir, name) = header_path_text(entry);
+    let mut highlights = vec![
+        (from, dim),
+        (dir, dim),
+        (
+            name,
+            HighlightStyle {
+                font_weight: Some(FontWeight::SEMIBOLD),
+                color: viewed.then_some(c.fg3),
+                ..Default::default()
+            },
+        ),
+    ];
     highlights.retain(|(range, _)| !range.is_empty());
     StyledText::new(text).with_highlights(highlights)
+}
+
+/// The text of the header's path and its parts' byte ranges in it: "old → " for a renamed
+/// file (empty otherwise), the directory, the name. Each path is one line
+/// (`crate::thread::one_line`): git allows a path any character but NUL, and the ranges
+/// are of the text as drawn.
+fn header_path_text(entry: &FileEntry) -> (String, Range<usize>, Range<usize>, Range<usize>) {
+    let mut text = String::new();
+    if let Some(old) = &entry.old_path {
+        text.push_str(&one_line(old));
+        text.push_str(" → ");
+    }
+    let from = 0..text.len();
+    let path = one_line(&entry.path);
+    let (dir, name) = split_path(&path);
+    let (dir, name) = (
+        from.end..from.end + dir.len(),
+        from.end + dir.len()..from.end + dir.len() + name.len(),
+    );
+    text.push_str(&path);
+    (text, from, dir, name)
 }
 
 /// The side labels under the header bar (the board's `main` | `working tree`; in an interdiff
@@ -511,5 +528,40 @@ mod tests {
             root.join("src").join("main.rs")
         );
         assert_eq!(reveal_target(&local, "README.md", true), root);
+    }
+
+    /// A path is drawn as one line whatever it holds, and its parts are told from the text
+    /// as drawn.
+    #[test]
+    fn a_path_that_holds_a_line_break_or_reorders_text_is_one_line() {
+        let entry = FileEntry {
+            path: "src/a\nb\u{202e}.rs".into(),
+            old_path: Some("old\r/x.rs".into()),
+            status: dv_core::diff::FileStatus::Modified,
+            additions: 0,
+            deletions: 0,
+            binary: false,
+            old_mode: None,
+            new_mode: None,
+            old_oid: None,
+            new_oid: None,
+            new_untracked: false,
+        };
+        let (text, from, dir, name) = header_path_text(&entry);
+        assert_eq!(text, "old\\r/x.rs → src/a\\nb\\u{202e}.rs");
+        assert_eq!(
+            (&text[from], &text[dir], &text[name]),
+            ("old\\r/x.rs → ", "src/", "a\\nb\\u{202e}.rs")
+        );
+        let plain = FileEntry {
+            path: "README.md".into(),
+            old_path: None,
+            ..entry
+        };
+        let (text, from, dir, name) = header_path_text(&plain);
+        assert_eq!(
+            (text.as_str(), from, dir, name),
+            ("README.md", 0..0, 0..0, 0..9)
+        );
     }
 }

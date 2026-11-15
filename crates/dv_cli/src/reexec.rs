@@ -36,6 +36,12 @@
 //! - **Who it acts as** crosses too: `CLAUDECODE`, `DV_AUTHOR`, `DV_MODEL` and `DV_REVIEW`, those set, join
 //!   `WSLENV` as `NAME/u` after whatever else it lists, replacing an entry it has for the same
 //!   name in any case or with other flags, so each crosses verbatim ([`environment`]).
+//! - **What it may reach** crosses the same way ([`crossing`]): `GIT_ALLOW_PROTOCOL` whenever
+//!   it is set here, so a run whose git reaches only local paths stays one inside the distro;
+//!   and `DV_GH` when the run is sandboxed (`DV_WSL_HOME`), so a test's or an automation run's
+//!   stand-in for `gh` is the distro's too (verbatim: a Windows path names no program there,
+//!   and a `gh` that isn't there asks GitHub nothing). Outside a sandbox the distro's own
+//!   environment decides which `gh` runs.
 //! - **Missing pieces:** the build not installed there (`RUN`'s 120) is installed
 //!   (`dv_backend::install`, "dv: installing dv in Ubuntu…" on stderr, and a warning when it
 //!   couldn't point `~/.local/bin/dv` at it) and the command runs once more. WSL, the distro or
@@ -63,9 +69,28 @@ use crate::error::{CliError, Exit, code};
 use crate::output;
 use crate::repo;
 
-/// The variables that cross into the distro with a command: who it acts as, on which model,
-/// and which review it means (PLAN §2.5, §10.2).
-pub(crate) const CROSSING: [&str; 4] = ["CLAUDECODE", "DV_AUTHOR", "DV_MODEL", "DV_REVIEW"];
+/// The variables that cross into the distro with every command: who it acts as, on which
+/// model, and which review it means (PLAN §2.5, §10.2).
+pub(crate) const ACTS_AS: [&str; 4] = ["CLAUDECODE", "DV_AUTHOR", "DV_MODEL", "DV_REVIEW"];
+
+/// The transports git may use (git's own variable): `file` in every automated run.
+pub(crate) const GIT_PROTOCOLS_VAR: &str = "GIT_ALLOW_PROTOCOL";
+
+/// The variables that cross into the distro with a command run with `env` (PLAN §10.4):
+/// [`ACTS_AS`] always, as `env` has each (one it lacks is removed from what `wsl.exe` gets);
+/// [`GIT_PROTOCOLS_VAR`] when `env` sets it; and `DV_GH` when `env` sets it and the run is
+/// `sandboxed` (its home is `DV_WSL_HOME`'s). Outside a sandbox `DV_GH` stays on this side:
+/// the distro's own environment says which `gh` its dv runs.
+pub(crate) fn crossing(env: &Env, sandboxed: bool) -> Vec<&'static str> {
+    let mut names = ACTS_AS.to_vec();
+    if env.var(GIT_PROTOCOLS_VAR).is_some() {
+        names.push(GIT_PROTOCOLS_VAR);
+    }
+    if sandboxed && env.non_empty(dv_core::github::GH_VAR).is_some() {
+        names.push(dv_core::github::GH_VAR);
+    }
+    names
+}
 
 /// The distro and path of the repository `command` runs on when it runs inside a WSL distro
 /// (module docs); `None` when it runs here.
@@ -134,7 +159,7 @@ pub(crate) fn run_in(
     let mut line: Vec<OsString> = hashes.into_iter().map(OsString::from).collect();
     line.push(workdir(&ctx.cwd, distro, path).into());
     line.extend(forwarded.args);
-    let env = environment(&ctx.env);
+    let env = environment(&ctx.env, shell.home().is_some());
     let mut installed = false;
     loop {
         let ran = run_once(shell, &line, &env, input.as_deref(), ctx)?;
@@ -249,13 +274,13 @@ pub(crate) fn workdir(cwd: &Path, distro: &str, repo: &str) -> String {
     }
 }
 
-/// The environment `wsl.exe` gets (module docs): each of [`CROSSING`] as `env` has it (set, or
+/// The environment `wsl.exe` gets (module docs): each of [`crossing`]'s as `env` has it (set, or
 /// removed), and `WSLENV` with the entries it has, in order, then those set as `NAME/u`. An
 /// entry it has for one of those set goes, whatever its case and flags (`CLAUDECODE/w` wouldn't
 /// pass the value into the distro, `DV_AUTHOR/p` would translate it as a path, `dv_author`
 /// would export it under a name dv doesn't read), so each crosses verbatim under its own name.
 /// `WSLENV` is removed when it would be empty.
-pub(crate) fn environment(env: &Env) -> Vec<(String, Option<String>)> {
+pub(crate) fn environment(env: &Env, sandboxed: bool) -> Vec<(String, Option<String>)> {
     let mut changes = Vec::new();
     let mut entries: Vec<String> = env
         .var("WSLENV")
@@ -264,8 +289,8 @@ pub(crate) fn environment(env: &Env) -> Vec<(String, Option<String>)> {
         .filter(|entry| !entry.is_empty())
         .map(str::to_string)
         .collect();
-    let mut crossing = Vec::new();
-    for name in CROSSING {
+    let mut set = Vec::new();
+    for name in crossing(env, sandboxed) {
         let value = env.var(name);
         if value.is_some() {
             entries.retain(|entry| {
@@ -274,11 +299,11 @@ pub(crate) fn environment(env: &Env) -> Vec<(String, Option<String>)> {
                     .next()
                     .is_none_or(|listed| !listed.eq_ignore_ascii_case(name))
             });
-            crossing.push(format!("{name}/u"));
+            set.push(format!("{name}/u"));
         }
         changes.push((name.to_string(), value));
     }
-    entries.extend(crossing);
+    entries.extend(set);
     changes.push((
         "WSLENV".to_string(),
         (!entries.is_empty()).then(|| entries.join(":")),

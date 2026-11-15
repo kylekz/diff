@@ -334,7 +334,7 @@ fn change(name: &str, value: Option<&str>) -> (String, Option<String>) {
 #[test]
 fn who_the_command_acts_as_crosses_through_wslenv() {
     assert_eq!(
-        environment(&Env::empty()),
+        environment(&Env::empty(), false),
         [
             change("CLAUDECODE", None),
             change("DV_AUTHOR", None),
@@ -344,7 +344,7 @@ fn who_the_command_acts_as_crosses_through_wslenv() {
         ]
     );
     assert_eq!(
-        environment(&vars(&[("CLAUDECODE", "1"), ("DV_REVIEW", "r-1")])),
+        environment(&vars(&[("CLAUDECODE", "1"), ("DV_REVIEW", "r-1")]), false),
         [
             change("CLAUDECODE", Some("1")),
             change("DV_AUTHOR", None),
@@ -355,10 +355,10 @@ fn who_the_command_acts_as_crosses_through_wslenv() {
     );
     // The model an agent names crosses with its name.
     assert_eq!(
-        environment(&vars(&[
-            ("DV_AUTHOR", "codex"),
-            ("DV_MODEL", "GPT 6.1 Sol")
-        ]))
+        environment(
+            &vars(&[("DV_AUTHOR", "codex"), ("DV_MODEL", "GPT 6.1 Sol")]),
+            false
+        )
         .last(),
         Some(&change("WSLENV", Some("DV_AUTHOR/u:DV_MODEL/u")))
     );
@@ -367,14 +367,17 @@ fn who_the_command_acts_as_crosses_through_wslenv() {
     // that name (`/w` wouldn't pass it in, `/p` would translate it, `dv_author` would be
     // another variable there).
     assert_eq!(
-        environment(&vars(&[
-            (
-                "WSLENV",
-                "USERPROFILE/p:CLAUDECODE/w:FOO/u:BAR:DV_AUTHOR/p:dv_author"
-            ),
-            ("CLAUDECODE", "1"),
-            ("DV_AUTHOR", "codex"),
-        ]))
+        environment(
+            &vars(&[
+                (
+                    "WSLENV",
+                    "USERPROFILE/p:CLAUDECODE/w:FOO/u:BAR:DV_AUTHOR/p:dv_author"
+                ),
+                ("CLAUDECODE", "1"),
+                ("DV_AUTHOR", "codex"),
+            ]),
+            false
+        )
         .last(),
         Some(&change(
             "WSLENV",
@@ -382,17 +385,89 @@ fn who_the_command_acts_as_crosses_through_wslenv() {
         ))
     );
     assert_eq!(
-        environment(&vars(&[
-            ("WSLENV", "claudecode/up:DV_REVIEW"),
-            ("CLAUDECODE", "1")
-        ]))
+        environment(
+            &vars(&[("WSLENV", "claudecode/up:DV_REVIEW"), ("CLAUDECODE", "1")]),
+            false
+        )
         .last(),
         Some(&change("WSLENV", Some("DV_REVIEW:CLAUDECODE/u")))
     );
     // A name that doesn't cross (it isn't set) keeps its entry.
     assert_eq!(
-        environment(&vars(&[("WSLENV", "USERPROFILE/p:DV_AUTHOR/p")])).last(),
+        environment(&vars(&[("WSLENV", "USERPROFILE/p:DV_AUTHOR/p")]), false).last(),
         Some(&change("WSLENV", Some("USERPROFILE/p:DV_AUTHOR/p")))
+    );
+}
+
+/// What a command may reach crosses with it (PLAN §10.4): git's transports whenever they are
+/// set here, the `gh` stand-in only into a sandbox.
+#[test]
+fn what_the_command_may_reach_crosses_by_the_sandbox() {
+    use crate::reexec::crossing;
+    let acts_as = ["CLAUDECODE", "DV_AUTHOR", "DV_MODEL", "DV_REVIEW"];
+    for sandboxed in [false, true] {
+        assert_eq!(crossing(&Env::empty(), sandboxed), acts_as, "{sandboxed}");
+    }
+    let both = vars(&[
+        ("GIT_ALLOW_PROTOCOL", "file"),
+        ("DV_GH", "D:\\t\\mock_gh.exe"),
+    ]);
+    assert_eq!(
+        crossing(&both, false),
+        [
+            "CLAUDECODE",
+            "DV_AUTHOR",
+            "DV_MODEL",
+            "DV_REVIEW",
+            "GIT_ALLOW_PROTOCOL"
+        ]
+    );
+    assert_eq!(
+        crossing(&both, true),
+        [
+            "CLAUDECODE",
+            "DV_AUTHOR",
+            "DV_MODEL",
+            "DV_REVIEW",
+            "GIT_ALLOW_PROTOCOL",
+            "DV_GH"
+        ]
+    );
+    // A blank `DV_GH` names no program, so there is nothing to take across.
+    assert_eq!(crossing(&vars(&[("DV_GH", " ")]), true), acts_as);
+    assert_eq!(
+        crossing(&vars(&[("DV_GH", "/t/gh")]), true).last(),
+        Some(&"DV_GH")
+    );
+
+    // Outside a sandbox `DV_GH` is left as `wsl.exe` inherits it and joins nothing: the
+    // distro's own environment says which `gh` runs. An entry the user's `WSLENV` has for it
+    // stays theirs.
+    assert_eq!(
+        environment(&vars(&[("DV_GH", "/t/gh"), ("WSLENV", "DV_GH/p")]), false),
+        [
+            change("CLAUDECODE", None),
+            change("DV_AUTHOR", None),
+            change("DV_MODEL", None),
+            change("DV_REVIEW", None),
+            change("WSLENV", Some("DV_GH/p")),
+        ]
+    );
+    assert_eq!(
+        environment(&both, true),
+        [
+            change("CLAUDECODE", None),
+            change("DV_AUTHOR", None),
+            change("DV_MODEL", None),
+            change("DV_REVIEW", None),
+            change("GIT_ALLOW_PROTOCOL", Some("file")),
+            change("DV_GH", Some("D:\\t\\mock_gh.exe")),
+            change("WSLENV", Some("GIT_ALLOW_PROTOCOL/u:DV_GH/u")),
+        ]
+    );
+    assert_eq!(
+        environment(&both, false).last(),
+        Some(&change("WSLENV", Some("GIT_ALLOW_PROTOCOL/u")))
     );
 }
 

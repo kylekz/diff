@@ -96,6 +96,7 @@ pub use load::Batch;
 use load::ReviewText;
 pub use placement::ThreadPlacement;
 use placement::{FileIndex, FuzzyTables};
+pub use pr::{Commits, MoveKind, PrFacts, PrMove};
 pub use side::{SideFileState, ViewFrom};
 use watch::WatchState;
 use writes::ViewedIntent;
@@ -413,11 +414,16 @@ impl ReviewSession {
         session.ensure_watch(cx);
         session.refresh(Batch::everything(), cx);
         // A PR review is refreshed as it opens (PLAN §9.4): an open by the pull request's
-        // reference did that already.
+        // reference did that already. Until the refresh lands, the review shows what was
+        // last read of its pull request.
         match pr {
             Some(read) => session.pr.read = Some(read),
-            None => session.refresh_pr(cx),
+            None => {
+                session.show_stored_pr(cx);
+                session.refresh_pr(cx);
+            }
         }
+        session.read_pr_facts(cx);
         session
     }
 
@@ -483,12 +489,14 @@ impl ReviewSession {
 
     /// What the review's own sides are called (all changes, whichever comparison shows):
     /// `main` / `working tree`, for the file view (PLAN §18.1); a pull request's base and
-    /// head branches once it was read.
+    /// head branches once it was read, each as a row draws a name GitHub sent
+    /// (`thread::drawn`, PLAN §9.9).
     pub fn target_side_labels(&self) -> (String, String) {
         match self.pr.read.as_ref().and_then(|read| read.mirror.as_ref()) {
-            Some(mirror) if self.review.is_pr_review() => {
-                (mirror.pr.base_ref.clone(), mirror.pr.head_ref.clone())
-            }
+            Some(mirror) if self.review.is_pr_review() => (
+                crate::thread::drawn(&mirror.pr.base_ref),
+                crate::thread::drawn(&mirror.pr.head_ref),
+            ),
             _ => side_labels(&self.review.target, &self.labels),
         }
     }

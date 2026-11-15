@@ -20,6 +20,7 @@ use crate::components::{icon, small_button};
 use crate::failure::Failure;
 use crate::icons::DvIcon;
 use crate::theme::{ActiveTheme as _, StyledText as _};
+use crate::thread::one_line;
 
 type Handler = Rc<dyn Fn(&mut Window, &mut App)>;
 
@@ -45,12 +46,25 @@ impl BannerAction {
     }
 }
 
-/// The text "Copy diagnostics" writes: the headline, then the detail when there is one.
+/// The text "Copy diagnostics" writes: the headline, then the detail when there is one, its
+/// lines kept. Each line is written as the CLI prints one (`dv_cli::escape`, PLAN §10.3):
+/// what a program printed, or GitHub answered, can't redraw the terminal it is pasted into
+/// or show in another order than it is written.
 pub fn diagnostics(failure: &Failure) -> String {
+    let headline = one_line(&failure.message);
     match &failure.detail {
-        Some(detail) => format!("{}\n\n{detail}", failure.message),
-        None => failure.message.clone(),
+        Some(detail) => format!("{headline}\n\n{}", lines(detail)),
+        None => headline.into_owned(),
     }
+}
+
+/// `text` with its lines kept and each one as the CLI prints a line (`dv_cli::escape`):
+/// the detail as Details draws it and Copy diagnostics writes it.
+fn lines(text: &str) -> String {
+    dv_cli::escape::breaks(text)
+        .map(one_line)
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 /// An error banner (see the module docs).
@@ -119,7 +133,7 @@ impl RenderOnce for Banner {
                     .text_spec(&theme.text.body)
                     .font_weight(FontWeight::MEDIUM)
                     .text_color(c.fg)
-                    .child(self.failure.message.clone()),
+                    .child(one_line(&self.failure.message).into_owned()),
             )
             .children(self.actions.into_iter().map(|action| {
                 let handler = action.handler.clone();
@@ -167,7 +181,12 @@ impl RenderOnce for Banner {
                     })
                     .automation_target(format!("{name}/copy")),
             );
-        let detail = self.failure.detail.clone().filter(|_| expanded);
+        let detail = self
+            .failure
+            .detail
+            .as_deref()
+            .filter(|_| expanded)
+            .map(lines);
         div()
             .flex_none()
             .flex()
@@ -213,5 +232,19 @@ mod tests {
             "git diff failed (exit code 128)\n\n$ git diff --raw\nfatal: bad object"
         );
         assert_eq!(diagnostics(&Failure::new("gone")), "gone");
+    }
+
+    /// What a program printed is copied as the CLI prints it: its lines kept, and nothing
+    /// in one that would redraw a terminal or reorder the line.
+    #[test]
+    fn diagnostics_spell_out_what_would_redraw_or_reorder_a_line() {
+        let failure = Failure::with_detail(
+            "gh failed: \u{202e}evil\nsecond",
+            "$ gh pr view 7\r\n\x1b[2Jwiped\rlast\n",
+        );
+        assert_eq!(
+            diagnostics(&failure),
+            "gh failed: \\u{202e}evil\\nsecond\n\n$ gh pr view 7\n\\x1b[2Jwiped\nlast"
+        );
     }
 }

@@ -435,6 +435,24 @@ impl GitRepo {
         }
     }
 
+    /// How the commits `from` and `to` differ in history (`git rev-list --count --left-right
+    /// <from>...<to>`): how many commits only `from` reaches, and how many only `to` does.
+    /// `(0, n)` is a fast-forward of n commits; a first count above zero means `to` doesn't
+    /// hold `from` (a force-push). Both are full object ids, so neither reads as an option.
+    pub fn commits_apart(&self, from: &Oid, to: &Oid) -> Result<(u32, u32), GitError> {
+        let range = format!("{from}...{to}");
+        let output = self.git(&["rev-list", "--count", "--left-right", &range], &[0])?;
+        let text = stdout_text("rev-list", &output)?;
+        let mut counts = text.split_whitespace().map(str::parse::<u32>);
+        match (counts.next(), counts.next(), counts.next()) {
+            (Some(Ok(behind)), Some(Ok(ahead)), None) => Ok((behind, ahead)),
+            _ => Err(GitError::UnexpectedOutput {
+                command: "rev-list",
+                detail: format!("expected two counts, got {text:?}"),
+            }),
+        }
+    }
+
     /// The object each of the refs `names` (full names) points at; a ref that doesn't exist is
     /// left out (one `git for-each-ref`).
     pub fn ref_oids(&self, names: &[&str]) -> Result<HashMap<String, Oid>, GitError> {

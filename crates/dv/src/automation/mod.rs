@@ -6,7 +6,8 @@
 //! `state` ([`state`]): `app`, `data_dir`, `settings`, `shell`, `system`, `repos` (the known
 //! repositories), `switcher` and `source_picker` (the title bar's overlays), `file_list` (the
 //! panel), `session` (the open review, or `null`), `stream` (the diff stream, or `null`),
-//! `comments_list`, `find`, `file_view`, `file_finder`, `palette`, `history`, `intel` (code
+//! `comments_list`, `find`, `file_view`, `file_finder`, `palette`, `pr_picker` and `pr_strip`
+//! (pull requests, PLAN §9.9), `history`, `intel` (code
 //! intelligence: the language servers, the hover card, the references), `cli` (the
 //! `cli_spawn` children not yet joined), `backends` (the connections to `dv backend
 //! --stdio` servers), `setup` (the first-run screen, Settings and every environment's
@@ -29,8 +30,9 @@
 //!   (to reach `stopped`) ([`backends`]); `wsl_distros {distros}` tells the stand-in for WSL
 //!   which distros there are and which run, in a run without `DV_WSL_HOME`
 //!   (`dv_ui::services::WslAccess`).
-//! - `open {path}`, `open_review {path, target?}`, `open_pr {path, pr}`, `pr_refresh` and
-//!   `review_op {op, thread, …}` ([`commands`]).
+//! - `open {path}`, `open_review {path, target?}`, `open_pr {path, pr}`, `pr_refresh`,
+//!   `folder_answer {path}` (what the next folder picker answers) and `review_op {op,
+//!   thread, …}` ([`commands`]).
 //! - `update_ready {version}` makes an update of dv ready through the seam (the status bar's
 //!   Restart to update, which records the restart, [`commands`]).
 //! - `home_file {path, contents}` writes a file in the run's scratch home (`<data_dir>/home`,
@@ -47,6 +49,7 @@
 mod agent_cli;
 mod backends;
 mod commands;
+mod pr_state;
 mod repos;
 mod state;
 
@@ -195,6 +198,8 @@ impl AutomationHost for DvAutomation {
             "file_view": state::file_view(self.shell.read(cx), cx),
             "file_finder": state::file_finder(self.shell.read(cx), window, cx),
             "palette": state::palette(self.shell.read(cx), window, cx),
+            "pr_picker": pr_state::pr_picker(self.shell.read(cx), window, cx),
+            "pr_strip": pr_state::pr_strip(self.shell.read(cx), cx),
             "history": state::history(self.shell.read(cx)),
             "intel": state::intel(self.shell.read(cx), cx),
             "comments_list": state::comments_list(self.shell.read(cx), cx),
@@ -237,6 +242,7 @@ impl AutomationHost for DvAutomation {
             "wsl_distros" => Some(backends::wsl_distros(args, cx)),
             "home_file" => Some(commands::home_file(&args, cx)),
             "pr_refresh" => Some(commands::pr_refresh(&self.shell, &args, cx)),
+            "folder_answer" => Some(commands::folder_answer(&args, cx)),
             "update_ready" => Some(commands::update_ready(&args, cx)),
             _ => None,
         }
@@ -285,6 +291,7 @@ const COMMANDS: &[&str] = &[
     "open_review",
     "open_pr",
     "pr_refresh",
+    "folder_answer",
     "review_op",
     "cli",
     "cli_spawn",

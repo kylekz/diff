@@ -106,14 +106,12 @@ impl From<&StoreError> for Failure {
     }
 }
 
-/// The headline says what failed and, when a command fixes it, which (`gh auth login`); the
-/// detail is what `gh` ran and printed.
+/// The headline is the failure's one line as the CLI says it (`GithubError::one_line`,
+/// PLAN §9.10): what failed, what git said when it was git, and the command that fixes it
+/// when there is one (`gh auth login`); the detail is what `gh` ran and printed.
 impl From<&GithubError> for Failure {
     fn from(error: &GithubError) -> Self {
-        let message = match error.fix() {
-            Some(fix) if !error.to_string().contains(&fix) => format!("{error}: run `{fix}`"),
-            _ => error.to_string(),
-        };
+        let message = error.one_line();
         match error {
             GithubError::Backend(backend) => Self::with_backend(message, Some(backend)),
             GithubError::Target(target) => Self {
@@ -191,6 +189,47 @@ mod tests {
         assert!(!plain.message.contains('\n'));
         assert_eq!(plain.detail, None);
         assert!(!plain.disconnected);
+    }
+
+    /// PLAN §9.10: a GitHub failure's headline is the one line the CLI prints for it, what
+    /// git itself said included, and the command that fixes it.
+    #[test]
+    fn a_github_failures_headline_is_the_clis_line_with_gits_words() {
+        let fetch = GithubError::Backend(BackendError::Git {
+            args: vec!["fetch".into(), "origin".into()],
+            code: Some(128),
+            stderr: "fatal: unable to access 'https://github.com/acme/api.git/': \
+                     Could not resolve host: github.com\n"
+                .into(),
+        });
+        let failure = Failure::from(&fetch);
+        assert_eq!(failure.message, fetch.one_line());
+        assert!(
+            failure
+                .message
+                .contains("Could not resolve host: github.com"),
+            "{failure:?}"
+        );
+        assert!(!failure.message.contains('\n'));
+        assert!(
+            failure
+                .detail
+                .is_some_and(|detail| detail.contains("$ git fetch origin"))
+        );
+
+        let signed_out = GithubError::NotAuthenticated {
+            host: "github.com".into(),
+            failure: dv_core::github::GhFailure {
+                args: vec!["api".into(), "user".into()],
+                code: Some(4),
+                stderr: "gh auth login\n".into(),
+                body: String::new(),
+            },
+        };
+        assert_eq!(
+            Failure::from(&signed_out).message,
+            "gh isn't signed in to github.com: run `gh auth login`"
+        );
     }
 
     #[test]

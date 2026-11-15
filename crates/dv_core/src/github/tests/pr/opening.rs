@@ -3,7 +3,7 @@
 use serde_json::json;
 
 use super::*;
-use crate::review::{EventBody, ReviewStatus, Verdict, ops};
+use crate::review::{ReviewStatus, Verdict, ops};
 use crate::target::{DiffSpec, Side, Target};
 
 #[test]
@@ -95,15 +95,13 @@ fn a_first_open_fetches_the_pull_request_and_makes_its_draft() {
     assert_eq!(opened.refreshed.pins, Some(pins));
     assert_eq!(opened.refreshed.moved_from, None);
 
-    // Its log says which pull request it is.
+    // Its target says which pull request it is: one event, and the fold links it.
     let events = fixture.store().events(&review.id).unwrap().events;
-    assert!(
-        matches!(
-            &events[1].body,
-            EventBody::PrLinked { owner, repo, number }
-                if owner == GITHUB_OWNER && repo == "api" && *number == NUMBER
-        ),
-        "{events:?}"
+    assert_eq!(events.len(), 1, "{events:?}");
+    let link = review.pr_target().expect("a PR review");
+    assert_eq!(
+        (link.owner.as_str(), link.repo.as_str(), link.number),
+        (GITHUB_OWNER, "api", NUMBER)
     );
 
     // The mirror was read at that head.

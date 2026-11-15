@@ -1,6 +1,7 @@
 use std::path::Path;
 use std::time::{Duration, Instant};
 
+use dv_core::github::RepoUrl;
 use dv_core::review::ReviewStatus;
 use dv_test_support::FixtureRepo;
 use gpui::TestAppContext;
@@ -64,6 +65,105 @@ fn known_repos_read_leniently_and_keep_what_they_dont_know() {
     assert!(problems[0].contains("newer dv"), "{problems:?}");
     // Repos that aren't a list make a file this version can't read.
     assert!(KnownReposFile::from_object(object(json!({"repos": {"a": 1}}))).is_err());
+}
+
+#[test]
+fn a_known_repos_github_name_is_remembered_and_read_leniently() {
+    // A file written before `github` existed loads, and so does one whose `github` isn't a
+    // repository's name: it reads as none, the entry kept.
+    let (mut file, problems) = KnownReposFile::from_object(object(json!({
+        "v": 1,
+        "repos": [
+            {"location": {"local": "D:\\code\\old"}, "added_at": 1},
+            {"location": {"local": "D:\\code\\api"}, "added_at": 2,
+             "github": {"host": "github.com", "owner": "Acme", "repo": "API"}},
+            {"location": {"local": "D:\\code\\odd"}, "added_at": 3, "github": "acme/odd"},
+            {"location": {"local": "D:\\code\\evil"}, "added_at": 4,
+             "github": {"host": "github.com", "owner": "a\nb", "repo": "x y"}},
+        ],
+    })))
+    .unwrap();
+    assert_eq!(problems, Vec::<String>::new());
+    let github = |file: &KnownReposFile, path: &str| {
+        file.get(&local(path))
+            .expect("the entry is kept")
+            .github
+            .as_ref()
+            .map(|github| format!("{}/{}/{}", github.host, github.owner, github.repo.repo))
+    };
+    assert_eq!(github(&file, "D:\\code\\old"), None);
+    assert_eq!(
+        github(&file, "D:\\code\\api").as_deref(),
+        Some("github.com/Acme/API")
+    );
+    assert_eq!(github(&file, "D:\\code\\odd"), None);
+    assert_eq!(github(&file, "D:\\code\\evil"), None);
+
+    let named = |owner: &str, repo: &str| RepoUrl {
+        host: "github.com".into(),
+        owner: owner.into(),
+        repo: repo.into(),
+    };
+    // The same name again changes nothing; another spelling of it, or another name, does.
+    let api = local("D:\\code\\api");
+    assert!(!file.set_github(&api, Some(named("Acme", "API"))));
+    assert!(file.set_github(&api, Some(named("acme", "api"))));
+    assert!(file.set_github(&local("D:\\code\\old"), Some(named("acme", "old"))));
+    assert!(!file.set_github(&local("D:\\code\\odd"), None));
+    assert!(!file.set_github(&local("D:\\nowhere"), Some(named("a", "b"))));
+    let written: Value = serde_json::from_str(&file.to_json()).unwrap();
+    assert_eq!(
+        written["repos"],
+        json!([
+            {"location": {"local": "D:\\code\\old"}, "added_at": 1,
+             "github": {"host": "github.com", "owner": "acme", "repo": "old"}},
+            {"location": {"local": "D:\\code\\api"}, "added_at": 2,
+             "github": {"host": "github.com", "owner": "acme", "repo": "api"}},
+            {"location": {"local": "D:\\code\\odd"}, "added_at": 3},
+            {"location": {"local": "D:\\code\\evil"}, "added_at": 4},
+        ])
+    );
+    // A clone that left GitHub is remembered as having none.
+    assert!(file.set_github(&api, None));
+    assert_eq!(github(&file, "D:\\code\\api"), None);
+}
+
+/// A newer dv may keep more under `github` than this one reads: what it wrote there stays
+/// through a load and a save, and through a name set again.
+#[test]
+fn keys_this_version_doesnt_read_inside_github_are_kept() {
+    let repos = json!([
+        {"location": {"local": "D:\\code\\api"}, "added_at": 2, "later": true,
+         "github": {"host": "github.com", "owner": "acme", "repo": "api",
+                    "default_branch": "main", "seen": {"at": 7}}},
+    ]);
+    let (mut file, problems) =
+        KnownReposFile::from_object(object(json!({"v": 1, "repos": repos.clone()}))).unwrap();
+    assert_eq!(problems, Vec::<String>::new());
+    let written: Value = serde_json::from_str(&file.to_json()).unwrap();
+    assert_eq!(written["repos"], repos);
+
+    // Another spelling of the name: the name changes, the rest stays.
+    let api = local("D:\\code\\api");
+    assert!(file.set_github(
+        &api,
+        Some(RepoUrl {
+            host: "github.com".into(),
+            owner: "Acme".into(),
+            repo: "API".into(),
+        })
+    ));
+    let written: Value = serde_json::from_str(&file.to_json()).unwrap();
+    assert_eq!(
+        written["repos"][0]["github"],
+        json!({"host": "github.com", "owner": "Acme", "repo": "API",
+               "default_branch": "main", "seen": {"at": 7}})
+    );
+    // A clone that left GitHub has nothing under `github` to keep.
+    assert!(file.set_github(&api, None));
+    let written: Value = serde_json::from_str(&file.to_json()).unwrap();
+    assert_eq!(written["repos"][0].get("github"), None);
+    assert_eq!(written["repos"][0]["later"], json!(true));
 }
 
 #[test]
@@ -269,7 +369,7 @@ async fn a_repo_is_added_listed_and_saved(cx: &mut TestAppContext) {
         );
         assert_eq!(row.open_review_of(&Target::Staged), None);
         assert_eq!(row.reviews.len(), 1);
-        let ReviewRow::Ok { summary, label } = &row.reviews[0] else {
+        let ReviewRow::Ok { summary, label, .. } = &row.reviews[0] else {
             panic!("a readable review");
         };
         assert_eq!(summary.status, ReviewStatus::Open);
@@ -347,6 +447,74 @@ async fn an_unreadable_review_log_is_a_row_of_its_own(cx: &mut TestAppContext) {
             .find(|review| review.id() == &broken)
             .expect("the broken log is listed");
         assert!(matches!(bad, ReviewRow::Err { .. }), "{bad:?}");
+    });
+}
+
+#[gpui::test]
+async fn a_stopped_distros_repo_matches_a_pull_request_by_its_remembered_name(
+    cx: &mut TestAppContext,
+) {
+    cx.executor().allow_parking();
+    let data = tempfile::tempdir().unwrap();
+    let wsl = wsl_at("Ubuntu", "/home/kyle/api");
+    let elsewhere = wsl_at("Ubuntu", "/home/kyle/web");
+    // Known from an earlier run, with the GitHub repository each clone was then.
+    std::fs::write(
+        data.path().join(KNOWN_REPOS_FILE),
+        json!({"v": 1, "repos": [
+            {"location": wsl, "added_at": 1, "opened_at": 5,
+             "github": {"host": "github.com", "owner": "Acme", "repo": "Api"}},
+            {"location": elsewhere, "added_at": 2,
+             "github": {"host": "ghe.example", "owner": "acme", "repo": "api"}},
+        ]})
+        .to_string(),
+    )
+    .unwrap();
+    let stopped = vec![Distro {
+        name: "Ubuntu".into(),
+        running: false,
+    }];
+    let (locations, reviews) = services_with(cx, data.path(), stopped);
+    let found = |reviews: &Reviews, host: Option<&str>, owner: &str, repo: &str| {
+        reviews
+            .clones_of(host, owner, repo)
+            .into_iter()
+            .map(|row| row.location.clone())
+            .collect::<Vec<_>>()
+    };
+    // Before anything is listed, and whatever the case: nothing is opened to tell.
+    reviews.read_with(cx, |reviews, _| {
+        assert_eq!(
+            found(reviews, Some("github.com"), "acme", "API"),
+            std::slice::from_ref(&wsl)
+        );
+        // A reference without a host names the repository on any: the most recently used
+        // first.
+        assert_eq!(
+            found(reviews, None, "ACME", "api"),
+            [wsl.clone(), elsewhere.clone()]
+        );
+        assert_eq!(
+            found(reviews, Some("ghe.example"), "acme", "api"),
+            std::slice::from_ref(&elsewhere)
+        );
+        assert_eq!(found(reviews, None, "acme", "web"), Vec::<Location>::new());
+    });
+    // A listing leaves the distro stopped and the names as they were remembered.
+    reviews.update(cx, |reviews, cx| reviews.refresh_all(cx));
+    settle(cx, &reviews);
+    reviews.read_with(cx, |reviews, _| {
+        assert_eq!(
+            reviews.row(&wsl).unwrap().stopped.as_deref(),
+            Some("Ubuntu")
+        );
+        assert_eq!(found(reviews, None, "acme", "api").len(), 2);
+    });
+    locations.read_with(cx, |locations, _| {
+        assert!(
+            locations.connections().all().is_empty(),
+            "the listing started something"
+        );
     });
 }
 
@@ -545,7 +713,7 @@ async fn another_worktrees_working_review_is_named_by_its_own_head(cx: &mut Test
             .reviews
             .iter()
             .filter_map(|review| match review {
-                ReviewRow::Ok { summary, label } => Some((&summary.id, label.as_str())),
+                ReviewRow::Ok { summary, label, .. } => Some((&summary.id, label.as_str())),
                 ReviewRow::Err { .. } => None,
             })
             .collect();

@@ -7,6 +7,7 @@
 //!   (PLAN §9.2).
 //! - [`pr_ref`]: how a pull request is named (PLAN §9.3).
 //! - [`pr`]: a pull request's metadata and checks, as `gh pr view` tells them (PLAN §9.3).
+//! - [`list`]: a repository's open pull requests, for the PR picker (PLAN §9.9).
 //! - [`fetch`]: a pull request's commits fetched into `refs/dv/pr/…` (PLAN §9.3).
 //! - [`open`]: opening a pull request as a review (PLAN §9.3).
 //! - [`refresh`]: reading everything again into the mirror, and a draft following the head
@@ -29,6 +30,7 @@ pub mod error;
 pub mod fetch;
 pub(crate) mod forget;
 pub mod gh;
+pub mod list;
 mod lock;
 pub mod mirror;
 pub mod open;
@@ -46,11 +48,13 @@ pub use gh::{
     AuthStatus, Connection, GH_VAR, Gh, GhOptions, MAX_PAGES, MIN_VERSION, Mutation, Nested,
     PAGE_SIZE, Paged, Truncated, Version, program, says_signed_out,
 };
+pub use list::{ListedPr, Listing, list};
 pub use mirror::store::{MirrorError, MirrorRead, MirrorStore, Refetch};
 pub use mirror::{
     Checks, CommentReview, FilePatch, FileStatus, GithubComment, GithubThread, HeadRepo,
-    MIRROR_VERSION, Mirror, MirrorKey, PendingReview, PrState, PullRequest, ReviewDecision,
-    ReviewState, ThreadLines, ThreadStart, ThreadSubject, ViewedFile, ViewedState, is_mirror_of,
+    MIRROR_VERSION, Mirror, MirrorKey, MirrorPart, PendingReview, PrState, PullRequest,
+    ReviewDecision, ReviewState, ThreadLines, ThreadStart, ThreadSubject, ViewedFile, ViewedState,
+    is_mirror_of,
 };
 pub use open::{OpenedPr, open};
 pub use pr_ref::{InvalidPrRef, PrRef};

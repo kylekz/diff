@@ -94,6 +94,15 @@ pub enum GithubError {
     /// The review store couldn't be read or written (the PR's reviews, its mirror).
     #[error(transparent)]
     Store(#[from] StoreError),
+    /// An open made a draft and then failed to pin it (`source`): the draft `review` is in
+    /// the store, without its pins. Opening the pull request again resumes it, and its
+    /// refresh pins it (PLAN §9.3, §9.5).
+    #[error("{}", draft_left(.review, &.source.to_string()))]
+    DraftLeft {
+        review: String,
+        #[source]
+        source: Box<GithubError>,
+    },
     /// The pull request's head moved between what gh reported and what git fetched, twice
     /// running, or again while its files were read (PLAN §9.3, §9.4): someone is pushing.
     #[error("#{number} moved while dv was reading it (someone is pushing to it); refresh again")]
@@ -137,6 +146,21 @@ pub enum GithubError {
     /// A PR reference that names another repository than the clone's (PLAN §9.3).
     #[error("#{number} is in {repository}; open it from a clone of that repository")]
     OtherRepository { number: u64, repository: String },
+    /// The pull request was read here from another GitHub host than the one the clone's
+    /// repository is on now, under the same owner and name (PLAN §9.4): a review's target
+    /// names no host, and what was read from one is never continued from another.
+    #[error(
+        "#{number} of {repository} was read here from {read_from}, and this clone now takes \
+         pull requests from {now}: pick the repository again with `gh repo set-default`, or \
+         delete the reviews of #{number} made from {read_from} (`dv review delete <id>`)"
+    )]
+    OtherHost {
+        number: u64,
+        /// `owner/repo`.
+        repository: String,
+        read_from: String,
+        now: String,
+    },
     /// The program dv runs as `gh` isn't there: the setup check's state (PLAN §12.2).
     #[error("gh isn't installed: dv reaches GitHub through it (https://cli.github.com)")]
     GhMissing { program: String },
@@ -170,7 +194,7 @@ pub enum GithubError {
         failure: GhFailure,
     },
     /// HTTP 5xx, a network failure or a timeout.
-    #[error("GitHub can't be reached: {reason}")]
+    #[error("{}", unavailable(.reason))]
     Unavailable { reason: String, failure: GhFailure },
     /// Any other failure of gh.
     #[error("gh {} failed: {}", subcommand(&.failure.args), .failure.first_line())]
@@ -184,11 +208,35 @@ pub enum GithubError {
     },
 }
 
+/// [`GithubError::DraftLeft`]'s line: `why` the open failed, then what to do with the draft
+/// `review` it left.
+fn draft_left(review: &str, why: &str) -> String {
+    format!(
+        "a draft was made ({review}) before the open failed: {why}; open the pull request \
+         again to go on with it, or `dv review delete {review}`"
+    )
+}
+
+/// How [`GithubError::Unavailable`]'s `reason` starts when GitHub did answer, with a
+/// server error's status.
+pub(super) const ANSWERED: &str = "GitHub answered HTTP ";
+
+/// [`GithubError::Unavailable`]'s line: a status is an answer, so only a failure to get one
+/// (the network, a timeout) reads "can't be reached".
+fn unavailable(reason: &str) -> String {
+    if reason.starts_with(ANSWERED) {
+        format!("{reason}, a server error")
+    } else {
+        format!("GitHub can't be reached: {reason}")
+    }
+}
+
 impl GithubError {
     /// The backend's failure under this one, when it is one: git or the store failing where
     /// the repository lives.
     fn backend(&self) -> Option<&BackendError> {
         match self {
+            GithubError::DraftLeft { source, .. } => source.backend(),
             GithubError::Backend(error)
             | GithubError::Target(TargetError::Git(crate::git::GitError::Backend(error)))
             | GithubError::Store(StoreError::Backend(error)) => Some(error),
@@ -230,6 +278,7 @@ impl GithubError {
         !matches!(
             self,
             GithubError::OtherRepository { .. }
+                | GithubError::OtherHost { .. }
                 | GithubError::NoRepository { .. }
                 | GithubError::NotFound { .. }
                 | GithubError::BaseGone { .. }
@@ -240,6 +289,7 @@ impl GithubError {
     /// the response body.
     pub fn detail(&self) -> Option<String> {
         match self {
+            GithubError::DraftLeft { source, .. } => source.detail(),
             GithubError::Backend(_)
             | GithubError::Target(TargetError::Git(crate::git::GitError::Backend(_)))
             | GithubError::Store(StoreError::Backend(_)) => {
@@ -258,6 +308,7 @@ impl GithubError {
             | GithubError::NotGithub { .. }
             | GithubError::NoRemote { .. }
             | GithubError::OtherRepository { .. }
+            | GithubError::OtherHost { .. }
             | GithubError::GhMissing { .. }
             | GithubError::Target(_)
             | GithubError::Store(_)
@@ -269,6 +320,7 @@ impl GithubError {
     /// The kind as the CLI's JSON names it (PLAN §9.10).
     pub fn kind(&self) -> &'static str {
         match self {
+            GithubError::DraftLeft { source, .. } => source.kind(),
             GithubError::Backend(_) | GithubError::Target(_) => "git",
             GithubError::Store(_) => "store",
             GithubError::Moved { .. } => "moved",
@@ -277,7 +329,9 @@ impl GithubError {
             GithubError::UnreadableDefault { .. } => "unreadable_default",
             GithubError::NotGithub { .. } => "not_github",
             GithubError::NoRemote { .. } => "no_remote",
-            GithubError::OtherRepository { .. } => "other_repository",
+            GithubError::OtherRepository { .. } | GithubError::OtherHost { .. } => {
+                "other_repository"
+            }
             GithubError::GhMissing { .. } => "gh_missing",
             GithubError::NotAuthenticated { .. } => "not_authenticated",
             GithubError::NotFound { .. } => "not_found",
@@ -287,6 +341,26 @@ impl GithubError {
             GithubError::Unavailable { .. } => "unavailable",
             GithubError::Gh { .. } => "gh",
             GithubError::UnexpectedOutput { .. } => "unexpected_output",
+        }
+    }
+
+    /// The failure in one line (PLAN §9.10), the same wherever it is said: what failed,
+    /// what git itself said when it was git (a fetch that failed says why:
+    /// [`GithubError::git_said`]), and the command that fixes it when there is one
+    /// ([`GithubError::fix`]). The CLI's exit 5 and its warnings, and the app's banners, the
+    /// strip and the picker all read this.
+    pub fn one_line(&self) -> String {
+        // What failed, whole, before what to do about the draft it left.
+        if let GithubError::DraftLeft { review, source } = self {
+            return draft_left(review, &source.one_line());
+        }
+        let message = match self.git_said() {
+            Some(said) => format!("{self}: {said}"),
+            None => self.to_string(),
+        };
+        match self.fix() {
+            Some(fix) if !message.contains(&fix) => format!("{message}: run `{fix}`"),
+            _ => message,
         }
     }
 

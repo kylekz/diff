@@ -18,7 +18,7 @@ use dv_core::github::Mirror;
 use dv_core::label::Labels;
 use dv_core::review::{
     ItemId, ListEntry, Review, ReviewId, ReviewSummary, StoreError, Thread, ThreadId, ThreadKey,
-    ops,
+    displayed_round, ops,
 };
 use dv_core::target::Target;
 
@@ -167,7 +167,7 @@ pub(crate) fn pr_review(
             .with_candidates(
                 several
                     .iter()
-                    .map(|summary| candidate(summary, &labels))
+                    .map(|summary| candidate(repo, summary, &labels))
                     .collect(),
             ))
         }
@@ -203,7 +203,7 @@ fn unclear(repo: &Repo, listing: &Listing, matches: usize) -> CliError {
     let labels = repo.labels();
     let candidates: Vec<CandidateDto> = listing
         .open()
-        .map(|summary| candidate(summary, &labels))
+        .map(|summary| candidate(repo, summary, &labels))
         .collect();
     let (code, message) = if matches > 1 {
         (
@@ -229,12 +229,19 @@ fn unclear(repo: &Repo, listing: &Listing, matches: usize) -> CliError {
     CliError::new(Exit::Usage, code, message).with_candidates(candidates)
 }
 
-fn candidate(summary: &ReviewSummary, labels: &Labels) -> CandidateDto {
+fn candidate(repo: &Repo, summary: &ReviewSummary, labels: &Labels) -> CandidateDto {
+    // A PR review's place among its pull request's reviews in the store (PLAN §9.5).
+    let pr_round = summary
+        .pr
+        .as_ref()
+        .filter(|link| link.is_target(&summary.target))
+        .map(|link| repo.stored_prs().round_of(link, &summary.id));
     CandidateDto {
         id: summary.id.to_string(),
         label: labels.label(&summary.target, &summary.worktree),
         status: summary.status.as_str(),
         round: summary.current_round,
+        shown_round: displayed_round(summary.current_round, pr_round),
         worktree: summary.worktree.clone(),
     }
 }

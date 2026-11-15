@@ -111,7 +111,7 @@ fn a_thread_key_is_a_thread_id_or_githubs_node_id() {
 
     let github: ThreadKey = "gh:PRRT_kwDOAbc-12_=".parse().unwrap();
     assert_eq!(github, ThreadKey::Github("PRRT_kwDOAbc-12_=".to_string()));
-    assert!(github.is_github() && github.local().is_none());
+    assert!(github.github().is_some() && github.local().is_none());
     assert_eq!(github.to_string(), "gh:PRRT_kwDOAbc-12_=");
 
     for bad in ["gh:", "gh: x", "gh:a\tb", "GH:PRRT_1", "PRRT_1", "t-1", ""] {

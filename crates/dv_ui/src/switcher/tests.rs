@@ -40,6 +40,7 @@ fn row(name: &str, path: &str) -> RepoRow {
         },
         branches: Vec::new(),
         last_used: 0,
+        github: None,
     }
 }
 
@@ -62,6 +63,119 @@ fn summary(target: Target, worktree: &str, status: ReviewStatus) -> ReviewSummar
         pr: None,
         warnings: 0,
     }
+}
+
+#[test]
+fn a_repos_pr_reviews_list_under_their_own_label_by_number_and_title() {
+    use crate::services::reviews::PrRow;
+    use dv_core::review::PrLink;
+
+    let mut api = row("api", "D:\\code\\api");
+    let pr = |number: u64, status: ReviewStatus| {
+        let mut summary = summary(
+            Target::Pr {
+                owner: "acme".into(),
+                repo: "api".into(),
+                number,
+                base_oid: Oid::parse(&"1".repeat(40)).unwrap(),
+                head_oid: Oid::parse(&"2".repeat(40)).unwrap(),
+            },
+            "D:\\code\\api",
+            status,
+        );
+        summary.pr = Some(PrLink {
+            owner: "acme".into(),
+            repo: "api".into(),
+            number,
+        });
+        summary
+    };
+    let draft = pr(482, ReviewStatus::Draft);
+    let submitted = pr(482, ReviewStatus::Submitted);
+    let closed = pr(9, ReviewStatus::Closed);
+    let unread = pr(7, ReviewStatus::Draft);
+    for (summary, title, round) in [
+        (&draft, Some("Fix the\ncache"), 2),
+        (&submitted, Some("Fix the\ncache"), 1),
+        (&closed, Some("Gone"), 1),
+        (&unread, None, 1),
+    ] {
+        api.reviews.push(ReviewRow::Ok {
+            summary: Box::new(summary.clone()),
+            label: "acme/api#n".into(),
+            pr: Some(PrRow {
+                number: summary.pr.as_ref().unwrap().number,
+                title: title.map(str::to_string),
+                round,
+            }),
+        });
+    }
+    let listing = build(&[&api], "");
+    let rows: Vec<(&str, &str, &str)> = listing
+        .items
+        .iter()
+        .map(|item| (item.key.as_str(), item.kind_key(), item.label()))
+        .collect();
+    let draft_key = format!("api/pr/{}", draft.id);
+    let submitted_key = format!("api/pr/{}", submitted.id);
+    let unread_key = format!("api/pr/{}", unread.id);
+    assert_eq!(
+        rows,
+        [
+            ("api/working", "target", "Uncommitted changes"),
+            ("api/staged", "target", "Staged changes"),
+            ("api/branch", "target", "Branch feat vs main"),
+            // A title is one line whatever it holds; a closed review is listed nowhere.
+            (draft_key.as_str(), "pr", "#482 Fix the\\ncache"),
+            (submitted_key.as_str(), "pr", "#482 Fix the\\ncache"),
+            (unread_key.as_str(), "pr", "#7"),
+            ("open_folder", "open_folder", "Open folder…"),
+        ]
+    );
+    // The label stands over the first of them, once.
+    assert_eq!(
+        listing.entries,
+        [
+            Entry::Repo(0),
+            Entry::Item(0),
+            Entry::Item(1),
+            Entry::Item(2),
+            Entry::Section(items::PULL_REQUESTS),
+            Entry::Item(3),
+            Entry::Item(4),
+            Entry::Item(5),
+        ]
+    );
+    // The PR round, and what Close review closes: a draft, never a submitted review.
+    let item = &listing.items[3];
+    assert!(matches!(item.kind, ItemKind::Pr { .. }));
+    assert_eq!(item.review().map(|badge| badge.round), Some(2));
+    assert_eq!(
+        item.review().map(|badge| badge.status),
+        Some(ReviewStatus::Draft)
+    );
+    assert!(item.open_review().is_some());
+    assert!(listing.items[4].review().is_some());
+    assert!(listing.items[4].open_review().is_none());
+    assert_eq!(
+        listing.request(4),
+        Some((
+            api.location.clone(),
+            OpenRequest::Review(submitted.id.clone())
+        ))
+    );
+    // Filtered by number or title; the label goes with its rows.
+    let filtered = build(&[&api], "#482 cache");
+    assert_eq!(
+        keys(&filtered),
+        [draft_key.as_str(), submitted_key.as_str(), "open_folder"]
+    );
+    assert_eq!(filtered.entries[1], Entry::Section(items::PULL_REQUESTS));
+    assert!(
+        !build(&[&api], "staged")
+            .entries
+            .contains(&Entry::Section(items::PULL_REQUESTS))
+    );
 }
 
 fn keys(listing: &items::Listing) -> Vec<&str> {
@@ -93,6 +207,7 @@ fn a_repo_offers_its_targets_beside_their_open_reviews() {
         api.reviews.push(ReviewRow::Ok {
             summary: Box::new(summary.clone()),
             label: "label".into(),
+            pr: None,
         });
     }
     let listing = build(&[&api], "");
@@ -203,6 +318,8 @@ fn rows_say_why_a_repo_has_nothing_to_offer() {
             ReviewStatus::Open,
         )),
         label: "abc".into(),
+
+        pr: None,
     });
     // A folder that is no longer a repository: a read error, without the path again.
     let mut gone = row("gone", r"D:\gone");
@@ -840,6 +957,7 @@ fn the_branch_picker_offers_each_branch_against_its_stack_base() {
     api.reviews.push(ReviewRow::Ok {
         summary: Box::new(stacked.clone()),
         label: "feat-b vs feat-a".into(),
+        pr: None,
     });
     let listing = build_branches(&[&api], &api.location, "");
     // Newest first, the default branch left out.

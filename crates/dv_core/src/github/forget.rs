@@ -22,6 +22,7 @@ use super::fetch::refs_prefix;
 use super::lock;
 use super::mirror::spelled_pr_dir;
 use super::repo::remote_hosts;
+use super::spelling::spell;
 use crate::backend::{Backend, BackendError, GitOpts};
 use crate::review::{ListEntry, PrLink, ReviewStore, StoreError};
 use crate::target::Target;
@@ -72,7 +73,7 @@ pub(crate) fn unreviewed(store: &ReviewStore) -> Result<(), StoreError> {
 /// it: what an open that failed fetched (PLAN §9.3). Nothing of any other pull request is
 /// touched, so another process between its own fetch and its review loses nothing to this
 /// one's failure. As in [`unreviewed`], nothing goes while any log doesn't load.
-pub(super) fn pull_request(store: &ReviewStore, link: &PrLink) -> Result<(), StoreError> {
+pub(crate) fn pull_request(store: &ReviewStore, link: &PrLink) -> Result<(), StoreError> {
     for entry in store.list()? {
         match entry {
             ListEntry::Ok(summary) if link.is_target(&summary.target) => return Ok(()),
@@ -92,6 +93,11 @@ pub(super) fn pull_request(store: &ReviewStore, link: &PrLink) -> Result<(), Sto
     )?;
     let text = String::from_utf8_lossy(&output.stdout);
     let fetched: Vec<&str> = text.lines().filter(|line| !line.is_empty()).collect();
+    // Its mirrors go whether or not its refs are still there (removed by hand, say).
+    let (owner, repo) = (spell(&link.owner), spell(&link.repo));
+    for host in remote_hosts(backend)? {
+        remove_mirrors(backend, &spelled_pr_dir(&host, &owner, &repo, link.number))?;
+    }
     remove(backend, &fetched)
 }
 

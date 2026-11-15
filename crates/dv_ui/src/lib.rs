@@ -15,7 +15,9 @@
 //! the stream: the [`switcher`] (and its source picker) in the title bar, the [`file_list`] and
 //! the [`comments_list`] in the panel, the [`diff_pane`] with its [`thread`] cards and composer
 //! (and, in a one-file scope, the file view, with the [`file_finder`] and the [`history`] of
-//! positions), and the [`submit`] sheet that finishes a round. [`syntax`] highlights its diffs into token
+//! positions), and the [`submit`] sheet that finishes a round. A GitHub pull request is found
+//! through the [`pr_picker`] (`Ctrl G`) or a reference typed into the [`palette`], and its
+//! review shows under the shell's PR strip (PLAN §9.9). [`syntax`] highlights its diffs into token
 //! kinds and [`markdown`] renders its comment bodies, sanitised. [`keymap`] binds the
 //! [`actions`]; [`banner`] is how a region shows a failure. [`setup`] is the first-run screen
 //! and Settings › Setup over the setup checks (PLAN §12).
@@ -39,6 +41,7 @@ pub mod intel;
 pub mod keymap;
 pub mod markdown;
 pub mod palette;
+pub mod pr_picker;
 pub mod services;
 pub mod session;
 pub mod setup;

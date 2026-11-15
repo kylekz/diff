@@ -242,3 +242,25 @@ fn a_sweep_that_fails_leaves_the_review_deleted() {
     assert!(store.delete(&local.id).unwrap());
     assert_eq!(dv_refs(&fixture), Vec::<String>::new());
 }
+
+#[test]
+fn a_pull_requests_mirrors_go_with_its_last_review_even_without_its_refs() {
+    let fixture = PrFixture::new();
+    let review = fixture.open().review;
+    let dir = "github/github.com/dv-fixture/api/pr-7";
+    assert_eq!(
+        fixture.backend().store_list(dir).unwrap(),
+        ["kylekz.json", "kylekz.summary"]
+    );
+    // Its fetched refs removed by hand: nothing is left to find the mirrors by but the
+    // review's own pull request.
+    let clone = fixture.github.checkout();
+    for (name, _) in fixture.refs("refs/dv/pr/") {
+        clone.git(&["update-ref", "-d", &name]);
+    }
+    assert!(fixture.store().delete(&review.id).unwrap());
+    assert_eq!(
+        fixture.backend().store_list(dir).unwrap(),
+        Vec::<String>::new()
+    );
+}

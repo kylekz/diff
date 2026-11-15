@@ -175,6 +175,7 @@ fn comment_list_shows_githubs_threads_after_the_reviews_own() {
             "url": "https://github.com/dv-fixture/api/pull/7#discussion_r1001",
             "resolved": false,
             "outdated": false,
+            "standing": "placed",
             "pending": false,
             "diff_hunk": "@@ -0,0 +1,3 @@\n+pub fn answer() -> u32 {\n+    42",
         })
@@ -202,6 +203,7 @@ fn comment_list_shows_githubs_threads_after_the_reviews_own() {
         (&json!("outdated"), &json!(true), &json!(false))
     );
     assert_eq!(outdated["github"]["outdated"], true);
+    assert_eq!(outdated["github"]["standing"], "outdated_on_github");
     assert_eq!(outdated["anchor"]["current"], Value::Null);
     assert_eq!(
         (&outdated["code"], &outdated["excerpt"]),
@@ -910,6 +912,9 @@ fn a_thread_dv_cant_place_says_so_and_shows_githubs_hunk() {
             &json!("    41")
         )
     );
+    // `placement` alone reads as for a thread GitHub calls outdated: `standing` tells them
+    // apart.
+    assert_eq!(threads[0]["github"]["standing"], "unplaced");
     assert_eq!(
         (&threads[1]["code"], &threads[1]["github"]["diff_hunk"]),
         (&json!(""), &json!(""))

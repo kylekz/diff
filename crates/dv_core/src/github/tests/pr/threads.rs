@@ -497,6 +497,31 @@ fn a_thread_follows_its_file_through_a_rename_either_way() {
             "anchored unchanged src/api.rs:6-6",
         ]
     );
+
+    // The rename is GitHub's file list's to tell (PLAN §9.4): when that list can't be read
+    // the refresh fails, rather than write a mirror whose old-side thread would be read
+    // under the new name and shown as one dv can't place. The mirror read before stands.
+    fixture.answer(vec![json!({
+        "argv": ["api", format!("repos/dv-fixture/threads/pulls/{NUMBER}/files?per_page=100"), "**"],
+        "stderr": "HTTP 502: Bad Gateway\n",
+        "exit": 1
+    })]);
+    let failed = fixture.refresh(&opened.review);
+    assert_eq!(
+        failed.stale.as_ref().map(|error| error.kind()),
+        Some("unavailable")
+    );
+    assert!(!failed.fresh);
+    let kept = failed.mirror.expect("the mirror read before");
+    assert_eq!(kept.read_at, mirror.read_at);
+    assert_eq!(kept.files, mirror.files);
+    assert_eq!(
+        placed(&fixture, &kept, &now.spec()),
+        [
+            "anchored unchanged src/service.rs:6-6",
+            "anchored unchanged src/service.rs:6-6",
+        ]
+    );
 }
 
 #[test]

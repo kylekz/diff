@@ -127,7 +127,7 @@ pub enum EventBody {
         repo: String,
         number: u64,
     },
-    /// The review was posted to GitHub as review `github_review_id` (PLAN §9.3).
+    /// The review was posted to GitHub as review `github_review_id` (PLAN §9.8).
     Submitted {
         github_review_id: u64,
         url: String,

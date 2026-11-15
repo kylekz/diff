@@ -119,7 +119,7 @@ fn a_refresh_reads_everything_gh_holds_into_the_mirror() {
     );
     assert!(line.viewer_can_resolve && !line.viewer_can_unresolve && line.viewer_can_reply);
     let comment = &line.comments[0];
-    assert_eq!(comment.database_id, 1001);
+    assert_eq!(comment.database_id, Some(1001));
     assert_eq!(comment.author, "octocat");
     assert_eq!(comment.body, "Why 42?");
     assert_eq!(comment.commit.as_ref(), Some(&head));
@@ -127,7 +127,7 @@ fn a_refresh_reads_everything_gh_holds_into_the_mirror() {
         comment.review,
         Some(CommentReview {
             id: "PRR_1".to_string(),
-            database_id: 2001,
+            database_id: Some(2001),
             state: ReviewState::Commented,
         })
     );
@@ -149,7 +149,7 @@ fn a_refresh_reads_everything_gh_holds_into_the_mirror() {
     );
     let comment = &outdated.comments[0];
     assert_eq!(comment.author, "ghost");
-    assert_eq!(comment.database_id, 3_000_000_001);
+    assert_eq!(comment.database_id, Some(3_000_000_001));
     assert_eq!(comment.reply_to.as_deref(), Some("PRRC_1"));
     assert_eq!(comment.commit, None);
     assert_eq!(mirror.threads[2].subject, ThreadSubject::File);
@@ -182,7 +182,7 @@ fn a_refresh_reads_everything_gh_holds_into_the_mirror() {
         Some("docs/old.md")
     );
     assert_eq!(mirror.files[2].status, FileStatus::Renamed);
-    let viewed = |path: &str| mirror.viewed[path];
+    let viewed = |path: &str| mirror.viewed[path].clone();
     assert_eq!(
         viewed("src/lib.rs"),
         ViewedFile {
@@ -499,21 +499,41 @@ fn the_latest_mirror_stands_in_when_the_viewer_cant_be_read() {
 }
 
 #[test]
-fn the_viewer_is_asked_once_per_gh() {
+fn the_viewer_is_whoever_gh_is_signed_in_as_at_each_operation() {
     let fixture = PrFixture::new();
     let opened = fixture.open();
     fixture.refresh(&opened.review);
     fixture.refresh(&opened.review);
+    // Asked by the open and by each refresh: no login outlives the operation it was read
+    // for.
     let asked = fixture.asked();
     assert_eq!(
         asked
             .iter()
             .filter(|call| call.starts_with("api user "))
             .count(),
-        1,
+        3,
         "{asked:?}"
     );
-    // A failure isn't remembered: signing in is seen without a restart.
+    // `gh auth switch`: the next refresh is the other account's, under its own name.
+    let mut calls = vec![fixture_gh::viewer("octocat")];
+    calls.extend(fixture.pr.calls_in(&fixture.github));
+    fixture.mock.answer(Value::Array(calls));
+    let refreshed = fixture.refresh(&opened.review);
+    assert_eq!(refreshed.stale.as_ref().map(|e| e.to_string()), None);
+    assert_eq!(refreshed.mirror.as_ref().unwrap().key.login, "octocat");
+    let other = MirrorKey::new(&fixture.repo(), NUMBER, "octocat");
+    assert!(matches!(
+        fixture.mirrors().read(&other).unwrap(),
+        MirrorRead::Found(_)
+    ));
+    // The first account's mirror is as it last read it.
+    let MirrorRead::Found(first) = fixture.mirrors().read(&fixture.key()).unwrap() else {
+        panic!("the first login's mirror is gone");
+    };
+    assert_eq!(first.key.login, VIEWER);
+
+    // A failure isn't remembered either: signing in is seen without a restart.
     let fresh = another_gh(
         &fixture,
         vec![{
@@ -523,7 +543,6 @@ fn the_viewer_is_asked_once_per_gh() {
         }],
     );
     assert!(fresh.gh.viewer("github.com").is_err());
-    assert_eq!(fresh.gh.viewer("github.com").unwrap(), VIEWER);
     assert_eq!(fresh.gh.viewer("github.com").unwrap(), VIEWER);
     assert_eq!(fresh.calls().len(), 2);
 }
@@ -748,4 +767,280 @@ fn a_pr_review_without_pins_resolves_as_its_target() {
         pins::resolve(&git, &local.id, &local.target).unwrap(),
         local.target.resolve(&git).unwrap()
     );
+}
+
+/// The two reads only the write side needs (PLAN §9.4, "Best effort"), each as the call
+/// that makes it.
+fn best_effort_calls() -> [(MirrorPart, Value); 2] {
+    let failing = |call: Value| {
+        let mut call = call;
+        call["stderr"] = json!("HTTP 502: Bad Gateway\n");
+        call["exit"] = json!(1);
+        call
+    };
+    [
+        (
+            MirrorPart::PendingReview,
+            failing(
+                json!({"argv": ["api", "graphql", "**"], "stdin_contains": "states: [PENDING]"}),
+            ),
+        ),
+        (
+            MirrorPart::Viewed,
+            failing(
+                json!({"argv": ["api", "graphql", "**"], "stdin_contains": "viewerViewedState"}),
+            ),
+        ),
+    ]
+}
+
+#[test]
+fn what_only_the_write_side_needs_never_costs_the_mirror() {
+    let mut fixture = PrFixture::new();
+    let head = fixture.head();
+    fixture.pr.threads = vec![fixture_gh::thread(
+        "PRRT_1",
+        "src/lib.rs",
+        2,
+        "octocat",
+        "Why 42?",
+        head.as_str(),
+    )];
+    fixture.answer(Vec::new());
+    let review = fixture.open().review;
+
+    // Each of the two failing alone, then both at once: the mirror is written, its
+    // threads are there, and it says which part it didn't read and why.
+    let calls = best_effort_calls();
+    let alone = calls
+        .iter()
+        .map(|(part, call)| (vec![*part], vec![call.clone()]));
+    let all = (
+        calls.iter().map(|(part, _)| *part).collect::<Vec<_>>(),
+        calls
+            .iter()
+            .map(|(_, call)| call.clone())
+            .collect::<Vec<_>>(),
+    );
+    for (parts, failing) in alone.chain([all]) {
+        fixture.answer(failing);
+        let refreshed = fixture.refresh(&review);
+        assert_eq!(
+            refreshed.stale.as_ref().map(|e| e.to_string()),
+            None,
+            "{parts:?}"
+        );
+        assert!(refreshed.fresh, "{parts:?}");
+        let mirror = refreshed.mirror.expect("a mirror");
+        assert_eq!(mirror.threads.len(), 1, "{parts:?}");
+        assert_eq!(mirror.pr.title, "Add the answer");
+        assert_eq!(
+            mirror.unread.keys().copied().collect::<Vec<_>>(),
+            parts,
+            "what wasn't read"
+        );
+        for part in &parts {
+            assert_eq!(
+                mirror.unread(*part),
+                Some("GitHub answered HTTP 502, a server error"),
+                "{part:?}"
+            );
+        }
+        // The files are read whatever else isn't.
+        assert_eq!(mirror.files.len(), 1);
+        // What is stored says the same, for whoever reads it next.
+        let MirrorRead::Found(stored) = fixture.mirrors().read(&fixture.key()).unwrap() else {
+            panic!("no mirror stored");
+        };
+        assert_eq!(stored.unread, mirror.unread);
+    }
+
+    // Read whole again, nothing is unread, and the stored mirror no longer says so.
+    fixture.answer(Vec::new());
+    let mirror = fixture.refresh(&review).mirror.unwrap();
+    assert!(mirror.unread.is_empty());
+    let stored = String::from_utf8(
+        fixture
+            .backend()
+            .store_read(&fixture.key().path())
+            .unwrap()
+            .unwrap(),
+    )
+    .unwrap();
+    assert!(
+        !stored.contains("\"unread\""),
+        "an older dv reads it as before"
+    );
+}
+
+#[test]
+fn values_github_adds_later_are_kept_not_refused() {
+    let mut fixture = PrFixture::new();
+    let head = fixture.head();
+    let mut thread = fixture_gh::thread(
+        "PRRT_1",
+        "src/lib.rs",
+        2,
+        "octocat",
+        "Why 42?",
+        head.as_str(),
+    );
+    // A review state and a database id as no build knows them.
+    thread["comments"]["nodes"][0]["pullRequestReview"]["state"] = json!("ESCALATED");
+    // One id `null`, the other not in the answer at all.
+    thread["comments"]["nodes"][0]["pullRequestReview"]["fullDatabaseId"] = json!(null);
+    thread["comments"]["nodes"][0]
+        .as_object_mut()
+        .unwrap()
+        .remove("fullDatabaseId");
+    fixture.pr.threads = vec![thread];
+    fixture.pr.viewed = vec![("src/lib.rs".to_string(), "PEEKED".to_string())];
+    fixture.pr.files = vec![fixture_gh::file("src/lib.rs", "teleported", None)];
+    fixture.answer(Vec::new());
+    // And a review decision of the same kind, in `gh pr view`'s answer.
+    let mut view = fixture.pr.view("api");
+    view["reviewDecision"] = json!("ESCALATED");
+    fixture.answer(vec![json!({
+        "argv": ["pr", "view", "7", "--json", crate::github::pr::VIEW_FIELDS, "**"],
+        "stdout": view,
+    })]);
+
+    let opened = fixture.open();
+    assert_eq!(opened.refreshed.stale.as_ref().map(|e| e.to_string()), None);
+    let mirror = opened.refreshed.mirror.expect("a mirror");
+    assert!(mirror.unread.is_empty());
+    assert_eq!(
+        mirror.pr.review_decision,
+        Some(ReviewDecision::Other("ESCALATED".to_string()))
+    );
+    let comment = &mirror.threads[0].comments[0];
+    assert_eq!(comment.database_id, None);
+    let review = comment.review.as_ref().unwrap();
+    assert_eq!(review.database_id, None);
+    assert_eq!(review.state, ReviewState::Other("ESCALATED".to_string()));
+    assert!(!comment.is_pending());
+    assert_eq!(
+        mirror.viewed["src/lib.rs"].state,
+        ViewedState::Other("PEEKED".to_string())
+    );
+    assert_eq!(
+        mirror.files[0].status,
+        FileStatus::Other("teleported".to_string())
+    );
+    // Stored and read back as they came.
+    let MirrorRead::Found(stored) = fixture.mirrors().read(&fixture.key()).unwrap() else {
+        panic!("no mirror stored");
+    };
+    assert_eq!(*stored, *mirror);
+    let text = String::from_utf8(
+        fixture
+            .backend()
+            .store_read(&fixture.key().path())
+            .unwrap()
+            .unwrap(),
+    )
+    .unwrap();
+    assert!(text.contains("\"review_decision\":\"ESCALATED\""), "{text}");
+    assert!(text.contains("\"status\":\"teleported\""));
+}
+
+#[test]
+fn a_review_read_on_another_host_isnt_refreshed_from_this_one() {
+    let fixture = PrFixture::new();
+    let opened = fixture.open();
+    let pinned = fixture.pins(&opened.review);
+    // The clone gains a remote for the same `owner/repo` on another host, and what was
+    // read of the pull request is that host's (as if the review had been made while pull
+    // requests were taken from there).
+    let clone = fixture.github.checkout();
+    clone.git(&[
+        "remote",
+        "add",
+        "enterprise",
+        "https://ghe.example/dv-fixture/api.git",
+    ]);
+    let store = clone.path().join(".git/dv/github");
+    std::fs::create_dir_all(store.join("ghe.example/dv-fixture/api")).unwrap();
+    std::fs::rename(
+        store.join("github.com/dv-fixture/api/pr-7"),
+        store.join("ghe.example/dv-fixture/api/pr-7"),
+    )
+    .unwrap();
+    let asked = fixture.asked().len();
+
+    let refreshed = fixture.refresh(&opened.review);
+    let stale = refreshed.stale.expect("refused");
+    assert_eq!(stale.kind(), "other_repository");
+    assert_eq!(
+        stale.to_string(),
+        "#7 of dv-fixture/api was read here from ghe.example, and this clone now takes pull \
+         requests from github.com: pick the repository again with `gh repo set-default`, or \
+         delete the reviews of #7 made from ghe.example (`dv review delete <id>`)"
+    );
+    // Nothing was asked about the other repository's pull request 7, and nothing moved.
+    assert!(!refreshed.fresh);
+    assert_eq!(refreshed.pins, Some(pinned.clone()));
+    assert_eq!(fixture.pins(&opened.review), pinned);
+    let after: Vec<String> = fixture.asked()[asked..].to_vec();
+    assert!(
+        after.iter().all(|call| call.starts_with("auth status ")),
+        "{after:?}"
+    );
+    assert!(
+        fixture.mirrors().read(&fixture.key()).unwrap() == MirrorRead::Refetch(Refetch::Missing)
+    );
+
+    // An open says the same before it asks, fetches or makes anything: the review that is
+    // here opens as it stands; with none left to resume, nothing is made.
+    let asked = fixture.asked().len();
+    let again = fixture.open();
+    assert!(!again.created);
+    assert_eq!(again.review.id, opened.review.id);
+    assert_eq!(
+        again.refreshed.stale.as_ref().map(|error| error.kind()),
+        Some("other_repository")
+    );
+    crate::review::ops::set_status(
+        &fixture.store(),
+        &opened.review.id,
+        crate::review::ReviewStatus::Closed,
+        &reviewer(),
+        None,
+    )
+    .unwrap();
+    let reviews = fixture.store().list().unwrap().len();
+    let refused = fixture
+        .open_ref(&PrRef::Hash(NUMBER))
+        .expect_err("no draft is made");
+    assert_eq!(refused.kind(), "other_repository");
+    assert!(!refused.is_retryable());
+    assert_eq!(fixture.store().list().unwrap().len(), reviews);
+    let after: Vec<String> = fixture.asked()[asked..].to_vec();
+    assert!(
+        after.iter().all(|call| call.starts_with("auth status ")),
+        "{after:?}"
+    );
+
+    // Read on this host too (the same repository reachable both ways), it refreshes.
+    std::fs::create_dir_all(store.join("github.com/dv-fixture/api")).unwrap();
+    std::fs::rename(
+        store.join("ghe.example/dv-fixture/api/pr-7"),
+        store.join("github.com/dv-fixture/api/pr-7"),
+    )
+    .unwrap();
+    assert_eq!(
+        fixture.refresh(&opened.review).stale.map(|e| e.to_string()),
+        None
+    );
+}
+
+#[test]
+fn a_fetch_writes_no_commit_graph_whatever_the_configuration_says() {
+    let fixture = PrFixture::new();
+    let clone = fixture.github.checkout();
+    clone.git(&["config", "fetch.writeCommitGraph", "true"]);
+    fixture.open();
+    let graph = clone.path().join(".git/objects/info");
+    assert!(!graph.join("commit-graph").exists());
+    assert!(!graph.join("commit-graphs").exists());
 }

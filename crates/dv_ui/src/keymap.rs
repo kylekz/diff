@@ -16,8 +16,8 @@
 use gpui::{Action, App, KeyBinding, KeyBindingContextPredicate, SharedString};
 
 use crate::actions::{
-    app, composer, diff_pane, field, file_finder, file_list, find, first_run, palette, settings,
-    sheet, shell, source_picker, switcher,
+    app, composer, diff_pane, field, file_finder, file_list, find, first_run, palette, pr_picker,
+    settings, sheet, shell, source_picker, switcher,
 };
 
 /// Key context of the shell's root element: everything in the main window.
@@ -33,6 +33,8 @@ pub const SOURCE_PICKER: &str = "SourcePicker";
 pub const FILE_FINDER: &str = "FileFinder";
 /// Key context of the open palette (inside [`SHELL`]).
 pub const PALETTE: &str = "Palette";
+/// Key context of the open PR picker (inside [`SHELL`]).
+pub const PR_PICKER: &str = "PrPicker";
 /// Key context of the panel's file list (inside [`SHELL`]).
 pub const FILE_LIST: &str = "FileList";
 /// Key context of the composer, a new thread's or a reply's (inside [`DIFF_PANE`]).
@@ -137,6 +139,10 @@ pub const SHORTCUTS: &[Shortcut] = &[
     shortcut!("secondary-p", SHELL, shell::FindFile),
     shortcut!("secondary-,", SHELL, shell::ToggleSettings),
     shortcut!("secondary-k", SHELL, shell::TogglePalette),
+    // Pull requests (DESIGN §4.5): the picker, and a PR review's refresh. No text field of
+    // dv's binds either key.
+    shortcut!("secondary-g", SHELL, shell::TogglePrPicker),
+    shortcut!("secondary-r", SHELL, shell::RefreshPr),
     // Settings and the first-run screen have the keyboard themselves (no text field).
     shortcut!("escape", SETTINGS, settings::Dismiss),
     shortcut!("enter", FIRST_RUN, first_run::Continue),
@@ -178,6 +184,11 @@ pub const SHORTCUTS: &[Shortcut] = &[
     shortcut!("up", PALETTE, palette::SelectPrevious, AheadOfInputs),
     shortcut!("enter", PALETTE, palette::Confirm),
     shortcut!("escape", PALETTE, palette::Dismiss),
+    // The PR picker: as the switcher, its field has the keyboard.
+    shortcut!("down", PR_PICKER, pr_picker::SelectNext, AheadOfInputs),
+    shortcut!("up", PR_PICKER, pr_picker::SelectPrevious, AheadOfInputs),
+    shortcut!("enter", PR_PICKER, pr_picker::Confirm),
+    shortcut!("escape", PR_PICKER, pr_picker::Dismiss),
     // The source picker has the keyboard itself (no text field).
     shortcut!("down", SOURCE_PICKER, source_picker::SelectNext),
     shortcut!("up", SOURCE_PICKER, source_picker::SelectPrevious),

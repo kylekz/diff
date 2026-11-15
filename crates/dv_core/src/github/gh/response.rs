@@ -10,7 +10,7 @@
 
 use serde_json::Value;
 
-use super::super::error::{GhFailure, GithubError, subcommand, unexpected};
+use super::super::error::{ANSWERED, GhFailure, GithubError, subcommand, unexpected};
 
 /// The exit code gh ends with when it has no login to use.
 const EXIT_AUTH: i32 = 4;
@@ -172,7 +172,7 @@ pub(super) fn outcome(
         }
         Some(status) if status >= 500 => {
             return Err(GithubError::Unavailable {
-                reason: format!("GitHub answered HTTP {status}"),
+                reason: format!("{ANSWERED}{status}"),
                 failure,
             });
         }

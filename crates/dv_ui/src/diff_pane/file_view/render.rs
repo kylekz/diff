@@ -22,6 +22,7 @@ use crate::icons::DvIcon;
 use crate::keymap;
 use crate::session::ViewFrom;
 use crate::theme::{DvTheme, StyledText as _};
+use crate::thread::one_line;
 
 impl DiffPane {
     /// The file view's header bar; `pinned` draws the copy that stays at the top.
@@ -120,10 +121,12 @@ impl DiffPane {
         };
         // A file outside the repository is named whole, its line too, cut in its middle when
         // it doesn't fit (DESIGN §4.1 "File view outside the repository").
+        // Drawn as one line: git allows a path any character but NUL.
+        let drawn = one_line(path);
         let shown_path = if outside {
             let named = match self.file_view_opened_at() {
-                Some(line) => format!("{path}:{line}"),
-                None => path.to_string(),
+                Some(line) => format!("{drawn}:{line}"),
+                None => drawn.to_string(),
             };
             let advance = {
                 let system = cx.text_system();
@@ -135,7 +138,7 @@ impl DiffPane {
             let columns = (room / f32::from(advance).max(1.)).max(12.) as usize;
             elide_path_middle(&named, |text| text.chars().count() <= columns)
         } else {
-            path.to_string()
+            drawn.into_owned()
         };
         div()
             .flex()

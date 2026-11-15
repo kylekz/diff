@@ -1,0 +1,24 @@
+{"scenario": {"window_size": "1440x900", "gh": "../fixtures/gh/pr_bidi.json", "description": "Comment bodies that try to draw another order than they are written (PLAN §10.3, §11; DESIGN §4.5), to be looked at: GitHub's threads on pull request 7 whose bodies hold a right-to-left override before a link (its text and its address written backwards, so that reversed they would read \"See details\" and a github.com host), an override after a link (so that what follows would read as the end of the host dv writes), a link with no override, text written right to left (Hebrew) around a link with a reply in Hebrew that holds no link, and right-to-left marks before a host written by hand and before a link (so that the hand-written host would stand beside the link's text); and the same first body as the reviewer's own comment. The overrides are spelled out (\\u{202e}) and each link's host stands directly after it; a body with a link and text that runs right to left is drawn as plain text, the link as it was typed; the Hebrew reply without a link is drawn as Markdown."}}
+{"cmd": "wait_ready", "timeout_ms": 20000}
+{"cmd": "set_setting", "key": "mode", "value": "dark"}
+{"cmd": "settle"}
+{"cmd": "seed_repo", "name": "api", "github": [{"branch": "feat"}, {"checkout": "feat"}, {"write": "src/lib.rs", "text": "pub fn answer() -> u32 {\n    42\n}\n"}, {"commit": "Add the answer"}, {"pr": [7, "feat"]}], "expect_result": {"pointer": "/github/prs/7", "equals": "5746f3cb7598128a528c413ffe03e23666d1e9d6"}}
+{"cmd": "open_pr", "path": "${data_dir}/repos/api", "pr": "7", "save": {"review": "/review_id"}}
+{"cmd": "wait_for", "pointer": "/session/github_threads", "len": 5, "timeout_ms": 20000}
+{"cmd": "settle", "timeout_ms": 20000, "expect": [{"pointer": "/session/github_threads/0/comments/0/body", "contains": "\u202e[sliated eeS]"}, {"pointer": "/session/github_threads/0/standing", "equals": "anchored"}, {"pointer": "/session/github_threads/3/id", "equals": "gh:PRRT_rtl"}, {"pointer": "/session/github_threads/3/comments/0/body", "contains": "](https://evil.example/doc)"}, {"pointer": "/session/github_threads/3/comments/1/body", "contains": "`answer()`"}, {"pointer": "/session/github_threads/4/id", "equals": "gh:PRRT_rlm"}]}
+// The reviewer's own comment is drawn by the same rule.
+{"cmd": "cli", "cwd": "repos/api", "args": ["comment", "add", "--review", "${review}", "--file", "src/lib.rs", "--lines", "3", "--body-file", "-"], "stdin": "\u202e[sliated eeS](https://moc.buhtig.evil.example/login)", "expect_result": {"pointer": "/exit", "equals": 0}}
+{"cmd": "wait_for", "pointer": "/session/threads", "len": 1, "timeout_ms": 20000}
+{"cmd": "settle", "timeout_ms": 20000}
+{"cmd": "screenshot", "name": "bidi-dark"}
+{"cmd": "set_setting", "key": "mode", "value": "light"}
+{"cmd": "settle", "timeout_ms": 20000}
+{"cmd": "screenshot", "name": "bidi-light"}
+// The last thread: a right-to-left mark before a host in brackets and before a link, so that the host written by hand would stand beside the link's text. It holds a link and a mark that runs right to left, so it shows as plain text.
+{"cmd": "scroll", "target": "stream", "dy": -600}
+{"cmd": "settle", "timeout_ms": 20000}
+{"cmd": "screenshot", "name": "bidi-marks-light"}
+{"cmd": "set_setting", "key": "mode", "value": "dark"}
+{"cmd": "settle", "timeout_ms": 20000}
+{"cmd": "screenshot", "name": "bidi-marks-dark"}
+{"cmd": "quit"}

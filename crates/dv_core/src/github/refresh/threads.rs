@@ -56,6 +56,14 @@ pub(super) fn read(
             }),
         },
     )?;
+    if let Some(why) = paged.truncated {
+        log::warn!(
+            "{}#{number}: its review threads were cut short ({why:?}); the mirror holds the \
+             first {}",
+            repo.name_with_owner(),
+            paged.nodes.len()
+        );
+    }
     paged.nodes.into_iter().map(thread).collect()
 }
 
@@ -93,6 +101,8 @@ struct Nodes<T> {
 #[serde(rename_all = "camelCase")]
 struct CommentNode {
     id: String,
+    /// `null` or absent: kept as none.
+    #[serde(default)]
     full_database_id: Value,
     author: Option<Login>,
     #[serde(default)]
@@ -128,6 +138,8 @@ struct Id {
 #[serde(rename_all = "camelCase")]
 struct ReviewNode {
     id: String,
+    /// `null` or absent: kept as none.
+    #[serde(default)]
     full_database_id: Value,
     state: String,
 }
@@ -190,22 +202,22 @@ fn comment_of(
     let review = match node.pull_request_review {
         None => None,
         Some(review) => Some(CommentReview {
-            database_id: database_id(&review.full_database_id)
-                .ok_or_else(|| wrong("a review without its fullDatabaseId"))?,
+            database_id: database_id(&review.full_database_id),
             state: match review.state.as_str() {
                 "PENDING" => ReviewState::Pending,
                 "COMMENTED" => ReviewState::Commented,
                 "APPROVED" => ReviewState::Approved,
                 "CHANGES_REQUESTED" => ReviewState::ChangesRequested,
                 "DISMISSED" => ReviewState::Dismissed,
-                other => return Err(wrong(&format!("an unknown review state, {other:?}"))),
+                // Only `PENDING` changes what a thread shows: another is kept as sent.
+                other => ReviewState::Other(other.to_string()),
             },
             id: review.id,
         }),
     };
     Ok(GithubComment {
-        database_id: database_id(&node.full_database_id)
-            .ok_or_else(|| wrong("a comment without its fullDatabaseId"))?,
+        // The read side names a comment by its node id: a missing database id costs nothing.
+        database_id: database_id(&node.full_database_id),
         author: node
             .author
             .map_or_else(|| GHOST.to_string(), |author| author.login),

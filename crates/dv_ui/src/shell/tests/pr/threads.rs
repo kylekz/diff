@@ -22,7 +22,7 @@ fn with(mut thread: Value, fields: Value) -> Value {
 }
 
 /// A thread by `author` on `line` of `src/lib.rs` at the fixture's head.
-fn on_line(fixture: &PrFixture, id: &str, line: u32, author: &str, body: &str) -> Value {
+pub(super) fn on_line(fixture: &PrFixture, id: &str, line: u32, author: &str, body: &str) -> Value {
     fixture_gh::thread(id, "src/lib.rs", line, author, body, &fixture.pr.head)
 }
 
@@ -633,7 +633,7 @@ fn a_resolve_github_refuses_leaves_the_card_as_it_was_with_why(cx: &mut TestAppC
         ),
         (
             refuse(None, "gh: HTTP 502\n", 1),
-            "GitHub can't be reached: ",
+            "GitHub answered HTTP 502, a server error",
         ),
     ];
     for (entry, message) in cases {
@@ -678,7 +678,7 @@ fn a_resolve_github_refuses_leaves_the_card_as_it_was_with_why(cx: &mut TestAppC
         assert!(!session.is_refreshing_pr());
         assert_eq!(session.pr().unwrap().stale, None);
         let error = session.github_error("PRRT_open").expect("the reason stays");
-        assert!(error.message.starts_with("GitHub can't be reached"));
+        assert!(error.message.starts_with("GitHub answered HTTP 502"));
     });
     // Nor does a Resolve of another thread.
     let mut answers = threads(&fixture);
@@ -910,6 +910,70 @@ fn a_resolve_and_a_refresh_take_turns(cx: &mut TestAppContext) {
     );
 }
 
+/// PLAN §9.6: the pull request that is open, opened again (its reference pasted once more,
+/// a Retry), is refreshed by its session in its turn: asked for while a Resolve runs, it
+/// waits behind the Resolve and the Resolve's own refresh, and no open reads the pull
+/// request beside them.
+#[gpui::test]
+fn opening_the_open_pull_request_again_waits_behind_a_resolve(cx: &mut TestAppContext) {
+    let (_dir, shell, cx) = open_shell(cx);
+    let (mut fixture, session) = opened(cx, &shell);
+    let pane = pane(&shell, cx);
+    let mut resolved = threads(&fixture);
+    resolved[0] = with(
+        resolved[0].clone(),
+        json!({"isResolved": true, "viewerCanResolve": false, "viewerCanUnresolve": true}),
+    );
+    fixture.pr.threads = resolved;
+    fixture.answer(vec![fixture_gh::resolve("PRRT_open", true)]);
+    let _ = std::fs::remove_file(log(&fixture));
+    pane.update(cx, |pane, cx| pane.toggle_github_resolved("PRRT_open", cx));
+
+    let location = fixture.location();
+    let opening = cx.update(|window, cx| {
+        shell.update(cx, |shell, cx| {
+            shell.open(location, OpenRequest::Pr(PrRef::Hash(7)), window, cx)
+        })
+    });
+    // The open is the session's refresh, waiting its turn; the review stays as it shows.
+    shell.read_with(cx, |shell, cx| {
+        assert!(shell.opening().is_some());
+        let shown = shell.session().unwrap();
+        assert_eq!(shown.entity_id(), session.entity_id());
+        let session = shown.read(cx);
+        assert_eq!(session.resolving("PRRT_open"), Some(true));
+        assert!(session.is_refreshing_pr());
+    });
+
+    settle(cx, &shell, "the open", |shell, _| shell.opening().is_none());
+    let again = cx.foreground_executor().block_test(opening).unwrap();
+    assert!(!again.created);
+    assert_eq!(
+        again.review,
+        session.read_with(cx, |session, _| session.review_id().clone())
+    );
+    settle_pr(cx, &shell);
+    // The Resolve, its own refresh, then the open's: each done before the next began.
+    let calls = asked(&fixture);
+    let turns: Vec<&str> = calls
+        .iter()
+        .map(String::as_str)
+        .filter(|call| call.contains("eviewThread"))
+        .collect();
+    assert_eq!(
+        turns,
+        ["resolveReviewThread", "reviewThreads", "reviewThreads"]
+    );
+    assert_eq!(calls[0], "resolveReviewThread");
+    // As many calls for the open's refresh as for the Resolve's own: no open of its own
+    // asked `gh` anything more.
+    assert_eq!((calls.len() - 1) % 2, 0, "{calls:?}");
+    let (own, opens) = calls[1..].split_at((calls.len() - 1) / 2);
+    assert_eq!(own, opens);
+    assert!(shown(&session, cx, "PRRT_open").2);
+    assert!(shell.read_with(cx, |shell, _| shell.banner().is_none()));
+}
+
 /// PLAN §9.6: GitHub took the change and the refresh after it read nothing. The card shows
 /// GitHub's answer and says what happened.
 #[gpui::test]
@@ -942,7 +1006,7 @@ fn a_resolve_whose_refresh_reads_no_mirror_shows_githubs_answer(cx: &mut TestApp
     assert!(resolved && can_unresolve && stale);
     let error = error.expect("the card says the refresh failed");
     assert!(
-        error.starts_with("Resolved on GitHub, but the refresh failed: GitHub can't be reached"),
+        error.starts_with("Resolved on GitHub, but the refresh failed: GitHub answered HTTP 502"),
         "{error}"
     );
     assert!(pane.read_with(cx, |pane, _| !pane.is_card_open(&key("PRRT_open"), true)));

@@ -337,12 +337,22 @@ impl ReviewStore {
     ///
     /// What dv keeps for a pull request goes with its last review: the commits fetched under
     /// `refs/dv/pr/` and the mirror files (`crate::github::forget`), swept best effort once
-    /// the review itself is gone; a sweep that fails is the next deletion's to finish.
+    /// the review itself is gone; a sweep that fails is the next deletion's to finish. The
+    /// deleted review's own pull request is swept by name, so its mirrors go even when its
+    /// fetched refs are no longer there to find them by.
     pub fn delete(&self, id: &ReviewId) -> Result<bool, StoreError> {
+        let link = self
+            .load(id)
+            .ok()
+            .and_then(|loaded| loaded.review.pr_target().cloned());
         let existed = self.backend.store_remove(&log_path(id))?;
         self.backend.store_remove(&snapshot_path(id))?;
         self.delete_refs(id)?;
-        if let Err(error) = crate::github::forget::unreviewed(self) {
+        let swept = crate::github::forget::unreviewed(self).and_then(|()| match &link {
+            Some(link) => crate::github::forget::pull_request(self, link),
+            None => Ok(()),
+        });
+        if let Err(error) = swept {
             log::warn!("review {id}: what dv keeps for its pull request wasn't removed: {error}");
         }
         Ok(existed)

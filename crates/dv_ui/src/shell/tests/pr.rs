@@ -16,6 +16,9 @@ use serde_json::{Value, json};
 use super::*;
 use crate::services::GitHub;
 
+mod picker;
+mod read;
+mod strip;
 mod threads;
 
 use crate::test_support::{open_shell, register, settle};
@@ -33,12 +36,27 @@ impl PrFixture {
     /// The fixture, the app's `GitHub` service running `mock_gh` over it, and its clone
     /// registered with `Locations`.
     fn new(cx: &mut VisualTestContext) -> Self {
+        Self::with_gh(cx, false)
+    }
+
+    /// [`PrFixture::new`] whose `mock_gh` logs every call ([`PrFixture::gh_calls`]).
+    fn logged(cx: &mut VisualTestContext) -> Self {
+        Self::with_gh(cx, true)
+    }
+
+    fn with_gh(cx: &mut VisualTestContext, logged: bool) -> Self {
         let fixture = Self::without_gh(cx);
         let mut options = GhOptions::new(mock_gh().into_os_string());
         options.env = vec![(
             "DV_MOCK_GH".into(),
             Some(fixture.scenario.clone().into_os_string()),
         )];
+        if logged {
+            options.env.push((
+                "DV_MOCK_GH_LOG".into(),
+                Some(fixture.log().into_os_string()),
+            ));
+        }
         let service = cx.update(|_, cx| cx.services().github.clone());
         service.update(cx, |service, _| {
             *service = GitHub::with_gh(Gh::new(options))
@@ -74,6 +92,28 @@ impl PrFixture {
         };
         fixture.answer(Vec::new());
         fixture
+    }
+
+    /// Where a [`PrFixture::logged`] fixture's `mock_gh` logs its calls.
+    fn log(&self) -> PathBuf {
+        self.scenario.with_file_name("gh_calls.jsonl")
+    }
+
+    /// The arguments of every call `gh` got so far (a [`PrFixture::logged`] fixture).
+    fn gh_calls(&self) -> Vec<Vec<String>> {
+        std::fs::read_to_string(self.log())
+            .unwrap_or_default()
+            .lines()
+            .map(|line| {
+                let call: Value = serde_json::from_str(line).unwrap();
+                call["argv"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|arg| arg.as_str().unwrap().to_string())
+                    .collect()
+            })
+            .collect()
     }
 
     /// Has `gh` answer about the pull request as it stands, `first` before that.
@@ -569,14 +609,24 @@ fn a_review_that_is_here_opens_under_a_banner_when_github_cant_be_read(cx: &mut 
         );
     });
 
-    // Signed in again, Retry reads it.
+    // The open's banner said the read that failed before: it went with that reason, and
+    // the strip's own says the one that holds now.
+    cx.update(|_, cx| {
+        shell.update(cx, |shell, cx| {
+            assert!(shell.banner().is_none());
+            assert!(shell.pr_error_open(cx) && shell.pr_banner(cx).is_some());
+        })
+    });
+
+    // Signed in again, `Ctrl R` reads it.
     fixture.answer(Vec::new());
-    cx.update(|window, cx| shell.update(cx, |shell, cx| shell.retry(window, cx)));
-    settle(cx, &shell, "the retry", |shell, _| {
-        shell.opening().is_none()
+    cx.simulate_keystrokes("secondary-r");
+    settle(cx, &shell, "the refresh", |shell, cx| {
+        !shell.session().unwrap().read(cx).is_refreshing_pr()
     });
     shell.read_with(cx, |shell, cx| {
         assert!(shell.banner().is_none());
+        assert!(!shell.pr_error_open(cx));
         let session = shell.session().unwrap().read(cx);
         assert_eq!(session.pr().unwrap().stale, None);
     });

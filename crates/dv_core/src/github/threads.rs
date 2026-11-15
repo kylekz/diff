@@ -239,8 +239,8 @@ pub fn anchor_thread(
     let previous = file.and_then(|file| file.previous_path.clone());
     let lines = match &thread.subject {
         ThreadSubject::File => {
-            let side = match file.map(|file| file.status) {
-                Some(FileStatus::Removed) => AnchorSide::Old,
+            let side = match file.map(|file| &file.status) {
+                Some(&FileStatus::Removed) => AnchorSide::Old,
                 _ => AnchorSide::New,
             };
             return GithubAnchor {

@@ -268,18 +268,11 @@ impl From<StoreError> for CliError {
     }
 }
 
-/// What a GitHub failure says in one line (PLAN §9.10): what failed, what git itself said
-/// when it was git (a fetch that failed says why), and the command that fixes it when there
-/// is one. The same for exit 5 and for the warning of an open that went on without GitHub.
+/// What a GitHub failure says in one line (PLAN §9.10): `GithubError::one_line`, which the
+/// app says too. The same for exit 5 and for the warning of an open that went on without
+/// GitHub.
 pub(crate) fn github_message(error: &GithubError) -> String {
-    let message = match error.git_said() {
-        Some(said) => format!("{error}: {said}"),
-        None => error.to_string(),
-    };
-    match error.fix() {
-        Some(fix) if !message.contains(&fix) => format!("{message}: run `{fix}`"),
-        _ => message,
-    }
+    error.one_line()
 }
 
 /// Exit 5, `github` (PLAN §9.10): the message says what failed ([`github_message`]); the

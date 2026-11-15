@@ -1,6 +1,7 @@
 //! What the views' tests share: a main window with the shell over real services in a temporary
 //! data dir, fixture repos registered with `Locations`, and a wait that lets real time pass for
-//! background git work.
+//! background git work. Every backend a test opens runs its git with `GIT_ALLOW_PROTOCOL=file`
+//! (`Locations`' base environment in this crate's tests, PLAN §14.2), a fixture's or not.
 
 use std::time::{Duration, Instant};
 
@@ -30,6 +31,23 @@ pub fn open_shell_with(
     cx: &mut TestAppContext,
     first_run: bool,
 ) -> (tempfile::TempDir, Entity<Shell>, &mut VisualTestContext) {
+    open_shell_in(cx, first_run, Vec::new())
+}
+
+/// [`open_shell`] on a machine whose WSL has `distros`: the stand-in lists them and starts
+/// dv in none (`WslAccess::scripted`).
+pub fn open_shell_wsl(
+    cx: &mut TestAppContext,
+    distros: Vec<dv_backend::wsl::Distro>,
+) -> (tempfile::TempDir, Entity<Shell>, &mut VisualTestContext) {
+    open_shell_in(cx, false, distros)
+}
+
+fn open_shell_in(
+    cx: &mut TestAppContext,
+    first_run: bool,
+    distros: Vec<dv_backend::wsl::Distro>,
+) -> (tempfile::TempDir, Entity<Shell>, &mut VisualTestContext) {
     cx.executor().allow_parking();
     let dir = tempfile::tempdir().expect("a temporary data dir");
     let data_dir = dir.path().to_path_buf();
@@ -44,7 +62,7 @@ pub fn open_shell_with(
                     first_run,
                 ),
                 data_dir,
-                wsl: crate::services::WslAccess::scripted(Vec::new()),
+                wsl: crate::services::WslAccess::scripted(distros),
             },
             cx,
         );

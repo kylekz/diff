@@ -183,6 +183,38 @@ fn parents_of_root_ordinary_and_merge_commits() {
 }
 
 #[test]
+fn commits_apart_counts_each_side_of_two_commits() {
+    let repo = FixtureRepo::new();
+    repo.write("a.txt", "a\n");
+    let root = repo.commit("root");
+    repo.write("a.txt", "b\n");
+    repo.commit("second");
+    repo.write("a.txt", "c\n");
+    let third = repo.commit("third");
+    repo.branch("side")
+        .checkout("side")
+        .git(&["reset", "-q", "--hard", &root]);
+    repo.write("s.txt", "s\n");
+    let side = repo.commit("side");
+    let git = git_repo(&repo);
+    let oid = |text: &str| Oid::parse(text).unwrap();
+
+    assert_eq!(git.commits_apart(&oid(&root), &oid(&root)).unwrap(), (0, 0));
+    // A fast-forward: two new commits.
+    assert_eq!(
+        git.commits_apart(&oid(&root), &oid(&third)).unwrap(),
+        (0, 2)
+    );
+    // History rewritten: `third`'s two commits are gone from `side`, which has one of its own.
+    assert_eq!(
+        git.commits_apart(&oid(&third), &oid(&side)).unwrap(),
+        (2, 1)
+    );
+    let missing = oid("0123456789abcdef0123456789abcdef01234567");
+    assert!(git.commits_apart(&missing, &oid(&root)).is_err());
+}
+
+#[test]
 fn full_ref_name_follows_gits_ref_rules() {
     let repo = FixtureRepo::new();
     repo.write("a.txt", "a\n");

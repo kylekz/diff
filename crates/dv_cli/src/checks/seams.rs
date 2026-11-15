@@ -8,6 +8,7 @@ use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 
 use dv_backend::install::{self, LINUX_DIR_VAR, WSL_HOME_VAR};
+use dv_backend::wsl;
 
 use super::user_path::{MACHINE_PATH_FILE_VAR, USER_PATH_FILE_VAR, UserPath};
 use crate::context::{Context, Env};
@@ -53,8 +54,9 @@ pub struct Seams {
     /// automation run's, so it reaches no distro but the one the run is sandboxed in. `None`:
     /// every distro.
     pub only_distros: Option<Vec<String>>,
-    /// Variables a distro's dv runs with besides the sandbox's home (`DV_GH` naming a program
-    /// that isn't there, in a test or an automation run, so nothing asks GitHub).
+    /// Variables a distro's dv runs with besides the sandbox's home: what crosses with a
+    /// command run there ([`distro_env`], PLAN §10.4), or a test's or an automation run's own
+    /// (`DV_GH` naming a program that isn't there, so nothing asks GitHub).
     pub distro_env: Vec<(String, String)>,
 }
 
@@ -70,6 +72,18 @@ fn child_env(ctx: &Context) -> Vec<(OsString, Option<OsString>)> {
     }
     env.extend(ctx.git_env.iter().cloned());
     env
+}
+
+/// [`Seams::distro_env`] read from `env`: what a command run inside a distro takes across
+/// besides who it acts as (`reexec::crossing`): `GIT_ALLOW_PROTOCOL` whenever it is set, and
+/// `DV_GH` when the checks are sandboxed (`DV_WSL_HOME`), so a sandboxed run's distro asks the
+/// same stand-in `gh`, or none.
+fn distro_env(env: &Env) -> Vec<(String, String)> {
+    crate::reexec::crossing(env, wsl::is_sandbox(env.var_lossy(WSL_HOME_VAR)))
+        .into_iter()
+        .filter(|name| !crate::reexec::ACTS_AS.contains(name))
+        .filter_map(|name| Some((name.to_string(), env.var(name)?)))
+        .collect()
 }
 
 impl Seams {
@@ -104,7 +118,7 @@ impl Seams {
                     .map(str::to_string)
                     .collect()
             }),
-            distro_env: Vec::new(),
+            distro_env: distro_env(env),
         }
     }
 

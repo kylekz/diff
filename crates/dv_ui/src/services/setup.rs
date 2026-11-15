@@ -108,10 +108,13 @@ impl SetupConfig {
         if !names_gh(std::env::var_os(dv_cli::checks::GH_VAR).as_deref()) {
             seams.gh = NO_GH.into();
         }
-        seams.distro_env = vec![(
+        seams
+            .distro_env
+            .retain(|(name, _)| name != dv_cli::checks::GH_VAR);
+        seams.distro_env.push((
             dv_cli::checks::GH_VAR.to_string(),
             "/dv-sandbox-has-no-gh".to_string(),
-        )];
+        ));
         seams.only_distros = Some(sandbox_distros());
         Self {
             seams,

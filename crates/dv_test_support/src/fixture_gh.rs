@@ -297,6 +297,28 @@ pub fn signed_out() -> Value {
     })
 }
 
+/// One item of `gh pr list --json number,title,author,isDraft,updatedAt`: an open pull
+/// request by `author`, last changed at `updated_at` (`2026-10-19T08:30:00Z`).
+pub fn listed(number: u64, title: &str, author: &str, draft: bool, updated_at: &str) -> Value {
+    json!({
+        "number": number,
+        "title": title,
+        "author": {"id": "U_kgDOfixture", "is_bot": false, "login": author, "name": ""},
+        "isDraft": draft,
+        "updatedAt": updated_at,
+    })
+}
+
+/// The two `mock_gh` entries answering the PR picker's list (PLAN §9.9): `open`, the
+/// repository's open pull requests ([`listed`]), and `requested`, the ones that ask for the
+/// viewer's review, in the same shape.
+pub fn pr_list(open: Vec<Value>, requested: Vec<Value>) -> Vec<Value> {
+    vec![
+        json!({"argv": ["pr", "list", "--search", "**"], "stdout": requested}),
+        json!({"argv": ["pr", "list", "--json", "**"], "stdout": open}),
+    ]
+}
+
 /// A GraphQL connection's one and last page.
 pub fn connection(nodes: Vec<Value>) -> Value {
     json!({"nodes": nodes, "pageInfo": {"hasNextPage": false, "endCursor": null}})

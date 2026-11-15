@@ -31,6 +31,7 @@
 mod files;
 mod threads;
 
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use serde_json::{Map, Value};
@@ -38,7 +39,7 @@ use serde_json::{Map, Value};
 use super::error::GithubError;
 use super::fetch::{self, Fetched};
 use super::mirror::store::{MirrorRead, MirrorStore};
-use super::mirror::{Checks, Mirror, MirrorKey, PullRequest, ViewedFile};
+use super::mirror::{Checks, Mirror, MirrorKey, MirrorPart, PullRequest, ViewedFile};
 use super::repo::GithubRepo;
 use super::{Gh, pr};
 use crate::backend::Backend;
@@ -166,10 +167,16 @@ pub(super) fn refresh_seen(
 ) -> Refreshed {
     let git = GitRepo::new(backend.clone());
     let mirrors = MirrorStore::new(backend.clone());
-    let number = match review.pr_target() {
-        Some(link) => link.number,
+    let link = match review.pr_target() {
+        Some(link) => link,
         None => return Refreshed::default(),
     };
+    let number = link.number;
+    // A review records no host (PLAN §2.2): one read on another host than the clone's
+    // repository is now on is another repository's, whatever its name.
+    if let Some(error) = read_on_another_host(&mirrors, repo, link) {
+        return unread(backend, review, link, error);
+    }
     let before = match pins::read(&git, &review.id) {
         Ok(pins) => pins,
         Err(error) => {
@@ -201,7 +208,9 @@ pub(super) fn refresh_seen(
         }
     };
     let written = read(&git, gh, repo, &key, seen).and_then(|(seen, mut mirror)| {
-        // What dv last synced for each file is dv's own: it outlives the mirror it was in.
+        // What dv last synced for a file is dv's own: each file this read's Viewed part
+        // holds keeps it from the mirror it replaces. A read without that part holds no
+        // file to keep it for; carrying it past one is the write side's (PLAN §9.7).
         if let Some(previous) = stored() {
             for (path, file) in &mut mirror.viewed {
                 file.synced = previous.viewed.get(path).and_then(|file| file.synced);
@@ -247,6 +256,37 @@ pub(super) fn refresh_seen(
         }
     }
     refreshed
+}
+
+/// Why `link`'s pull request can't be read from `repo`: it was read on another host than
+/// `repo`'s and nothing was read of it on `repo`'s. The clone has remotes for the same
+/// `owner/repo` on two hosts, and the one pull requests are taken from changed since the
+/// review was made (`gh repo set-default`, a remote added). Only what is stored is looked
+/// at; `None` when nothing stands in the way.
+pub(super) fn read_on_another_host(
+    mirrors: &MirrorStore,
+    repo: &GithubRepo,
+    link: &PrLink,
+) -> Option<GithubError> {
+    let hosts = mirrors.hosts().ok()?;
+    let here = hosts
+        .iter()
+        .filter(|host| host.eq_ignore_ascii_case(&repo.host))
+        .cloned()
+        .collect::<Vec<_>>();
+    if mirrors.holds_any(&here, link) || mirrors.holds_any(std::slice::from_ref(&repo.host), link) {
+        return None;
+    }
+    hosts
+        .into_iter()
+        .filter(|host| !host.eq_ignore_ascii_case(&repo.host))
+        .find(|host| mirrors.holds_any(std::slice::from_ref(host), link))
+        .map(|read_from| GithubError::OtherHost {
+            number: link.number,
+            repository: format!("{}/{}", link.owner, link.repo),
+            read_from,
+            now: repo.host.clone(),
+        })
 }
 
 /// What `review`, a PR review without pins, shows: its target as it resolves, at the commits
@@ -306,8 +346,27 @@ fn gather(
 ) -> Result<Option<Mirror>, GithubError> {
     let number = key.number;
     let threads = threads::read(gh, repo, number)?;
-    let pending_review = files::pending_review(gh, repo, number, &key.login)?;
-    let viewed = files::viewed(gh, repo, number)?;
+    // Best effort (PLAN §9.4): what the read side doesn't rest on never costs the mirror.
+    let mut unread = BTreeMap::new();
+    let mut best_effort = |part: MirrorPart, error: GithubError| {
+        let why = error.one_line();
+        log::warn!(
+            "{}#{number}: {part:?} wasn't read: {why}",
+            repo.name_with_owner()
+        );
+        unread.insert(part, why);
+    };
+    let pending_review =
+        files::pending_review(gh, repo, number, &key.login).unwrap_or_else(|error| {
+            best_effort(MirrorPart::PendingReview, error);
+            None
+        });
+    let viewed = files::viewed(gh, repo, number).unwrap_or_else(|error| {
+        best_effort(MirrorPart::Viewed, error);
+        BTreeMap::new()
+    });
+    // Required: thread placement reads a file's renames and status from this list
+    // (`threads`), so a mirror without it would place threads another way than GitHub.
     let files = files::patches(gh, repo, number)?;
     if pr::head(gh, repo, number)? != seen.pr.head_oid {
         return Ok(None);
@@ -333,6 +392,7 @@ fn gather(
                 )
             })
             .collect(),
+        unread,
     }))
 }
 

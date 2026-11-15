@@ -1,7 +1,7 @@
 //! The custom title bar (DESIGN §2, §4.1): 40px of `chrome` holding dv's mark, the review
 //! switcher button (`repo · working tree vs main`, a location chip for WSL, `Ctrl O`), the
-//! source picker, the centred command field (`Ctrl K`), the `⋯` that opens Settings (`Ctrl ,`)
-//! and, on Windows, the caption buttons.
+//! source picker, the centred command field (`Ctrl K`), **PRs** (`Ctrl G`, `super::pr`), the
+//! `⋯` that opens Settings (`Ctrl ,`) and, on Windows, the caption buttons.
 //! The whole bar is a window drag region; its controls occlude it so they stay clickable.
 //!
 //! The switcher and the source picker hang under their buttons while open, and the file
@@ -61,6 +61,33 @@ fn distro(location: &Location) -> Option<String> {
     }
 }
 
+/// How many characters of a PR review's label (`#482 Title`) the title bar shows: about what
+/// a long branch's label comes to ("feature/cache-the-config vs main"). A title is as long
+/// as its author likes, and the label moves the command field right as far as it needs
+/// (module docs, "Room"): capped, a title moves it no further than a branch's name does,
+/// and **PRs** keeps its words in a window that has room for them. The strip under the
+/// bar shows the title whole.
+const PR_LABEL_CHARS: usize = 48;
+
+/// `label`, a PR review's, at [`PR_LABEL_CHARS`] characters at most, then "…".
+fn capped(label: &str) -> String {
+    match label.char_indices().nth(PR_LABEL_CHARS) {
+        Some((at, _)) => format!("{}…", label[..at].trim_end()),
+        None => label.to_string(),
+    }
+}
+
+/// The open review's target as the title bar's label names it: its label, a PR review's
+/// capped ([`capped`]).
+pub fn title_target(session: &crate::session::ReviewSession) -> String {
+    let target = session.target_label();
+    if session.review().is_pr_review() {
+        capped(&target)
+    } else {
+        target
+    }
+}
+
 impl Shell {
     /// The title bar of the main window.
     pub(super) fn render_title_bar(
@@ -85,7 +112,7 @@ impl Shell {
                 let location = &session.backend().repo().location;
                 SwitcherLabel::Review {
                     name: location.short_name(),
-                    target: session.target_label(),
+                    target: title_target(session),
                     distro: distro(location),
                 }
             }
@@ -97,12 +124,27 @@ impl Shell {
         let needed = left_group_width(&label, left_inset, has_review, window, theme);
         // The bar spans the window inside the frame Linux's client-side decorations draw.
         let frame = gpui_component::window_paddings(window);
-        let field = field_left(
-            window.viewport_size().width - frame.left - frame.right,
+        let width = window.viewport_size().width - frame.left - frame.right;
+        let right = SETTINGS_BUTTON_ROOM
+            + theme.sizes.caption_button_width * caption_buttons(window).len() as f32;
+        // **PRs** gives up its label and keycap before the left group gives up anything.
+        let prs_room = super::pr::prs_button_room(window, theme);
+        let prs_compact = prs_is_compact(
+            width,
             theme.sizes.command_field_width,
             needed,
-            SETTINGS_BUTTON_ROOM
-                + theme.sizes.caption_button_width * caption_buttons(window).len() as f32,
+            right + prs_room,
+        );
+        let field = field_left(
+            width,
+            theme.sizes.command_field_width,
+            needed,
+            right
+                + if prs_compact {
+                    super::pr::PRS_COMPACT_ROOM
+                } else {
+                    prs_room
+                },
         );
         let room = field - FIELD_GAP;
         div()
@@ -141,6 +183,7 @@ impl Shell {
                     }),
             )
             .child(div().flex_1())
+            .child(self.render_prs_button(theme, prs_compact, cx))
             .child(
                 div()
                     .flex_none()
@@ -333,6 +376,13 @@ pub fn field_left(width: Pixels, field: Pixels, needed: Pixels, right: Pixels) -
     let centred = (width - field) / 2.;
     let furthest = width - right - FIELD_GAP - field;
     centred.max((needed + FIELD_GAP).min(furthest))
+}
+
+/// Whether **PRs** draws as its glyph alone: when a left group `needed` wide can't have the
+/// command field where it needs it with `right` reserved at the window's right edge, the
+/// whole button counted in ([`field_left`]'s `furthest`).
+pub fn prs_is_compact(width: Pixels, field: Pixels, needed: Pixels, right: Pixels) -> bool {
+    needed + FIELD_GAP > width - right - FIELD_GAP - field
 }
 
 /// How wide the left group draws when nothing truncates: the mark, the switcher button with
@@ -777,6 +827,19 @@ mod tests {
     }
 
     #[test]
+    fn a_pull_requests_label_is_capped_and_a_short_one_left_alone() {
+        assert_eq!(capped("#7 Add the answer"), "#7 Add the answer");
+        let long = "#12 Cache the parsed config between requests so a reload neither reads \
+                    nor validates every file again";
+        let label = capped(long);
+        assert_eq!(label, "#12 Cache the parsed config between requests so…");
+        assert_eq!(label.chars().count(), PR_LABEL_CHARS);
+        // Characters, not bytes.
+        let wide = "#3 ".to_string() + &"é".repeat(60);
+        assert_eq!(capped(&wide).chars().count(), PR_LABEL_CHARS + 1);
+    }
+
+    #[test]
     fn caption_buttons_follow_the_platform_and_the_window_manager() {
         use CaptionButton::{Close, Maximize, Minimize, Restore};
 
@@ -837,6 +900,19 @@ mod tests {
             ),
             []
         );
+    }
+
+    #[test]
+    fn prs_keeps_its_label_while_the_left_group_has_room() {
+        let (field, right) = (px(300.), px(34. + 120. + 138.));
+        // 1440 wide: room for everything.
+        assert!(!prs_is_compact(px(1440.), field, px(600.), right));
+        // 1100 wide: a short label fits beside the whole button, a long one doesn't.
+        assert!(!prs_is_compact(px(1100.), field, px(455.), right));
+        assert!(prs_is_compact(px(1100.), field, px(600.), right));
+        // Exactly enough is enough.
+        assert!(!prs_is_compact(px(1100.), field, px(484.), right));
+        assert!(prs_is_compact(px(1100.), field, px(485.), right));
     }
 
     #[test]

@@ -80,6 +80,12 @@ pub fn shell(shell: &Shell, window: &Window, cx: &App) -> Value {
             },
             "connection": pending.connection().name(),
         })),
+        // The repository `#n` names and the PR picker lists (PLAN §9.9).
+        "repo_in_view": shell.repo_in_view(cx).map(|location| location.display_name()),
+        // The open review's target as the title bar's label names it (DESIGN §4.1).
+        "title_target": shell
+            .session()
+            .map(|session| dv_ui::shell::title_bar::title_target(session.read(cx))),
         "banner": shell.banner().map(|banner| json!({
             "message": banner.failure.message,
             "detail": banner.failure.detail,
@@ -285,10 +291,16 @@ fn repo(row: &RepoRow) -> Value {
         .reviews
         .iter()
         .map(|review| match review {
-            ReviewRow::Ok { summary, label } => json!({
+            ReviewRow::Ok { summary, label, pr } => json!({
                 "id": summary.id,
                 "target": summary.target,
                 "target_label": label,
+                // A PR review's pull request as the switcher names it.
+                "pr": pr.as_ref().map(|pr| json!({
+                    "number": pr.number,
+                    "title": pr.title,
+                    "round": pr.round,
+                })),
                 "status": summary.status.as_str(),
                 "round": summary.current_round,
                 "threads": {
@@ -305,6 +317,8 @@ fn repo(row: &RepoRow) -> Value {
         "path": row.path,
         "name": row.name,
         "location": row.location,
+        // Its repository on GitHub as last read (`known_repos.json`'s `github`).
+        "github": row.github,
         "loading": row.loading,
         "error": failure(row.error.as_ref()),
         "stopped": row.stopped,
@@ -694,7 +708,13 @@ pub fn file_finder(shell: &Shell, window: &Window, cx: &App) -> Value {
 /// the keyboard.
 pub fn palette(shell: &Shell, window: &Window, cx: &App) -> Value {
     let Some(palette) = shell.palette() else {
-        return json!({"open": false, "query": null, "rows": [], "selected": null});
+        return json!({
+            "open": false,
+            "query": null,
+            "rows": [],
+            "selected": null,
+            "notice": null,
+        });
     };
     let palette = palette.read(cx);
     let rows: Vec<Value> = palette
@@ -715,6 +735,8 @@ pub fn palette(shell: &Shell, window: &Window, cx: &App) -> Value {
         "rows": rows,
         "selected": palette.selected_key(),
         "focused": palette.is_focused(window, cx),
+        // Why the folder chosen for a pull request wasn't taken.
+        "notice": palette.notice(),
     })
 }
 

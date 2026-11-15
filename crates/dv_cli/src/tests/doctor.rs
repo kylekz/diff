@@ -361,6 +361,46 @@ fn a_restricted_run_reaches_no_other_distro() {
     assert_eq!(Seams::from_context(&ctx).only_distros, Some(Vec::new()));
 }
 
+/// A distro's checks run with what a command run there would take across (PLAN §10.4).
+#[test]
+fn a_distros_checks_take_across_what_a_command_would() {
+    use crate::checks::Seams;
+
+    let home = tempfile::tempdir().unwrap();
+    let mut fixture = with_home(home.path(), None);
+    let distro_env = |fixture: &Fixture| {
+        let (ctx, _, _) = fixture.context(fixture.path(), &Input::default());
+        Seams::from_context(&ctx).distro_env
+    };
+    let pair = |name: &str, value: &str| (name.to_string(), value.to_string());
+    fixture.env.remove("DV_WSL_HOME");
+    fixture.env.remove("GIT_ALLOW_PROTOCOL");
+    fixture
+        .env
+        .insert("DV_GH".to_string(), "/t/no-gh".to_string());
+    // Outside a sandbox the distro's own environment decides which `gh` runs.
+    assert_eq!(distro_env(&fixture), []);
+    fixture
+        .env
+        .insert("GIT_ALLOW_PROTOCOL".to_string(), "file".to_string());
+    assert_eq!(distro_env(&fixture), [pair("GIT_ALLOW_PROTOCOL", "file")]);
+    // A value that is no sandbox (PLAN §5.2) is an error where it is used, never a sandbox.
+    fixture
+        .env
+        .insert("DV_WSL_HOME".to_string(), "/".to_string());
+    assert_eq!(distro_env(&fixture), [pair("GIT_ALLOW_PROTOCOL", "file")]);
+    fixture
+        .env
+        .insert("DV_WSL_HOME".to_string(), "/tmp/dv-home".to_string());
+    assert_eq!(
+        distro_env(&fixture),
+        [
+            pair("GIT_ALLOW_PROTOCOL", "file"),
+            pair("DV_GH", "/t/no-gh")
+        ]
+    );
+}
+
 #[test]
 fn container_tools_vm_distros_arent_the_users() {
     use crate::checks::distro::is_vm;

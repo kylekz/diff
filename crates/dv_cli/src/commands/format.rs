@@ -20,15 +20,16 @@ use crate::escape;
 pub(crate) const BODY_INDENT: &str = "    ";
 
 /// `r-…  working tree vs main  changes_requested  round 2  1 open, 0 addressed, 2 resolved`;
-/// a PR review whose pull request has threads of GitHub's own ends with them, counted apart
-/// (PLAN §9.6): `…  on GitHub: 5 open, 1 resolved`.
+/// a PR review's round is its pull request's, as the app shows it
+/// (`dv_core::review::displayed_round`), and one whose pull request has threads of GitHub's
+/// own ends with them, counted apart (PLAN §9.6): `…  on GitHub: 5 open, 1 resolved`.
 pub(crate) fn review_line(review: &ReviewDto) -> String {
     let mut line = format!(
         "{}  {}  {}  round {}  {}",
         review.id,
         review.target.label,
         review.status,
-        review.round,
+        dv_core::review::displayed_round(review.round, review.pr.as_ref().map(|pr| pr.pr_round)),
         counts(&review.threads)
     );
     let github = review.pr.as_ref().and_then(|pr| pr.threads);

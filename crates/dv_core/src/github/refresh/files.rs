@@ -39,6 +39,14 @@ pub(super) fn viewed(
             nested: None,
         },
     )?;
+    if let Some(why) = paged.truncated {
+        log::warn!(
+            "{}#{number}: its files' Viewed states were cut short ({why:?}); the mirror holds \
+             the first {}",
+            repo.name_with_owner(),
+            paged.nodes.len()
+        );
+    }
     paged
         .nodes
         .into_iter()
@@ -51,7 +59,7 @@ pub(super) fn viewed(
                 "VIEWED" => ViewedState::Viewed,
                 "UNVIEWED" => ViewedState::Unviewed,
                 "DISMISSED" => ViewedState::Dismissed,
-                other => return Err(wrong(&format!("an unknown viewed state, {other:?}"))),
+                other => ViewedState::Other(other.to_string()),
             };
             Ok((file.path, state))
         })
@@ -104,6 +112,8 @@ pub(super) fn pending_review(
     #[serde(rename_all = "camelCase")]
     struct Review {
         id: String,
+        /// `null` or absent: kept as none.
+        #[serde(default)]
         full_database_id: Value,
         #[serde(default)]
         body: String,

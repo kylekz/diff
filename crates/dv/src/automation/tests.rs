@@ -229,11 +229,17 @@ fn state_describes_the_empty_shell(cx: &mut TestAppContext) {
             "window_native": null,
             "opening": false,
             "pending": null,
+            "repo_in_view": null,
+            "title_target": null,
             "banner": null,
             "backend_banner": null,
             "status": {"health": "idle", "location": "No repo", "review": null, "finish": false},
         })
     );
+    assert_eq!(state["pr_strip"], json!(null));
+    assert_eq!(state["pr_picker"]["open"], false);
+    assert_eq!(state["pr_picker"]["rows"], json!([]));
+    assert_eq!(state["palette"]["notice"], json!(null));
     assert_eq!(state["backends"], json!([]));
     assert_eq!(
         state["switcher"],
@@ -1166,4 +1172,39 @@ fn a_repo_seeded_with_a_fixture_github_has_pull_requests_to_open(cx: &mut TestAp
         refused.to_string().contains("needs an open PR review"),
         "{refused}"
     );
+}
+
+#[gpui::test]
+fn folder_answer_queues_what_the_next_folder_picker_answers(cx: &mut TestAppContext) {
+    let (dir, host, cx) = open(cx);
+    let answer = |args: Value, cx: &mut VisualTestContext| {
+        cx.update(|window, cx| {
+            host.update(cx, |host, cx| {
+                host.custom("folder_answer", args, window, cx)
+            })
+        })
+        .expect("folder_answer is a dv command")
+    };
+    let folder = dir.path().join("repos").join("api");
+    let reply = answer(json!({"path": folder.display().to_string()}), cx).unwrap();
+    assert_eq!(reply, json!({"answers_left": 1}));
+    let reply = answer(json!({"path": null}), cx).unwrap();
+    assert_eq!(reply, json!({"answers_left": 2}));
+    for (args, error) in [
+        (json!({"path": 3}), "needs a string"),
+        (json!({"folder": "x"}), "takes path"),
+    ] {
+        let message = answer(args.clone(), cx).unwrap_err().to_string();
+        assert!(message.contains(error), "{args}: {message}");
+    }
+
+    // The pickers get them in order: the folder, then a cancel, then (none queued) a cancel.
+    let picked = |cx: &mut VisualTestContext| {
+        let task = cx.update(|_, cx| dv_ui::system::pick_folder("Choose its folder", cx));
+        cx.foreground_executor().block_test(task).unwrap()
+    };
+    assert_eq!(picked(cx), Some(folder));
+    assert_eq!(picked(cx), None);
+    assert_eq!(picked(cx), None);
+    assert_eq!(state(&host, cx)["system"]["answers_left"], 0);
 }

@@ -5,7 +5,7 @@
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 
-use dv_core::review::{ReviewStatus, Verdict};
+use dv_core::review::{ReviewId, ReviewStatus, Verdict, pins};
 use dv_test_support::fixture_gh::{self, GhPr};
 use dv_test_support::{FixtureGithub, GITHUB_OWNER, GitTrace};
 use pretty_assertions::assert_eq;
@@ -162,6 +162,18 @@ impl PrFixture {
     }
 }
 
+/// A review's `pr` document without `read_at`, which is when its mirror was read (ms since
+/// the Unix epoch): a time of this run.
+fn read_then(pr: &Value) -> Value {
+    let mut pr = pr.clone();
+    let read_at = pr.as_object_mut().unwrap().remove("read_at").unwrap();
+    assert!(
+        read_at.as_u64().is_some_and(|at| at > 1_700_000_000_000),
+        "{read_at}"
+    );
+    pr
+}
+
 #[test]
 fn review_new_pr_opens_the_pull_request_as_a_draft() {
     let fixture = PrFixture::new();
@@ -191,7 +203,7 @@ fn review_new_pr_opens_the_pull_request_as_a_draft() {
     assert_eq!(review["status"], "draft");
     assert_eq!(review["round"], 1);
     assert_eq!(
-        review["pr"],
+        read_then(&review["pr"]),
         json!({
             "owner": GITHUB_OWNER,
             "repo": "api",
@@ -199,6 +211,7 @@ fn review_new_pr_opens_the_pull_request_as_a_draft() {
             "url": "https://github.com/dv-fixture/api/pull/7",
             "state": "open",
             "head_oid": fixture.pr.head,
+            "github_head_oid": fixture.pr.head,
             "pr_round": 1,
             "threads": {"open": 0, "resolved": 0},
         })
@@ -313,8 +326,23 @@ fn review_refresh_follows_the_head_and_the_threads_relocate() {
     let json = fixture.run(&["review", "refresh", &id, "--json"]).ok_json();
     assert_eq!(json["moved"], json!({"from": old, "to": head}));
     assert_eq!(json["review"]["pr"]["head_oid"], head.as_str());
-    // The target keeps the commits the review was made at.
-    assert_eq!(json["review"]["target"]["head_oid"], old.as_str());
+    // The target is printed at the commits the review shows now, its pins; the stored one
+    // keeps the commits the review was made at.
+    assert_eq!(json["review"]["target"]["head_oid"], head.as_str());
+    assert_eq!(
+        json["review"]["target"]["base_oid"],
+        fixture
+            .github
+            .checkout()
+            .git(&["rev-parse", "origin/main"])
+            .trim()
+    );
+    let stored = fixture.store().load(&id.parse().unwrap()).unwrap().review;
+    assert!(
+        matches!(&stored.target, Target::Pr { head_oid, .. } if head_oid.as_str() == old),
+        "{:?}",
+        stored.target
+    );
 
     let shown = fixture
         .run(&["comment", "show", &thread, "--json"])
@@ -341,6 +369,82 @@ fn review_refresh_follows_the_head_and_the_threads_relocate() {
             ),
         ]
     );
+}
+
+/// A PR target's `base_oid` is the old side the review shows, the merge base, with the
+/// review's pins and without them; never the base branch's tip the stored target keeps,
+/// which moves on without the pull request.
+#[test]
+fn a_pr_targets_base_is_the_merge_base_with_pins_and_without() {
+    let fixture = PrFixture::new();
+    let fork = fixture
+        .repo()
+        .git(&["rev-parse", "main"])
+        .trim()
+        .to_string();
+    // The base branch moves on after the pull request forked from it.
+    let author = fixture.github.author();
+    author.checkout("main").write("NOTES.md", "later\n");
+    let tip = author.commit("Move main on");
+    fixture.github.publish("main");
+    assert_ne!(tip, fork);
+
+    let json = fixture
+        .run(&["review", "new", "--pr", "7", "--json"])
+        .ok_json();
+    let id: ReviewId = json["review"]["id"].as_str().unwrap().parse().unwrap();
+    let stored = fixture.store().load(&id).unwrap().review;
+    assert!(
+        matches!(&stored.target, Target::Pr { base_oid, .. } if base_oid.as_str() == tip),
+        "{:?}",
+        stored.target
+    );
+    let sides = json!({"base_oid": fork, "head_oid": fixture.pr.head});
+    let shown_sides = |review: &Value| {
+        json!({
+            "base_oid": review["target"]["base_oid"],
+            "head_oid": review["target"]["head_oid"],
+        })
+    };
+    assert_eq!(shown_sides(&json["review"]), sides);
+
+    // Without its pins the review shows its target as it resolves: the same two commits.
+    for pin in [pins::head_ref(&id), pins::base_ref(&id)] {
+        fixture.repo().git(&["update-ref", "-d", &pin]);
+    }
+    let shown = fixture
+        .run(&["review", "show", &id.to_string(), "--json"])
+        .ok_json();
+    assert_eq!(shown_sides(&shown["review"]), sides);
+    assert_eq!(shown["review"]["pr"]["head_oid"], fixture.pr.head.as_str());
+}
+
+/// A PR review whose commits aren't in the clone (its store came from another one) shows
+/// nothing: its target says the head it was made at and no old side, rather than the base
+/// branch's tip as if it were one.
+#[test]
+fn a_pr_target_whose_commits_are_gone_has_no_base() {
+    let fixture = PrFixture::new();
+    let (base, head) = ("e".repeat(40), "f".repeat(40));
+    let review = fixture
+        .store()
+        .create(
+            Target::Pr {
+                owner: GITHUB_OWNER.into(),
+                repo: "api".into(),
+                number: 7,
+                base_oid: dv_core::git::Oid::parse(&base).unwrap(),
+                head_oid: dv_core::git::Oid::parse(&head).unwrap(),
+            },
+            reviewer(),
+        )
+        .unwrap();
+    let shown = fixture
+        .run(&["review", "show", &review.id.to_string(), "--json"])
+        .ok_json();
+    assert_eq!(shown["review"]["target"]["base_oid"], Value::Null);
+    assert_eq!(shown["review"]["target"]["head_oid"], head.as_str());
+    assert_eq!(shown["review"]["pr"]["head_oid"], head.as_str());
 }
 
 #[test]
@@ -488,12 +592,77 @@ fn a_github_failure_is_exit_5_with_its_kind() {
     assert_eq!(error["detail"], "moved");
 }
 
+/// PLAN §9.4: what the read side doesn't act on (the Viewed marks, the viewer's pending
+/// review) is read best effort. One of them failing leaves the mirror whole otherwise: the
+/// review opens as any, with no warning.
+#[test]
+fn a_part_the_read_side_doesnt_act_on_failing_still_reads_the_mirror() {
+    let failing = |argv: Value, holds: Option<&str>| {
+        let mut entry = json!({
+            "argv": argv,
+            "stderr": "gh: Server Error (HTTP 502)\n",
+            "exit": 1
+        });
+        if let Some(holds) = holds {
+            entry["stdin_contains"] = json!(holds);
+        }
+        entry
+    };
+    let graphql = json!(["api", "graphql", "**"]);
+    for (part, entry) in [
+        (
+            "viewed",
+            failing(graphql.clone(), Some("viewerViewedState")),
+        ),
+        (
+            "pending review",
+            failing(graphql, Some("states: [PENDING]")),
+        ),
+    ] {
+        let fixture = PrFixture::new();
+        fixture.answer(vec![entry]);
+        let ran = fixture.run(&["review", "new", "--pr", "7", "--json"]);
+        let json = ran.ok_json();
+        assert_eq!(json["created"], true, "{part}");
+        assert_eq!(json["stale"], Value::Null, "{part}");
+        assert_eq!(json["review"]["pr"]["state"], "open");
+        assert_eq!(
+            json["review"]["pr"]["url"],
+            "https://github.com/dv-fixture/api/pull/7"
+        );
+        assert_eq!(ran.stderr, "", "{part}");
+    }
+
+    // The files are another matter: where GitHub's threads show rests on them (a rename,
+    // a removed file), so without them there is no mirror, and the command says so.
+    let fixture = PrFixture::new();
+    fixture.answer(vec![failing(
+        json!([
+            "api",
+            "repos/dv-fixture/api/pulls/7/files?per_page=100",
+            "**"
+        ]),
+        None,
+    )]);
+    let ran = fixture.run(&["review", "new", "--pr", "7", "--json"]);
+    let json = ran.ok_json();
+    assert_eq!(json["created"], true);
+    assert_eq!(json["stale"]["kind"], "unavailable");
+    assert_eq!(json["review"]["pr"]["state"], Value::Null);
+    assert!(
+        ran.stderr
+            .starts_with("dv: warning: what GitHub holds about the pull request couldn't be read"),
+        "{}",
+        ran.stderr
+    );
+}
+
 #[test]
 fn a_mirror_that_cant_be_read_still_opens_the_review_with_a_warning() {
     let fixture = PrFixture::new();
     fixture.answer(vec![json!({
         "argv": ["api", "graphql", "**"],
-        "stdin_contains": "viewerViewedState",
+        "stdin_contains": "reviewThreads(first",
         "stderr": "gh: Server Error (HTTP 502)\n",
         "exit": 1
     })]);
@@ -501,14 +670,17 @@ fn a_mirror_that_cant_be_read_still_opens_the_review_with_a_warning() {
     let json = ran.ok_json();
     assert_eq!(json["created"], true);
     let id = json["review"]["id"].as_str().unwrap();
-    // Never read whole, there is no mirror to tell GitHub's word on its state, or its URL.
+    // Never read whole, there is no mirror to tell GitHub's word on its state, its URL,
+    // the head GitHub has or when it was read.
     assert_eq!(json["review"]["pr"]["state"], Value::Null);
     assert_eq!(json["review"]["pr"]["url"], Value::Null);
+    assert_eq!(json["review"]["pr"]["github_head_oid"], Value::Null);
+    assert_eq!(json["review"]["pr"]["read_at"], Value::Null);
     assert_eq!(
         ran.stderr,
         format!(
             "dv: warning: what GitHub holds about the pull request couldn't be read (GitHub \
-             can't be reached: GitHub answered HTTP 502); `dv review refresh {id}` reads it again\n"
+             answered HTTP 502, a server error); `dv review refresh {id}` reads it again\n"
         )
     );
 }
@@ -760,8 +932,23 @@ fn the_pull_requests_rounds_are_its_reviews() {
     assert_eq!(refreshed["review"]["pr"]["head_oid"], old.as_str());
     assert_eq!(refreshed["review"]["pr"]["pr_round"], 1);
 
-    // Deleting them takes what dv kept for the pull request with the last one.
+    // A command that can't tell which review it means lists the open ones, each with the
+    // round every text line prints for it: the pull request's second (its own round, 1, in
+    // the document).
     let second = next["review"]["id"].as_str().unwrap();
+    let unclear = fixture.run(&["comment", "list", "--json"]);
+    assert_eq!(unclear.exit, Exit::Usage);
+    let listed = unclear
+        .stderr
+        .lines()
+        .find(|line| line.trim_start().starts_with(second))
+        .unwrap_or_else(|| panic!("no candidate line: {}", unclear.stderr));
+    assert!(listed.contains("  draft  round 2  "), "{listed}");
+    let document: Value = serde_json::from_str(&unclear.stdout).unwrap();
+    assert_eq!(document["error"]["candidates"][0]["round"], 1);
+    assert_eq!(document["error"]["candidates"][0].get("shown_round"), None);
+
+    // Deleting them takes what dv kept for the pull request with the last one.
     fixture
         .run(&["review", "delete", &first, "--json"])
         .ok_json();
@@ -813,20 +1000,21 @@ fn commands_that_only_read_never_start_gh() {
         "url": "https://github.com/dv-fixture/api/pull/7",
         "state": "open",
         "head_oid": fixture.pr.head,
+        "github_head_oid": fixture.pr.head,
         "pr_round": 1,
         "threads": {"open": 0, "resolved": 0},
     });
     for vars in [&[][..], &[("CLAUDECODE", "1")]] {
         let status = fixture.run_as(vars, &["status", "--json"]).ok_json();
-        assert_eq!(status["reviews"][0]["pr"], pr);
+        assert_eq!(read_then(&status["reviews"][0]["pr"]), pr);
         let list = fixture
             .run_as(vars, &["review", "list", "--json"])
             .ok_json();
-        assert_eq!(list["reviews"][0]["pr"], pr);
+        assert_eq!(read_then(&list["reviews"][0]["pr"]), pr);
         let shown = fixture
             .run_as(vars, &["review", "show", &id, "--json"])
             .ok_json();
-        assert_eq!(shown["review"]["pr"], pr);
+        assert_eq!(read_then(&shown["review"]["pr"]), pr);
         for line in [
             vec!["review", "show", &id],
             vec!["comment", "list", "--review", &id, "--json"],

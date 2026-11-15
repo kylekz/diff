@@ -370,7 +370,12 @@ impl RenderOnce for GithubCard {
                     .text_spec(&theme.text.secondary)
                     .text_color(c.red)
                     .child(icon(DvIcon::TriangleAlert, px(13.), c.red))
-                    .child(div().flex_1().min_w_0().child(error.message.clone()))
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .child(one_line(&error.message).into_owned()),
+                    )
                     .automation_target(format!("{name}/error"))
             }));
         if self.collapsed {

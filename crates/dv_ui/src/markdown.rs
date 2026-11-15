@@ -11,6 +11,15 @@
 //! [`crate::system::open_url`], which opens web addresses only and only records them under
 //! automation.
 //!
+//! **A link says where it goes** (DESIGN §4.5). A link's text is its author's: "the docs",
+//! or another site's address. So the sanitiser writes the host a click opens after every
+//! link to the web, "the docs (docs.rs)", whatever the link's text is, its own address
+//! included ([`link_host`]). The host is an aid to the reader, drawn inside text a
+//! stranger wrote: it stands directly after its link because nothing in a body that holds
+//! a link draws out of the order it is written in. A body with a link to the web and any
+//! character that runs right to left ([`runs_right_to_left`]) is drawn without Markdown,
+//! so without links; the explicit controls are spelled out in every body.
+//!
 //! **Read as the view reads it.** The sanitiser parses a body with the options `TextView`
 //! parses with ([`view_options`]: GFM with inline and block math, gpui-base's
 //! `MarkdownExtensions::parse_options` with nothing registered), edits the spans that parse
@@ -19,8 +28,16 @@
 //! shows math nobody claims as the prose between its dollars (gpui-base's
 //! `flatten_unclaimed_math`). An edit can change what the text around it means (escaping a
 //! tag frees a backtick inside it; escaping an HTML block ends it early), so only the second
-//! reading says whether an image or a tag is left. When one is, the whole body is escaped
-//! coarsely ([`coarse_escape`]), which no parse can read an image or a tag out of.
+//! reading says whether an image or a tag is left, a link that doesn't say where it
+//! goes, or a character that reorders or hides text (one written as a character reference
+//! is such a character only once Markdown has read it). When one is, the whole body is
+//! escaped coarsely ([`coarse_escape`]), which no parse can read an image, a tag or a link
+//! to the web out of.
+
+use std::borrow::Cow;
+use std::collections::HashMap;
+use std::fmt::Write as _;
+use std::hash::{Hash as _, Hasher as _};
 
 use gpui::{App, ElementId, SharedString};
 use gpui_component::text::{TextView, TextViewStyle};
@@ -32,13 +49,27 @@ use crate::theme::ActiveTheme as _;
 /// A Markdown body as a [`TextView`] keyed by `id`, which must be stable and unique per body
 /// (a thread or reply id), so the view's parsed state follows the body across renders. The
 /// current light/dark appearance is part of the key, so a mode change parses again and fenced
-/// code takes the new palette.
+/// code takes the new palette; and so is the text itself ([`view_key`]).
 pub fn view(id: impl Into<ElementId>, text: &str, cx: &App) -> TextView {
     let sanitized: SharedString = sanitize_untrusted(text).into();
-    let keyed = SharedString::from(format!("{}/{}", id.into(), cx.dv_theme().key()));
+    let keyed = view_key(&id.into(), cx.dv_theme().key(), &sanitized);
     TextView::markdown(keyed, sanitized)
         .style(TextViewStyle::default().paragraph_gap(gpui::rems(0.5)))
         .on_link_click(|url, _event, _window, cx| crate::system::open_url(url, cx))
+}
+
+/// The key of the view's state for the sanitised text `sanitized` under `id` and the theme
+/// `theme`. The text is part of it (its hash), so a body that changed is a new state, parsed
+/// whole. A `TextView` handed a text that starts with the one its state holds takes it as
+/// an append and parses only the last block and what was added (gpui-base's
+/// `TextViewState::set_text`), in a context of its own: a link definition earlier in the
+/// body doesn't exist there, so the tail can read as other links than the whole body the
+/// sanitiser read and checked (a comment edited on GitHub to end in `[text [d]](address)`,
+/// `[d]` defined above). No state ever sees two texts.
+fn view_key(id: &ElementId, theme: impl std::fmt::Display, sanitized: &str) -> SharedString {
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    sanitized.hash(&mut hasher);
+    SharedString::from(format!("{id}/{theme}/{:016x}", hasher.finish()))
 }
 
 /// [`view`] whose links go to `on_link` instead of [`crate::system::open_url`]: the hover
@@ -144,14 +175,85 @@ fn fence_run(line: &str) -> Option<(char, usize, &str)> {
 /// itself, with the options it uses ([`view_options`]), so code is left alone for free: text
 /// in fenced and indented blocks and inline code spans lives under `Code`/`InlineCode` nodes,
 /// never `Image` or `Html` ones. A math node's source is sanitised as the prose `TextView`
-/// shows it as. Everything else (links, emphasis, tables, lists) passes through. The result
-/// is then read as `TextView` will read it ([`is_inert`]); when the parse fails, a span
-/// doesn't map onto the source, or that reading still finds an image or a tag, the whole body
-/// is escaped coarsely instead: uglier, and fetch-proof under any parse.
+/// shows it as. Every link to the web gains the host it opens after it ([`link_host`]);
+/// an address in a link's text becomes plain text there, and a hard break in it a line
+/// break that draws as a space. Everything else (emphasis, tables, lists) passes through.
+/// The result is then read as `TextView` will read it ([`is_inert`]); when the parse
+/// fails, a span doesn't map onto the source, or that reading still finds an image, a tag,
+/// a link that doesn't name its host, or a link in a body with text that runs right to
+/// left, the whole body is escaped coarsely instead: uglier, and
+/// fetch-proof and link-free. That too is read as `TextView` will read it, and should it
+/// hold a link to the web or anything but inert text all the same, the body is drawn with
+/// no Markdown at all ([`no_markdown`]).
+///
+/// Before any of it, the characters that reorder or hide text are spelled out
+/// ([`spell_out`]), in prose and in code alike. One written as a character reference
+/// (`&#x202E;`) is such a character only in what Markdown reads out of the body, which is
+/// where [`is_inert`] looks for it: a body holding one is escaped coarsely, and the
+/// reference shows as the text it is.
 pub fn sanitize_untrusted(source: &str) -> String {
-    edited(source, &view_options())
+    let source = spell_out(source);
+    edited(&source, &view_options())
         .filter(|sanitized| is_inert(sanitized))
-        .unwrap_or_else(|| coarse_escape(source))
+        .or_else(|| Some(coarse_escape(&source)).filter(|escaped| is_link_free(escaped)))
+        .unwrap_or_else(|| no_markdown(&source))
+}
+
+/// Whether `c` is an explicit bidirectional control (an embedding, an override or an
+/// isolate, U+202A–U+202E and U+2066–U+2069) or a tag character (U+E0000–U+E007F): what a
+/// body may not hold as a character ([`spell_out`], [`is_inert`]).
+fn reorders_or_hides(c: char) -> bool {
+    matches!(c, '\u{202A}'..='\u{202E}' | '\u{2066}'..='\u{2069}' | '\u{E0000}'..='\u{E007F}')
+}
+
+/// Whether `c` can draw a line in another order than it is written without any explicit
+/// control: a letter of a script written right to left or one of its numbers (the blocks
+/// from Hebrew to Arabic Extended, their presentation forms, the right-to-left scripts of
+/// the supplementary planes) or a right-to-left mark. Without one of these, and with the
+/// explicit controls spelled out ([`spell_out`]), every piece `TextView` shapes on its own
+/// (a line, a code span, the text beside it) draws left to right in the order it is
+/// written. A body that holds one may hold no link to the web ([`is_inert`]).
+fn runs_right_to_left(c: char) -> bool {
+    matches!(
+        c,
+        '\u{0590}'..='\u{08FF}'
+            | '\u{200F}'
+            | '\u{FB1D}'..='\u{FDFF}'
+            | '\u{FE70}'..='\u{FEFF}'
+            | '\u{10800}'..='\u{10FFF}'
+            | '\u{1E800}'..='\u{1EFFF}'
+    )
+}
+
+/// Whether `c` ends a paragraph for the bidirectional algorithm inside one piece of text
+/// (U+001C–U+001E, U+0085, U+2028, U+2029): a link's text is one line and holds none.
+fn ends_a_paragraph(c: char) -> bool {
+    matches!(
+        c,
+        '\u{001C}'..='\u{001E}' | '\u{0085}' | '\u{2028}' | '\u{2029}'
+    )
+}
+
+/// `source` with every explicit bidirectional control (the embeddings, overrides and
+/// isolates, U+202A–U+202E and U+2066–U+2069) and every tag character (U+E0000–U+E007F)
+/// spelled out as the CLI spells them (`\u{202e}`, PLAN §10.3): an override would draw a
+/// line, and the host dv writes after a link in it, in another order than it is written,
+/// and a tag hides text. Line breaks and tabs stay, as do the marks scripts written right
+/// to left need (LRM, RLM, the joiners): Hebrew or Arabic reads as it is written.
+fn spell_out(source: &str) -> Cow<'_, str> {
+    if !source.contains(reorders_or_hides) {
+        return Cow::Borrowed(source);
+    }
+    let mut out = String::with_capacity(source.len() + 16);
+    for c in source.chars() {
+        if reorders_or_hides(c) {
+            // Writing to a `String` can't fail.
+            let _ = write!(out, "\\u{{{:x}}}", u32::from(c));
+        } else {
+            out.push(c);
+        }
+    }
+    Cow::Owned(out)
 }
 
 /// The options `TextView` parses a body with: gpui-base's
@@ -175,7 +277,7 @@ fn prose_options() -> ParseOptions {
 fn edited(source: &str, options: &ParseOptions) -> Option<String> {
     let ast = markdown::to_mdast(source, options).ok()?;
     let mut edits: Vec<(usize, usize, String)> = Vec::new();
-    if !collect_unsafe_spans(&ast, source, &mut edits) {
+    if !collect_unsafe_spans(&ast, source, &definitions(&ast), false, &mut edits) {
         return None;
     }
     if edits.is_empty() {
@@ -185,8 +287,9 @@ fn edited(source: &str, options: &ParseOptions) -> Option<String> {
     let mut out = String::with_capacity(source.len());
     let mut cursor = 0usize;
     for (start, end, replacement) in edits {
-        // Spans never nest (a replaced node isn't descended into); skip an overlap rather than
-        // emit text twice.
+        // Spans never nest (a replaced node isn't descended into; what goes after a link is
+        // written at its end, after the edits inside it); skip an overlap rather than emit
+        // text twice.
         if start < cursor {
             continue;
         }
@@ -199,28 +302,217 @@ fn edited(source: &str, options: &ParseOptions) -> Option<String> {
 }
 
 /// Whether `text`, read as `TextView` reads a body (module docs), holds nothing it fetches
-/// or renders as markup: no `Image`, `ImageReference` or `Html` node in a parse with
-/// [`view_options`], nor in a math node's source read as prose. Text that doesn't parse is
-/// not inert.
+/// or renders as markup, no link that hides where it goes, and nothing that reorders or
+/// hides text: no `Image`, `ImageReference` or `Html` node in a parse with
+/// [`view_options`], nor in a math node's source read as prose; after every link to the
+/// web, its host ([`link_host`]); in a link's text no link, no hard break and nothing
+/// that ends a paragraph; in what the parse read out of the body ([`read_out`]) no
+/// character [`spell_out`] spells out, which only a character reference can have put
+/// there; and, when the body holds a link to the web, no character that runs right to
+/// left anywhere in it, written or read out ([`runs_right_to_left`]): the host stands
+/// directly after its link only where the text draws in the order it is written. Text
+/// that doesn't parse is not inert.
 fn is_inert(text: &str) -> bool {
-    fn inert_under(node: &Node, source: &str) -> bool {
+    /// What a reading found beside what fails it at once.
+    #[derive(Default)]
+    struct Found {
+        web_link: bool,
+        right_to_left: bool,
+    }
+    fn inert_under(
+        node: &Node,
+        source: &str,
+        definitions: &HashMap<String, String>,
+        in_link: bool,
+        found: &mut Found,
+    ) -> bool {
+        let read = read_out(node);
+        let holds = |is: fn(char) -> bool| read.iter().any(|text| text.contains(is));
+        if holds(reorders_or_hides) || (in_link && holds(ends_a_paragraph)) {
+            return false;
+        }
+        found.right_to_left |= holds(runs_right_to_left);
+        let children = |node: &Node, in_link: bool, found: &mut Found| {
+            node.children()
+                .into_iter()
+                .flatten()
+                .all(|child| inert_under(child, source, definitions, in_link, found))
+        };
         match node {
             Node::Image(_) | Node::ImageReference(_) | Node::Html(_) => false,
             Node::InlineMath(_) | Node::Math(_) => node
                 .position()
                 .and_then(|position| source.get(position.start.offset..position.end.offset))
                 .is_some_and(|literal| {
-                    markdown::to_mdast(literal, &prose_options())
-                        .is_ok_and(|prose| inert_under(&prose, literal))
+                    markdown::to_mdast(literal, &prose_options()).is_ok_and(|prose| {
+                        inert_under(&prose, literal, &self::definitions(&prose), in_link, found)
+                    })
                 }),
-            other => other
-                .children()
-                .into_iter()
-                .flatten()
-                .all(|child| inert_under(child, source)),
+            // A link in another link's text opens its own address under the outer link's
+            // host, and a hard break there puts the host lines below the link's start
+            // (`collect_unsafe_spans` leaves neither).
+            Node::Link(_) | Node::LinkReference(_) | Node::Break(_) if in_link => false,
+            Node::Link(_) | Node::LinkReference(_) => {
+                let named = match link_host(node, definitions) {
+                    Some(host) => {
+                        found.web_link = true;
+                        node.position()
+                            .and_then(|position| source.get(position.end.offset..))
+                            .is_some_and(|after| after.starts_with(&host_suffix(&host)))
+                    }
+                    None => true,
+                };
+                named && children(node, true, found)
+            }
+            other => children(other, in_link, found),
         }
     }
-    markdown::to_mdast(text, &view_options()).is_ok_and(|ast| inert_under(&ast, text))
+    let mut found = Found::default();
+    markdown::to_mdast(text, &view_options())
+        .is_ok_and(|ast| inert_under(&ast, text, &definitions(&ast), false, &mut found))
+        && !(found.web_link && (found.right_to_left || text.contains(runs_right_to_left)))
+}
+
+/// What the parse read out of `node` itself, character references decoded: its text when
+/// it is text (`Text`, code, math, raw HTML), and what it carries beside its children (a
+/// link's address and title, a definition's, a reference's label, an image's alternative
+/// text, a code block's language and the rest of its fence's line).
+fn read_out(node: &Node) -> Vec<&str> {
+    fn all<'a>(texts: &[Option<&'a str>]) -> Vec<&'a str> {
+        texts.iter().flatten().copied().collect()
+    }
+    match node {
+        Node::Text(text) => vec![&text.value],
+        Node::InlineCode(code) => vec![&code.value],
+        Node::InlineMath(math) => vec![&math.value],
+        Node::Html(html) => vec![&html.value],
+        Node::Code(code) => all(&[
+            Some(&code.value),
+            code.lang.as_deref(),
+            code.meta.as_deref(),
+        ]),
+        Node::Math(math) => all(&[Some(&math.value), math.meta.as_deref()]),
+        Node::Link(link) => all(&[Some(&link.url), link.title.as_deref()]),
+        Node::Definition(definition) => all(&[
+            Some(&definition.url),
+            definition.title.as_deref(),
+            definition.label.as_deref(),
+            Some(&definition.identifier),
+        ]),
+        Node::LinkReference(reference) => {
+            all(&[reference.label.as_deref(), Some(&reference.identifier)])
+        }
+        Node::Image(image) => all(&[Some(&image.alt), Some(&image.url), image.title.as_deref()]),
+        Node::ImageReference(image) => all(&[
+            Some(&image.alt),
+            image.label.as_deref(),
+            Some(&image.identifier),
+        ]),
+        Node::FootnoteDefinition(note) => all(&[note.label.as_deref(), Some(&note.identifier)]),
+        Node::FootnoteReference(note) => all(&[note.label.as_deref(), Some(&note.identifier)]),
+        _ => Vec::new(),
+    }
+}
+
+/// Where each link reference under `node` goes: its definitions' destinations by their
+/// identifier, the first of each as Markdown reads them.
+fn definitions(node: &Node) -> HashMap<String, String> {
+    fn collect(node: &Node, found: &mut HashMap<String, String>) {
+        if let Node::Definition(definition) = node {
+            found
+                .entry(definition.identifier.clone())
+                .or_insert_with(|| definition.url.clone());
+        }
+        for child in node.children().into_iter().flatten() {
+            collect(child, found);
+        }
+    }
+    let mut found = HashMap::new();
+    collect(node, &mut found);
+    found
+}
+
+/// The host to write after `link` (a `Link` or a `LinkReference`, whose destination
+/// `definitions` has) so it says where it goes (module docs): the host of the web address
+/// a click opens, as [`shown_host`] writes it. Every link to the web has one, a link
+/// written as its own address too: what stands beside a link, or what its text reads
+/// as, can make any address read as another's, so no link is trusted to name itself.
+/// `None` only for a link that opens nothing (`crate::system::open_url` opens web
+/// addresses only).
+///
+/// Only a link that isn't inside another's text is asked. GFM reads an address in a link's
+/// text as a link too (`[https://docs.rs/x](https://docs.rs/x)` is two), and in
+/// `TextView` a click on that text opens the inner address, whatever the outer link's
+/// host says. So the inner one is taken away ([`collect_unsafe_spans`]): its text stays,
+/// as text of the outer link, which is then the only thing a click there opens.
+fn link_host(link: &Node, definitions: &HashMap<String, String>) -> Option<String> {
+    let url = match link {
+        Node::Link(link) => link.url.as_str(),
+        Node::LinkReference(reference) => definitions.get(&reference.identifier)?.as_str(),
+        _ => return None,
+    };
+    let url = url.trim();
+    crate::system::is_web_url(url).then(|| shown_host(url))
+}
+
+/// What follows a link whose host is `host`: the host in brackets, as plain text.
+fn host_suffix(host: &str) -> String {
+    format!(" ({host})")
+}
+
+/// The host of the web address `url` as text that is plain in Markdown: lowercase letters,
+/// digits, `.`, `-` and an IPv6 literal's `:`, without the login before it or the port
+/// after it. Any other character is spelled out (`{U+0430}`), so a host can't pass for
+/// another by a letter that looks like one of its own, nor open any syntax; `www.` is kept
+/// from reading as an address of its own.
+fn shown_host(url: &str) -> String {
+    let address = url.split_once(':').map_or("", |(_, rest)| rest);
+    let address = address.strip_prefix("//").unwrap_or(address);
+    let authority = address
+        .split(['/', '\\', '?', '#'])
+        .next()
+        .unwrap_or_default();
+    let host = authority.rsplit('@').next().unwrap_or_default();
+    let host = match host.strip_prefix('[') {
+        Some(v6) => v6.split(']').next().unwrap_or_default(),
+        None => match host.rsplit_once(':') {
+            Some((name, port)) if port.chars().all(|c| c.is_ascii_digit()) => name,
+            _ => host,
+        },
+    };
+    let mut shown = String::with_capacity(host.len());
+    for c in host.chars() {
+        match c {
+            'a'..='z' | '0'..='9' | '.' | '-' | ':' => shown.push(c),
+            'A'..='Z' => shown.push(c.to_ascii_lowercase()),
+            // Writing to a `String` can't fail.
+            c => {
+                let _ = write!(shown, "{{U+{:04X}}}", u32::from(c));
+            }
+        }
+    }
+    if shown.is_empty() {
+        return "no host".to_string();
+    }
+    break_www(&shown)
+}
+
+/// `text` with every `www.`, in any case, kept from starting an address of its own (`www\.`):
+/// GFM takes `www.`, `WWW.` and every mix of the two for the start of a link.
+fn break_www(text: &str) -> String {
+    let mut out = String::with_capacity(text.len() + 4);
+    let mut rest = text;
+    while let Some(at) = rest
+        .as_bytes()
+        .windows(4)
+        .position(|window| window.eq_ignore_ascii_case(b"www."))
+    {
+        out.push_str(&rest[..at + 3]);
+        out.push_str("\\.");
+        rest = &rest[at + 4..];
+    }
+    out.push_str(rest);
+    out
 }
 
 /// The first line of a Markdown body as plain text, for one-line summaries (the comments list,
@@ -297,11 +589,17 @@ fn first_text_line(text: &str) -> Option<String> {
 
 /// Collects a `(start, end, replacement)` byte-span edit for every image and raw-HTML node
 /// under `node`, and for every math node, whose source is sanitised as the prose `TextView`
-/// shows it as. `false` when a node's span can't be mapped onto `source` (no position, out
-/// of range, off a char boundary), which makes the caller escape the whole body.
+/// shows it as; inside a link's text (`in_link`), for every link, its source as text that
+/// is no link, and for every hard break, a line break that draws as a space; and, after
+/// every link to the web, the host that says where it goes ([`link_host`], with
+/// `definitions` for a reference's destination), written after the edits inside the link.
+/// `false` when a node's span can't be mapped onto `source` (no position, out of range,
+/// off a char boundary), which makes the caller escape the whole body.
 fn collect_unsafe_spans(
     node: &Node,
     source: &str,
+    definitions: &HashMap<String, String>,
+    in_link: bool,
     edits: &mut Vec<(usize, usize, String)>,
 ) -> bool {
     let span_of = |node: &Node| -> Option<(usize, usize)> {
@@ -323,19 +621,40 @@ fn collect_unsafe_spans(
         Node::InlineMath(_) | Node::Math(_) => edit(node, &|math| {
             edited(math, &prose_options()).unwrap_or_else(|| coarse_escape(math))
         }),
-        other => match other.children() {
-            Some(children) => children
-                .iter()
-                .all(|child| collect_unsafe_spans(child, source, edits)),
-            None => true,
-        },
+        // An address GFM reads as a link inside another link's text (`link_host`): its
+        // source with every punctuation character escaped reads as the same text and as
+        // no link.
+        Node::Link(_) | Node::LinkReference(_) if in_link => edit(node, &no_markdown),
+        // A link's text is one line, so its host is on the line the link starts on: a hard
+        // break in it keeps its line ending alone, which Markdown folds into a space.
+        Node::Break(_) if in_link => edit(node, &|written| match written.find(['\r', '\n']) {
+            Some(line_end) => written[line_end..].to_string(),
+            None => " ".to_string(),
+        }),
+        other => {
+            let is_link = matches!(other, Node::Link(_) | Node::LinkReference(_));
+            let inside = other.children().into_iter().flatten().all(|child| {
+                collect_unsafe_spans(child, source, definitions, in_link || is_link, edits)
+            });
+            // The host goes after the edits inside the link.
+            match (link_host(other, definitions), span_of(other)) {
+                (Some(host), Some((_, end))) if inside => {
+                    edits.push((end, end, host_suffix(&host)));
+                    true
+                }
+                (Some(_), None) => false,
+                _ => inside,
+            }
+        }
     }
 }
 
-/// The inert literal an image becomes: its alt text, stripped of every character that could
-/// reopen Markdown or HTML syntax once spliced back into the source.
+/// The inert literal an image becomes: its alt text, what reorders or hides text spelled
+/// out ([`spell_out`]) and stripped of every character that could reopen Markdown or HTML
+/// syntax once spliced back into the source.
 fn image_placeholder(alt: &str) -> String {
-    let clean: String = alt
+    // The alt as Markdown read it: a character reference in it is the character by now.
+    let clean: String = spell_out(alt)
         .chars()
         .filter(|c| !matches!(c, '[' | ']' | '(' | ')' | '<' | '>' | '`' | '!' | '&'))
         .collect();
@@ -347,20 +666,76 @@ fn image_placeholder(alt: &str) -> String {
     }
 }
 
-/// Escapes HTML (`&`, `<`) and breaks image syntax (`![` to `!\[`), so the result can only
-/// render as literal text: for a raw-HTML node's span (an image inside an HTML block must not
-/// come back to life once the tags are escaped) and for a whole body when span edits aren't
-/// possible or didn't hold. No `<` and no `![` is left in it, and without one no parser,
-/// whatever its options and however it pairs the rest, reads a tag or an image out of it:
-/// that is what makes it the fallback. A bare address in it is kept from becoming a link (`://` to `:\/\/`, `www.` to
-/// `www\.`): an automatic link runs on through the escaped markup after it (`&lt;/details>`),
-/// which would then show as written and be part of what a click opens.
+/// Escapes HTML (`&`, `<`) and every opening bracket (`[` to `\[`, after each backslash is
+/// made a literal one, `\\`, so none written before a bracket undoes the escape), so the
+/// result can only render as literal text: for a raw-HTML node's span (an image inside an
+/// HTML block must not come back to life once the tags are escaped) and for a whole body
+/// when span edits aren't possible or didn't hold. No `<` and no bracket that opens anything
+/// is left in it, and without one no parser, whatever its options and however it pairs the
+/// rest, reads a tag, an image or a bracketed link out of it: that is what makes it the
+/// fallback. A bare address in it is kept from becoming a link (`://` to `:\/\/`, `www.` in
+/// any case to `www\.`): an automatic link runs on through the escaped markup after it (`&lt;/details>`),
+/// which would then show as written and be part of what a click opens. So nothing in it is
+/// a link to the web at all, and none can hide where it goes. Code in it shows the
+/// backslashes it gained.
 fn coarse_escape(text: &str) -> String {
-    text.replace('&', "&amp;")
-        .replace('<', "&lt;")
-        .replace("![", "!\\[")
-        .replace("://", ":\\/\\/")
-        .replace("www.", "www\\.")
+    break_www(
+        &text
+            .replace('\\', "\\\\")
+            .replace('&', "&amp;")
+            .replace('<', "&lt;")
+            .replace('[', "\\[")
+            .replace("://", ":\\/\\/"),
+    )
+}
+
+/// Whether `text`, read as `TextView` reads a body, is inert ([`is_inert`]) and holds no
+/// link to the web at all: what the coarse escape's output must be.
+fn is_link_free(text: &str) -> bool {
+    fn free_under(node: &Node, source: &str, definitions: &HashMap<String, String>) -> bool {
+        let url = match node {
+            Node::Link(link) => Some(link.url.as_str()),
+            Node::LinkReference(reference) => {
+                definitions.get(&reference.identifier).map(String::as_str)
+            }
+            Node::InlineMath(_) | Node::Math(_) => {
+                return node
+                    .position()
+                    .and_then(|position| source.get(position.start.offset..position.end.offset))
+                    .is_some_and(|literal| {
+                        markdown::to_mdast(literal, &prose_options()).is_ok_and(|prose| {
+                            free_under(&prose, literal, &self::definitions(&prose))
+                        })
+                    });
+            }
+            _ => None,
+        };
+        !url.is_some_and(|url| crate::system::is_web_url(url.trim()))
+            && node
+                .children()
+                .into_iter()
+                .flatten()
+                .all(|child| free_under(child, source, definitions))
+    }
+    is_inert(text)
+        && markdown::to_mdast(text, &view_options())
+            .is_ok_and(|ast| free_under(&ast, text, &definitions(&ast)))
+}
+
+/// `text` as Markdown that is no Markdown: every ASCII punctuation character escaped, which
+/// CommonMark reads as that character and nothing else, so no emphasis, link, image, tag,
+/// address, heading, list or code span is left to read out of it. What a body is drawn as
+/// when even its coarse escape reads as something ([`sanitize_untrusted`]): its words,
+/// and its line breaks as Markdown folds them.
+fn no_markdown(text: &str) -> String {
+    let mut out = String::with_capacity(text.len() * 2);
+    for c in text.chars() {
+        if c.is_ascii_punctuation() {
+            out.push('\\');
+        }
+        out.push(c);
+    }
+    out
 }
 
 #[cfg(test)]

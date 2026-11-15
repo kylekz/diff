@@ -121,6 +121,15 @@ impl Palette {
                 lines.push(section_label(row.section.title(), ix == 0, theme));
             }
             lines.push(self.render_row(ix, row, theme, cx));
+            // Why the folder chosen wasn't taken, under the row that asked for it.
+            if matches!(row.kind, RowKind::ChooseFolder { .. })
+                && let Some(notice) = &self.notice
+            {
+                lines.push(
+                    crate::pr_picker::notice_line(notice, theme)
+                        .automation_target("palette/notice"),
+                );
+            }
         }
         list.children(lines).into_any_element()
     }
@@ -158,6 +167,58 @@ impl Palette {
             })
             .on_click(cx.listener(move |this, _, _, cx| this.pick(ix, cx)));
         let line = match &row.kind {
+            // A pull request's name and title are its author's text: one line each, and the
+            // title truncates.
+            RowKind::Pr {
+                name, title, clone, ..
+            } => line
+                .child(icon(DvIcon::Github, px(14.), glyph_color))
+                .child(
+                    div()
+                        .flex_none()
+                        .font_weight(FontWeight::MEDIUM)
+                        .child("Open pull request"),
+                )
+                .child(
+                    div()
+                        .flex_none()
+                        .max_w(px(220.))
+                        .truncate()
+                        .font_family(theme.fonts.mono.clone())
+                        .text_size(px(12.))
+                        .text_color(c.fg2)
+                        .child(SharedString::from(name.clone())),
+                )
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .truncate()
+                        .text_color(c.fg2)
+                        .children(title.clone().map(SharedString::from)),
+                )
+                .children(clone.clone().map(|clone| {
+                    div()
+                        .flex_none()
+                        .max_w(px(140.))
+                        .truncate()
+                        .text_spec(&theme.text.secondary)
+                        .text_color(c.fg3)
+                        .child(SharedString::from(clone))
+                })),
+            RowKind::ChooseFolder { repository, .. } => line
+                .child(icon(DvIcon::Folder, px(14.), glyph_color))
+                .child(div().min_w_0().truncate().child(SharedString::from(format!(
+                    "{repository} isn't open in dv yet"
+                ))))
+                .child(div().flex_1())
+                .child(
+                    div()
+                        .flex_none()
+                        .font_weight(FontWeight::MEDIUM)
+                        .text_color(c.accent_text)
+                        .child("Choose its folder"),
+                ),
             RowKind::Command(command) => line
                 .child(icon(DvIcon::ChevronRight, px(14.), glyph_color))
                 .child(div().min_w_0().truncate().child(command.title))

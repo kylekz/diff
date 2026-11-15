@@ -199,6 +199,20 @@ enum Mode {
     Listing,
 }
 
+/// The base environment a new [`Locations`] starts with: nothing, the app's.
+#[cfg(not(test))]
+fn initial_base_env() -> EnvOverlay {
+    Vec::new()
+}
+
+/// The base environment a new [`Locations`] starts with in this crate's tests: git reaches
+/// nothing but a local path (`GIT_ALLOW_PROTOCOL=file`, PLAN §14.2), however a test builds
+/// its services and whichever repository it opens.
+#[cfg(test)]
+fn initial_base_env() -> EnvOverlay {
+    vec![("GIT_ALLOW_PROTOCOL".into(), Some("file".into()))]
+}
+
 /// The backends of the repositories dv has opened (see the module docs).
 pub struct Locations {
     backends: HashMap<Location, Cached>,
@@ -240,7 +254,7 @@ impl Locations {
         Self {
             backends: HashMap::new(),
             routes: Vec::new(),
-            base_env: Vec::new(),
+            base_env: initial_base_env(),
             connections: Connections::new(),
             wsl,
             followed: HashMap::new(),
@@ -292,6 +306,18 @@ impl Locations {
     /// How WSL is reached (automation tells a stand-in its distros).
     pub fn wsl(&self) -> &WslAccess {
         &self.wsl
+    }
+
+    /// Lets go of the backend opened for `location` and of whatever other name it is cached
+    /// under (its worktree root): for a folder that was opened only to be looked at and
+    /// isn't taken (`Reviews::pr_folder`), so it leaves nothing behind. A local backend
+    /// holds nothing else: this service starts no watch. A connection the open went through
+    /// (a distro's) is that host's, shared by its repositories, and stays.
+    pub fn forget(&mut self, location: &Location) {
+        if let Some(stale) = self.backends.remove(location) {
+            self.backends
+                .retain(|_, kept| !Arc::ptr_eq(&kept.backend, &stale.backend));
+        }
     }
 
     /// The backend already open for `location`, if any.

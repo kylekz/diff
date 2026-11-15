@@ -437,6 +437,21 @@ pub(crate) fn one_line(text: &str) -> std::borrow::Cow<'_, str> {
     dv_cli::escape::line(text)
 }
 
+/// How many characters of a line dv didn't write a row hands its layout at most.
+pub(crate) const DRAWN_CHARS: usize = 300;
+
+/// `text` as a row draws it when GitHub wrote it (a pull request's title, a login, a
+/// branch's name; PLAN §9.9): one line ([`one_line`]), and no more than [`DRAWN_CHARS`]
+/// characters of it, then "…". The row's layout truncates what doesn't fit; this bounds
+/// what is handed to it, whatever length GitHub's answer has.
+pub fn drawn(text: &str) -> String {
+    let line = one_line(text.trim());
+    match line.char_indices().nth(DRAWN_CHARS) {
+        Some((at, _)) => format!("{}…", &line[..at]),
+        None => line.into_owned(),
+    }
+}
+
 /// `body` as a Markdown quote, each line after `> `: a line ends wherever Markdown ends one
 /// (`\n`, `\r\n`, a lone `\r`), so nothing in it leaves the quote; a body without text is an
 /// empty quote.

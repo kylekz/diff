@@ -25,6 +25,8 @@
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
 
+use serde::{Deserialize, Serialize};
+
 use crate::backend::{Backend, BackendError, GitOpts};
 
 use super::error::Elsewhere;
@@ -52,7 +54,17 @@ impl GithubRepo {
     /// The repository of the clone `backend` is bound to. `gh` says which hosts are GitHub's:
     /// it is asked about a host at most once here, and never about `github.com`.
     pub fn of(backend: &dyn Backend, gh: &Gh) -> Result<Self, GithubError> {
-        // What gh said about each host, so a second remote there, or the same URL read again
+        Self::of_hosts(backend, |host| gh.is_github_host(host))
+    }
+
+    /// [`GithubRepo::of`] with `is_github` saying which hosts are GitHub's
+    /// ([`Gh::is_github_host`], or what a caller remembers of its answers): asked about a
+    /// host at most once here.
+    pub fn of_hosts(
+        backend: &dyn Backend,
+        mut is_github: impl FnMut(&str) -> bool,
+    ) -> Result<Self, GithubError> {
+        // What was said about each host, so a second remote there, or the same URL read again
         // as git rewrites it, doesn't ask again (a gh that hangs costs one timeout a host).
         let mut counts: HashMap<String, bool> = HashMap::new();
         let mut place = |url: &str| match parse_url(url) {
@@ -61,7 +73,7 @@ impl GithubRepo {
                 let host = repo.host.clone();
                 if *counts
                     .entry(host.clone())
-                    .or_insert_with(|| gh.is_github_host(&host))
+                    .or_insert_with(|| is_github(&host))
                 {
                     Place::Github(repo)
                 } else {
@@ -178,12 +190,45 @@ pub enum Place {
 }
 
 /// The host, owner and repository a GitHub URL names. Two are equal whatever the case of
-/// their names, as [`GithubRepo`] is.
-#[derive(Debug, Clone)]
+/// their names, as [`GithubRepo`] is. It serialises as `{"host", "owner", "repo"}`, which is
+/// how the app remembers a known repository's GitHub name (PLAN §9.9, §11).
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RepoUrl {
     pub host: String,
     pub owner: String,
     pub repo: String,
+}
+
+impl RepoUrl {
+    /// Whether its three parts can be a GitHub host and names ([`parse_url`]'s rules): what
+    /// was read from a file a user can edit is kept only when they can.
+    pub fn is_well_formed(&self) -> bool {
+        is_host(&self.host) && is_name(&self.owner) && is_name(&self.repo)
+    }
+
+    /// `owner/repo`, as GitHub writes a repository.
+    pub fn name_with_owner(&self) -> String {
+        format!("{}/{}", self.owner, self.repo)
+    }
+
+    /// Whether this is the repository `owner/repo` on `host` (any host when `None`: a
+    /// reference without one names the repository on its clone's host). GitHub compares
+    /// all three without case.
+    pub fn is(&self, host: Option<&str>, owner: &str, repo: &str) -> bool {
+        host.is_none_or(|host| self.host.eq_ignore_ascii_case(host))
+            && self.owner.eq_ignore_ascii_case(owner)
+            && self.repo.eq_ignore_ascii_case(repo)
+    }
+}
+
+impl From<&GithubRepo> for RepoUrl {
+    fn from(repo: &GithubRepo) -> Self {
+        Self {
+            host: repo.host.clone(),
+            owner: repo.owner.clone(),
+            repo: repo.repo.clone(),
+        }
+    }
 }
 
 impl PartialEq for RepoUrl {

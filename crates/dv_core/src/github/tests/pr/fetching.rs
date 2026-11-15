@@ -308,6 +308,30 @@ fn a_base_branch_gh_names_must_be_a_branchs_name() {
     assert_eq!(fixture.refs("refs/dv/"), []);
 }
 
+/// An answer about another pull request than the one asked for is no answer: nothing is
+/// kept under the number asked for.
+#[test]
+fn an_answer_about_another_pull_request_is_refused() {
+    let fixture = PrFixture::new();
+    let mut view = fixture.pr.view("api");
+    view["number"] = json!(NUMBER + 1);
+    fixture.answer(vec![json!({
+        "argv": ["pr", "view", "7", "--json", crate::github::pr::VIEW_FIELDS, "**"],
+        "stdout": view,
+    })]);
+    let error = fixture.open_ref(&PrRef::Hash(NUMBER)).unwrap_err();
+    assert!(
+        matches!(&error, GithubError::UnexpectedOutput { command, .. } if command == "pr view"),
+        "{error:?}"
+    );
+    assert!(
+        error.to_string().contains("pull request 8, asked for 7"),
+        "{error}"
+    );
+    assert_eq!(fixture.refs("refs/dv/"), []);
+    assert_eq!(fixture.store().list().unwrap().len(), 0);
+}
+
 /// The author's `feat` merged into `main` by `merge` (git's arguments after `merge`), the
 /// result published; the fixture's pull request then reads as merged at `main`'s new tip.
 /// Returns `main` as it was before, and after.

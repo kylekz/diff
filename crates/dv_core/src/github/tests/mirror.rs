@@ -23,7 +23,7 @@ fn key() -> MirrorKey {
 fn comment(id: &str, review: Option<(&str, ReviewState)>) -> GithubComment {
     GithubComment {
         id: id.to_string(),
-        database_id: 2_000_000_001,
+        database_id: Some(2_000_000_001),
         author: "octocat".to_string(),
         body: "Why not `?` here?".to_string(),
         created_at: 1_792_398_615_000,
@@ -36,7 +36,7 @@ fn comment(id: &str, review: Option<(&str, ReviewState)>) -> GithubComment {
         reply_to: None,
         review: review.map(|(id, state)| CommentReview {
             id: id.to_string(),
-            database_id: 3_000_000_001,
+            database_id: Some(3_000_000_001),
             state,
         }),
     }
@@ -178,6 +178,7 @@ fn mirror() -> Mirror {
                 },
             ),
         ]),
+        unread: BTreeMap::new(),
     }
 }
 
@@ -517,6 +518,134 @@ fn the_latest_mirror_is_the_most_recently_read_of_any_login() {
     assert_eq!(latest.key.login, "octocat");
     assert_eq!(latest.read_at, 3_000);
     assert_eq!(store.latest(&pr, 484).unwrap(), None);
+}
+
+#[test]
+fn a_listing_reads_a_pull_requests_title_from_the_mirrors_summary() {
+    use crate::review::PrLink;
+
+    let repo = FixtureRepo::new();
+    repo.write("a.txt", "a\n");
+    repo.commit("base");
+    let backend = open(&repo);
+    let store = MirrorStore::new(Arc::new(open(&repo)));
+    let link = PrLink {
+        owner: "ACME".to_string(),
+        repo: "Api".to_string(),
+        number: 482,
+    };
+    let hosts = ["ghe.example".to_string(), "github.com".to_string()];
+    let titled = |login: &str, read_at: u64, title: &str| {
+        let mut mirror = Mirror {
+            key: MirrorKey {
+                login: login.to_string(),
+                ..key()
+            },
+            read_at,
+            ..mirror()
+        };
+        mirror.pr.title = title.to_string();
+        mirror
+    };
+    assert_eq!(store.latest_title(&hosts, &link).unwrap(), None);
+
+    // A write leaves the summary beside the mirror, and nothing else.
+    store
+        .write(&titled("kylekz", 1_000, "Fix the cache"))
+        .unwrap();
+    let dir = "github/github.com/acme/api/pr-482";
+    assert_eq!(
+        backend.store_list(dir).unwrap(),
+        ["kylekz.json", "kylekz.summary"]
+    );
+    assert_eq!(
+        store.latest_title(&hosts, &link).unwrap().as_deref(),
+        Some("Fix the cache")
+    );
+    // The mirror itself isn't read for it: cut short, the title still comes.
+    backend
+        .store_write_atomic(&format!("{dir}/kylekz.json"), b"{\"v\": 1, \"key\"")
+        .unwrap();
+    assert_eq!(
+        store.latest_title(&hosts, &link).unwrap().as_deref(),
+        Some("Fix the cache")
+    );
+    // And a summary is no mirror: nothing else takes it for one.
+    assert_eq!(store.latest_stored(&hosts, &link).unwrap(), None);
+    assert!(!is_mirror_of(
+        &format!("{dir}/kylekz.summary"),
+        "acme",
+        "api",
+        482
+    ));
+
+    // The most recently read mirror's, whichever login read it.
+    store
+        .write(&titled("octocat", 3_000, "Fix the cache, again"))
+        .unwrap();
+    store.write(&titled("hubot", 2_000, "Older")).unwrap();
+    assert_eq!(
+        store.latest_title(&hosts, &link).unwrap().as_deref(),
+        Some("Fix the cache, again")
+    );
+
+    // A store an earlier dv wrote has no summaries: the mirror is read whole, and a summary
+    // this build doesn't read (another version's, torn) counts as none.
+    backend
+        .store_remove(&format!("{dir}/octocat.summary"))
+        .unwrap();
+    assert_eq!(
+        store.latest_title(&hosts, &link).unwrap().as_deref(),
+        Some("Fix the cache, again")
+    );
+    backend
+        .store_write_atomic(
+            &format!("{dir}/octocat.summary"),
+            br#"{"v": 2, "title": "From the future"}"#,
+        )
+        .unwrap();
+    assert_eq!(
+        store.latest_title(&hosts, &link).unwrap().as_deref(),
+        Some("Fix the cache, again")
+    );
+    // Nor does a summary keyed for another pull request than its folder's (a file copied
+    // there): its mirror is read for the title.
+    backend
+        .store_write_atomic(
+            &format!("{dir}/octocat.summary"),
+            br#"{"v": 1, "key": {"host": "github.com", "owner": "acme", "repo": "api", "number": 999, "login": "octocat"}, "read_at": 9000, "title": "Another pull request's"}"#,
+        )
+        .unwrap();
+    assert_eq!(
+        store.latest_title(&hosts, &link).unwrap().as_deref(),
+        Some("Fix the cache, again")
+    );
+    // A summary left alone, its mirror gone, names nothing.
+    backend
+        .store_remove(&format!("{dir}/octocat.json"))
+        .unwrap();
+    backend.store_remove(&format!("{dir}/hubot.json")).unwrap();
+    backend.store_remove(&format!("{dir}/kylekz.json")).unwrap();
+    assert_eq!(store.latest_title(&hosts, &link).unwrap(), None);
+    assert!(
+        !store.holds_any(&hosts, &link),
+        "summaries alone hold no mirror"
+    );
+
+    // Another pull request's mirror under this one's name isn't this one's title.
+    let mut misplaced = serde_json::to_value(titled("kylekz", 9_000, "Not this one")).unwrap();
+    misplaced["v"] = json!(MIRROR_VERSION);
+    misplaced["key"]["number"] = json!(999);
+    backend
+        .store_remove(&format!("{dir}/kylekz.summary"))
+        .unwrap();
+    backend
+        .store_write_atomic(
+            &format!("{dir}/kylekz.json"),
+            &serde_json::to_vec(&misplaced).unwrap(),
+        )
+        .unwrap();
+    assert_eq!(store.latest_title(&hosts, &link).unwrap(), None);
 }
 
 #[test]

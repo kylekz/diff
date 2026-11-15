@@ -322,7 +322,7 @@ impl Switcher {
         let Some(ix) = self
             .listing
             .position(key)
-            .filter(|ix| self.listing.items[*ix].review().is_some())
+            .filter(|ix| self.listing.items[*ix].open_review().is_some())
         else {
             return;
         };
@@ -341,7 +341,7 @@ impl Switcher {
     pub fn closing(&self) -> Option<&str> {
         let key = self.closing.as_deref()?;
         let selected = self.listing.items.get(self.selected)?;
-        (selected.key == key && selected.review().is_some()).then_some(key)
+        (selected.key == key && selected.open_review().is_some()).then_some(key)
     }
 
     /// Whether the selected row stands beside an open review, which `Ctrl Shift W` asks to
@@ -350,7 +350,7 @@ impl Switcher {
         self.listing
             .items
             .get(self.selected)
-            .is_some_and(|item| item.review().is_some())
+            .is_some_and(|item| item.open_review().is_some())
     }
 
     /// Why the last close failed.
@@ -370,12 +370,15 @@ impl Switcher {
             return;
         };
         let (Some(badge), Some(location)) = (
-            self.listing.items[ix].review(),
+            self.listing.items[ix].open_review(),
             self.listing.location_of(ix),
         ) else {
             return;
         };
-        if matches!(self.listing.items[ix].kind, ItemKind::Review { .. }) {
+        if matches!(
+            self.listing.items[ix].kind,
+            ItemKind::Review { .. } | ItemKind::Pr { .. }
+        ) {
             self.after_remove = self
                 .listing
                 .items
@@ -481,7 +484,7 @@ impl Switcher {
             && !self
                 .listing
                 .position(row)
-                .is_some_and(|ix| self.listing.items[ix].review().is_some())
+                .is_some_and(|ix| self.listing.items[ix].open_review().is_some())
         {
             self.menu = None;
         }

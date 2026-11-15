@@ -338,13 +338,42 @@ impl PrLink {
     }
 }
 
+impl PrLink {
+    /// The PR round of the review `id` (PLAN §9.5): its place among this pull request's
+    /// reviews in the store, 1 for the first. `reviews` are the store's reviews with their
+    /// targets, in any order (ids lead with their time); a review that isn't among them is
+    /// round 1.
+    pub fn round_of<'a>(
+        &self,
+        id: &ReviewId,
+        reviews: impl IntoIterator<Item = (&'a ReviewId, &'a Target)>,
+    ) -> u32 {
+        let mut ids: Vec<&ReviewId> = reviews
+            .into_iter()
+            .filter(|(_, target)| self.is_target(target))
+            .map(|(id, _)| id)
+            .collect();
+        ids.sort();
+        ids.iter()
+            .position(|other| *other == id)
+            .map_or(1, |index| u32::try_from(index + 1).unwrap_or(u32::MAX))
+    }
+}
+
+/// The round a review is shown as having, wherever one is drawn or printed: a PR review's
+/// is its pull request's (`pr_round`, [`PrLink::round_of`]; its own never closes, PLAN
+/// §9.5), any other review's its own (`own`, [`Review::shown_round`]).
+pub fn displayed_round(own: u32, pr_round: Option<u32>) -> u32 {
+    pr_round.unwrap_or(own)
+}
+
 impl fmt::Display for PrLink {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{}/{}#{}", self.owner, self.repo, self.number)
     }
 }
 
-/// A GitHub review dv posted for this review (PLAN §9.3).
+/// A GitHub review dv posted for this review (PLAN §9.8).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Submission {
     pub github_review_id: u64,

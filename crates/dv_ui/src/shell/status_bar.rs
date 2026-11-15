@@ -18,7 +18,7 @@
 
 use dv_backend::ConnectionState;
 use dv_core::Location;
-use dv_core::review::ThreadCounts;
+use dv_core::review::{ThreadCounts, displayed_round};
 use gpui::{
     AnyElement, App, Context, Hsla, InteractiveElement as _, IntoElement as _, ParentElement as _,
     StatefulInteractiveElement as _, Styled as _, Window, anchored, deferred, div, point,
@@ -212,9 +212,16 @@ impl Shell {
                 health,
                 location: format!("{} · {state}", session.backend_place()),
                 review: Some(format!(
-                    "{} · round {} · {}{since}",
+                    "{}{} · {}{since}",
                     status_label(review.status),
-                    review.shown_round(),
+                    // A PR review's round is its pull request's, once the store told it.
+                    match (review.is_pr_review(), session.pr_facts().round) {
+                        (true, None) => String::new(),
+                        (_, pr_round) => format!(
+                            " · round {}",
+                            displayed_round(review.shown_round(), pr_round)
+                        ),
+                    },
                     thread_counts(
                         review.summary().threads,
                         session

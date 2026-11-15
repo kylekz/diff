@@ -114,7 +114,7 @@ pub fn error(ctx: &mut Context, json: bool, error: &CliError) -> Exit {
                 candidate.id,
                 candidate.label,
                 candidate.status,
-                candidate.round,
+                candidate.shown_round,
                 candidate.worktree
             );
             escape::line(&line).into_owned()

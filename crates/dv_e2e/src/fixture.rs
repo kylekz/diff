@@ -126,8 +126,13 @@ impl DvHeader {
 #[derive(Debug, PartialEq, Deserialize)]
 #[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub enum DvAction {
-    /// `{"gh_log": {}}`: the calls `mock_gh` has logged so far in the scenario.
-    GhLog {},
+    /**
+     * `{"gh_log": {"stdin_contains"?: text}}`: the calls `mock_gh` has logged so far in the
+     * scenario; with `stdin_contains`, only those whose stdin holds that text, so a line
+     * counts the calls of one kind (a mutation by its name) whatever was called around
+     * them.
+     */
+    GhLog { stdin_contains: Option<String> },
     /**
      * `{"lsp_log": {"wait_ms"?: n}}`: what every `mock_lsp` the scenario started has logged so
      * far (the messages it read, its starts and crashes). With `wait_ms`, the log is read again
@@ -241,14 +246,24 @@ impl Fixture<DvAction> for DvFixture {
 
     fn run(&mut self, action: &DvAction) -> Result<Value> {
         match action {
-            DvAction::GhLog {} => read_log(&self.gh_log),
+            DvAction::GhLog { stdin_contains } => {
+                let mut calls = read_log(&self.gh_log)?;
+                if let (Some(text), Value::Array(calls)) = (stdin_contains, &mut calls) {
+                    calls.retain(|call| {
+                        call["stdin"]
+                            .as_str()
+                            .is_some_and(|stdin| stdin.contains(text.as_str()))
+                    });
+                }
+                Ok(calls)
+            }
             DvAction::LspLog { .. } => read_log(&self.lsp_log),
         }
     }
 
     fn retry_for(&self, action: &DvAction) -> Option<Duration> {
         match action {
-            DvAction::GhLog {} => None,
+            DvAction::GhLog { .. } => None,
             DvAction::LspLog { wait_ms } => wait_ms.map(Duration::from_millis),
         }
     }

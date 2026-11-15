@@ -367,6 +367,8 @@ impl ReviewSession {
                 self.ensure_histories(cx);
                 self.refresh_side_reads(&batch, cx);
                 self.ensure_side_reads(cx);
+                // GitHub's threads are anchored against the sides the review shows now.
+                self.read_github(cx);
                 self.load_file_view(cx);
                 self.ensure_watch(cx);
             }
@@ -847,14 +849,14 @@ impl ReviewSession {
             return;
         };
         let mut wanted: Vec<FileEntry> = Vec::new();
-        for thread in self.review.live_threads() {
-            if thread.anchor.is_file_level() {
+        for card in self.cards() {
+            if card.anchor().is_file_level() || !card.is_anchored() {
                 continue;
             }
-            let Some(entry) = self.thread_entry(thread) else {
+            let Some(entry) = self.card_entry(card) else {
                 continue;
             };
-            let needed = if self.draws(thread, entry) {
+            let needed = if self.draws(card, entry) {
                 matches!(self.states.get(&entry.path), Some(FileState::Loaded { diff, .. })
                     if self.needs_full_text(diff))
             } else {
@@ -960,6 +962,17 @@ impl ReviewSession {
         }));
     }
 
+    /// The threads the review shows changed (its log's, or GitHub's on its pull request): a
+    /// thread in a file the stream hasn't loaded, or can't place it against, has that file
+    /// loaded or read.
+    pub(super) fn threads_changed(&mut self, cx: &mut Context<Self>) {
+        self.requeue_wanted();
+        self.pump(cx);
+        self.ensure_review_texts(cx);
+        self.ensure_histories(cx);
+        self.ensure_side_reads(cx);
+    }
+
     /// Applies fold reload `number`'s result and forgets the viewed states it read back
     /// (`writes`). A round that closed moves the comparison to the interdiff since it, and a
     /// review that finished to all changes (PLAN §2.3, `comparison`).
@@ -981,13 +994,7 @@ impl ReviewSession {
                     self.review = loaded.review;
                     self.warnings = loaded.warnings;
                     cx.emit(SessionEvent::ReviewChanged);
-                    // A thread added in a file the stream hasn't loaded, or can't place it
-                    // against, has that file loaded or read.
-                    self.requeue_wanted();
-                    self.pump(cx);
-                    self.ensure_review_texts(cx);
-                    self.ensure_histories(cx);
-                    self.ensure_side_reads(cx);
+                    self.threads_changed(cx);
                     if self.review.rounds.len() > rounds
                         || self.review.status.is_final() != finished
                     {

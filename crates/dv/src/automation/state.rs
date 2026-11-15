@@ -5,7 +5,7 @@ use dv_core::diff::{FileEntry, FileStatus};
 use dv_core::review::{AnchorSide, Author, ReviewStatus, Thread};
 use dv_ui::diff_pane::PlaceRef;
 use dv_ui::services::reviews::{OpenRequest, RepoRow, ReviewRow};
-use dv_ui::session::{Comparison, FileState, ReviewSession, diff_kind};
+use dv_ui::session::{Card, Comparison, FileState, GithubShown, ReviewSession, diff_kind};
 use dv_ui::submit::SummaryTab;
 use dv_ui::switcher::MenuTarget;
 use dv_ui::switcher::items::{ItemKind, ReviewBadge};
@@ -336,6 +336,11 @@ pub fn session(shell: &Shell, cx: &App) -> Value {
         .live_threads()
         .map(|thread| thread_state(session, thread))
         .collect();
+    let github_threads: Vec<Value> = session
+        .github_threads()
+        .iter()
+        .map(|shown| github_thread_state(session, shown))
+        .collect();
     let rounds: Vec<Value> = review
         .rounds
         .iter()
@@ -387,8 +392,20 @@ pub fn session(shell: &Shell, cx: &App) -> Value {
             "end_line": selection.end_line,
         })),
         "threads": threads,
+        // GitHub's threads on a PR review's pull request (PLAN §9.6), in GitHub's order.
+        "github_threads": github_threads,
         "composer": composer(shell, cx),
-        "focused_thread": shell.main_pane().read(cx).focused_thread(),
+        // A thread's id, or `gh:<node id>` for one of GitHub's.
+        "focused_thread": shell
+            .main_pane()
+            .read(cx)
+            .focused_key()
+            .map(|key| key.to_string()),
+        // The GitHub thread whose card says replying arrives with submitting (`R` on it).
+        "reply_notice": shell.main_pane().read(cx).reply_notice(),
+        // The GitHub thread whose card says GitHub doesn't let the viewer resolve or
+        // unresolve it (`X` on it).
+        "resolve_notice": shell.main_pane().read(cx).resolve_notice(),
         "sheet": sheet(shell, cx),
         "rounds": rounds,
         "comparison": comparison(session.comparison()),
@@ -526,12 +543,34 @@ pub fn comments_list(shell: &Shell, cx: &App) -> Value {
             })
         })
         .collect();
+    let github: Vec<Value> = list
+        .github_rows(cx)
+        .into_iter()
+        .map(|row| {
+            json!({
+                "id": row.key().to_string(),
+                "resolved": row.resolved,
+                "outdated": row.outdated,
+                "unplaced": row.unplaced,
+                "pending_on_github": row.pending_on_github,
+                "not_in_comparison": row.not_in_comparison,
+                "pending": row.pending,
+                "location": row.location,
+                "file_level": row.file_level,
+                "author": row.author,
+                "summary": row.summary,
+            })
+        })
+        .collect();
     json!({
         "show_resolved": list.shows_resolved(),
         "show_annotations": list.shows_annotations(),
+        "show_github_resolved": list.shows_github_resolved(),
         "expanded": list.expanded(),
         "rows": rows,
-        "menu": list.menu_thread(),
+        // The "On GitHub" group: GitHub's threads on a PR review's pull request.
+        "github": github,
+        "menu": list.menu_key().map(|key| key.to_string()),
     })
 }
 
@@ -569,6 +608,7 @@ pub fn stream(shell: &Shell, window: &Window, cx: &App) -> Value {
         json!({
             "collapsed": section.collapsed,
             "threads": section.threads,
+            "github": section.github,
             "empty": section.empty,
         })
     });
@@ -944,6 +984,75 @@ fn thread_state(session: &ReviewSession, thread: &Thread) -> Value {
         }),
         "original_lines": lines(Some((first.start_line, first.end_line))),
         "round": anchor.round,
+    })
+}
+
+/// One of `state.session.github_threads`: a GitHub thread as the review shows it (PLAN
+/// §9.6): what GitHub says of it, the anchor read for it, and where it is placed.
+fn github_thread_state(session: &ReviewSession, shown: &GithubShown) -> Value {
+    let thread = &shown.thread;
+    let anchor = &shown.anchor;
+    let card = Card::Github(shown);
+    let placement = session.card_placement(card);
+    let comments: Vec<Value> = thread
+        .comments
+        .iter()
+        .map(|comment| {
+            json!({
+                "id": comment.id,
+                "author": comment.author,
+                "body": comment.body,
+                "pending": comment.is_pending(),
+            })
+        })
+        .collect();
+    json!({
+        "id": shown.key().to_string(),
+        "node": thread.id,
+        "path": anchor.path,
+        "side": side(anchor.side),
+        "start_line": anchor.start_line,
+        "end_line": anchor.end_line,
+        "file_level": thread.is_file_level(),
+        "resolved": thread.resolved,
+        // GitHub's own word that the code under it changed since.
+        "outdated_on_github": thread.outdated,
+        // Whether it has an anchor to place: `anchored`, `outdated_on_github` (made on
+        // another commit than the one the review shows) or `unplaced` (dv can't tell which
+        // code it is on).
+        "standing": match shown.standing {
+            dv_core::github::Standing::Anchored => "anchored",
+            dv_core::github::Standing::OutdatedOnGithub => "outdated_on_github",
+            dv_core::github::Standing::Unplaced => "unplaced",
+        },
+        "pending": thread.is_pending(),
+        "can_resolve": thread.viewer_can_resolve,
+        "can_unresolve": thread.viewer_can_unresolve,
+        // A Resolve or an Unresolve on its way to GitHub.
+        "resolving": session.resolving(&thread.id).map(|resolve| {
+            if resolve { "resolve" } else { "unresolve" }
+        }),
+        "error": failure(session.github_error(&thread.id)),
+        "url": thread.url(),
+        // What "Open on GitHub" opens: `url` when it is a page of the pull request's host,
+        // else `null` and no such action.
+        "open_url": session.github_url(&thread.id),
+        "comments": comments,
+        // As for a thread of the review's own.
+        "outdated": if placement.is_outdated() {
+            json!(true)
+        } else if placement.is_pending() {
+            Value::Null
+        } else {
+            json!(false)
+        },
+        "placement": placement.card_key(card),
+        "in_diff": placement.placement().in_diff(),
+        "file": placement.file(),
+        "lines": placement
+            .lines(anchor)
+            .map(|(start, end)| json!({"start": start, "end": end})),
+        "location": session.card_location(card),
     })
 }
 

@@ -56,10 +56,10 @@ pub enum Rejection {
     DuplicateId { id: String },
     #[error("{item} was deleted")]
     Deleted { item: ItemId },
-    #[error("thread {thread} is mirrored from GitHub and read-only")]
-    ReadOnlyThread { thread: ThreadId },
-    #[error("a GitHub author can only write to threads mirrored from GitHub, not {thread}")]
-    GithubOnLocalThread { thread: ThreadId },
+    /// GitHub's threads are shown from the pull request's mirror (PLAN §9.6): nothing GitHub
+    /// wrote is an event of a review's log.
+    #[error("GitHub's threads are never written to a review's log")]
+    GithubAuthor,
     /// An annotation waits on no one, so its state doesn't change: a reply asks about it
     /// (PLAN §19.1).
     #[error("thread {thread} is an annotation, which waits on no one: reply to it to ask about it")]
@@ -144,52 +144,30 @@ pub fn fold(id: &ReviewId, events: &[Event]) -> Result<Folded, FoldError> {
     Ok(Folded { review, warnings })
 }
 
-/// The moves a thread's state may make (PLAN §2.5), for a thread opened by `thread_author` and
-/// a change by `by`:
+/// The moves a thread's state may make (PLAN §2.5), for a change by `by`:
 ///
 /// - Agents address; the reviewer may address too (say, after fixing something themselves).
 ///   Addressing an addressed thread again replaces the note. A resolved thread must be reopened
 ///   before it can be addressed.
 /// - Only the reviewer resolves (from `open` or `addressed`) and reopens (back to `open`).
-/// - A thread mirrored from GitHub changes only through its GitHub author's events (PLAN §9.2),
-///   and a GitHub author changes no other thread.
+/// - GitHub changes no thread of a log: its own threads are never in one (PLAN §9.6).
 /// - An annotation's state doesn't change this way, and nothing moves a thread to
 ///   `annotation` (PLAN §19.1): a reviewer's reply is what opens one.
 ///
 /// `Ok(Outcome::Unchanged)` when the thread is already in `to` (except `addressed`, above).
 pub fn check_thread_state(
     thread: &ThreadId,
-    thread_author: AuthorKind,
     from: ThreadState,
     to: ThreadState,
     by: AuthorKind,
 ) -> Result<Outcome, Rejection> {
-    use AuthorKind::{Agent, Github, Reviewer};
+    use AuthorKind::{Agent, Reviewer};
     use ThreadState::{Addressed, Annotation, Open, Resolved};
+    check_local(by)?;
     if from == Annotation {
         return Err(Rejection::Annotation {
             thread: thread.clone(),
         });
-    }
-    match (thread_author == Github, by == Github) {
-        (true, false) => {
-            return Err(Rejection::ReadOnlyThread {
-                thread: thread.clone(),
-            });
-        }
-        (false, true) => {
-            return Err(Rejection::GithubOnLocalThread {
-                thread: thread.clone(),
-            });
-        }
-        (true, true) if to != Annotation => {
-            return Ok(if from == to {
-                Outcome::Unchanged
-            } else {
-                Outcome::Changed
-            });
-        }
-        (true, true) | (false, false) => {}
     }
     match (from, to, by) {
         (Open, Open, _) | (Resolved, Resolved, _) => Ok(Outcome::Unchanged),
@@ -401,6 +379,7 @@ impl Folder {
                 author,
                 annotation,
             } => {
+                check_local(author.kind)?;
                 if self.threads.contains_key(id) {
                     return Err(Rejection::DuplicateId { id: id.to_string() });
                 }
@@ -438,8 +417,8 @@ impl Folder {
                 author,
                 anchor,
             } => {
+                check_local(author.kind)?;
                 let t = self.live_thread(thread)?;
-                check_thread_author(&self.review.threads[t], author.kind)?;
                 if self.comments.contains_key(id) {
                     return Err(Rejection::DuplicateId { id: id.to_string() });
                 }
@@ -473,13 +452,7 @@ impl Folder {
             } => {
                 let t = self.live_thread(thread)?;
                 let current = &self.review.threads[t];
-                let outcome = check_thread_state(
-                    thread,
-                    current.author.kind,
-                    current.state,
-                    *state,
-                    author.kind,
-                )?;
+                let outcome = check_thread_state(thread, current.state, *state, author.kind)?;
                 if let Some(anchor) = anchor {
                     check_anchor(anchor, self.review.current_round())?;
                 }
@@ -706,16 +679,12 @@ fn record_move(thread: &mut Thread, anchor: Option<&Anchor>) {
     }
 }
 
-/// Replies to a thread follow the same GitHub rule as its state ([`check_thread_state`]).
-fn check_thread_author(thread: &Thread, by: AuthorKind) -> Result<(), Rejection> {
-    match (thread.is_from_github(), by == AuthorKind::Github) {
-        (true, false) => Err(Rejection::ReadOnlyThread {
-            thread: thread.id.clone(),
-        }),
-        (false, true) => Err(Rejection::GithubOnLocalThread {
-            thread: thread.id.clone(),
-        }),
-        _ => Ok(()),
+/// A thread, a reply and a thread's state are the reviewer's or an agent's: GitHub's own
+/// threads are shown from the pull request's mirror and never written to a log (PLAN §9.6).
+fn check_local(by: AuthorKind) -> Result<(), Rejection> {
+    match by {
+        AuthorKind::Reviewer | AuthorKind::Agent => Ok(()),
+        AuthorKind::Github => Err(Rejection::GithubAuthor),
     }
 }
 

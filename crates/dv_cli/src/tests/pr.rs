@@ -7,11 +7,13 @@ use std::path::PathBuf;
 
 use dv_core::review::{ReviewStatus, Verdict};
 use dv_test_support::fixture_gh::{self, GhPr};
-use dv_test_support::{FixtureGithub, GITHUB_OWNER};
+use dv_test_support::{FixtureGithub, GITHUB_OWNER, GitTrace};
 use pretty_assertions::assert_eq;
 use serde_json::json;
 
 use super::*;
+
+mod threads;
 
 const LIB: &str = "pub fn answer() -> u32 {\n    42\n}\n";
 
@@ -22,6 +24,8 @@ struct PrFixture {
     pr: GhPr,
     env: BTreeMap<String, String>,
     scenario: PathBuf,
+    /// git's trace of the commands the fixture's `dv` runs, once a test asks for one.
+    trace: Option<GitTrace>,
 }
 
 impl PrFixture {
@@ -59,6 +63,7 @@ impl PrFixture {
             pr,
             env,
             scenario,
+            trace: None,
         };
         fixture.answer(Vec::new());
         fixture
@@ -69,7 +74,7 @@ impl PrFixture {
     fn answer(&self, first: Vec<Value>) {
         let mut calls = first;
         calls.push(fixture_gh::viewer("kylekz"));
-        calls.extend(self.pr.calls("api"));
+        calls.extend(self.pr.calls_in(&self.github));
         std::fs::write(&self.scenario, json!({ "calls": calls }).to_string()).unwrap();
     }
 
@@ -112,7 +117,12 @@ impl PrFixture {
             stderr_is_terminal: false,
             stdin_is_terminal: false,
             process_stdio: false,
-            git_env: self.repo().env_overlay(),
+            git_env: self
+                .repo()
+                .env_overlay()
+                .into_iter()
+                .chain(self.trace.as_ref().map(GitTrace::env))
+                .collect(),
         };
         let exit = crate::main_with(std::iter::once("dv").chain(args.iter().copied()), &mut ctx);
         Ran {
@@ -190,6 +200,7 @@ fn review_new_pr_opens_the_pull_request_as_a_draft() {
             "state": "open",
             "head_oid": fixture.pr.head,
             "pr_round": 1,
+            "threads": {"open": 0, "resolved": 0},
         })
     );
     assert_eq!(review["submissions"], json!([]));
@@ -803,6 +814,7 @@ fn commands_that_only_read_never_start_gh() {
         "state": "open",
         "head_oid": fixture.pr.head,
         "pr_round": 1,
+        "threads": {"open": 0, "resolved": 0},
     });
     for vars in [&[][..], &[("CLAUDECODE", "1")]] {
         let status = fixture.run_as(vars, &["status", "--json"]).ok_json();
@@ -843,6 +855,7 @@ fn a_review_that_is_here_opens_when_github_cant_be_asked() {
         pr: fixture.pr,
         env: fixture.env,
         scenario: fixture.scenario,
+        trace: None,
     };
     offline
         .env

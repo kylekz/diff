@@ -3,7 +3,7 @@
 //! changes"; `C` on an interdiff's old column; a card following its moved lines; and a comments
 //! row the interdiff doesn't show switching to all changes.
 
-use dv_core::review::{ThreadId, Verdict};
+use dv_core::review::{ThreadId, ThreadKey, Verdict};
 use gpui::Modifiers;
 use pretty_assertions::assert_eq;
 
@@ -240,14 +240,14 @@ fn a_card_follows_its_lines_when_they_move(cx: &mut TestAppContext) {
         let rows = &pane.blocks[1].rows;
         let card = rows
             .iter()
-            .position(|row| row.thread() == Some(&id))
+            .position(|row| row.thread().and_then(ThreadKey::local) == Some(&id))
             .expect("the card has a row");
         assert_eq!(
             rows[card],
             Row::Insert(rows::Insert {
                 line: at,
                 side: AnchorSide::New,
-                item: rows::InsertItem::Thread(id.clone()),
+                item: rows::InsertItem::Thread(id.clone().into()),
             })
         );
     });
@@ -619,11 +619,11 @@ fn an_outdated_card_shows_where_its_code_went_since_its_round(cx: &mut TestAppCo
     let at = new_index(&pane, "a/long.txt", 11, cx);
     pane.read_with(cx, |pane, _| {
         let rows = &pane.blocks[0].rows;
-        assert!(!rows.contains(&Row::Heading(InsertItem::Thread(id.clone()))));
+        assert!(!rows.contains(&Row::Heading(InsertItem::Thread(id.clone().into()))));
         assert!(rows.contains(&Row::Insert(rows::Insert {
             line: at,
             side: AnchorSide::New,
-            item: rows::InsertItem::Thread(id.clone()),
+            item: rows::InsertItem::Thread(id.clone().into()),
         })));
     });
     session.read_with(cx, |session, _| {
@@ -738,7 +738,7 @@ fn a_reply_being_typed_keeps_its_card_while_its_history_is_read(cx: &mut TestApp
         assert!(block.rows.contains(&Row::Insert(rows::Insert {
             line: at,
             side: AnchorSide::New,
-            item: rows::InsertItem::Thread(id.clone()),
+            item: rows::InsertItem::Thread(id.clone().into()),
         })));
     });
     assert_eq!(

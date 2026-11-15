@@ -55,7 +55,11 @@ pub struct Refreshed {
     /// stored (the viewer's; the most recently read, whoever read it, when the viewer can't
     /// be told). `None` when the pull request was never read here.
     pub mirror: Option<Box<Mirror>>,
-    /// Why the refresh failed, which makes `mirror` stale.
+    /// Whether `mirror` is the one this refresh read from GitHub and wrote: what GitHub
+    /// holds now. A refresh that failed after that (a draft's pins couldn't move) is stale
+    /// with a fresh mirror.
+    pub fresh: bool,
+    /// Why the refresh failed, which makes `mirror` stale unless it is `fresh`.
     pub stale: Option<GithubError>,
     /// The review's pins after it; `None` for a review without any.
     pub pins: Option<Pins>,
@@ -133,7 +137,7 @@ pub(super) fn unread(
         pins: pins::read(&GitRepo::new(backend.clone()), &review.id)
             .ok()
             .flatten(),
-        moved_from: None,
+        ..Refreshed::default()
     }
 }
 
@@ -183,7 +187,7 @@ pub(super) fn refresh_seen(
                 mirror: latest(&mirrors, repo, number),
                 stale: Some(error),
                 pins: before,
-                moved_from: None,
+                ..Refreshed::default()
             };
         }
     };
@@ -214,12 +218,13 @@ pub(super) fn refresh_seen(
                 mirror: stored(),
                 stale: Some(error),
                 pins: before,
-                moved_from: None,
+                ..Refreshed::default()
             };
         }
     };
     let mut refreshed = Refreshed {
         mirror: Some(Box::new(mirror)),
+        fresh: true,
         pins: before.clone(),
         ..Refreshed::default()
     };
@@ -311,6 +316,7 @@ fn gather(
         key: key.clone(),
         read_at: now_ms(),
         pr: seen.pr.clone(),
+        merge_base_oid: Some(seen.fetched.merge_base.clone()),
         checks: seen.checks,
         threads,
         pending_review,

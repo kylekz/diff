@@ -9,6 +9,7 @@ DESIGN §1.6). Every file here is listed in `crates/dv_ui/src/icons.rs`, which e
 | `window-minimize.svg`, `window-maximize.svg`, `window-restore.svg`, `window-close.svg` | Windows caption glyphs on a 10 grid at a 1px stroke |
 | `dv-mark.svg` | dv's mark (design canvas, `GlassReview` title bar) |
 | `model-claude.svg`, `model-openai.svg`, `model-gemini.svg`, `model-kimi.svg`, `model-deepseek.svg`, `model-zai.svg`, `model-qwen.svg` | The model families' marks (DESIGN §1.6), from [lobe-icons](https://github.com/lobehub/lobe-icons) (`@lobehub/icons-static-svg` 1.102.0, its one-colour `claude`, `openai`, `gemini`, `kimi`, `deepseek`, `zai` and `qwen`; MIT, `LICENSE-LOBE-ICONS`), their paths unchanged in a plain 24-grid `<svg>`. The marks themselves are their makers' trademarks, used only to name whose model wrote something |
+| `github.svg` | GitHub's mark, beside what is on GitHub (DESIGN §4.5): the one-colour mark as [Simple Icons](https://simpleicons.org) draws it (CC0 1.0: the drawing is dedicated to the public domain, so no licence file stands beside it as one does for Lucide and lobe-icons), its path unchanged in a plain 24-grid `<svg>`. The mark itself is GitHub's trademark, used only to say that something is on GitHub |
 
 The Lucide icons keep Lucide's 24 grid with the stroke scaled to match the design canvas, which
 draws its icons on a 16 grid at 1.5–1.6 (DESIGN §1.6): `2.25` for 1.5 and `2.4` for 1.6, so they

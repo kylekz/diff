@@ -320,7 +320,7 @@ impl FileList {
                     let state = RowState {
                         current: current.as_deref() == Some(entry.path.as_str()),
                         viewed: session.is_viewed(&entry.path),
-                        open_threads: session.open_threads_in(&entry.path),
+                        open_threads: self.open_threads.get(&entry.path).copied().unwrap_or(0),
                         read_only,
                     };
                     Some((row, entry.clone(), state))

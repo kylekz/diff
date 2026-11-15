@@ -54,14 +54,14 @@ mod tests;
 use std::sync::Arc;
 
 use dv_core::diff::{DiffLimits, DiffLine, FileDiff, LineKind, Segment, TextDiff};
-use dv_core::review::{AnchorSide, Thread};
+use dv_core::review::AnchorSide;
 use gpui::{App, Context, ListOffset};
 
 use super::rows::{Content, Insert, InsertItem, LinePos, RowsSpec, file_rows, side_number};
 use super::{Block, Cursor, DiffPane, DiffPaneEvent};
 use crate::failure::Failure;
 use crate::services::ViewMode;
-use crate::session::{FileState, ReviewSession, SideFileState, ViewFrom};
+use crate::session::{Card, FileState, ReviewSession, SideFileState, ViewFrom};
 use crate::thread::ComposerTarget;
 
 /// The file view's scope in its pane.
@@ -320,7 +320,7 @@ impl DiffPane {
             self.selection = None;
             self.clear_text_selection();
             self.caret = None;
-            self.focused_thread = None;
+            self.set_focused(None);
             self.files.clear();
             self.measured.clear();
             self.h_offset = 0.;
@@ -505,7 +505,7 @@ impl DiffPane {
     /// on the whole file, or outdated in it; on either side in a file the review doesn't change,
     /// whose two sides are the same text (PLAN §8); in the order they were added. In an interdiff
     /// an old side is a round's snapshot, which no thread shows on.
-    pub(super) fn file_view_threads<'a>(&self, session: &'a ReviewSession) -> Vec<&'a Thread> {
+    pub(super) fn file_view_threads<'a>(&self, session: &'a ReviewSession) -> Vec<Card<'a>> {
         let Some(file) = self.shown_file() else {
             return Vec::new();
         };
@@ -513,14 +513,13 @@ impl DiffPane {
             return Vec::new();
         }
         session
-            .review()
-            .live_threads()
-            .filter(|thread| {
-                let placement = session.placement(thread);
+            .cards()
+            .filter(|&card| {
+                let placement = session.card_placement(card);
                 let inner = placement.placement();
                 !placement.is_pending()
-                    && session.shows_card(thread, &placement)
-                    && ((thread.anchor.side == file.side
+                    && session.shows(card, &placement)
+                    && ((card.anchor().side == file.side
                         && inner.file() == Some(file.path.as_str()))
                         || inner.unlisted_path() == Some(file.path.as_str()))
             })
@@ -541,16 +540,16 @@ impl DiffPane {
         let mut inserts = Vec::new();
         let mut files = Vec::new();
         let mut outdated = Vec::new();
-        for thread in self.file_view_threads(session) {
-            let item = InsertItem::Thread(thread.id.clone());
-            if thread.anchor.is_file_level() {
+        for card in self.file_view_threads(session) {
+            let item = InsertItem::Thread(card.key());
+            if card.anchor().is_file_level() {
                 files.push(item);
                 continue;
             }
-            let placement = session.placement(thread);
+            let placement = session.card_placement(card);
             let inner = placement.placement();
             let after = inner
-                .lines(&thread.anchor)
+                .lines(card.anchor())
                 .map(|(_, end)| end)
                 .or_else(|| inner.trail().and_then(|trail| trail.after_line()))
                 .filter(|_| side == AnchorSide::New || inner.trail().is_none());

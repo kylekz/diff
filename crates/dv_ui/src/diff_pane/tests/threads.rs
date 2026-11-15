@@ -4,7 +4,7 @@
 //! away, collapses or goes, the last file's header reaching the top past a collapsed card, and
 //! a line's `+` starting a comment with the mouse (a click, a drag over lines).
 
-use dv_core::review::{Thread, ThreadId, ThreadState, Verdict};
+use dv_core::review::{Thread, ThreadId, ThreadKey, ThreadState, Verdict};
 use gpui::{Modifiers, MouseButton};
 
 use pretty_assertions::assert_eq;
@@ -242,7 +242,7 @@ fn a_thread_whose_lines_changed_heads_its_file_as_outdated(cx: &mut TestAppConte
     let wanted = id.clone();
     settle_drawn(cx, &shell, "the thread to be outdated", move |_, cx| {
         watched.read(cx).blocks[0].rows.get(1)
-            == Some(&Row::Heading(InsertItem::Thread(wanted.clone())))
+            == Some(&Row::Heading(InsertItem::Thread(wanted.clone().into())))
     });
     let session = session(&shell, cx);
     let outdated = session.read_with(cx, |session, _| {
@@ -316,7 +316,9 @@ fn the_composer_and_cards_stay_while_their_file_loads_again(cx: &mut TestAppCont
         let composer = rows.iter().any(
             |row| matches!(row, Row::Insert(insert) if insert.item == rows::InsertItem::Composer),
         );
-        let thread = rows.iter().any(|row| row.thread() == Some(&card));
+        let thread = rows
+            .iter()
+            .any(|row| row.thread().and_then(ThreadKey::local) == Some(&card));
         (composer, thread)
     };
     // The agent saves b.txt again: it loads again, and until the new diff lands its rows, the
@@ -732,4 +734,114 @@ fn a_post_answered_after_its_card_is_drawn_leaves_nothing_to_reveal_later(cx: &m
     pane.read_with(cx, |pane, _| assert_eq!(pane.top_file(), Some("c.txt")));
     press(cx, &shell, "s");
     pane.read_with(cx, |pane, _| assert_eq!(pane.top_file(), Some("c.txt")));
+}
+
+/// A long file wholly shown, with a comment many screens tall on line 10 and another just
+/// below it on line 12: the two threads.
+fn tall_card_above(
+    shell: &Entity<Shell>,
+    pane: &Entity<DiffPane>,
+    cx: &mut VisualTestContext,
+) -> (ThreadId, ThreadId) {
+    press(cx, shell, "n shift-e");
+    pane.update(cx, |pane, cx| {
+        pane.expand("a/long.txt", 0, Expand::All, cx);
+        pane.expand("a/long.txt", 0, Expand::All, cx);
+    });
+    let tall: String = (1..=150).map(|n| format!("Paragraph {n}.\n\n")).collect();
+    let above = add_thread(shell, "a/long.txt", AnchorSide::New, (10, 10), &tall, cx);
+    let below = add_thread(shell, "a/long.txt", AnchorSide::New, (12, 12), "Below.", cx);
+    (above, below)
+}
+
+fn settle_reveal(cx: &mut VisualTestContext, shell: &Entity<Shell>) {
+    // A frame at a time: the card is placed again as the stream is drawn.
+    for _ in 0..12 {
+        draw(cx);
+    }
+    settle_drawn(cx, shell, "the reveal", |shell, cx| {
+        shell.diff_pane().read(cx).is_settled()
+    });
+}
+
+/// DESIGN §4.5: a revealed card is placed again over the next frames, since the cards on
+/// the way aren't laid out at their final height yet, and then left alone.
+#[gpui::test]
+fn a_revealed_card_past_a_tall_one_ends_in_view(cx: &mut TestAppContext) {
+    let repo = stream_fixture(300);
+    let (_dir, shell, cx) = open(&repo, cx);
+    let pane = pane(&shell, cx);
+    let (above, below) = tall_card_above(&shell, &pane, cx);
+    for (from, thread) in [(0, &below), (250, &below), (250, &above), (0, &below)] {
+        pane.update(cx, |pane, cx| {
+            pane.list.scroll_to(ListOffset {
+                item_ix: pane.starts[0] + from,
+                offset_in_item: px(0.),
+            });
+            cx.notify();
+        });
+        settle_drawn(cx, &shell, "the scroll", |_, _| true);
+        pane.update(cx, |pane, cx| {
+            pane.reveal_thread(thread, cx);
+            // Not settled until the card has been placed for the last time.
+            assert!(pane.revealing.is_some() && !pane.is_settled());
+        });
+        settle_reveal(cx, &shell);
+        pane.read_with(cx, |pane, _| {
+            assert!(pane.revealing.is_none());
+            let item = pane.thread_item(thread).expect("its card");
+            let top = pane.offset_of(item, f32::MAX).expect("its place");
+            let (height, size) = (pane.viewport_height(), pane.item_height(item));
+            // In view: all of it, or as much of a card taller than the stream as fits.
+            assert!(
+                top >= 0. && top < height && (top + size <= height || size > height),
+                "{thread} from {from}: at {top}, {size} high in {height}"
+            );
+        });
+    }
+}
+
+/// What is asked of the stream after a reveal is never undone by it: a scroll that follows
+/// stays where it went.
+#[gpui::test]
+fn a_scroll_after_a_reveal_keeps_the_stream_where_it_went(cx: &mut TestAppContext) {
+    let repo = stream_fixture(300);
+    let (_dir, shell, cx) = open(&repo, cx);
+    let pane = pane(&shell, cx);
+    let (_, below) = tall_card_above(&shell, &pane, cx);
+    // The reader's wheel, a frame after the card was revealed: far below it. The frames
+    // are stepped by hand here; drawn, they would all be over before the scroll.
+    let far = pane.read_with(cx, |pane, _| ListOffset {
+        item_ix: pane.starts[0] + 250,
+        offset_in_item: px(0.),
+    });
+    cx.update(|window, cx| {
+        pane.update(cx, |pane, cx| {
+            pane.reveal_thread(&below, cx);
+            pane.reveal_laid_out_thread(window, cx);
+            assert!(pane.revealing.is_some());
+            pane.list.scroll_to(far);
+            pane.reveal_laid_out_thread(window, cx);
+            // Something else moved the stream: the card is left where it is.
+            assert!(pane.revealing.is_none());
+            assert_eq!(pane.list.logical_scroll_top(), far);
+            cx.notify();
+        })
+    });
+    settle_reveal(cx, &shell);
+    pane.read_with(cx, |pane, _| {
+        assert!(pane.revealing.is_none() && pane.is_settled());
+        assert_eq!(pane.list.logical_scroll_top().item_ix, far.item_ix);
+    });
+
+    // Left alone, the same reveal runs its frames and ends by itself.
+    cx.update(|window, cx| {
+        pane.update(cx, |pane, cx| {
+            pane.reveal_thread(&below, cx);
+            for _ in 0..8 {
+                pane.reveal_laid_out_thread(window, cx);
+            }
+            assert!(pane.revealing.is_none());
+        })
+    });
 }

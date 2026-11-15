@@ -68,6 +68,7 @@ fn a_thread_whose_file_left_heads_the_stream_in_its_section(cx: &mut TestAppCont
             Some(SectionSummary {
                 collapsed: false,
                 threads: vec![id.clone()],
+                github: Vec::new(),
                 empty: None,
             })
         );
@@ -78,7 +79,7 @@ fn a_thread_whose_file_left_heads_the_stream_in_its_section(cx: &mut TestAppCont
                     collapsed: false,
                     labels: false
                 },
-                Row::Heading(InsertItem::Thread(id.clone()))
+                Row::Heading(InsertItem::Thread(id.clone().into()))
             ]
         );
         let files: Vec<String> = pane
@@ -213,6 +214,7 @@ fn an_empty_interdiff_shows_the_section_with_the_empty_state_under_it(cx: &mut T
             Some(SectionSummary {
                 collapsed: false,
                 threads: vec![id.clone()],
+                github: Vec::new(),
                 empty: Some("no_changes_since"),
             })
         );
@@ -296,4 +298,26 @@ fn a_reply_being_written_follows_its_thread_into_the_section(cx: &mut TestAppCon
     let replied = thread(&shell, &id, cx);
     assert_eq!(replied.replies.len(), 1);
     assert_eq!(replied.replies[0].body, "Half a reply, finished.");
+}
+
+/// DESIGN §4.1, §4.5: what the section's bar says of the cards it holds.
+#[test]
+fn the_sections_bar_says_what_its_cards_are() {
+    use crate::diff_pane::section::section_words;
+    assert_eq!(
+        section_words(1, 0, 0),
+        "comment on files the review doesn't change now"
+    );
+    assert_eq!(
+        section_words(3, 0, 0),
+        "comments on files the review doesn't change now"
+    );
+    // GitHub's threads without a place in the diff (PLAN §9.6).
+    assert_eq!(section_words(0, 2, 0), "outdated on GitHub");
+    assert_eq!(section_words(0, 0, 1), "on GitHub, can't be placed here");
+    assert_eq!(
+        section_words(1, 2, 1),
+        "1 comment on files the review doesn't change now · 2 outdated on GitHub · 1 on GitHub, \
+         can't be placed here"
+    );
 }

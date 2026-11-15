@@ -6,15 +6,15 @@ use std::rc::Rc;
 
 use dv_core::review::{Author, AuthorKind, Thread, ThreadState};
 use gpui::{
-    AnyElement, App, Div, ElementId, Entity, FontWeight, InteractiveElement as _, IntoElement,
-    MouseButton, ParentElement as _, RenderOnce, SharedString, StatefulInteractiveElement as _,
-    Styled as _, Window, div, prelude::FluentBuilder as _, px,
+    AnyElement, App, Div, ElementId, Entity, FontFeatures, FontWeight, InteractiveElement as _,
+    IntoElement, MouseButton, ParentElement as _, RenderOnce, SharedString,
+    StatefulInteractiveElement as _, Styled as _, Window, div, prelude::FluentBuilder as _, px,
 };
 use gpui_component::input::{Textarea, TextareaState};
 
 use super::{
-    first_line, initial, relative_time, role_tag, role_word, shown_anchor_label, state_label,
-    state_note, trail_label,
+    first_line, initial, one_line, relative_time, role_tag, role_word, shown_anchor_label,
+    state_label, state_note, trail_label,
 };
 use crate::actions::composer::{Cancel, Post};
 use crate::agents;
@@ -183,7 +183,8 @@ impl RenderOnce for ThreadCard {
         let anchor_text = match (&self.path, self.trail) {
             (_, Some(round)) => trail_label(round),
             (Some(path), None) => format!(
-                "{path} · {}",
+                "{} · {}",
+                one_line(path),
                 shown_anchor_label(anchor, self.lines, self.moved)
             ),
             (None, None) => shown_anchor_label(anchor, self.lines, self.moved),
@@ -374,6 +375,8 @@ impl RenderOnce for ThreadCard {
                 .rounded(theme.radii.control)
                 .bg(c.recess)
                 .font_family(theme.fonts.mono.clone())
+                // Code shows the characters as typed: no ligatures (DESIGN §4.1).
+                .font_features(FontFeatures::disable_ligatures())
                 .text_size(px(11.5))
                 .line_height(px(17.))
                 .text_color(c.fg2)
@@ -445,7 +448,8 @@ impl ThreadCard {
         let name = format!("thread/{}", self.thread.id);
         let anchor_text = match &self.path {
             Some(path) => format!(
-                "{path} · {}",
+                "{} · {}",
+                one_line(path),
                 shown_anchor_label(&self.thread.anchor, self.lines, self.moved)
             ),
             None => shown_anchor_label(&self.thread.anchor, self.lines, self.moved),
@@ -695,13 +699,47 @@ fn comment(
             .child(role_word(author)),
         AuthorKind::Agent | AuthorKind::Github => tag(role_tag(author).to_string(), theme),
     };
+    let mut tags = vec![role];
+    if annotation {
+        tags.push(tag("annotation", theme));
+    }
+    comment_frame(
+        id,
+        avatar(author, theme),
+        agents::shown_name(author).to_string(),
+        tags,
+        body,
+        (at, now),
+        first,
+        theme,
+        cx,
+    )
+}
+
+/// A comment's layout, for a review's own comment and for one of GitHub's
+/// (`super::github`): the avatar, then the name, its tags and the time (`times`: when it was
+/// written, and now) over the body as Markdown.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn comment_frame(
+    id: ElementId,
+    avatar: AnyElement,
+    name: String,
+    tags: Vec<Div>,
+    body: &str,
+    times: (u64, u64),
+    first: bool,
+    theme: &DvTheme,
+    cx: &App,
+) -> Div {
+    let c = &theme.colors;
+    let (at, now) = times;
     div()
         .flex()
         .gap(px(10.))
         .pt(if first { px(10.) } else { theme.spacing.md })
         .px(theme.spacing.lg)
         .pb(theme.spacing.xs)
-        .child(avatar(author, theme))
+        .child(avatar)
         .child(
             div()
                 .flex_1()
@@ -720,10 +758,9 @@ fn comment(
                                 .min_w_0()
                                 .truncate()
                                 .font_weight(FontWeight::SEMIBOLD)
-                                .child(SharedString::from(agents::shown_name(author).to_string())),
+                                .child(SharedString::from(name)),
                         )
-                        .child(role)
-                        .when(annotation, |this| this.child(tag("annotation", theme)))
+                        .children(tags)
                         .child(
                             div()
                                 .text_spec(&theme.text.secondary)
@@ -775,7 +812,7 @@ fn avatar(author: &Author, theme: &DvTheme) -> AnyElement {
 }
 
 /// The board's `agentTag`: 16 high, a `line2` outline, 11/500 in `fg2`.
-fn tag(text: impl Into<SharedString>, theme: &DvTheme) -> Div {
+pub(super) fn tag(text: impl Into<SharedString>, theme: &DvTheme) -> Div {
     let c = &theme.colors;
     div()
         .flex_none()

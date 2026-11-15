@@ -98,3 +98,25 @@ fn ids_serialise_as_strings_and_are_checked_when_read() {
         format!("\"c-{ULID}\"")
     );
 }
+
+/// PLAN §9.6: a GitHub thread's key is `gh:<node id>`, never an id that names a log's item.
+#[test]
+fn a_thread_key_is_a_thread_id_or_githubs_node_id() {
+    let id = ThreadId::generate();
+    let local = ThreadKey::parse(id.as_str()).unwrap();
+    assert_eq!(local, ThreadKey::Local(id.clone()));
+    assert_eq!((local.local(), local.github()), (Some(&id), None));
+    assert_eq!(local.to_string(), id.as_str());
+    assert_eq!(ThreadKey::from(&id), local);
+
+    let github: ThreadKey = "gh:PRRT_kwDOAbc-12_=".parse().unwrap();
+    assert_eq!(github, ThreadKey::Github("PRRT_kwDOAbc-12_=".to_string()));
+    assert!(github.is_github() && github.local().is_none());
+    assert_eq!(github.to_string(), "gh:PRRT_kwDOAbc-12_=");
+
+    for bad in ["gh:", "gh: x", "gh:a\tb", "GH:PRRT_1", "PRRT_1", "t-1", ""] {
+        assert!(ThreadKey::parse(bad).is_err(), "{bad:?}");
+    }
+    // A node id is never read as a thread id, whatever it looks like.
+    assert!(ThreadId::parse(&format!("gh:{id}")).is_err());
+}

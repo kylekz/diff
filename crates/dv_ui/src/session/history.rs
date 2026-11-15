@@ -35,7 +35,7 @@ use dv_core::review::{
 use gpui::{AppContext as _, Context, Task};
 
 use super::load::Batch;
-use super::{ReviewSession, SessionEvent};
+use super::{Card, ReviewSession, SessionEvent};
 use crate::failure::Failure;
 
 /// One round's history as the session has it.
@@ -144,7 +144,7 @@ impl ReviewSession {
         if thread.anchor.is_file_level() {
             return false;
         }
-        let drawn = self.draws(thread, entry);
+        let drawn = self.draws(Card::Local(thread), entry);
         let Some(basis) = self.basis(&entry.path, thread.anchor.side, drawn) else {
             return false;
         };

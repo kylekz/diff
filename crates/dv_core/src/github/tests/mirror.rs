@@ -78,6 +78,7 @@ fn mirror() -> Mirror {
             additions: 12,
             deletions: 3,
         },
+        merge_base_oid: Some(oid('b')),
         checks: Checks {
             passing: 4,
             failing: 1,
@@ -594,4 +595,52 @@ fn a_store_path_is_a_pull_requests_mirror_whatever_the_host_and_login() {
     ] {
         assert!(!is_mirror_of(other, owner, repo, number), "{other}");
     }
+}
+
+/// PLAN §9.6: a thread's link is GitHub's answer, not dv's own text. Only a page of the
+/// pull request's host over https is one dv opens.
+#[test]
+fn only_a_page_of_the_host_over_https_is_a_threads_link() {
+    let mut thread = mirror().threads.remove(0);
+    let mut on = |url: &str, host: &str| {
+        thread.comments[0].url = url.to_string();
+        thread.url_on(host).map(str::to_string)
+    };
+    let page = "https://github.com/acme/api/pull/482#discussion_r1";
+    assert_eq!(on(page, "github.com").as_deref(), Some(page));
+    // A host's case is not part of it.
+    assert_eq!(on(page, "GitHub.com").as_deref(), Some(page));
+    let enterprise = "https://github.acme.example/acme/api/pull/482#discussion_r1";
+    assert_eq!(
+        on(enterprise, "github.acme.example").as_deref(),
+        Some(enterprise)
+    );
+    for other in [
+        // Another host, however it is dressed.
+        enterprise,
+        "https://github.com.evil.example/acme/api/pull/482",
+        "https://evil.example/github.com/acme/api/pull/482",
+        "https://github.com@evil.example/acme/api/pull/482",
+        "https://evil.example\\@github.com/acme/api/pull/482",
+        "https://github.com:8443/acme/api/pull/482",
+        "https://github.com",
+        // Another scheme, or none.
+        "http://github.com/acme/api/pull/482",
+        "HTTPS://github.com/acme/api/pull/482",
+        "javascript:alert(1)//https://github.com/",
+        "file:///etc/passwd",
+        "//github.com/acme/api/pull/482",
+        "github.com/acme/api/pull/482",
+        "",
+        // What a shell or a terminal would read more into.
+        "https://github.com/acme/api/pull/482 --flag",
+        "https://github.com/acme/api/pull/482\nhttps://evil.example/",
+        "https://github.com/acme/api/pull/482\x1b[2J",
+        " https://github.com/acme/api/pull/482",
+    ] {
+        assert_eq!(on(other, "github.com"), None, "{other:?}");
+    }
+    // No comment, no link.
+    thread.comments.clear();
+    assert_eq!(thread.url_on("github.com"), None);
 }

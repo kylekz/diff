@@ -5,15 +5,16 @@
 //! naming the path it was written on.
 
 use dv_core::diff::LineKind;
-use dv_core::review::{AnchorSide, ThreadId};
+use dv_core::review::{AnchorSide, ThreadId, ThreadKey};
 use gpui::{AnyElement, Context, IntoElement, ParentElement as _, Styled as _, div, px};
 
 use super::super::DiffPane;
 use super::super::rows::Insert;
 use super::{MARKER_WIDTH, NUMBER_WIDTH};
 use crate::services::ViewMode;
+use crate::session::Card;
 use crate::theme::DvTheme;
-use crate::thread::{ComposerBox, ThreadCard};
+use crate::thread::{ComposerBox, GithubCard, ThreadCard};
 
 /// Room to the card's right, and above and below it (the board's `8px 14px 10px`).
 const CARD_RIGHT: f32 = 14.;
@@ -25,6 +26,114 @@ impl DiffPane {
     /// thread, a comment on the whole file, or one placed at lines of a file whose rows aren't
     /// shown (too large to show).
     pub(in super::super) fn render_thread(
+        &self,
+        block: usize,
+        thread: &ThreadKey,
+        at: Option<&Insert>,
+        theme: &DvTheme,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        match thread {
+            ThreadKey::Local(thread) => self.render_local_thread(block, thread, at, theme, cx),
+            ThreadKey::Github(node) => self.render_github_thread(block, node, at, theme, cx),
+        }
+    }
+
+    /// The card of GitHub's thread `node` (DESIGN §4.5), placed as [`DiffPane::render_thread`]
+    /// places any.
+    fn render_github_thread(
+        &self,
+        block: usize,
+        node: &str,
+        at: Option<&Insert>,
+        theme: &DvTheme,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let Some(session) = self.session.clone() else {
+            return div().into_any_element();
+        };
+        let key = ThreadKey::Github(node.to_string());
+        let (shown, placement, resolving, error) = {
+            let session = session.read(cx);
+            let Some(shown) = session.github_thread(node) else {
+                return div().into_any_element();
+            };
+            (
+                shown.clone(),
+                session.card_placement(Card::Github(shown)),
+                session.resolving(node),
+                session.github_error(node).cloned(),
+            )
+        };
+        let lines = placement.lines(&shown.anchor);
+        let moved = placement.card_shows_moved(Card::Github(&shown));
+        let pane = cx.weak_entity();
+        // In the section the card names its file; one found in a file the review doesn't
+        // change offers that file's view at its lines.
+        let in_section = placement.is_not_in_diff() && !self.is_file_view();
+        let path = in_section.then(|| shown.anchor.path.clone());
+        let view = placement
+            .placement()
+            .unlisted_path()
+            .filter(|_| in_section)
+            .map(|path| {
+                let (pane, path) = (pane.clone(), path.to_string());
+                let line = lines.map(|(start, _)| start);
+                move |_: &mut gpui::Window, cx: &mut gpui::App| {
+                    pane.update(cx, |_, cx| {
+                        cx.emit(crate::diff_pane::DiffPaneEvent::ViewFile {
+                            path: path.clone(),
+                            line,
+                        })
+                    })
+                    .ok();
+                }
+            });
+        let url = session.read(cx).github_url(node).map(str::to_string);
+        let card = GithubCard::new(shown.clone(), dv_core::review::event::now_ms())
+            .outdated(placement.is_outdated())
+            .path(path)
+            .unlisted(view)
+            .shown_at(lines, moved)
+            .focused(self.focused_thread.as_ref() == Some(&key))
+            .collapsed(!self.is_card_open(&key, shown.thread.resolved))
+            .resolving(resolving)
+            .notice(
+                self.github_notice
+                    .as_ref()
+                    .filter(|(noted, _)| noted == node)
+                    .map(|(_, notice)| *notice),
+            )
+            .error(error)
+            .on_resolve({
+                let (pane, node) = (pane.clone(), node.to_string());
+                move |_, cx| {
+                    pane.update(cx, |this, cx| this.toggle_github_resolved(&node, cx))
+                        .ok();
+                }
+            })
+            .on_toggle({
+                let (pane, key) = (pane.clone(), key.clone());
+                move |_, cx| {
+                    pane.update(cx, |this, cx| this.toggle_thread(&key, cx))
+                        .ok();
+                }
+            })
+            .on_focus({
+                let (pane, key) = (pane.clone(), key.clone());
+                move |_, cx| {
+                    pane.update(cx, |this, cx| this.focus_thread(&key, cx)).ok();
+                }
+            });
+        let card = match url {
+            Some(url) => card.on_open(move |_, cx| crate::system::open_url(&url, cx)),
+            None => card,
+        };
+        self.place(block, at, card.into_any_element(), theme)
+    }
+
+    /// The card of `thread`, one of the review's own.
+    fn render_local_thread(
         &self,
         block: usize,
         thread: &ThreadId,
@@ -82,7 +191,7 @@ impl DiffPane {
             .path(path)
             .unlisted(view)
             .shown_at(lines, moved)
-            .focused(self.focused_thread.as_ref() == Some(thread))
+            .focused(self.focused_thread() == Some(thread))
             .collapsed(collapsed)
             .read_only(read_only)
             .reply(reply)

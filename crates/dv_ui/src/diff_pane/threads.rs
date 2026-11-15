@@ -23,23 +23,31 @@
 //! takes it up. One whose file left the diff, or whose thread was deleted, is dropped. A
 //! composer that goes for good, its draft with it, says so ([`DiffPaneEvent::ComposerClosed`]):
 //! a pick waiting for the draft runs then (`crate::shell::pending`).
+//!
+//! GitHub's threads on a PR review (PLAN §9.6, DESIGN §4.5) are cards here like the review's
+//! own, named by their [`ThreadKey`]: placed by the session as any thread, stepped through
+//! by `]`/`[`, collapsed while GitHub calls them resolved. `X` on one resolves or unresolves
+//! it on GitHub, where GitHub allows the viewer (`ReviewSession::toggle_github_resolved`),
+//! on a finished review too: it is GitHub's state, not the review's. `R` on one opens no
+//! composer: replies to GitHub's threads post with the review, which arrives with
+//! submitting, and until then the card says so and points at the thread on GitHub.
 
 use dv_core::diff::{DiffLine, FileDiff};
-use dv_core::review::{AnchorSide, ThreadId, ThreadState};
+use dv_core::review::{AnchorSide, ThreadId, ThreadKey, ThreadState};
 use gpui::{App, AppContext as _, Context, FocusHandle, Focusable as _, Window};
 use gpui_component::input::{InputEvent, TextareaState};
 
 use super::rows::{Dir, Insert, InsertItem, Row, side_number};
 use super::{DiffPane, DiffPaneEvent, rows};
 use crate::failure::Failure;
-use crate::session::{Comparison, ReviewSession};
-use crate::thread::{COMPOSER_ROWS, Composer, ComposerTarget, REPLY_ROWS};
+use crate::session::{Card, Comparison, ResolveAsked, ReviewSession};
+use crate::thread::{COMPOSER_ROWS, Composer, ComposerTarget, GithubNotice, REPLY_ROWS};
 
 /// Whether `row` of `path` holds `composer`: its own row in its file, or the card of the thread
 /// it answers, wherever that is drawn (a thread's card shows once in the stream).
 fn holds_composer(composer: &Composer, path: &str, row: &Row) -> bool {
     match &composer.target.reply_to {
-        Some(thread) => row.thread() == Some(thread),
+        Some(thread) => row.thread().and_then(ThreadKey::local) == Some(thread),
         None => {
             composer.target.path == path
                 && matches!(
@@ -61,7 +69,7 @@ pub(super) fn thread_rows(
     diff: &FileDiff,
     session: &ReviewSession,
     composer: Option<&ComposerTarget>,
-) -> (Vec<Insert>, Vec<ThreadId>) {
+) -> (Vec<Insert>, Vec<ThreadKey>) {
     let mut inserts = Vec::new();
     let mut outdated = Vec::new();
     // A file whose content didn't change shows a notice rather than its lines: its threads'
@@ -70,20 +78,21 @@ pub(super) fn thread_rows(
         .as_text()
         .filter(|text| text.has_changes())
         .map(|text| text.lines.as_slice());
-    for thread in session
-        .threads_in(path)
-        .filter(|thread| !thread.anchor.is_file_level())
+    for card in session
+        .cards_in(path)
+        .filter(|card| !card.anchor().is_file_level())
     {
-        let side = thread.anchor.side;
+        let anchor = card.anchor();
+        let side = anchor.side;
         // Placed against the diff these rows show, which may be the one a reload replaces.
-        let placement = session.placement(thread);
+        let placement = session.card_placement(card);
         if placement.is_pending() {
             // Its side isn't there to place it against yet: it is drawn once it is.
             continue;
         }
         // Found, it follows the last line of its range; outdated with a trail, the line its
         // code went to (a trail is on the new side); else it heads the file.
-        let after = match placement.lines(&thread.anchor) {
+        let after = match placement.lines(anchor) {
             Some((_, end)) => Some((side, end)),
             None => placement
                 .trail()
@@ -95,11 +104,11 @@ pub(super) fn thread_rows(
                 Some(line) => inserts.push(Insert {
                     line,
                     side,
-                    item: InsertItem::Thread(thread.id.clone()),
+                    item: InsertItem::Thread(card.key()),
                 }),
-                None => outdated.push(thread.id.clone()),
+                None => outdated.push(card.key()),
             },
-            _ => outdated.push(thread.id.clone()),
+            _ => outdated.push(card.key()),
         }
     }
     // An interdiff's old column is round n's snapshot: a draft on the old side waits for all
@@ -134,10 +143,10 @@ pub(super) fn thread_lines(path: &str, diff: &FileDiff, session: &ReviewSession)
         return Vec::new();
     };
     let mut out = Vec::new();
-    for thread in session.threads_in(path) {
-        let placement = session.placement(thread);
-        let shown = match placement.lines(&thread.anchor) {
-            Some(lines) => Some((thread.anchor.side, lines)),
+    for card in session.cards_in(path) {
+        let placement = session.card_placement(card);
+        let shown = match placement.lines(card.anchor()) {
+            Some(lines) => Some((card.anchor().side, lines)),
             None => placement.trail().map(|trail| {
                 let (start, end) = trail.lines();
                 // Removed code stood between the line it follows and the next one.
@@ -181,6 +190,34 @@ fn nearest_line(lines: &[DiffLine], side: AnchorSide, number: u32) -> Option<usi
         .or_else(|| lines.iter().position(|line| rows::on_side(line, side)))
 }
 
+/// How many frames after a thread's card is revealed it may be placed again, every other
+/// frame ([`DiffPane::reveal_laid_out_thread`]): long enough for the cards on the way to be
+/// laid out and their Markdown parsed, an eighth of a second at 60 frames a second.
+const REVEAL_FRAMES: u8 = 8;
+
+/// A revealed card being placed again ([`DiffPane::reveal_laid_out_thread`]).
+#[derive(Clone, Copy, Debug)]
+pub(super) struct Revealing {
+    /// The frames left.
+    frames: u8,
+    /// Where the list's scroll top stood at the last frame; `None` for the frame after a
+    /// placement, whose scroll the layout between the two may still settle.
+    top: Option<gpui::ListOffset>,
+    /// Where the card stood in the viewport when it was last placed.
+    offset: Option<f32>,
+}
+
+impl Revealing {
+    /// A card just revealed.
+    fn started() -> Self {
+        Self {
+            frames: REVEAL_FRAMES,
+            top: None,
+            offset: None,
+        }
+    }
+}
+
 impl DiffPane {
     /// The open composer.
     pub fn composer(&self) -> Option<&crate::thread::Composer> {
@@ -213,20 +250,51 @@ impl DiffPane {
             || self.is_find_focused(window, cx)
     }
 
-    /// The keyboard's thread.
+    /// The keyboard's thread, when it is one of the review's own.
     pub fn focused_thread(&self) -> Option<&ThreadId> {
+        self.focused_thread.as_ref().and_then(ThreadKey::local)
+    }
+
+    /// The keyboard's thread: one of the review's own, or one of GitHub's.
+    pub fn focused_key(&self) -> Option<&ThreadKey> {
         self.focused_thread.as_ref()
+    }
+
+    /// The GitHub thread whose card says replying arrives with submitting (`R` on it).
+    pub fn reply_notice(&self) -> Option<&str> {
+        self.github_notice(|notice| notice == GithubNotice::Reply)
+    }
+
+    /// The GitHub thread whose card says GitHub doesn't let the viewer resolve or unresolve
+    /// it (`X` on it).
+    pub fn resolve_notice(&self) -> Option<&str> {
+        self.github_notice(|notice| matches!(notice, GithubNotice::NotAllowed(_)))
+    }
+
+    fn github_notice(&self, is: impl Fn(GithubNotice) -> bool) -> Option<&str> {
+        self.github_notice
+            .as_ref()
+            .filter(|(_, notice)| is(*notice))
+            .map(|(node, _)| node.as_str())
     }
 
     /// Whether `thread`'s card shows whole: every thread but a resolved one the reviewer hasn't
     /// opened and isn't replying to.
     pub fn is_thread_open(&self, thread: &ThreadId, state: ThreadState) -> bool {
-        state != ThreadState::Resolved
+        self.is_card_open(
+            &ThreadKey::Local(thread.clone()),
+            state == ThreadState::Resolved,
+        )
+    }
+
+    /// [`DiffPane::is_thread_open`] for any thread the review shows, `resolved` or not.
+    pub fn is_card_open(&self, thread: &ThreadKey, resolved: bool) -> bool {
+        !resolved
             || self.opened_threads.contains(thread)
-            || self
-                .composer
-                .as_ref()
-                .is_some_and(|composer| composer.target.reply_to.as_ref() == Some(thread))
+            || self.composer.as_ref().is_some_and(|composer| {
+                composer.target.reply_to.as_ref() == thread.local()
+                    && composer.target.reply_to.is_some()
+            })
     }
 
     /// Why the last change to `thread`'s state failed.
@@ -293,11 +361,29 @@ impl DiffPane {
         self.open_composer(target, window, cx);
     }
 
-    /// `R`: replies to the focused thread.
+    /// `R`: replies to the focused thread; on one of GitHub's, its card says that replying
+    /// arrives with submitting (module docs).
     pub(super) fn reply(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if let Some(thread) = self.focused_thread.clone() {
-            self.start_reply(&thread, window, cx);
+        match self.focused_thread.clone() {
+            Some(ThreadKey::Local(thread)) => self.start_reply(&thread, window, cx),
+            Some(ThreadKey::Github(node)) => {
+                self.show_github_notice(&node, GithubNotice::Reply, cx)
+            }
+            None => {}
         }
+    }
+
+    /// Has GitHub's thread `node`'s card say `notice` under its comments, opened and with
+    /// the keyboard: why `R`, or `X`, did nothing on it (module docs).
+    pub fn show_github_notice(&mut self, node: &str, notice: GithubNotice, cx: &mut Context<Self>) {
+        let key = ThreadKey::Github(node.to_string());
+        self.opened_threads.insert(key.clone());
+        self.focused_thread = Some(key.clone());
+        self.github_notice = Some((node.to_string(), notice));
+        if let Some(item) = self.thread_item(&key) {
+            self.remeasure(item);
+        }
+        cx.notify();
     }
 
     /// Opens the reply composer in `thread`'s card (a click on its reply field, or `R`).
@@ -305,6 +391,7 @@ impl DiffPane {
         if self.read_only(cx) {
             return;
         }
+        let key = ThreadKey::Local(thread.clone());
         let Some(session) = self.session.clone() else {
             return;
         };
@@ -339,12 +426,12 @@ impl DiffPane {
         // Only into a card the stream has a block for: a composer in a card that isn't drawn
         // would hold the keyboard where nothing shows it.
         if !self
-            .thread_block_path(thread, cx)
+            .thread_block_path(&key, cx)
             .is_some_and(|path| self.index.contains_key(&path))
         {
             return;
         }
-        self.focused_thread = Some(thread.clone());
+        self.set_focused(Some(key.clone()));
         if self
             .composer
             .as_ref()
@@ -356,8 +443,19 @@ impl DiffPane {
         if self.keep_composer(window, cx) {
             return;
         }
-        self.opened_threads.insert(thread.clone());
+        self.opened_threads.insert(key);
         self.open_composer(target, window, cx);
+    }
+
+    /// Gives `thread` the keyboard's focus; a GitHub card's notice goes once another thread
+    /// has it.
+    pub(super) fn set_focused(&mut self, thread: Option<ThreadKey>) {
+        if self.github_notice.as_ref().map(|(node, _)| node.as_str())
+            != thread.as_ref().and_then(ThreadKey::github)
+        {
+            self.github_notice = None;
+        }
+        self.focused_thread = thread;
     }
 
     /// Reply (the comments list's menu): shows `thread`'s card and opens the reply composer in
@@ -388,12 +486,13 @@ impl DiffPane {
         let Some(thread) = self.reply_when_shown.clone() else {
             return;
         };
-        if self.thread_item(&thread).is_some() {
+        let key = ThreadKey::Local(thread.clone());
+        if self.thread_item(&key).is_some() {
             self.reply_when_shown = None;
             cx.defer_in(window, move |this, window, cx| {
                 this.start_reply(&thread, window, cx);
             });
-        } else if !self.card_may_come(&thread, cx) {
+        } else if !self.card_may_come(&key, cx) {
             self.reply_when_shown = None;
         }
     }
@@ -401,17 +500,17 @@ impl DiffPane {
     /// Whether `thread`'s card, not built now, may still be: all changes are being listed, the
     /// thread waits for its file's text, or its file is loading. Its block collapsed again, or
     /// built without it, it won't.
-    fn card_may_come(&self, thread: &ThreadId, cx: &App) -> bool {
+    fn card_may_come(&self, thread: &ThreadKey, cx: &App) -> bool {
         let Some(session) = self.session.as_ref().map(|session| session.read(cx)) else {
             return false;
         };
         if session.asked_comparison() != session.comparison() {
             return true;
         }
-        let Some(found) = session.review().thread(thread) else {
+        let Some(found) = session.card(thread) else {
             return false;
         };
-        if session.placement(found).is_pending() {
+        if session.card_placement(found).is_pending() {
             return true;
         }
         let Some(&index) = self
@@ -430,7 +529,7 @@ impl DiffPane {
     /// a new thread's file, or the block of the card a reply answers.
     fn target_block_path(&self, target: &ComposerTarget, cx: &App) -> Option<String> {
         match &target.reply_to {
-            Some(thread) => self.thread_block_path(thread, cx),
+            Some(thread) => self.thread_block_path(&thread.into(), cx),
             None => Some(target.path.clone()),
         }
     }
@@ -822,8 +921,8 @@ impl DiffPane {
                 if target.reply_to.is_none() {
                     self.selection = None;
                 }
-                self.focused_thread = Some(thread.clone());
-                self.pending_thread = Some(thread);
+                self.set_focused(Some(ThreadKey::Local(thread.clone())));
+                self.pending_thread = Some(ThreadKey::Local(thread));
                 // The review's reload can draw the card before this answer comes (a loaded
                 // machine), leaving no change to its rows to reveal it on: it is revealed now
                 // if it is there, else once it is drawn.
@@ -870,15 +969,11 @@ impl DiffPane {
         let Some(session) = self.session.clone() else {
             return;
         };
-        let unresolved: Vec<(usize, ThreadId)> = {
-            let review = session.read(cx).review();
+        let unresolved: Vec<(usize, ThreadKey)> = {
+            let session = session.read(cx);
             self.thread_items()
                 .into_iter()
-                .filter(|(_, id)| {
-                    review
-                        .thread(id)
-                        .is_some_and(|thread| thread.state.is_waiting())
-                })
+                .filter(|(_, id)| session.card(id).is_some_and(Card::is_waiting))
                 .collect()
         };
         let focused = self
@@ -912,11 +1007,11 @@ impl DiffPane {
             Dir::Up => (0..from_block).rev().collect(),
         };
         for index in order {
-            let waiting: Vec<ThreadId> = self
+            let waiting: Vec<ThreadKey> = self
                 .block_threads(index, session.read(cx))
                 .into_iter()
-                .filter(|thread| thread.state.is_waiting())
-                .map(|thread| thread.id.clone())
+                .filter(|card| card.is_waiting())
+                .map(Card::key)
                 .collect();
             if waiting.is_empty() {
                 continue;
@@ -935,9 +1030,10 @@ impl DiffPane {
     /// Focuses `thread` and scrolls to its card (a click on its row in the comments list).
     /// A thread whose card isn't built yet — its file collapsed or still loading, or the
     /// comparison asked for still being listed — is shown once it is.
-    pub fn reveal_thread(&mut self, thread: &ThreadId, cx: &mut Context<Self>) {
+    pub fn reveal_thread(&mut self, thread: impl Into<ThreadKey>, cx: &mut Context<Self>) {
+        let thread = &thread.into();
         // Showing another thread forgets a reply waiting for its card.
-        if self.reply_when_shown.as_ref() != Some(thread) {
+        if self.reply_when_shown.as_ref() != thread.local() {
             self.reply_when_shown = None;
         }
         let Some(session) = self.session.clone() else {
@@ -955,12 +1051,12 @@ impl DiffPane {
         };
         let Some(path) = path else {
             // The comparison being listed shows it once it lands (or nothing draws it).
-            self.focused_thread = Some(thread.clone());
+            self.set_focused(Some(thread.clone()));
             self.reveal_after_listing = switching.then(|| thread.clone());
             cx.notify();
             return;
         };
-        self.focused_thread = Some(thread.clone());
+        self.set_focused(Some(thread.clone()));
         self.pending_thread = Some(thread.clone());
         if self.is_collapsed(&path) {
             self.set_open(&path, true, cx);
@@ -976,27 +1072,88 @@ impl DiffPane {
     }
 
     /// A click on a card: it becomes the focused thread.
-    pub fn focus_thread(&mut self, thread: &ThreadId, cx: &mut Context<Self>) {
-        if self.focused_thread.as_ref() != Some(thread) {
-            self.focused_thread = Some(thread.clone());
+    pub fn focus_thread(&mut self, thread: impl Into<ThreadKey>, cx: &mut Context<Self>) {
+        let thread = thread.into();
+        if self.focused_thread.as_ref() != Some(&thread) {
+            self.set_focused(Some(thread));
             cx.notify();
         }
     }
 
-    fn focus_item(&mut self, item: usize, thread: ThreadId, cx: &mut Context<Self>) {
-        self.focused_thread = Some(thread);
+    fn focus_item(&mut self, item: usize, thread: ThreadKey, cx: &mut Context<Self>) {
+        self.set_focused(Some(thread));
         self.pending_thread = None;
         self.menu = None;
         self.reveal_item(item, 2);
+        self.revealing = Some(Revealing::started());
         self.viewport_changed(cx);
         cx.notify();
     }
 
-    /// `X`: resolves the focused thread, or reopens it when it is resolved; nothing on an
-    /// annotation.
-    pub(super) fn resolve_focused(&mut self, cx: &mut Context<Self>) {
-        let Some(thread) = self.focused_thread.clone() else {
+    /// Brings the focused thread's card into view again over the frames after it was
+    /// revealed ([`DiffPane::reveal_thread`], `]`/`[`): `reveal_item` places a card by the
+    /// heights of the rows on the way as last laid out, and those aren't final yet. A card
+    /// that was never drawn is an estimate, and one that comes back into view is laid out
+    /// short until its Markdown is parsed again, so past a tall card the first scroll lands
+    /// short, and so can the next. Every other frame for [`REVEAL_FRAMES`] the card is
+    /// placed again, until it stands where the placement before left it. It stops at once
+    /// when anything else moved the stream meanwhile (the reader's wheel, `J`, a page
+    /// down): what was asked for after the reveal is never undone. Runs as the stream is
+    /// drawn.
+    pub(super) fn reveal_laid_out_thread(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(mut revealing) = self.revealing.take() else {
             return;
+        };
+        let top = self.list.logical_scroll_top();
+        if revealing.top.is_some_and(|seen| seen != top) {
+            return;
+        }
+        revealing.frames -= 1;
+        revealing.top = Some(top);
+        if revealing.frames % 2 == 0 {
+            let item = self
+                .focused_thread
+                .clone()
+                .and_then(|thread| self.thread_item(thread));
+            let Some(item) = item else {
+                return;
+            };
+            let offset = self.offset_of(item, f32::MAX);
+            if offset.is_some() && offset == revealing.offset {
+                return;
+            }
+            revealing.offset = offset;
+            self.reveal_item(item, 2);
+            if self.list.logical_scroll_top() != top {
+                // The next layout may still settle where this scroll lands.
+                revealing.top = None;
+                self.viewport_changed(cx);
+            }
+        }
+        if revealing.frames > 0 {
+            self.revealing = Some(revealing);
+            // The next frame lays the rows out.
+            cx.defer_in(window, |_, _, cx| cx.notify());
+        }
+    }
+
+    /// `X`: resolves the focused thread, or reopens it when it is resolved; nothing on an
+    /// annotation. On one of GitHub's it resolves or unresolves it on GitHub, but not while
+    /// its card shows the reply notice: `R` opens a composer on a card of the review's own,
+    /// so what is typed after `R` out of habit must not write to GitHub. The first `X` then
+    /// only takes the notice away; the next one resolves (PLAN §9.6).
+    pub(super) fn resolve_focused(&mut self, cx: &mut Context<Self>) {
+        let thread = match self.focused_thread.clone() {
+            Some(ThreadKey::Local(thread)) => thread,
+            Some(ThreadKey::Github(node)) if self.reply_notice() == Some(node.as_str()) => {
+                self.github_notice = None;
+                if let Some(item) = self.thread_item(ThreadKey::Github(node)) {
+                    self.remeasure(item);
+                }
+                return cx.notify();
+            }
+            Some(ThreadKey::Github(node)) => return self.toggle_github_resolved(&node, cx),
+            None => return,
         };
         let state = self.session.as_ref().and_then(|session| {
             session
@@ -1015,6 +1172,38 @@ impl DiffPane {
         }
     }
 
+    /// Resolve / Unresolve on GitHub's thread `node` (its card's button, `X`): GitHub's
+    /// state changes at once, where GitHub allows the viewer, then the mirror is read again
+    /// (`ReviewSession::toggle_github_resolved`, PLAN §9.6). A finished review resolves too.
+    /// A card being resolved collapses once GitHub calls it resolved, as a thread of the
+    /// review's own does; one being unresolved stays as it is, whatever GitHub answers.
+    /// Where GitHub doesn't let the viewer, the card says so.
+    pub fn toggle_github_resolved(&mut self, node: &str, cx: &mut Context<Self>) {
+        let Some(session) = self.session.clone() else {
+            return;
+        };
+        match session.update(cx, |session, cx| session.toggle_github_resolved(node, cx)) {
+            ResolveAsked::Asked(resolve) => {
+                if resolve {
+                    self.opened_threads
+                        .remove(&ThreadKey::Github(node.to_string()));
+                }
+                if self
+                    .github_notice
+                    .as_ref()
+                    .is_some_and(|(noted, _)| noted == node)
+                {
+                    self.github_notice = None;
+                }
+            }
+            ResolveAsked::NotAllowed(resolve) => {
+                self.show_github_notice(node, GithubNotice::NotAllowed(resolve), cx)
+            }
+            ResolveAsked::Nothing => {}
+        }
+        cx.notify();
+    }
+
     /// Resolves or reopens `thread` as the reviewer (`ops::set_thread_state`); nothing on a
     /// finished review. A resolved thread collapses.
     pub fn set_thread_state(
@@ -1030,7 +1219,8 @@ impl DiffPane {
             return;
         };
         if state == ThreadState::Resolved {
-            self.opened_threads.remove(thread);
+            self.opened_threads
+                .remove(&ThreadKey::Local(thread.clone()));
         }
         self.thread_error = None;
         let writing = session.update(cx, |session, cx| {
@@ -1054,18 +1244,19 @@ impl DiffPane {
     }
 
     /// Opens or collapses a resolved thread's card (its chevron).
-    pub fn toggle_thread(&mut self, thread: &ThreadId, cx: &mut Context<Self>) {
-        if !self.opened_threads.remove(thread) {
+    pub fn toggle_thread(&mut self, thread: impl Into<ThreadKey>, cx: &mut Context<Self>) {
+        let thread = thread.into();
+        if !self.opened_threads.remove(&thread) {
             self.opened_threads.insert(thread.clone());
         }
-        if let Some(item) = self.thread_item(thread) {
+        if let Some(item) = self.thread_item(&thread) {
             self.remeasure(item);
         }
         cx.notify();
     }
 
     /// Every thread card in the stream, as `(list item, thread)`, top to bottom.
-    fn thread_items(&self) -> Vec<(usize, ThreadId)> {
+    fn thread_items(&self) -> Vec<(usize, ThreadKey)> {
         self.blocks
             .iter()
             .enumerate()
@@ -1078,10 +1269,11 @@ impl DiffPane {
             .collect()
     }
 
-    pub(super) fn thread_item(&self, thread: &ThreadId) -> Option<usize> {
+    pub(super) fn thread_item(&self, thread: impl Into<ThreadKey>) -> Option<usize> {
+        let thread = thread.into();
         self.thread_items()
             .into_iter()
-            .find(|(_, id)| id == thread)
+            .find(|(_, id)| *id == thread)
             .map(|(item, _)| item)
     }
 
@@ -1091,7 +1283,10 @@ impl DiffPane {
     pub(crate) fn composer_card(&self) -> Option<(&str, Option<&ThreadId>)> {
         let (block, row) = self.locate(self.composer_item()?)?;
         let block = &self.blocks[block];
-        Some((block.path.as_str(), block.rows[row].thread()))
+        Some((
+            block.path.as_str(),
+            block.rows[row].thread().and_then(ThreadKey::local),
+        ))
     }
 
     /// The composer's list item: its own row, or the card of the thread it answers.
@@ -1117,6 +1312,7 @@ impl DiffPane {
         if let Some(item) = self.thread_item(&thread) {
             self.pending_thread = None;
             self.reveal_item(item, 2);
+            self.revealing = Some(Revealing::started());
         }
     }
 
@@ -1169,10 +1365,10 @@ impl DiffPane {
         let Some(session) = self.session.clone() else {
             return;
         };
-        let review = session.read(cx).review();
-        let exists = |id: &ThreadId| review.thread(id).is_some_and(|thread| !thread.is_deleted());
+        let session = session.read(cx);
+        let exists = |id: &ThreadKey| session.card(id).is_some();
         if self.focused_thread.as_ref().is_some_and(|id| !exists(id)) {
-            self.focused_thread = None;
+            self.set_focused(None);
         }
         if self.pending_thread.as_ref().is_some_and(|id| !exists(id)) {
             self.pending_thread = None;
@@ -1184,7 +1380,11 @@ impl DiffPane {
         {
             self.reveal_after_listing = None;
         }
-        if self.reply_when_shown.as_ref().is_some_and(|id| !exists(id)) {
+        if self
+            .reply_when_shown
+            .as_ref()
+            .is_some_and(|id| !exists(&id.into()))
+        {
             self.reply_when_shown = None;
         }
         self.opened_threads.retain(exists);
@@ -1192,7 +1392,7 @@ impl DiffPane {
             .composer
             .as_ref()
             .and_then(|composer| composer.target.reply_to.as_ref())
-            .is_some_and(|thread| !exists(thread));
+            .is_some_and(|thread| !exists(&thread.into()));
         if reply_gone {
             self.close_composer(cx);
         }

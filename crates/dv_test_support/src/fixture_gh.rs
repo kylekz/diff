@@ -9,7 +9,7 @@
 
 use serde_json::{Value, json};
 
-use crate::GITHUB_OWNER;
+use crate::{FixtureGithub, FixtureRepo, GITHUB_OWNER};
 
 /// A pull request as the fixture GitHub's `gh` tells it.
 #[derive(Debug, Clone)]
@@ -173,6 +173,111 @@ impl GhPr {
             }),
         ]
     }
+
+    /// [`GhPr::calls`] about it in `github`'s repository, each line thread that names no
+    /// `diffHunk` given the one GitHub shows above it, cut from the author's repository
+    /// ([`cut_hunk`]).
+    pub fn calls_in(&self, github: &FixtureGithub) -> Vec<Value> {
+        let mut pr = self.clone();
+        for thread in &mut pr.threads {
+            cut_hunk(github.author(), &self.base_branch, thread);
+        }
+        pr.calls(github.name())
+    }
+}
+
+/**
+ * Gives `thread`, a `reviewThreads` node on a line whose first comment has an empty
+ * `diffHunk`, the hunk GitHub shows above it: the hunk of the pull request's diff of its
+ * file (the merge base with `base_branch` against the comment's commit) from its header
+ * through the thread's line on its side, where GitHub cuts it. A line no hunk holds gets a
+ * hunk of that line alone. A thread whose commit `repo` doesn't hold, or whose line its
+ * file doesn't have, stays as it is.
+ */
+fn cut_hunk(repo: &FixtureRepo, base_branch: &str, thread: &mut Value) {
+    let comment = &thread["comments"]["nodes"][0];
+    if thread["subjectType"] != "LINE" || comment["diffHunk"] != "" {
+        return;
+    }
+    let git = |args: &[&str]| {
+        let output = repo.git_command().args(args).output().ok()?;
+        output
+            .status
+            .success()
+            .then(|| String::from_utf8_lossy(&output.stdout).into_owned())
+    };
+    let left = thread["diffSide"] == "LEFT";
+    let hunk = (|| {
+        let commit = comment["commit"]["oid"]
+            .as_str()
+            .or_else(|| comment["originalCommit"]["oid"].as_str())?;
+        let line = thread["line"]
+            .as_u64()
+            .or_else(|| thread["originalLine"].as_u64())?;
+        let path = thread["path"].as_str()?;
+        let base = git(&["merge-base", base_branch, commit])?;
+        let base = base.trim();
+        let diff = git(&["diff", "--no-color", "-U3", "-M", base, commit])?;
+        cut(&diff, path, left, line).or_else(|| {
+            // Outside every hunk: the line alone, as it stands on its side.
+            let at = if left { base } else { commit };
+            let text = git(&["show", &format!("{at}:{path}")])?;
+            // Not text: GitHub shows no hunk for it.
+            if text.contains('\0') {
+                return None;
+            }
+            let row = text
+                .lines()
+                .nth(usize::try_from(line).ok()?.checked_sub(1)?)?;
+            Some(format!("@@ -{line} +{line} @@\n {row}"))
+        })
+    })();
+    if let Some(hunk) = hunk {
+        thread["comments"]["nodes"][0]["diffHunk"] = Value::from(hunk);
+    }
+}
+
+/// The hunk of `path` in `diff` (git's patch output) that holds `line` of the old (`left`)
+/// or the new side, from its header through that line.
+fn cut(diff: &str, path: &str, left: bool, line: u64) -> Option<String> {
+    let (mut old_path, mut new_path) = ("", "");
+    let (mut in_header, mut in_file) = (true, false);
+    let (mut old_no, mut new_no) = (0, 0);
+    let mut hunk: Vec<&str> = Vec::new();
+    // Split at `\n` alone: a CRLF file's rows keep their `\r`, as GitHub's do.
+    for row in diff.split('\n') {
+        if row.starts_with("diff --git ") {
+            in_header = true;
+        } else if in_header && let Some(old) = row.strip_prefix("--- ") {
+            old_path = old.strip_prefix("a/").unwrap_or(old);
+        } else if in_header && let Some(new) = row.strip_prefix("+++ ") {
+            new_path = new.strip_prefix("b/").unwrap_or(new);
+        } else if let Some(header) = row.strip_prefix("@@ -") {
+            in_header = false;
+            in_file = new_path == path || (new_path == "/dev/null" && old_path == path);
+            let mut starts = header.split(' ').map(|range| {
+                let start = range.trim_start_matches('+');
+                start.split(',').next().and_then(|start| start.parse().ok())
+            });
+            old_no = starts.next()??;
+            new_no = starts.next()??;
+            hunk = vec![row];
+        } else if !in_header && in_file {
+            hunk.push(row);
+            let (on_old, on_new) = match row.as_bytes().first() {
+                Some(b'+') => (false, true),
+                Some(b'-') => (true, false),
+                Some(b'\\') => (false, false),
+                _ => (true, true),
+            };
+            if (left && on_old && old_no == line) || (!left && on_new && new_no == line) {
+                return Some(hunk.join("\n"));
+            }
+            old_no += u64::from(on_old);
+            new_no += u64::from(on_new);
+        }
+    }
+    None
 }
 
 /// The `mock_gh` entry answering `gh api user`: gh is signed in as `login`.
@@ -215,7 +320,8 @@ pub fn file(path: &str, status: &str, patch: Option<&str>) -> Value {
 }
 
 /// One `reviewThreads` node: a thread `id` by `author` on line `line` of `path`'s new side
-/// in `commit`, with its one comment, `body`.
+/// in `commit`, with its one comment, `body`. Its `diffHunk` is empty until
+/// [`GhPr::calls_in`] cuts the one GitHub shows above it.
 pub fn thread(id: &str, path: &str, line: u32, author: &str, body: &str, commit: &str) -> Value {
     json!({
         "id": id,
@@ -239,7 +345,7 @@ pub fn thread(id: &str, path: &str, line: u32, author: &str, body: &str, commit:
             "body": body,
             "createdAt": "2026-10-19T08:00:00Z",
             "url": format!("https://github.com/{GITHUB_OWNER}/api/pull/7#discussion_r1001"),
-            "diffHunk": "@@ -0,0 +1,3 @@\n+pub fn answer() -> u32 {",
+            "diffHunk": "",
             "outdated": false,
             "commit": {"oid": commit},
             "originalCommit": {"oid": commit},
@@ -247,4 +353,34 @@ pub fn thread(id: &str, path: &str, line: u32, author: &str, body: &str, commit:
             "pullRequestReview": {"id": "PRR_1", "fullDatabaseId": "2001", "state": "COMMENTED"},
         })]),
     })
+}
+
+/// The `mock_gh` entry answering Resolve (`resolved`) or Unresolve of thread `id` as GitHub
+/// does when it takes it: `resolveReviewThread` / `unresolveReviewThread`, matched by the
+/// mutation's name and the thread's id in the request.
+pub fn resolve(id: &str, resolved: bool) -> Value {
+    let name = resolve_mutation(resolved);
+    json!({
+        "argv": ["api", "graphql", "**"],
+        "stdin_contains": resolve_request(id, resolved),
+        "stdout": {"data": {name: {"thread": {"id": id, "isResolved": resolved}}}}
+    })
+}
+
+/// What a request to resolve (or unresolve) thread `id` holds, for an entry's
+/// `stdin_contains`: the mutation's name as the request opens it (`resolveReviewThread` alone
+/// is also the end of `unresolveReviewThread`) and the thread's id among its variables.
+pub fn resolve_request(id: &str, resolved: bool) -> Vec<String> {
+    vec![
+        format!("{{ {}(", resolve_mutation(resolved)),
+        format!("\"thread\":\"{id}\""),
+    ]
+}
+
+fn resolve_mutation(resolved: bool) -> &'static str {
+    if resolved {
+        "resolveReviewThread"
+    } else {
+        "unresolveReviewThread"
+    }
 }

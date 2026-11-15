@@ -25,8 +25,9 @@ const REVIEWS_DIR: &str = "reviews";
 /// event field (a `status` note or condition, a relocated anchor), skipped an event this build
 /// applies (a thread on a whole file, whose file-level anchor an older build refuses) or didn't
 /// derive some state (the status a round closed from) or read a thread as something else (an
-/// annotation, PLAN §19) is never taken for this build's fold.
-const SNAPSHOT_VERSION: u32 = 7;
+/// annotation, PLAN §19; a thread written as GitHub's, which no log holds, PLAN §9.6) is never
+/// taken for this build's fold.
+const SNAPSHOT_VERSION: u32 = 8;
 
 /// A review's log, relative to the store root.
 fn log_path(id: &ReviewId) -> String {

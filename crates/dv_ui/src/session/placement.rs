@@ -50,6 +50,13 @@
 //! history (which read, `history`). A refresh that keeps
 //! a file's diff keeps its threads' placements. The fuzzy step's form of a side is built once
 //! and shared by every thread on it (`dv_core::review::FuzzyLines`).
+//!
+//! **GitHub's threads** (PLAN §9.6, `github`) are placed here too, each by the anchor read
+//! for it ([`Card::Github`]), through the same steps: its file by
+//! `dv_core::github::threads::thread_entry`'s rule (the review's own, and the file still
+//! under the name a rename gave up, since the review may show an older head than GitHub's
+//! thread was read at), no round history (a PR review has one round), and for one without a
+//! place in the diff, outdated without a file: the "Not in the diff" section's.
 
 use std::collections::HashMap;
 use std::rc::Rc;
@@ -58,15 +65,16 @@ use std::sync::Arc;
 use dv_core::diff::{FileDiff, FileEntry, FileStatus};
 use dv_core::review::{
     Anchor, AnchorPlace, AnchorSide, FuzzyLines, History, Placement, SideLines, SideText, Thread,
-    ThreadFile, ThreadId, ThreadState, Trail, place_thread, place_unlisted, relocated_anchor,
-    shows_edited, shows_moved, side_lines, thread_file, unlisted_path,
+    ThreadFile, ThreadId, ThreadKey, ThreadState, Trail, edited_since, moved_since, place_anchor,
+    place_unlisted_anchor, relocated_anchor, side_lines, thread_file, unlisted_path,
 };
 
+use super::github::Card;
 use super::history::HistoryKey;
 use super::load::FullRead;
 use super::{FileState, ReviewSession};
 use crate::session::Comparison;
-use crate::thread::{file_location, location_label, path_lines};
+use crate::thread::{file_location, path_lines};
 
 /// Where a thread shows in the session's stream.
 #[derive(Clone, Debug, PartialEq)]
@@ -170,8 +178,14 @@ impl ThreadPlacement {
     /// Whether `thread`, placed here, shows "· moved" (`dv_core::review::shows_moved`: found
     /// elsewhere now, or standing where a recorded move put it). Only a drawn thread shows.
     pub fn shows_moved(&self, thread: &Thread) -> bool {
+        self.card_shows_moved(Card::Local(thread))
+    }
+
+    /// [`ThreadPlacement::shows_moved`] for any thread the review shows: one of GitHub's is
+    /// moved where relocation finds it at other lines than GitHub has it at.
+    pub fn card_shows_moved(&self, card: Card) -> bool {
         match self {
-            Self::Placed(placement) => shows_moved(thread, placement),
+            Self::Placed(placement) => moved_since(card.first_anchor(), card.anchor(), placement),
             Self::NotInComparison(_) | Self::Reading(_) => false,
         }
     }
@@ -181,9 +195,18 @@ impl ThreadPlacement {
     /// [`ThreadPlacement::shows_moved`] says; `edited`, code edited where it stands, as
     /// `dv_core::review::shows_edited` says).
     pub fn key(&self, thread: &Thread) -> &'static str {
+        self.card_key(Card::Local(thread))
+    }
+
+    /// [`ThreadPlacement::key`] for any thread the review shows.
+    pub fn card_key(&self, card: Card) -> &'static str {
         match self {
-            _ if self.shows_moved(thread) => "moved",
-            Self::Placed(placement) if shows_edited(thread, placement) => "edited",
+            _ if self.card_shows_moved(card) => "moved",
+            Self::Placed(placement)
+                if edited_since(card.first_anchor(), card.anchor(), placement) =>
+            {
+                "edited"
+            }
             Self::Placed(Placement::Moved { .. }) => "unchanged",
             Self::Placed(placement) | Self::Reading(placement) => placement.as_str(),
             Self::NotInComparison(_) => "not_in_comparison",
@@ -245,12 +268,26 @@ impl FileIndex {
             .or_else(|| self.renamed(path))
             .or_else(|| old_path.and_then(|old| self.renamed(old)))
     }
+
+    /// The entry `card`'s anchor names a file at `path`, renamed from `old_path`, by: a
+    /// review's thread by [`FileIndex::lookup`], a GitHub thread by
+    /// `dv_core::github::threads::thread_entry`'s rule, which also finds the file still
+    /// under the name it is renamed from.
+    fn lookup_for(&self, card: Card, path: &str, old_path: Option<&str>) -> Option<&FileEntry> {
+        let found = self.lookup(path, old_path);
+        match card {
+            Card::Local(_) => found,
+            Card::Github(_) => found.or_else(|| old_path.and_then(|old| self.get(old))),
+        }
+    }
 }
 
 /// What a placement was worked out from (module docs, "Cost").
 #[derive(Clone, PartialEq)]
 struct Key {
     anchor: Anchor,
+    /// Whether the anchor is code to look for (`Card::is_anchored`).
+    anchored: bool,
     comparison: Comparison,
     /// The review's file that holds the thread: its path, rename and status.
     entry: Option<(String, Option<String>, FileStatus)>,
@@ -275,6 +312,7 @@ impl Key {
             _ => false,
         };
         diff && self.anchor == other.anchor
+            && self.anchored == other.anchored
             && self.comparison == other.comparison
             && self.entry == other.entry
             && self.drawn == other.drawn
@@ -317,10 +355,17 @@ pub(super) type FuzzyTables = HashMap<(String, AnchorSide), (Arc<FileDiff>, Rc<F
 impl ReviewSession {
     /// Where `thread` shows now (module docs).
     pub fn placement(&self, thread: &Thread) -> ThreadPlacement {
-        let key = self.placement_key(thread);
+        self.card_placement(Card::Local(thread))
+    }
+
+    /// Where `card`, a thread of the review's own or one of GitHub's, shows now (module
+    /// docs).
+    pub fn card_placement(&self, card: Card) -> ThreadPlacement {
+        let key = self.placement_key(card);
+        let id = card.key();
         let earlier = {
             let placements = self.placements.borrow();
-            let cached = placements.get(&thread.id);
+            let cached = placements.get(&id);
             if let Some(cached) = cached
                 && cached.key.same(&key)
             {
@@ -330,8 +375,8 @@ impl ReviewSession {
                 .map(|cached| cached.placement.clone())
                 .filter(|earlier| !earlier.is_pending())
         };
-        let history = self.history_for(thread);
-        let mut placement = self.place_with(thread, history);
+        let history = self.card_history(card);
+        let mut placement = self.place_with(card, history);
         let mut held = false;
         // Waiting for its round's history alone (placed without one, it isn't waiting), a
         // thread placed before keeps that placement: its card, and a reply being typed in it,
@@ -339,13 +384,13 @@ impl ReviewSession {
         if placement.is_pending()
             && !matches!(history, History::None)
             && let Some(earlier) = earlier
-            && !self.place_with(thread, History::None).is_pending()
+            && !self.place_with(card, History::None).is_pending()
         {
             placement = earlier;
             held = true;
         }
         self.placements.borrow_mut().insert(
-            thread.id.clone(),
+            id,
             Cached {
                 key,
                 placement: placement.clone(),
@@ -360,27 +405,42 @@ impl ReviewSession {
     pub(super) fn placement_held(&self, thread: &Thread) -> bool {
         self.placements
             .borrow()
-            .get(&thread.id)
+            .get(&ThreadKey::Local(thread.id.clone()))
             .is_some_and(|cached| cached.held)
     }
 
-    fn placement_key(&self, thread: &Thread) -> Key {
-        let entry = self.thread_entry(thread);
-        let drawn = entry.is_some_and(|entry| self.draws(thread, entry));
-        // A comment on the whole file is placed without its file's text.
+    /// `card`'s round history as the session has it: a thread of the review's own by
+    /// `history`; none for one of GitHub's, whose review has one round (PLAN §9.5).
+    pub(super) fn card_history(&self, card: Card) -> History<'_> {
+        match card {
+            Card::Local(thread) => self.history_for(thread),
+            Card::Github(_) => History::None,
+        }
+    }
+
+    fn placement_key(&self, card: Card) -> Key {
+        let anchor = card.anchor();
+        let entry = self.card_entry(card);
+        let drawn = entry.is_some_and(|entry| self.draws(card, entry));
+        // A comment on the whole file is placed without its file's text, as is a GitHub
+        // thread without a place in the diff.
         let diff = entry
-            .filter(|_| !thread.anchor.is_file_level())
-            .and_then(|entry| self.basis(&entry.path, thread.anchor.side, drawn))
+            .filter(|_| !anchor.is_file_level() && card.is_anchored())
+            .and_then(|entry| self.basis(&entry.path, anchor.side, drawn))
             .cloned();
         Key {
-            anchor: thread.anchor.clone(),
+            anchor: anchor.clone(),
+            anchored: card.is_anchored(),
             comparison: self.comparison,
             entry: entry.map(|entry| (entry.path.clone(), entry.old_path.clone(), entry.status)),
             drawn,
             diff,
             listed: self.listed,
-            history: self.history_key(thread),
-            side: self.side_version(&unlisted_path(&thread.anchor, self.history_for(thread))),
+            history: match card {
+                Card::Local(thread) => self.history_key(thread),
+                Card::Github(_) => HistoryKey::None,
+            },
+            side: self.side_version(&unlisted_path(anchor, self.card_history(card))),
         }
     }
 
@@ -390,10 +450,23 @@ impl ReviewSession {
         self.worked_out.get()
     }
 
-    fn place_with(&self, thread: &Thread, history: History<'_>) -> ThreadPlacement {
+    fn place_with(&self, card: Card, history: History<'_>) -> ThreadPlacement {
         #[cfg(test)]
         self.worked_out.set(self.worked_out.get() + 1);
-        let entry = match self.thread_file_with(thread, history) {
+        let anchor = card.anchor();
+        // A GitHub thread without a place in the diff (outdated there, or not placed here) is in
+        // the "Not in the diff" section once a list says what the diff is.
+        if !card.is_anchored() {
+            return ThreadPlacement::Placed(if self.listed {
+                Placement::Outdated {
+                    file: None,
+                    trail: None,
+                }
+            } else {
+                Placement::Pending { file: None }
+            });
+        }
+        let entry = match self.card_file_with(card, history) {
             ThreadFile::Found(entry) => entry,
             // Its round's history would say what its file is called now: it waits for it.
             ThreadFile::Pending(entry) => {
@@ -410,19 +483,20 @@ impl ReviewSession {
             // whichever comparison is shown; drawn in the stream's "Not in the diff" section,
             // where it waits (neutral, `Reading`) until that file's read lands.
             ThreadFile::Gone => {
-                let path = unlisted_path(&thread.anchor, history);
+                let path = unlisted_path(anchor, history);
                 let present = self.side_present(&path);
-                return match place_unlisted(thread, &path, present, self.side_text(&path)) {
+                return match place_unlisted_anchor(anchor, &path, present, self.side_text(&path)) {
                     pending @ Placement::Pending { .. } => ThreadPlacement::Reading(pending),
                     placement => ThreadPlacement::Placed(placement),
                 };
             }
         };
-        let drawn = self.draws(thread, entry);
-        let basis = self.basis(&entry.path, thread.anchor.side, drawn);
-        let placement = place_thread(
-            thread,
-            std::slice::from_ref(entry),
+        let drawn = self.draws(card, entry);
+        let basis = self.basis(&entry.path, anchor.side, drawn);
+        // Its file is found: placement reads that one entry.
+        let placement = place_anchor(
+            anchor,
+            |_, _| Some(entry),
             history,
             |entry, side| match basis {
                 Some(diff) => self.lines_of(&entry.path, side, diff),
@@ -440,13 +514,13 @@ impl ReviewSession {
     /// file is listed, and it isn't an old-side thread in an interdiff (module docs), nor an
     /// annotation written before the interdiff's round, about code the reviewer read already
     /// (PLAN §19.3).
-    pub(super) fn draws(&self, thread: &Thread, entry: &FileEntry) -> bool {
-        let old_column = self.comparison.is_interdiff() && thread.anchor.side == AnchorSide::Old;
-        let read_already = thread.state == ThreadState::Annotation
+    pub(super) fn draws(&self, card: Card, entry: &FileEntry) -> bool {
+        let old_column = self.comparison.is_interdiff() && card.anchor().side == AnchorSide::Old;
+        let read_already = card.is_annotation()
             && self
                 .comparison
                 .round()
-                .is_some_and(|since| thread.first_anchor().round <= since);
+                .is_some_and(|since| card.first_anchor().round <= since);
         !old_column && !read_already && self.file(&entry.path).is_some()
     }
 
@@ -455,10 +529,11 @@ impl ReviewSession {
     /// loads as any other.
     pub(super) fn thread_files(&self) -> Vec<String> {
         let mut paths: Vec<String> = Vec::new();
-        for thread in self.review.live_threads() {
-            if !thread.anchor.is_file_level()
-                && let Some(entry) = self.thread_entry(thread)
-                && self.draws(thread, entry)
+        for card in self.cards() {
+            if card.is_anchored()
+                && !card.anchor().is_file_level()
+                && let Some(entry) = self.card_entry(card)
+                && self.draws(card, entry)
                 && !paths.contains(&entry.path)
             {
                 paths.push(entry.path.clone());
@@ -471,7 +546,12 @@ impl ReviewSession {
     /// list shown, or in an interdiff the target's own list; `None` while its round's history,
     /// which would say, isn't read.
     pub fn thread_entry(&self, thread: &Thread) -> Option<&FileEntry> {
-        match self.thread_file_with(thread, self.history_for(thread)) {
+        self.card_entry(Card::Local(thread))
+    }
+
+    /// [`ReviewSession::thread_entry`] for any thread the review shows.
+    pub fn card_entry(&self, card: Card) -> Option<&FileEntry> {
+        match self.card_file_with(card, self.card_history(card)) {
             ThreadFile::Found(entry) => Some(entry),
             ThreadFile::Pending(_) | ThreadFile::Gone => None,
         }
@@ -479,8 +559,16 @@ impl ReviewSession {
 
     /// `dv_core::review::thread_file` over the review's files, with `history`.
     pub(super) fn thread_file_with(&self, thread: &Thread, history: History<'_>) -> ThreadFile<'_> {
+        self.card_file_with(Card::Local(thread), history)
+    }
+
+    /// [`ReviewSession::thread_file_with`] for any thread the review shows, its file looked
+    /// up by its kind's rule (`FileIndex::lookup_for`).
+    pub(super) fn card_file_with(&self, card: Card, history: History<'_>) -> ThreadFile<'_> {
         let index = self.target_index();
-        thread_file(&thread.anchor, history, |path, old| index.lookup(path, old))
+        thread_file(card.anchor(), history, |path, old| {
+            index.lookup_for(card, path, old)
+        })
     }
 
     /// The listed file `anchor` belongs to among the files shown (`dv_core::review::
@@ -583,18 +671,31 @@ impl ReviewSession {
     /// The live threads that show in `path`'s rows (inline, or as an outdated card heading
     /// it), in the order they were added.
     pub fn threads_in<'a>(&'a self, path: &'a str) -> impl Iterator<Item = &'a Thread> + 'a {
-        self.review.live_threads().filter(move |thread| {
-            let placement = self.placement(thread);
-            placement.file() == Some(path) && self.shows_card(thread, &placement)
+        self.cards_in(path).filter_map(Card::local)
+    }
+
+    /// The threads that show in `path`'s rows, the review's own ([`ReviewSession::threads_in`])
+    /// then GitHub's.
+    pub fn cards_in<'a>(&'a self, path: &'a str) -> impl Iterator<Item = Card<'a>> + 'a {
+        self.cards().filter(move |&card| {
+            let placement = self.card_placement(card);
+            placement.file() == Some(path) && self.shows(card, &placement)
         })
     }
 
     /// The live threads whose file left the review's list ([`ThreadPlacement::is_not_in_diff`]),
     /// in the order they were added: the stream's "Not in the diff" section (DESIGN §4.1).
     pub fn threads_not_in_diff(&self) -> impl Iterator<Item = &Thread> + '_ {
-        self.review.live_threads().filter(move |thread| {
-            let placement = self.placement(thread);
-            placement.is_not_in_diff() && self.shows_card(thread, &placement)
+        self.cards_not_in_diff().filter_map(Card::local)
+    }
+
+    /// The threads of the stream's "Not in the diff" section: the review's own
+    /// ([`ReviewSession::threads_not_in_diff`]), then GitHub's that are outdated there, that
+    /// dv can't place, or whose file the review doesn't list (DESIGN §4.5).
+    pub fn cards_not_in_diff(&self) -> impl Iterator<Item = Card<'_>> + '_ {
+        self.cards().filter(move |&card| {
+            let placement = self.card_placement(card);
+            placement.is_not_in_diff() && self.shows(card, &placement)
         })
     }
 
@@ -610,18 +711,48 @@ impl ReviewSession {
             || (self.annotations_shown && !placement.is_outdated() && !placement.is_not_in_diff())
     }
 
-    /// The listed file `thread` shows in, if any.
-    pub fn file_of(&self, thread: &Thread) -> Option<&FileEntry> {
-        self.placement(thread)
+    /// [`ReviewSession::shows_card`] for any thread the review shows: GitHub's are always
+    /// drawn where they are placed.
+    pub fn shows(&self, card: Card, placement: &ThreadPlacement) -> bool {
+        match card {
+            Card::Local(thread) => self.shows_card(thread, placement),
+            Card::Github(_) => true,
+        }
+    }
+
+    /// The listed file `card` shows in, if any.
+    pub fn file_of(&self, card: Card) -> Option<&FileEntry> {
+        self.card_placement(card)
             .file()
             .and_then(|path| self.file(path))
     }
 
-    /// Open threads showing in `path`.
+    /// The threads showing in `path` that wait on the author: the review's open ones, and
+    /// GitHub's that GitHub doesn't call resolved (the file list's badge, DESIGN §4.1). One
+    /// walk over every thread: a view that shows many files takes
+    /// [`ReviewSession::open_thread_counts`] once instead.
     pub fn open_threads_in(&self, path: &str) -> usize {
-        self.threads_in(path)
-            .filter(|thread| thread.state == ThreadState::Open)
-            .count()
+        self.open_thread_counts().remove(path).unwrap_or(0)
+    }
+
+    /// [`ReviewSession::open_threads_in`] for every file that has any, by path: one walk
+    /// over the threads, each placed once.
+    pub fn open_thread_counts(&self) -> HashMap<String, usize> {
+        let mut counts = HashMap::new();
+        for card in self.cards() {
+            let waits = match card {
+                Card::Local(thread) => thread.state == ThreadState::Open,
+                Card::Github(shown) => !shown.thread.resolved,
+            };
+            if !waits {
+                continue;
+            }
+            let placement = self.card_placement(card);
+            if let Some(path) = placement.file().filter(|_| self.shows(card, &placement)) {
+                *counts.entry(path.to_string()).or_default() += 1;
+            }
+        }
+        counts
     }
 
     /// `path:31`, `path:12–14`: where `thread` stands now (its side's path in the file that
@@ -633,28 +764,41 @@ impl ReviewSession {
     /// [`ThreadPlacement::is_pending`] says when it hasn't been placed yet. A comment on the
     /// whole file is `path (file)` under its file's name now (`(file, old)` on the old side).
     pub fn location(&self, thread: &Thread) -> String {
-        let placement = self.placement(thread);
-        let entry = self.thread_entry(thread);
-        if thread.anchor.is_file_level() {
+        self.card_location(Card::Local(thread))
+    }
+
+    /// [`ReviewSession::location`] for any thread the review shows: one of GitHub's by the
+    /// anchor read for it, where GitHub has it when it has no place in the diff.
+    pub fn card_location(&self, card: Card) -> String {
+        // One line whatever the path holds: it is drawn in a row and named in a prompt.
+        crate::thread::one_line(&self.location_of(card)).into_owned()
+    }
+
+    fn location_of(&self, card: Card) -> String {
+        let anchor = card.anchor();
+        let placement = self.card_placement(card);
+        let entry = self.card_entry(card).filter(|_| card.is_anchored());
+        if anchor.is_file_level() {
             let path = entry.map_or_else(
-                || thread.anchor.path.clone(),
-                |entry| AnchorPlace::for_entry(entry, thread.anchor.side, 0).path,
+                || anchor.path.clone(),
+                |entry| AnchorPlace::for_entry(entry, anchor.side, 0).path,
             );
-            return file_location(&path, thread.anchor.side);
+            return file_location(&path, anchor.side);
         }
-        let label = match (entry, placement.named_lines(&thread.anchor)) {
+        let written = || path_lines(&anchor.path, anchor.start_line, anchor.end_line);
+        let label = match (entry, placement.named_lines(anchor)) {
             (Some(entry), Some((start, end))) => {
-                let place = AnchorPlace::for_entry(entry, thread.anchor.side, 0);
+                let place = AnchorPlace::for_entry(entry, anchor.side, 0);
                 path_lines(&place.path, start, end)
             }
             // In a file the review doesn't change.
             (None, Some((start, end))) => match placement.placement().unlisted_path() {
                 Some(path) => path_lines(path, start, end),
-                None => location_label(thread),
+                None => written(),
             },
-            _ => location_label(thread),
+            _ => written(),
         };
-        match thread.anchor.side {
+        match anchor.side {
             AnchorSide::Old => format!("{label} (old)"),
             AnchorSide::New => label,
         }
@@ -679,7 +823,7 @@ impl ReviewSession {
                 self.review.current_round(),
             );
         }
-        let drawn = self.draws(thread, entry);
+        let drawn = self.draws(Card::Local(thread), entry);
         if drawn && !matches!(self.states.get(&entry.path), Some(FileState::Loaded { .. })) {
             return None;
         }

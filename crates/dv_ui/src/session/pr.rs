@@ -9,7 +9,15 @@
 //! (`dv review refresh`) is followed through the store's change events: its mirror's file
 //! is this session's to read again, and the pins it moves once the mirror is written are
 //! waited for and resolved again.
+//!
+//! **One at a time.** What a session asks GitHub about its pull request, a refresh or a
+//! Resolve / Unresolve with the refresh after it ([`PrOp`]), runs one after the other in the
+//! order asked: a Resolve asked for while a refresh runs waits for it, and a refresh asked
+//! for while a Resolve runs waits for that one's own refresh. So no read that began before
+//! a change can land after it and show the thread as it was (PLAN §9.6). Another process
+//! refreshing at that moment isn't waited for: the next refresh puts it right.
 
+use std::collections::VecDeque;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -34,16 +42,30 @@ const PIN_READS: usize = 10;
 pub(super) struct PrState {
     /// What the last refresh found; `None` before the first one lands.
     pub(super) read: Option<PrRead>,
-    /// A refresh running.
-    refreshing: Option<Task<()>>,
+    /// What is being asked of GitHub (module docs, "One at a time").
+    running: Option<(PrOp, Task<()>)>,
+    /// What was asked for meanwhile, in the order it runs.
+    waiting: VecDeque<PrOp>,
     /// A mirror another process wrote is being read.
     reading: Option<Task<()>>,
 }
 
 impl PrState {
     pub(super) fn is_settled(&self) -> bool {
-        self.refreshing.is_none() && self.reading.is_none()
+        self.running.is_none() && self.waiting.is_empty() && self.reading.is_none()
     }
+}
+
+/// One thing a session asks GitHub about its pull request.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) enum PrOp {
+    Refresh,
+    /// A Resolve (`resolved`) or an Unresolve of GitHub's thread `node`, and the refresh
+    /// after it.
+    Resolve {
+        node: String,
+        resolved: bool,
+    },
 }
 
 impl ReviewSession {
@@ -53,32 +75,76 @@ impl ReviewSession {
         self.pr.read.as_ref()
     }
 
-    /// Whether a refresh of the pull request is running.
+    /// Whether a refresh of the pull request was asked for and isn't done: running, or
+    /// waiting its turn behind a Resolve.
     pub fn is_refreshing_pr(&self) -> bool {
-        self.pr.refreshing.is_some()
+        matches!(self.pr.running, Some((PrOp::Refresh, _)))
+            || self.pr.waiting.contains(&PrOp::Refresh)
     }
 
     /// Refreshes the review's pull request (PLAN §9.4): everything GitHub holds read again
     /// into its mirror, a moved head fetched, a draft's pins moved to it. Nothing for a local
-    /// review, or while a refresh runs.
+    /// review, or while a refresh runs with nothing after it; after a Resolve that is
+    /// running or waiting (module docs, "One at a time").
     pub fn refresh_pr(&mut self, cx: &mut Context<Self>) {
-        if !self.review.is_pr_review() || self.pr.refreshing.is_some() {
-            return;
+        // A refresh that runs with nothing after it reads what this one would.
+        let covered =
+            matches!(self.pr.running, Some((PrOp::Refresh, _))) && self.pr.waiting.is_empty();
+        if self.review.is_pr_review() && !covered {
+            self.ask_pr(PrOp::Refresh, cx);
         }
-        let Some(github) = cx.try_services().map(|services| services.github.clone()) else {
-            return;
-        };
+    }
+
+    /// Runs `op` now, or once what is running and what was asked before it are done (module
+    /// docs, "One at a time"). What already waits isn't asked for twice.
+    pub(super) fn ask_pr(&mut self, op: PrOp, cx: &mut Context<Self>) {
+        if self.pr.running.is_none() {
+            self.start_pr(op, cx);
+        } else if !self.pr.waiting.contains(&op) {
+            self.pr.waiting.push_back(op);
+        }
+        cx.notify();
+    }
+
+    /// Starts `op`, or, when there is nothing to ask for it any more, the next one waiting.
+    fn start_pr(&mut self, op: PrOp, cx: &mut Context<Self>) {
+        let mut next = Some(op);
+        while let Some(op) = next {
+            let started = match &op {
+                PrOp::Refresh => self.start_refresh(cx),
+                PrOp::Resolve { node, resolved } => self.start_resolve(node, *resolved, cx),
+            };
+            match started {
+                Some(task) => {
+                    self.pr.running = Some((op, task));
+                    return;
+                }
+                None => next = self.pr.waiting.pop_front(),
+            }
+        }
+    }
+
+    /// What was running is done: the next one waiting starts.
+    pub(super) fn pr_done(&mut self, cx: &mut Context<Self>) {
+        self.pr.running = None;
+        if let Some(op) = self.pr.waiting.pop_front() {
+            self.start_pr(op, cx);
+        }
+        cx.notify();
+    }
+
+    fn start_refresh(&mut self, cx: &mut Context<Self>) -> Option<Task<()>> {
+        let github = cx.try_services()?.github.clone();
         let (backend, review) = (self.backend.clone(), self.review.clone());
         let refresh = github.update(cx, |github, cx| github.refresh(backend, review, cx));
-        self.pr.refreshing = Some(cx.spawn(async move |this, cx| {
+        Some(cx.spawn(async move |this, cx| {
             let read = PrRead::from(refresh.await);
             this.update(cx, |this, cx| {
-                this.pr.refreshing = None;
                 this.apply_pr_read(read, cx);
+                this.pr_done(cx);
             })
             .ok();
-        }));
-        cx.notify();
+        }))
     }
 
     /// Takes what a refresh read: when the pins moved, or aren't the ones the files were
@@ -96,6 +162,7 @@ impl ReviewSession {
                 .as_ref()
                 .is_some_and(|pins| listed.is_some_and(|listed| *listed != pins.spec()));
         self.pr.read = Some(read);
+        self.read_github(cx);
         if moved {
             self.refresh(
                 Batch {
@@ -173,10 +240,12 @@ impl ReviewSession {
                         })
                     {
                         read.mirror = Some(Arc::new(mirror));
+                        read.fresh = true;
                         read.stale = None;
                     }
                     cx.emit(SessionEvent::PrChanged);
                 }
+                this.read_github(cx);
                 // The sides are the pins as they stand now.
                 this.refresh(
                     Batch {

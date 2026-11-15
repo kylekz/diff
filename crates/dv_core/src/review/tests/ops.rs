@@ -264,43 +264,50 @@ fn agents_address_and_only_the_reviewer_resolves_or_reopens() {
     ));
     assert!(matches!(
         rejected(set(ThreadState::Resolved, None, Author::github("octocat"))),
-        Rejection::GithubOnLocalThread { .. }
+        Rejection::GithubAuthor
     ));
     assert_eq!(load(&store, &id).threads[0].state, ThreadState::Resolved);
     // The no-op and the refusals wrote nothing: `created`, the thread and four changes.
     assert_eq!(store.events(&id).unwrap().events.len(), 1 + 1 + 4);
 }
 
+/// GitHub's threads never enter a log (PLAN §9.6): no operation writes as GitHub.
 #[test]
-fn github_threads_are_read_only() {
+fn nothing_is_written_as_github() {
     let (_repo, store, id) = with_review();
-    let mirrored = add_thread(
-        &store,
-        &id,
-        anchor("src/lib.rs", 1),
-        "From GitHub",
-        Author::github("octocat"),
-    )
-    .unwrap();
+    let github = || Author::github("octocat");
+    let before = store.events(&id).unwrap().events.len();
     assert!(matches!(
-        rejected(reply(&store, &id, &mirrored, "x", reviewer(), None)),
-        Rejection::ReadOnlyThread { .. }
+        rejected(add_thread(
+            &store,
+            &id,
+            anchor("src/lib.rs", 1),
+            "From GitHub",
+            github(),
+        )),
+        Rejection::GithubAuthor
+    ));
+    let local = add_thread(&store, &id, anchor("src/lib.rs", 1), "Mine", reviewer()).unwrap();
+    assert!(matches!(
+        rejected(reply(&store, &id, &local, "x", github(), None)),
+        Rejection::GithubAuthor
     ));
     assert!(matches!(
         rejected(set_thread_state(
             &store,
             &id,
-            &mirrored,
+            &local,
             ThreadState::Resolved,
             None,
-            reviewer(),
+            github(),
             None
         )),
-        Rejection::ReadOnlyThread { .. }
+        Rejection::GithubAuthor
     ));
-    let item = ItemId::Thread(mirrored);
-    not_allowed(edit_body(&store, &id, &item, "x", &reviewer()));
-    not_allowed(delete_item(&store, &id, &item, &reviewer()));
+    let item = ItemId::Thread(local);
+    not_allowed(edit_body(&store, &id, &item, "x", &github()));
+    not_allowed(delete_item(&store, &id, &item, &github()));
+    assert_eq!(store.events(&id).unwrap().events.len(), before + 1);
 }
 
 #[test]

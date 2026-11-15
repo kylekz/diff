@@ -7,18 +7,20 @@
 
 use std::collections::HashMap;
 use std::ffi::OsString;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use dv_core::github::fetch::refs_prefix;
-use dv_core::github::{Gh, GhOptions, MirrorStore, PrState, program};
-use dv_core::review::{ListEntry, OpError, PrLink, Review, ReviewId, ops, pins};
+use dv_core::github::{Gh, GhOptions, Mirror, MirrorStore, PrState, program};
+use dv_core::review::{
+    AuthorKind, GITHUB_PREFIX, ListEntry, OpError, PrLink, Review, ReviewId, ops, pins,
+};
 use dv_core::target::Target;
 
 use crate::args::GlobalArgs;
 use crate::checks::GH_VAR;
 use crate::context::{Context, Env};
-use crate::dto::PrDto;
-use crate::error::CliError;
+use crate::dto::{GithubCountsDto, PrDto};
+use crate::error::{CliError, Exit, code};
 use crate::identity;
 use crate::repo::Repo;
 use crate::select;
@@ -57,12 +59,33 @@ pub(crate) enum Written<'a> {
 /// command line. Whatever keeps the review from being told here (no repository, no such
 /// review, none in context, an id that names nothing) is the command's own to report;
 /// `review::ops` refuses the write too.
+///
+/// A write to one of GitHub's threads (`gh:<node id>`, or one of its comments) is refused
+/// here too, whoever asks: only a PR review shows them, so an agent hears what it hears of
+/// any write to one, and the reviewer that the CLI writes nothing to GitHub's threads.
 pub(crate) fn refuse_agent(
     global: &GlobalArgs,
     ctx: &Context,
     written: Written,
 ) -> Result<(), CliError> {
-    let Ok(Some(agent)) = identity::agent(global, ctx) else {
+    let agent = identity::agent(global, ctx).ok().flatten();
+    if let Written::Item(id) = written
+        && id.trim().starts_with(GITHUB_PREFIX)
+    {
+        return Err(match agent {
+            Some(agent) => pr_reviews_are_the_reviewers(agent.kind),
+            None => CliError::new(
+                Exit::Failure,
+                code::NOT_ALLOWED,
+                format!(
+                    "{} is GitHub's, and the CLI writes nothing to GitHub's threads: resolve \
+                     it in the dv app, or answer it on GitHub (`dv comment show` has its URL)",
+                    shown_id(id)
+                ),
+            ),
+        });
+    }
+    let Some(agent) = agent else {
         return Ok(());
     };
     let Ok(repo) = Repo::open(global, ctx) else {
@@ -77,13 +100,18 @@ pub(crate) fn refuse_agent(
             .map(|(review, _)| review),
     };
     match review {
-        Some(review) if review.is_pr_review() => Err(OpError::NotAllowed {
-            actor: agent.kind,
-            action: ops::PR_REVIEWS_ARE_THE_REVIEWERS.to_string(),
-        }
-        .into()),
+        Some(review) if review.is_pr_review() => Err(pr_reviews_are_the_reviewers(agent.kind)),
         _ => Ok(()),
     }
+}
+
+/// What an agent's write to a PR review is refused with.
+fn pr_reviews_are_the_reviewers(actor: AuthorKind) -> CliError {
+    OpError::NotAllowed {
+        actor,
+        action: ops::PR_REVIEWS_ARE_THE_REVIEWERS.to_string(),
+    }
+    .into()
 }
 
 /// What a command's PR reviews are printed from, read once however many it prints
@@ -93,10 +121,10 @@ pub(crate) struct StoredPrs {
     /// Every PR review in the store with its target, oldest first: ids lead with their time.
     reviews: Vec<(ReviewId, Target)>,
     hosts: Vec<String>,
-    /// Each pull request's URL and state as its stored mirror has them, by the pull
-    /// request's ref namespace (`refs_prefix`: one spelling per pull request), read when its
-    /// first review is printed; `None` for one without a mirror.
-    mirrors: Mutex<HashMap<String, Option<(String, &'static str)>>>,
+    /// Each pull request's stored mirror, by the pull request's ref namespace
+    /// (`refs_prefix`: one spelling per pull request), read when its first review is
+    /// printed; `None` for one without a mirror.
+    mirrors: Mutex<HashMap<String, Option<Arc<Mirror>>>>,
 }
 
 impl StoredPrs {
@@ -125,9 +153,10 @@ impl StoredPrs {
         }
     }
 
-    /// The URL and the state of `link`'s pull request as its most recently read mirror has
-    /// them (blocking the first time a pull request is asked about: its mirror files).
-    fn mirror(&self, repo: &Repo, link: &PrLink) -> Option<(String, &'static str)> {
+    /// `link`'s pull request as its most recently read mirror has it, whichever login read
+    /// it and under whichever host a remote names (blocking the first time a pull request is
+    /// asked about: its mirror files).
+    fn mirror(&self, repo: &Repo, link: &PrLink) -> Option<Arc<Mirror>> {
         let mut mirrors = self
             .mirrors
             .lock()
@@ -135,21 +164,54 @@ impl StoredPrs {
         mirrors
             .entry(refs_prefix(&link.owner, &link.repo, link.number))
             .or_insert_with(|| {
-                let mirror = MirrorStore::new(repo.backend.clone())
+                MirrorStore::new(repo.backend.clone())
                     .latest_stored(&self.hosts, link)
                     .ok()
-                    .flatten()?;
-                let state = match mirror.pr.state {
-                    PrState::Open => "open",
-                    PrState::Draft => "draft",
-                    PrState::Merged => "merged",
-                    PrState::Closed => "closed",
-                };
-                Some((mirror.pr.url, state))
+                    .flatten()
+                    .map(Arc::new)
             })
             .clone()
     }
 }
+
+/// The stored mirror of `review`'s pull request, which GitHub's threads on it are read from
+/// (PLAN §9.10): the most recently read one. `None` for a local review, and for a pull
+/// request without a mirror to read here ([`why_no_mirror`]). No `gh` runs.
+pub(crate) fn mirror(repo: &Repo, review: &Review) -> Option<Arc<Mirror>> {
+    repo.stored_prs().mirror(repo, review.pr_target()?)
+}
+
+/// Why `review`, a PR review without a [`mirror`], has none, and what reads one: its pull
+/// request "was never read here", or, when something is stored that isn't a mirror this
+/// build reads (an empty or cut file, another version's), what was last read of it "can't
+/// be read"; then `dv review refresh <id>`, which reads it again either way.
+pub(crate) fn why_no_mirror(repo: &Repo, review: &Review) -> String {
+    let stored = review.pr_target().is_some_and(|link| {
+        MirrorStore::new(repo.backend.clone()).holds_any(&repo.stored_prs().hosts, link)
+    });
+    let (why, reads) = if stored {
+        ("what dv last read of it can't be read", "reads it again")
+    } else {
+        ("it was never read here", "reads it")
+    };
+    format!("{why}; `dv review refresh {}` {reads}", review.id)
+}
+
+/// `id`, a thread's id as it was typed, for a message: whole up to [`ID_SHOWN`] characters,
+/// else its start and "…". GitHub's node ids are a few dozen characters; what is longer
+/// names nothing and would only fill the line.
+pub(crate) fn shown_id(id: &str) -> String {
+    let id = id.trim();
+    if id.chars().count() <= ID_SHOWN {
+        id.to_string()
+    } else {
+        let start: String = id.chars().take(ID_SHOWN - 1).collect();
+        format!("{start}…")
+    }
+}
+
+/// How many characters of an id a message shows.
+const ID_SHOWN: usize = 80;
 
 /// The `pr` document of `review`, a PR review; `None` for a local one (blocking: the
 /// review's pins and, once per command, [`StoredPrs`] and the pull request's stored mirror).
@@ -171,14 +233,20 @@ pub(crate) fn dto(repo: &Repo, review: &Review) -> Option<PrDto> {
         .filter(|(_, target)| link.is_target(target))
         .position(|(id, _)| *id == review.id)
         .map_or(1, |index| index + 1);
-    let (url, state) = stored.mirror(repo, link).unzip();
+    let mirror = stored.mirror(repo, link);
     Some(PrDto {
         owner: link.owner.clone(),
         repo: link.repo.clone(),
         number: link.number,
-        url,
-        state,
+        url: mirror.as_ref().map(|mirror| mirror.pr.url.clone()),
+        state: mirror.as_ref().map(|mirror| match mirror.pr.state {
+            PrState::Open => "open",
+            PrState::Draft => "draft",
+            PrState::Merged => "merged",
+            PrState::Closed => "closed",
+        }),
         head_oid: head,
         pr_round: u32::try_from(round).unwrap_or(u32::MAX),
+        threads: mirror.as_deref().map(GithubCountsDto::of),
     })
 }

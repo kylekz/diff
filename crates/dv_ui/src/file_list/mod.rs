@@ -23,6 +23,7 @@ mod render;
 #[cfg(test)]
 mod tests;
 
+use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
 use dv_core::diff::{FileEntry, FileStatus};
@@ -125,6 +126,9 @@ pub struct FileList {
     query: String,
     /// Indices into the session's files that the filter leaves, in list order.
     shown: Vec<usize>,
+    /// Each file's open threads (`ReviewSession::open_thread_counts`), counted when the
+    /// session changes rather than for every row drawn.
+    open_threads: HashMap<String, usize>,
     scroll: UniformListScrollHandle,
     /// When the session started its first listing, while it hasn't landed.
     loading_since: Option<Instant>,
@@ -158,6 +162,7 @@ impl FileList {
             filter,
             query: String::new(),
             shown: Vec::new(),
+            open_threads: HashMap::new(),
             scroll: UniformListScrollHandle::new(),
             loading_since: None,
             skeleton_timer: None,
@@ -265,6 +270,11 @@ impl FileList {
             }
             _ => {}
         }
+        self.open_threads = self
+            .session
+            .as_ref()
+            .map(|session| session.read(cx).open_thread_counts())
+            .unwrap_or_default();
         self.refilter(cx);
     }
 

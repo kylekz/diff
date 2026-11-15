@@ -23,15 +23,24 @@
 //! is placed against that file's text at the review's new side (`dv_core::diff::side_file`,
 //! `dv_core::review::place_unlisted`), as the GUI places it: found there, it is placed, with
 //! the excerpt of that text around it, and not in the diff (`in_diff: false`).
+//!
+//! GitHub's threads on a PR review (PLAN §9.6) are placed here too ([`Placed::Github`]): each
+//! with the anchor `dv_core::github::threads` reads for it from the stored mirror and the
+//! commits it names, through the same diffs, so `comment list` says of them what the app
+//! shows. One without a place in the diff (outdated on GitHub, or can't be placed here) is
+//! outdated, with nothing read for it. Listing them reads each file a thread is on once
+//! ([`locate_with_github`]); showing one reads that thread's file alone ([`locate_github`]).
 
 use std::collections::{BTreeMap, HashMap};
 
 use dv_core::diff::{DiffLimits, FileDiff, FileEntry, file_diff, file_list, side_file};
 use dv_core::git::GitRepo;
+use dv_core::github::threads::{self, GithubAnchor, Standing};
+use dv_core::github::{GithubThread, Mirror, ThreadTexts, anchor_thread};
 use dv_core::review::{
     Anchor, AnchorPlace, AnchorSide, History, Placement, Review, RoundHistory, SideText, Thread,
-    ThreadFile, Went, anchored_entry, entry_for, excerpt, excerpt_lines, is_gone, pins,
-    place_thread, place_unlisted, read_round_history, relocated_anchor, side_lines, thread_file,
+    ThreadFile, Went, entry_for, excerpt, excerpt_lines, is_gone, pins, place_thread,
+    place_unlisted_anchor, read_round_history, relocated_anchor, side_lines, thread_file,
     unlisted_path,
 };
 use dv_core::target::DiffSpec;
@@ -41,6 +50,46 @@ use crate::dto::{CurrentAnchorDto, CurrentCode, Located, TrailCode, side_str};
 use crate::error::CliError;
 use crate::output;
 use crate::repo::Repo;
+
+/// A thread to place: one of the review's own, or one of GitHub's on its pull request with
+/// the anchor read for it (PLAN §9.6).
+#[derive(Clone, Copy)]
+pub(crate) enum Placed<'a> {
+    Local(&'a Thread),
+    Github(&'a GithubAnchor),
+}
+
+impl<'a> Placed<'a> {
+    fn anchor(self) -> &'a Anchor {
+        match self {
+            Self::Local(thread) => &thread.anchor,
+            Self::Github(anchored) => &anchored.anchor,
+        }
+    }
+
+    /// Whether its anchor is code to look for: every thread of the review, and a GitHub
+    /// thread that has a place in the diff.
+    fn is_anchored(self) -> bool {
+        match self {
+            Self::Local(_) => true,
+            Self::Github(anchored) => anchored.standing == Standing::Anchored,
+        }
+    }
+
+    /// The entry of `entries` for a file at `path`, renamed from `old_path`, by the rule its
+    /// kind of thread is placed with.
+    fn entry<'e>(
+        self,
+        path: &str,
+        old_path: Option<&str>,
+        entries: &'e [FileEntry],
+    ) -> Option<&'e FileEntry> {
+        match self {
+            Self::Local(_) => entry_for(path, old_path, entries),
+            Self::Github(_) => threads::thread_entry(path, old_path, entries),
+        }
+    }
+}
 
 /// A review's current diff: its file list, the diffs of the files read so far, and the round
 /// histories read.
@@ -99,11 +148,14 @@ impl Sides {
 
     /// Reads the diff of the file each of `threads` is anchored in (none for a comment on a
     /// whole file, which places without its text).
-    pub fn read_for(&mut self, threads: &[&Thread]) -> Result<(), CliError> {
+    pub fn read_for(&mut self, threads: &[Placed]) -> Result<(), CliError> {
         let paths: Vec<String> = threads
             .iter()
-            .filter(|thread| !thread.anchor.is_file_level())
-            .filter_map(|thread| anchored_entry(&thread.anchor, &self.entries))
+            .filter(|thread| thread.is_anchored() && !thread.anchor().is_file_level())
+            .filter_map(|thread| {
+                let anchor = thread.anchor();
+                thread.entry(&anchor.path, anchor.old_path.as_deref(), &self.entries)
+            })
             .map(|entry| entry.path.clone())
             .collect();
         for path in paths {
@@ -120,12 +172,12 @@ impl Sides {
     pub fn read_history_for(
         &mut self,
         review: &Review,
-        threads: &[&Thread],
+        threads: &[Placed],
         ctx: &mut Context,
     ) -> Result<(), CliError> {
         let mut wanted: BTreeMap<u32, Vec<String>> = BTreeMap::new();
-        for thread in threads {
-            let anchor = &thread.anchor;
+        for &thread in threads {
+            let anchor = thread.anchor();
             if self.history_round(anchor).is_none()
                 || !self.place(thread, History::None).is_outdated()
             {
@@ -155,10 +207,11 @@ impl Sides {
         }
         let followed: Vec<String> = threads
             .iter()
-            .filter(|thread| !thread.anchor.is_file_level())
+            .filter(|thread| thread.is_anchored() && !thread.anchor().is_file_level())
             .filter_map(|thread| {
-                match thread_file(&thread.anchor, self.history(thread), |path, old| {
-                    entry_for(path, old, &self.entries)
+                let anchor = thread.anchor();
+                match thread_file(anchor, self.history(anchor), |path, old| {
+                    thread.entry(path, old, &self.entries)
                 }) {
                     ThreadFile::Found(entry) => Some(entry.path.clone()),
                     ThreadFile::Pending(_) | ThreadFile::Gone => None,
@@ -178,13 +231,16 @@ impl Sides {
     /// stay outdated.
     pub fn read_unlisted_for(
         &mut self,
-        threads: &[&Thread],
+        threads: &[Placed],
         ctx: &mut Context,
     ) -> Result<(), CliError> {
         let mut paths: Vec<String> = threads
             .iter()
-            .filter(|thread| is_gone(&self.place_listed(thread, self.history(thread))))
-            .map(|thread| unlisted_path(&thread.anchor, self.history(thread)))
+            .filter(|&&thread| {
+                let history = self.history(thread.anchor());
+                thread.is_anchored() && is_gone(&self.place_listed(thread, history))
+            })
+            .map(|thread| unlisted_path(thread.anchor(), self.history(thread.anchor())))
             .collect();
         paths.sort();
         paths.dedup();
@@ -234,10 +290,10 @@ impl Sides {
             .then_some(anchor.round)
     }
 
-    /// `thread`'s round history as read ([`Sides::read_history_for`]): none when it wasn't
-    /// read for its path (the thread didn't need it).
-    fn history(&self, thread: &Thread) -> History<'_> {
-        let anchor = &thread.anchor;
+    /// The round history of the thread anchored at `anchor` as read
+    /// ([`Sides::read_history_for`]): none when it wasn't read for its path (the thread
+    /// didn't need it).
+    fn history(&self, anchor: &Anchor) -> History<'_> {
         match self
             .history_round(anchor)
             .and_then(|round| self.histories.get(&round))
@@ -258,27 +314,37 @@ impl Sides {
     /// `thread` placed against the diffs read so far (a file not read counts as one without
     /// text) with `history`, and when its file left the list, against that file's text at the
     /// new side once it is read ([`Sides::read_unlisted_for`]).
-    fn place(&self, thread: &Thread, history: History<'_>) -> Placement {
+    fn place(&self, thread: Placed, history: History<'_>) -> Placement {
         let placement = self.place_listed(thread, history);
-        if !is_gone(&placement) {
+        if !is_gone(&placement) || !thread.is_anchored() {
             return placement;
         }
-        let path = unlisted_path(&thread.anchor, history);
+        let anchor = thread.anchor();
+        let path = unlisted_path(anchor, history);
         let text = match self.unlisted_text(&path) {
             Some(text) => SideText::Lines(side_lines(text, AnchorSide::New)),
             None => SideText::Unavailable,
         };
-        place_unlisted(thread, &path, self.unlisted_present(&path), text)
+        place_unlisted_anchor(anchor, &path, self.unlisted_present(&path), text)
     }
 
     /// `thread` placed among the listed files alone ([`Sides::place`]).
-    fn place_listed(&self, thread: &Thread, history: History<'_>) -> Placement {
-        let side = thread.anchor.side;
+    fn place_listed(&self, thread: Placed, history: History<'_>) -> Placement {
+        let side = thread.anchor().side;
         let text = |entry: &FileEntry| match self.side_text(&entry.path, side) {
             Some(lines) => SideText::Lines(lines),
             None => SideText::Unavailable,
         };
-        place_thread(thread, &self.entries, history, |entry, _| text(entry))
+        match thread {
+            Placed::Local(thread) => {
+                place_thread(thread, &self.entries, history, |entry, _| text(entry))
+            }
+            Placed::Github(anchored) => threads::place(
+                anchored,
+                |path, old| threads::thread_entry(path, old, &self.entries),
+                |entry, _| text(entry),
+            ),
+        }
     }
 
     /// The listed entry at `path`.
@@ -289,12 +355,13 @@ impl Sides {
     /// Where `thread` stands now, from the diffs and histories read so far (a file not read
     /// counts as one without text, so read the threads' files and histories first:
     /// [`Sides::read_for`], [`Sides::read_history_for`]).
-    pub fn locate(&self, thread: &Thread) -> Located {
-        let side = thread.anchor.side;
-        let placement = self.place(thread, self.history(thread));
+    pub fn locate(&self, thread: Placed) -> Located {
+        let anchor = thread.anchor();
+        let side = anchor.side;
+        let placement = self.place(thread, self.history(anchor));
         let file = placement.file().map(str::to_string);
         let entry = file.as_deref().and_then(|path| self.entry(path));
-        let current = match (placement.lines(&thread.anchor), entry) {
+        let current = match (placement.lines(anchor), entry) {
             (Some((start, end)), Some(entry)) => self.current_code(entry, side, start, end),
             (Some((start, end)), None) => placement.unlisted_path().and_then(|path| {
                 let text = self.unlisted_text(path)?;
@@ -352,6 +419,20 @@ impl Sides {
         let text = self.diffs.get(&entry.path).and_then(FileDiff::as_text)?;
         let place = AnchorPlace::for_entry(entry, side, self.round);
         code_in(text, &place.path, side, start, end)
+    }
+
+    /// Reads what placing `threads` (threads of `review`, or GitHub's on its pull request)
+    /// needs: their files, the round histories those that the current text leaves outdated
+    /// need, and the files the review doesn't list that the rest are anchored in.
+    fn read_all(
+        &mut self,
+        review: &Review,
+        threads: &[Placed],
+        ctx: &mut Context,
+    ) -> Result<(), CliError> {
+        self.read_for(threads)?;
+        self.read_history_for(review, threads, ctx)?;
+        self.read_unlisted_for(threads, ctx)
     }
 
     /// The anchor a write on `thread` records (PLAN §8): its anchor re-taken where relocation
@@ -412,9 +493,8 @@ fn read(
     ctx: &mut Context,
 ) -> Result<Sides, CliError> {
     let mut sides = Sides::list(repo, review, ctx)?;
-    sides.read_for(threads)?;
-    sides.read_history_for(review, threads, ctx)?;
-    sides.read_unlisted_for(threads, ctx)?;
+    let placed: Vec<Placed> = threads.iter().map(|thread| Placed::Local(thread)).collect();
+    sides.read_all(review, &placed, ctx)?;
     Ok(sides)
 }
 
@@ -428,7 +508,93 @@ pub(crate) fn locate(
     ctx: &mut Context,
 ) -> Result<Vec<Located>, CliError> {
     let sides = read(repo, review, threads, ctx)?;
-    Ok(threads.iter().map(|thread| sides.locate(thread)).collect())
+    Ok(threads
+        .iter()
+        .map(|thread| sides.locate(Placed::Local(thread)))
+        .collect())
+}
+
+/// Where a review's threads stand, its own and GitHub's on its pull request
+/// ([`locate_with_github`]).
+pub(crate) struct LocatedThreads {
+    /// The review's own, in the order they were asked about.
+    pub own: Vec<Located>,
+    /// GitHub's that were kept, in the mirror's order: each thread's place among the
+    /// mirror's threads, its anchor, and where it is.
+    pub github: Vec<(usize, GithubAnchor, Located)>,
+}
+
+/// [`locate`], and with them where each of GitHub's threads on `review`'s pull request that
+/// `keep` keeps stands, as `mirror` has them (PLAN §9.6). `keep` is asked once the review's
+/// files are listed, with them: what it rules out is neither anchored nor placed. Blocking,
+/// beside [`locate`]'s: each file a kept thread is on read once at its commit, however many
+/// of them are on it, and no file only the others are on.
+pub(crate) fn locate_with_github(
+    repo: &Repo,
+    review: &Review,
+    threads: &[&Thread],
+    mirror: &Mirror,
+    keep: impl Fn(&GithubThread, &[FileEntry]) -> bool,
+    ctx: &mut Context,
+) -> Result<LocatedThreads, CliError> {
+    let mut sides = Sides::list(repo, review, ctx)?;
+    let texts = ThreadTexts::default();
+    let kept: Vec<usize> = (0..mirror.threads.len())
+        .filter(|&index| keep(&mirror.threads[index], &sides.entries))
+        .collect();
+    let anchors: Vec<GithubAnchor> = kept
+        .iter()
+        .map(|&index| {
+            let thread = &mirror.threads[index];
+            anchor_thread(&sides.git, mirror, &sides.spec, &texts, thread)
+        })
+        .collect();
+    let placed: Vec<Placed> = threads
+        .iter()
+        .map(|thread| Placed::Local(thread))
+        .chain(anchors.iter().map(Placed::Github))
+        .collect();
+    sides.read_all(review, &placed, ctx)?;
+    let own = threads
+        .iter()
+        .map(|thread| sides.locate(Placed::Local(thread)))
+        .collect();
+    let github = anchors
+        .iter()
+        .map(|anchored| sides.locate(Placed::Github(anchored)))
+        .collect::<Vec<_>>();
+    Ok(LocatedThreads {
+        own,
+        github: kept
+            .into_iter()
+            .zip(anchors)
+            .zip(github)
+            .map(|((index, anchored), located)| (index, anchored, located))
+            .collect(),
+    })
+}
+
+/// Where `thread`, one of GitHub's on `review`'s pull request as `mirror` has it, stands
+/// (PLAN §9.6), with the anchor read for it. Blocking: one file list, and that thread's file
+/// alone, at its commit and in the review's diff, whatever else the pull request holds.
+pub(crate) fn locate_github(
+    repo: &Repo,
+    review: &Review,
+    mirror: &Mirror,
+    thread: &GithubThread,
+    ctx: &mut Context,
+) -> Result<(GithubAnchor, Located), CliError> {
+    let mut sides = Sides::list(repo, review, ctx)?;
+    let anchored = anchor_thread(
+        &sides.git,
+        mirror,
+        &sides.spec,
+        &ThreadTexts::default(),
+        thread,
+    );
+    sides.read_all(review, &[Placed::Github(&anchored)], ctx)?;
+    let located = sides.locate(Placed::Github(&anchored));
+    Ok((anchored, located))
 }
 
 /// Where `thread` (a thread of `review`) stands now, and the anchor a write on it records when
@@ -440,7 +606,7 @@ pub(crate) fn locate_for_write(
     ctx: &mut Context,
 ) -> Result<(Located, Option<Anchor>), CliError> {
     let sides = read(repo, review, &[thread], ctx)?;
-    let located = sides.locate(thread);
+    let located = sides.locate(Placed::Local(thread));
     let relocated = sides.relocated(thread, &located);
     Ok((located, relocated))
 }

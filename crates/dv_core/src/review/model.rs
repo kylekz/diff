@@ -67,7 +67,8 @@ impl Author {
 }
 
 /// The three kinds of author (PLAN §2.5): the reviewer resolves, agents address, and `github`
-/// marks threads pulled from GitHub, which are read-only in dv (PLAN §9.2).
+/// is who wrote GitHub's threads on a pull request, which dv shows from the PR's mirror and
+/// never writes to a review's log (PLAN §9.6): no event's author is one.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AuthorKind {
@@ -440,11 +441,6 @@ pub struct Thread {
 impl Thread {
     pub fn is_deleted(&self) -> bool {
         self.deleted_at.is_some()
-    }
-
-    /// Whether the thread mirrors one on GitHub (read-only in dv, PLAN §9.2).
-    pub fn is_from_github(&self) -> bool {
-        self.author.kind == AuthorKind::Github
     }
 
     pub fn reply(&self, id: &CommentId) -> Option<&Comment> {

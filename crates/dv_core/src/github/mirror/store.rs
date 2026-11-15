@@ -132,6 +132,17 @@ impl MirrorStore {
         Ok(latest)
     }
 
+    /// Whether anything is stored for `link`'s pull request under any of `hosts`. With no
+    /// mirror to read there ([`MirrorStore::latest_stored`]), what is stored can't be read:
+    /// an empty or cut file, another version's, another key's.
+    pub fn holds_any(&self, hosts: &[String], link: &PrLink) -> bool {
+        hosts.iter().any(|host| {
+            self.backend
+                .store_list(&pr_dir(host, &link.owner, &link.repo, link.number))
+                .is_ok_and(|names| !names.is_empty())
+        })
+    }
+
     /// The most recently read mirror of pull request `number` of `owner/repo` on `host`.
     fn latest_on(
         &self,

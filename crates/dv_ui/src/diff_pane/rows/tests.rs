@@ -284,7 +284,7 @@ fn inserts_follow_the_row_of_their_line_on_their_side_or_the_gap_hiding_it() {
         Insert {
             line: 10,
             side: AnchorSide::Old,
-            item: InsertItem::Thread(thread(1)),
+            item: InsertItem::Thread(thread(1).into()),
         },
         // The added line, on the new side.
         Insert {
@@ -296,7 +296,7 @@ fn inserts_follow_the_row_of_their_line_on_their_side_or_the_gap_hiding_it() {
         Insert {
             line: 2,
             side: AnchorSide::New,
-            item: InsertItem::Thread(thread(2)),
+            item: InsertItem::Thread(thread(2).into()),
         },
     ];
     let unified = rows_of(&diff, ViewMode::Unified, &inserts);
@@ -305,8 +305,8 @@ fn inserts_follow_the_row_of_their_line_on_their_side_or_the_gap_hiding_it() {
             .position(|row| matches!(row, Row::Insert(insert) if &insert.item == item))
             .unwrap()
     };
-    let one = InsertItem::Thread(thread(1));
-    let two = InsertItem::Thread(thread(2));
+    let one = InsertItem::Thread(thread(1).into());
+    let two = InsertItem::Thread(thread(2).into());
     assert_eq!(unified[at(&unified, &one) - 1], Row::Line(10));
     assert_eq!(
         unified[at(&unified, &InsertItem::Composer) - 1],
@@ -331,7 +331,10 @@ fn outdated_threads_head_the_file_under_its_header_unless_it_is_collapsed() {
     let diff = edited();
     let segments = diff.segments(CONTEXT_LINES);
     let thread = |n: u8| ThreadId::parse(&format!("t-01j9{n:0>22}")).unwrap();
-    let outdated = [InsertItem::Thread(thread(1)), InsertItem::Thread(thread(2))];
+    let outdated = [
+        InsertItem::Thread(thread(1).into()),
+        InsertItem::Thread(thread(2).into()),
+    ];
     let spec = |collapsed| RowsSpec {
         mode: ViewMode::Unified,
         collapsed,
@@ -344,13 +347,16 @@ fn outdated_threads_head_the_file_under_its_header_unless_it_is_collapsed() {
     };
     let rows = file_rows(&spec(false));
     assert_eq!(rows[0], header());
-    assert_eq!(rows[1], Row::Heading(InsertItem::Thread(thread(1))));
-    assert_eq!(rows[2], Row::Heading(InsertItem::Thread(thread(2))));
+    assert_eq!(rows[1], Row::Heading(InsertItem::Thread(thread(1).into())));
+    assert_eq!(rows[2], Row::Heading(InsertItem::Thread(thread(2).into())));
     assert!(matches!(rows[3], Row::Gap(_)));
     // A card is measured, keyed like an inline card of the same thread, and names its thread.
     assert!(!rows[1].has_fixed_height());
-    assert_eq!(rows[1].key(), RowKey::Insert(InsertItem::Thread(thread(1))));
-    assert_eq!(rows[1].thread(), Some(&thread(1)));
+    assert_eq!(
+        rows[1].key(),
+        RowKey::Insert(InsertItem::Thread(thread(1).into()))
+    );
+    assert_eq!(rows[1].thread(), Some(&thread(1).into()));
     assert_eq!(rows[3].thread(), None);
     // A viewed file shows its header alone, cards included.
     assert_eq!(

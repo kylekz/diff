@@ -18,19 +18,21 @@ use crate::review::{ListEntry, PrLink};
 
 /// A backend whose next `git fetch` calls (or whichever git calls `fails` picks) fail with
 /// the errors it was given, in order, whose appends to the store take `slow` longer, whose
-/// first `git fetch` that succeeds is followed by the removal of `vanishing` refs, and
-/// which is the fixture's own otherwise.
-struct FetchFails {
+/// first `git fetch` that succeeds is followed by the removal of `vanishing` refs, whose
+/// first read of the store's file `rewritten` names is followed by another process
+/// replacing that file, and which is the fixture's own otherwise.
+pub(super) struct FetchFails {
     inner: LocalBackend,
     fails: fn(&[&str]) -> bool,
     failures: Mutex<Vec<BackendError>>,
     slow: Duration,
     vanishing: Mutex<Vec<String>>,
+    rewritten: Mutex<Option<(String, Vec<u8>)>>,
 }
 
 impl FetchFails {
     /// The fixture's backend whose git calls `fails` picks fail with `failures`, in order.
-    fn failing_at(
+    pub(super) fn failing_at(
         repo: &FixtureRepo,
         fails: fn(&[&str]) -> bool,
         mut failures: Vec<BackendError>,
@@ -42,6 +44,7 @@ impl FetchFails {
             failures: Mutex::new(failures),
             slow: Duration::ZERO,
             vanishing: Mutex::default(),
+            rewritten: Mutex::default(),
         })
     }
 
@@ -53,6 +56,7 @@ impl FetchFails {
             failures: Mutex::new(failures),
             slow: Duration::ZERO,
             vanishing: Mutex::default(),
+            rewritten: Mutex::default(),
         })
     }
 
@@ -65,6 +69,20 @@ impl FetchFails {
             failures: Mutex::default(),
             slow: Duration::ZERO,
             vanishing: Mutex::new(refs.to_vec()),
+            rewritten: Mutex::default(),
+        })
+    }
+
+    /// The fixture's backend beside a process that writes `bytes` to the store's file `rel`
+    /// right after this one first reads it.
+    pub(super) fn rewriting(repo: &FixtureRepo, rel: &str, bytes: Vec<u8>) -> Arc<dyn Backend> {
+        Arc::new(Self {
+            inner: open_backend(repo),
+            fails: is_fetch,
+            failures: Mutex::default(),
+            slow: Duration::ZERO,
+            vanishing: Mutex::default(),
+            rewritten: Mutex::new(Some((rel.to_string(), bytes))),
         })
     }
 
@@ -76,6 +94,7 @@ impl FetchFails {
             failures: Mutex::default(),
             slow,
             vanishing: Mutex::default(),
+            rewritten: Mutex::default(),
         })
     }
 }
@@ -110,7 +129,14 @@ impl Backend for FetchFails {
         self.inner.store_append(rel, line)
     }
     fn store_read(&self, rel: &str) -> Result<Option<Vec<u8>>, BackendError> {
-        self.inner.store_read(rel)
+        let read = self.inner.store_read(rel)?;
+        let mut rewritten = self.rewritten.lock().unwrap();
+        if rewritten.as_ref().is_some_and(|(path, _)| path == rel)
+            && let Some((path, bytes)) = rewritten.take()
+        {
+            self.inner.store_write_atomic(&path, &bytes)?;
+        }
+        Ok(read)
     }
     fn store_list(&self, dir: &str) -> Result<Vec<String>, BackendError> {
         self.inner.store_list(dir)

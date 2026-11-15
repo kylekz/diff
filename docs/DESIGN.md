@@ -669,7 +669,8 @@ inactive: material falls back to its inactive appearance (OS-managed); dv dims n
   (PLAN §5.1) is up, so the review's own state shows, "· refreshes when focused" when its watch
   couldn't start; then, after a `|`, the review's
   status, round and thread counts ("Changes requested · round 2 · 3 open · 1 resolved", "no comments"
-  when there are none; then the agent's annotations, "· 5 annotations", "· 5 annotations
+  when there are none; then, on a PR review, GitHub's threads that GitHub doesn't call
+  resolved, "· 5 on GitHub" (§4.5); then the agent's annotations, "· 5 annotations", "· 5 annotations
   hidden" while `A` hides them; an interdiff adds "· since round 1"); at the right, each language
   server of the review's worktree (PLAN §18.5) — a 7 dot and its name and state in `fg2`, 22 high,
   `controlHover` under the pointer: green "TypeScript ready", yellow "TypeScript loading 40%" (its
@@ -911,19 +912,87 @@ Setup unchanged.
   (`Ctrl R`, spinning while it runs), **Start round 3** (accent, only when the latest review is
   submitted and the PR has newer commits) and **Open on GitHub** (an icon button).
 - **GitHub's threads** use the thread card (§4.1) with: GitHub's mark as the avatar (round, `fg2`
-  on `surface2`), the login as the name, an "on GitHub" tag, the time, and no state chip but
-  **Resolved** (green) or **Outdated** (yellow) when they apply; a resolved GitHub thread is
-  collapsed like a resolved local one. The actions row: **Reply** (`R`; on a submitted review
+  on `layerStrong`), the login as the name, an "on GitHub" tag, the time, and no state chip but
+  **Resolved** (green), and in yellow, for one without a line in the diff shown, why it has
+  none: **Outdated on GitHub** (GitHub calls it outdated, and it was made on another commit
+  than the review shows), **Can't be placed** (dv can't tell which code it is on, PLAN §9.6)
+  or **Outdated** (dv read its code and can't find it in the head shown, as on a thread of
+  the review's own); a resolved GitHub thread is
+  collapsed like a resolved local one, to its header with its first comment's first line. The
+  header's anchor reads as any card's ("new · line 4 · moved" where dv found its code at other
+  lines than GitHub has it at). The actions row: **Reply** (`R`; on a submitted review
   "Start round n+1 to reply" instead), **Resolve** / **Unresolve** (`X`, only where GitHub allows
-  the viewer), **Open on GitHub**. A draft reply sits at the
+  the viewer; with its `X` keycap on the focused card), **Open on GitHub** (only when the
+  thread's link is a page of the pull request's host, PLAN §9.6). A draft reply sits at the
   bottom of the card, framed like the composer, headed "Your reply · posts with your review",
   with Edit and Delete; while it is posted to the pending review it reads "Posted to your pending
   review" and can't be edited (PLAN §9.8). Comments of a pending review on GitHub that dv didn't
-  post show with a "Pending on GitHub" tag; dv's own posted drafts show once, as the drafts.
-- **Not in the diff** (§4.1) lists GitHub threads that don't relocate under "Outdated on GitHub",
-  each with the code GitHub shows for it (its diff hunk, mono, the commented lines marked).
-- **Comments list:** GitHub's threads in their own group, "On GitHub", after the review's own;
-  the status bar counts them apart ("2 open · 5 on GitHub").
+  post show with a "Pending on GitHub" tag (in `yellow`); dv's own posted drafts show once, as the drafts.
+  - *Until dv submits to GitHub* (PLAN §9.12) the card has no Reply and no reply field. `R`
+    on it adds a line under its comments, in `fg3` at 12: "Replies to GitHub's threads post
+    with your review, and submitting to GitHub arrives in a later version. Until then, reply
+    on GitHub." It goes once another thread takes the keyboard, or with `X`: while the
+    line shows, `X` on the card takes it away and resolves nothing (what is typed after `R`
+    out of habit never writes to GitHub); the next `X` resolves.
+  - *From when a Resolve or an Unresolve is asked until it is done* the button reads
+    "Resolving…" ("Unresolving…"), dimmed and inert, and the card stays as GitHub has it. One
+    GitHub refuses leaves the card as it was, with why in the thread card's error row (a
+    triangle and one line in `red` under the header), until the next Resolve or Unresolve
+    asked of that card, or a refresh that shows the thread in the other state; a refresh
+    alone leaves the reason there (PLAN §9.6). One GitHub took whose refresh then read nothing shows the thread as
+    GitHub answered, and the same row says "Resolved on GitHub, but the refresh failed: …".
+    A card being resolved collapses; an opened resolved card being unresolved stays open,
+    whatever GitHub answers.
+  - *`X` where GitHub doesn't let the viewer* (the card has no Resolve button) adds a line
+    under its comments, as `R` does: "GitHub doesn't let this account resolve this thread."
+    ("unresolve"). It goes once another thread takes the keyboard.
+  - *A refresh that takes away the thread holding the keyboard* leaves no thread focused
+    and the stream with the keys: `]` goes on to the next thread there is.
+  - *The code it is on* shows in the card only where the stream doesn't show it under the
+    card: its lines in the `recess` block for one dv can't find in the head shown
+    ("Outdated", heading its file) or found in a file the review doesn't change ("Unchanged
+    file" in the section); the end of its diff hunk for one without a place in the diff
+    (below).
+  - *What it is drawn from is GitHub's.* Its path, a login and a row of its hunk are each
+    drawn as one line whatever they hold (a line break or a control character spelled out,
+    PLAN §10.3), in the card and in its comments row. A comment's body keeps the line
+    breaks inside its paragraphs, as GitHub shows a comment; a review's own comments fold
+    them, as Markdown does (fenced and indented code keeps its lines either way). Raw HTML
+    in a body shows as the text it is, an address inside it is no link, and an image is
+    the words `[image: alt]`: no body makes dv fetch anything (PLAN §11, the sanitiser).
+- **Not in the diff** (§4.1) lists GitHub's threads without a place in the diff: those
+  GitHub calls outdated, made on another commit than the review shows (chip "Outdated on
+  GitHub"; the section's bar says "outdated on GitHub"), and those dv can't place (chip
+  "Can't be placed"; the bar says "on GitHub, can't be placed here"), where a review's own
+  say "comments on files the review doesn't change now"; each kind with its count when the
+  section holds several ("1 outdated on GitHub · 1 on GitHub, can't be placed here"). Each
+  shows the code GitHub shows for it (its diff hunk, mono, the commented lines marked) when
+  GitHub gives one: in the `recess` block, the hunk's last rows (the commented lines and
+  three rows before them), each with its `+` in `green`, `−` in `red` or nothing, the
+  commented ones on `sel` behind a 2px `accent` bar, as the cursor's line is.
+- **Comments list:** GitHub's threads in their own group, "On GitHub", after the review's own
+  (after its annotations and resolved rows): a heading with GitHub's mark in `fg3`, "On
+  GitHub" at 600 in `fg2` and the count of the ones GitHub doesn't call resolved; then those
+  rows, in stream order, each as a thread's row with GitHub's mark (`fg2`) for its dot, where
+  it stands, in `yellow` "outdated" for one without a line in the diff ("can't be placed"
+  for one dv can't place) and "pending" in `fg3` for the viewer's own unsubmitted one, then `@login` in `fg3` before the comment's first
+  line (a long login is cut with an ellipsis at half the row, so the first line keeps the
+  rest); then "n resolved on GitHub · show", which lists the resolved ones (a green check for
+  their mark). A click shows the thread's card (the stream places it again every other
+  frame for up to eight, until it stays where it was placed, since the cards on the way
+  are laid out and their Markdown parsed only then, so a tall comment above it doesn't
+  leave it out of view; so for any thread's row and for `]`/`[`. Anything else that moves
+  the stream meanwhile, the wheel, `J`, a page down, ends that at once: what the reader
+  asked for after the reveal is never undone);
+  a right click opens its menu: **Resolve** or
+  **Unresolve** (where GitHub allows the viewer), **Open on GitHub** (as on the card), and
+  under a hairline **Copy as prompt** (that thread alone). The panel's "Copy as prompt"
+  hands over the review's open threads, then GitHub's unresolved ones under a heading of
+  their own that says whose words they are, each comment quoted whole (PLAN §9.6), and is
+  enabled while there is one of either. The file list's badge counts a file's open threads and GitHub's
+  unresolved ones that have a place in that file's diff, as it counts the review's own (a
+  thread in "Not in the diff" is in no file's badge); the status bar and the "On GitHub"
+  group count all of GitHub's unresolved ones, apart ("2 open · 5 on GitHub").
 - **Switcher:** a repository's PR reviews in a "Pull requests" section, `#482 Title` with the
   status chip (`draft` accent, `submitted` green); the title bar names a PR review the same way.
 - **After submitting:** the banner "Submitted to GitHub · View on GitHub" (§4.4) and, when the
@@ -937,14 +1006,14 @@ Setup unchanged.
 |---|---|
 | `J` / `K` | next / previous file: its header at the top, the cursor on its first change (the "Not in the diff" section isn't a file: `J` from it goes to the first file) |
 | `N` / `P` | next / previous block of changed lines, on into the next files |
-| `]` / `[` | focus the next / previous thread that isn't resolved (open or addressed), scrolling to it, on into the next files (in an interdiff, the threads it shows); annotations are passed over |
+| `]` / `[` | focus the next / previous thread that isn't resolved (open or addressed; on a PR review, GitHub's threads that GitHub doesn't call resolved too), scrolling to it, on into the next files (in an interdiff, the threads it shows); annotations are passed over |
 | `A` | show / hide the agent's annotations in the stream and the file view (PLAN §19.3; shown whenever a review opens) |
 | `I` | switch between the interdiff since the last round and all changes (the panel's toggle; while the review offers it, PLAN §2.3) |
 | `V` | toggle viewed on the current file (`V` then `J`: mark viewed and go next); each press flips the state the last one asked for, however fast they come |
 | `C` | comment on the selected lines, else the cursor's line (in the file view, any line of the file, changed or not), else (no cursor yet) the first line in view, where the cursor goes too (click a line number to put the cursor there, shift-click to select to it; a line's `+` does it all with the mouse, §4.1); a composer holding a draft takes the keyboard instead, wherever the cursor is. In an interdiff it comments on the new side only: on the old column (the round's snapshot, which no anchor names) it does nothing |
 | `Shift C` | comment on the whole of the current file: the composer heads the file (the header menu's Comment on file); a composer holding a draft takes the keyboard instead, as for `C`. Nothing on a finished review, or in an interdiff on a deleted file (its old column is the round's snapshot) |
-| `R` | reply to the focused thread (the reply composer opens in its card; on a GitHub thread, a draft reply that posts with your review; on an annotation, Ask: posting opens it as a thread) |
-| `X` | resolve the focused thread, or reopen it when it is resolved (a GitHub thread: resolve / unresolve on GitHub, where GitHub allows the viewer); nothing on an annotation |
+| `R` | reply to the focused thread (the reply composer opens in its card; on a GitHub thread, a draft reply that posts with your review, and until dv submits to GitHub its card says that replying arrives then, §4.5; on an annotation, Ask: posting opens it as a thread) |
+| `X` | resolve the focused thread, or reopen it when it is resolved (a GitHub thread: resolve / unresolve on GitHub, where GitHub allows the viewer, on a finished review too; while its card shows `R`'s notice, `X` only takes the notice away, §4.5); nothing on an annotation |
 | `↑` / `↓` | move the cursor a line (the stream scrolls to keep it in view; it crosses into the next file) |
 | `Shift ↑` / `Shift ↓` | extend a selection from the cursor, within its file and side; a gap in the way opens a step towards the cursor rather than being selected unseen |
 | `←` / `→` | in split view, put the cursor on the old / new side (the new side until one is chosen, or a line number clicked). A file without lines on that side (a deletion, an addition) moves it to the other side while it is in that file only: the next file that has lines on the chosen side puts it back |

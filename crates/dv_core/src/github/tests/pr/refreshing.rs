@@ -14,7 +14,7 @@ const CHANGED: &str = "pub fn answer() -> u32 {\n    43\n}\n";
 fn another_gh(fixture: &PrFixture, first: Vec<Value>) -> MockGh {
     let mut calls = first;
     calls.push(fixture_gh::viewer(VIEWER));
-    calls.extend(fixture.pr.calls(fixture.github.name()));
+    calls.extend(fixture.pr.calls_in(&fixture.github));
     MockGh::new(Value::Array(calls))
 }
 

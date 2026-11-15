@@ -38,9 +38,11 @@
 //! `merged` or `closed` as GitHub last said, `url` and `state` `null` while the pull request
 //! was never read here or the clone's GitHub repository can't be told, `head_oid` the head
 //! the review shows, `pr_round` its place among the pull request's reviews in this
-//! repository, 1 for the first; `null` for a local review) and `submissions` (the reviews dv
-//! posted to GitHub for it: `{github_review_id, url, event, at}`, `event` `comment`, `approve`
-//! or `request_changes`).
+//! repository, 1 for the first, `threads` GitHub's own threads on the pull request, counted
+//! apart from the review's: `{open, resolved}` as the stored mirror has them, `null` while
+//! the pull request was never read here; `null` for a local review) and `submissions` (the
+//! reviews dv posted to GitHub for it: `{github_review_id, url, event, at}`, `event`
+//! `comment`, `approve` or `request_changes`).
 //!
 //! A thread ([`ThreadDto`]): `id`, `review_id`, `state` (`open`, `addressed`, `resolved`, or
 //! `annotation`: an agent's explanation of its change, waiting on no one, PLAN §19),
@@ -73,16 +75,31 @@
 //! `path` now, one past the last line at its end, `code` and `excerpt` `null`; else `null`),
 //! `body` (Markdown), `author: {kind, name, model}` (`model`: the one an agent said it runs
 //! on, else `null`), `created_at`, `note` (the last state change's note),
-//! `replies: [{id, author, body, created_at}]`. Act on `anchor.current`, never on the
-//! original line numbers.
+//! `replies: [{id, author, body, created_at, pending}]`, `github` (`null` for a thread of the
+//! review's own). Act on `anchor.current`, never on the original line numbers.
+//!
+//! One of GitHub's threads on a PR review's pull request (PLAN §9.6, §9.10) is a thread too,
+//! read from the stored mirror and never written by the CLI: `id` `gh:<node id>`, `state`
+//! `open` or `resolved` (GitHub's), `author.kind` `github` with the login as its name,
+//! `anchor.original` where GitHub has it (round 1; its original lines once GitHub calls it
+//! outdated), `code` the lines it is on (read from the commit GitHub names, else the
+//! commented lines of its diff hunk), `placement`, `anchor.current`, `current_code` and
+//! `excerpt` where it stands in the diff the review shows, as for any thread, `replies` its
+//! later comments (`id` `gh:<comment's node id>`, `pending` `true` for one of the viewer's
+//! own that isn't submitted yet), and `github: {url, resolved, outdated, pending, diff_hunk}`:
+//! the thread on GitHub, GitHub's own word that it is resolved and that its code changed
+//! since (`outdated`: such a thread has a place in the diff only when the review shows the
+//! commit it was made on), whether it is the viewer's own unsubmitted comment, and the diff
+//! hunk GitHub shows above it.
 //!
 //! Within a schema a document only grows: readers ignore keys they don't know; a key removed,
 //! renamed or retyped, or a value whose meaning changes, is a new schema number (PLAN §10.3).
 
+use dv_core::github::{GithubAnchor, GithubThread, Mirror, Standing};
 use dv_core::label::Labels;
 use dv_core::review::{
-    Anchor, AnchorSide, Author, Comment, Placement, Review, Round, Submission, Thread, Trail, Went,
-    shows_edited, shows_moved,
+    Anchor, AnchorSide, Author, Comment, Placement, Review, Round, Submission, Thread, ThreadKey,
+    Trail, Went, edited_since, moved_since,
 };
 use dv_core::target::Target;
 use serde::Serialize;
@@ -284,6 +301,32 @@ pub struct PrDto {
     /// The review's place among the pull request's reviews in this repository, 1 for the
     /// first (PLAN §9.5).
     pub pr_round: u32,
+    /// GitHub's own threads on the pull request, as the stored mirror has them (PLAN §9.6);
+    /// `null` before the pull request was read here.
+    pub threads: Option<GithubCountsDto>,
+}
+
+/// GitHub's threads on a pull request, by GitHub's own state.
+#[derive(Serialize, Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct GithubCountsDto {
+    pub open: u32,
+    pub resolved: u32,
+}
+
+impl GithubCountsDto {
+    /// `mirror`'s threads.
+    pub fn of(mirror: &Mirror) -> Self {
+        let resolved = mirror
+            .threads
+            .iter()
+            .filter(|thread| thread.resolved)
+            .count();
+        let count = |n: usize| u32::try_from(n).unwrap_or(u32::MAX);
+        Self {
+            open: count(mirror.threads.len() - resolved),
+            resolved: count(resolved),
+        }
+    }
 }
 
 /// A review dv posted to GitHub.
@@ -416,10 +459,13 @@ pub struct AnchorDto {
 /// A reply.
 #[derive(Serialize, Debug, Clone, PartialEq, Eq)]
 pub struct ReplyDto {
+    /// A reply's id; `gh:<node id>` for a comment of one of GitHub's threads.
     pub id: String,
     pub author: AuthorDto,
     pub body: String,
     pub created_at: u64,
+    /// One of the viewer's own comments on GitHub that isn't submitted yet (PLAN §9.6).
+    pub pending: bool,
 }
 
 impl From<&Comment> for ReplyDto {
@@ -429,8 +475,24 @@ impl From<&Comment> for ReplyDto {
             author: (&reply.author).into(),
             body: reply.body.clone(),
             created_at: reply.created_at,
+            pending: false,
         }
     }
+}
+
+/// What GitHub says of one of its threads (module docs).
+#[derive(Serialize, Debug, Clone, PartialEq, Eq)]
+pub struct GithubDto {
+    /// The thread on GitHub: its first comment's page, when its link is a page of the pull
+    /// request's host over https; else `null`.
+    pub url: Option<String>,
+    pub resolved: bool,
+    /// GitHub's own word that the code under the thread changed since.
+    pub outdated: bool,
+    /// The viewer's own comment, not submitted yet.
+    pub pending: bool,
+    /// The diff hunk GitHub shows above the thread, ending at its last line.
+    pub diff_hunk: String,
 }
 
 /// Where a thread shows now, as [`crate::placement`] found it.
@@ -562,6 +624,8 @@ pub struct ThreadDto {
     /// The last state change's note (an agent's "what I did").
     pub note: Option<String>,
     pub replies: Vec<ReplyDto>,
+    /// One of GitHub's threads (module docs); `null` for a thread of the review's own.
+    pub github: Option<GithubDto>,
     /// Its file is among the review's changes now (`path` is that file): the text output
     /// tells a comment on a whole file that left them from one whose file lacks its side.
     #[serde(skip)]
@@ -570,6 +634,11 @@ pub struct ThreadDto {
     /// comment on the whole file by it, as the GUI does (`format::location`).
     #[serde(skip)]
     pub side_path: String,
+    /// One of GitHub's threads without a place in the diff (outdated there, or one dv can't
+    /// place): its code is its diff hunk's, which the text output shows as GitHub
+    /// does.
+    #[serde(skip)]
+    pub hunk_only: bool,
 }
 
 impl ThreadDto {
@@ -587,15 +656,7 @@ impl ThreadDto {
             review_id: review.id.to_string(),
             state: thread.state.as_str(),
             annotation: thread.annotation,
-            placement: match located.placement {
-                _ if shows_moved(thread, &located.placement) => "moved",
-                _ if shows_edited(thread, &located.placement) => "edited",
-                Placement::Unchanged { .. }
-                | Placement::Moved { .. }
-                | Placement::Unlisted { .. } => "unchanged",
-                Placement::Pending { .. } | Placement::Outdated { .. } => "outdated",
-                Placement::File { .. } | Placement::UnlistedFile { .. } => "file",
-            },
+            placement: placement_word(original, &thread.anchor, &located.placement),
             outdated,
             in_diff: located.placement.in_diff(),
             file_level,
@@ -626,12 +687,102 @@ impl ThreadDto {
                 .filter(|reply| !reply.is_deleted())
                 .map(ReplyDto::from)
                 .collect(),
+            github: None,
             listed: located.file.is_some(),
             side_path: located
                 .side_path
                 .clone()
                 .unwrap_or_else(|| thread.anchor.path.clone()),
+            hunk_only: false,
         }
+    }
+
+    /// One of GitHub's threads on `review`'s pull request (module docs): `thread` as the
+    /// mirror has it, a mirror read on `host`, `anchored` the anchor read for it and
+    /// `located` where that stands. Its `github.url` is its link only when that is a page
+    /// of `host` (`GithubThread::url_on`, PLAN §9.6), else `null`.
+    pub fn github(
+        review: &Review,
+        host: &str,
+        thread: &GithubThread,
+        anchored: &GithubAnchor,
+        located: &Located,
+    ) -> Self {
+        let anchor = &anchored.anchor;
+        let current = located.current.as_ref();
+        let file_level = thread.is_file_level();
+        let author = |login: &str| AuthorDto::from(&Author::github(login));
+        let (first, replies) = match thread.comments.split_first() {
+            Some((first, replies)) => (Some(first), replies),
+            None => (None, &[][..]),
+        };
+        Self {
+            id: ThreadKey::Github(thread.id.clone()).to_string(),
+            review_id: review.id.to_string(),
+            state: if thread.resolved { "resolved" } else { "open" },
+            annotation: false,
+            placement: placement_word(anchor, anchor, &located.placement),
+            outdated: located.placement.is_outdated(),
+            in_diff: located.placement.in_diff(),
+            file_level,
+            path: located.file.clone().unwrap_or_else(|| anchor.path.clone()),
+            side: side_str(anchor.side),
+            anchor: AnchorDto {
+                original: anchor.into(),
+                current: current.map(|current| current.anchor.clone()),
+            },
+            code: anchor.text.join("\n"),
+            code_context: (current.is_none() && !file_level).then(|| CodeContextDto {
+                before: anchor.context_before.clone(),
+                after: anchor.context_after.clone(),
+            }),
+            current_code: current.map(|current| current.code.clone()),
+            excerpt: current.map(|current| current.excerpt.clone()),
+            trail: None,
+            body: first.map(|first| first.body.clone()).unwrap_or_default(),
+            author: author(first.map_or(dv_core::github::pr::GHOST, |first| &first.author)),
+            created_at: first.map_or(0, |first| first.created_at),
+            note: None,
+            replies: replies
+                .iter()
+                .map(|reply| ReplyDto {
+                    id: ThreadKey::Github(reply.id.clone()).to_string(),
+                    author: author(&reply.author),
+                    body: reply.body.clone(),
+                    created_at: reply.created_at,
+                    pending: reply.is_pending(),
+                })
+                .collect(),
+            github: Some(GithubDto {
+                url: thread.url_on(host).map(str::to_string),
+                resolved: thread.resolved,
+                outdated: thread.outdated,
+                pending: thread.is_pending(),
+                diff_hunk: first
+                    .map(|first| first.diff_hunk.clone())
+                    .unwrap_or_default(),
+            }),
+            listed: located.file.is_some(),
+            side_path: located
+                .side_path
+                .clone()
+                .unwrap_or_else(|| anchor.path.clone()),
+            hunk_only: anchored.standing != Standing::Anchored,
+        }
+    }
+}
+
+/// A thread's `placement` (module docs): where the thread anchored at `anchor` now, written
+/// on `first`, stands at `placement`.
+fn placement_word(first: &Anchor, anchor: &Anchor, placement: &Placement) -> &'static str {
+    match placement {
+        _ if moved_since(first, anchor, placement) => "moved",
+        _ if edited_since(first, anchor, placement) => "edited",
+        Placement::Unchanged { .. } | Placement::Moved { .. } | Placement::Unlisted { .. } => {
+            "unchanged"
+        }
+        Placement::Pending { .. } | Placement::Outdated { .. } => "outdated",
+        Placement::File { .. } | Placement::UnlistedFile { .. } => "file",
     }
 }
 

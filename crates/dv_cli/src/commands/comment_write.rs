@@ -146,7 +146,11 @@ fn new_thread(
     let review = select::load(&repo, &review.id)?;
     let thread = select::live_thread(&review, &id)?;
     let doc = CommentShowDoc {
-        thread: ThreadDto::new(&review, thread, &sides.locate(thread)),
+        thread: ThreadDto::new(
+            &review,
+            thread,
+            &sides.locate(placement::Placed::Local(thread)),
+        ),
     };
     if global.json {
         output::json(ctx, &doc)?;

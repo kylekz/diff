@@ -456,7 +456,8 @@ fn a_seeded_repo_opens_as_a_review_and_the_agent_answers(cx: &mut TestAppContext
     assert_eq!(state["session"]["focused_thread"], Value::Null);
     assert_eq!(
         state["comments_list"],
-        json!({"show_resolved": false, "show_annotations": false, "expanded": null, "rows": [{
+        json!({"show_resolved": false, "show_annotations": false, "show_github_resolved": false,
+            "expanded": null, "github": [], "rows": [{
             "id": thread, "state": "open", "outdated": false, "not_in_comparison": false,
             "pending": false, "location": "src/app.ts:2", "file_level": false, "summary": "Why 3?",
             "snippet": null, "unlisted": false, "drawable": true,

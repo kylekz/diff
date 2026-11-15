@@ -89,6 +89,8 @@ dv_icons! {
     ModelOpenAi => "model-openai",
     ModelQwen => "model-qwen",
     ModelZai => "model-zai",
+    // GitHub's mark, beside what is on GitHub (DESIGN §4.5).
+    Github => "github",
 }
 
 #[cfg(test)]

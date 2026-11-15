@@ -9,6 +9,7 @@ mod comment;
 mod comment_write;
 mod doctor;
 mod errors;
+mod escape;
 mod file_level;
 mod hand_back;
 mod history;
@@ -124,6 +125,20 @@ impl Ran {
     pub fn lines(&self) -> Vec<&str> {
         self.stdout.lines().collect()
     }
+}
+
+/// The lines of a command's text output that start at column 0, where dv's own headers and
+/// code rows stand, having checked that nothing in the output moves a terminal's cursor but
+/// the end of each line: no control character but the tab, and no Unicode line separator.
+pub(crate) fn column_zero(stdout: &str) -> Vec<&str> {
+    let moves = |c: char| {
+        (c.is_control() && !matches!(c, '\n' | '\t')) || matches!(c, '\u{2028}' | '\u{2029}')
+    };
+    assert!(!stdout.contains(moves), "{stdout:?}");
+    stdout
+        .split('\n')
+        .filter(|line| !line.is_empty() && !line.starts_with(' '))
+        .collect()
 }
 
 /// A fixture repo with `src/app.ts` committed on `main` and edited in the working tree, so a

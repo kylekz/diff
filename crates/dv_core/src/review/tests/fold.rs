@@ -437,7 +437,7 @@ fn thread_state_transitions_follow_the_table() {
                     (Resolved, Addressed, Reviewer) => "refused",
                     (_, _, Reviewer) => "changed",
                 };
-                let actual = match check_thread_state(&id, Reviewer, from, to, by) {
+                let actual = match check_thread_state(&id, from, to, by) {
                     Ok(Outcome::Changed) => "changed",
                     Ok(Outcome::Unchanged) => "unchanged",
                     Err(_) => "refused",
@@ -446,20 +446,10 @@ fn thread_state_transitions_follow_the_table() {
             }
         }
     }
-    // A thread mirrored from GitHub moves only by GitHub's events.
-    for by in [Reviewer, Agent] {
-        assert_eq!(
-            check_thread_state(&id, Github, Open, Resolved, by),
-            Err(Rejection::ReadOnlyThread { thread: id.clone() })
-        );
-    }
+    // GitHub's threads are never in a log, so nothing there is GitHub's to change.
     assert_eq!(
-        check_thread_state(&id, Github, Resolved, Open, Github),
-        Ok(Outcome::Changed)
-    );
-    assert_eq!(
-        check_thread_state(&id, Github, Open, Open, Github),
-        Ok(Outcome::Unchanged)
+        check_thread_state(&id, Open, Open, Github),
+        Err(Rejection::GithubAuthor)
     );
 }
 
@@ -497,8 +487,10 @@ fn a_late_address_after_the_reviewer_resolved_is_skipped() {
     assert_eq!(thread.last_change.as_ref().unwrap().at, 7);
 }
 
+/// GitHub's threads are shown from the pull request's mirror (PLAN §9.6): a thread, a reply
+/// or a state change written as GitHub's is skipped, whatever it names.
 #[test]
-fn github_threads_take_only_github_replies() {
+fn nothing_github_wrote_is_folded() {
     let mirrored = ThreadId::generate();
     let local = ThreadId::generate();
     let reply = |thread: &ThreadId, author: Author| EventBody::ReplyAdded {
@@ -512,24 +504,27 @@ fn github_threads_take_only_github_replies() {
         created(Target::Working),
         thread_added(&mirrored, Author::github("octocat")),
         thread_added(&local, reviewer()),
-        reply(&mirrored, Author::github("hubot")),
         reply(&mirrored, reviewer()),
         reply(&local, Author::github("hubot")),
+        thread_state(&local, ThreadState::Resolved, Author::github("hubot")),
         reply(&local, agent()),
     ]);
     assert_eq!(
         rejections(&folded),
         [
-            Rejection::ReadOnlyThread {
+            Rejection::GithubAuthor,
+            Rejection::UnknownThread {
                 thread: mirrored.clone()
             },
-            Rejection::GithubOnLocalThread {
-                thread: local.clone()
-            },
+            Rejection::GithubAuthor,
+            Rejection::GithubAuthor,
         ]
     );
-    assert_eq!(folded.review.threads[0].replies.len(), 1);
-    assert_eq!(folded.review.threads[1].replies.len(), 1);
+    let [thread] = &folded.review.threads[..] else {
+        panic!("{:?}", folded.review.threads);
+    };
+    assert_eq!((&thread.id, thread.state), (&local, ThreadState::Open));
+    assert_eq!(thread.replies.len(), 1);
 }
 
 /// Which status moves are allowed (PLAN §2.4).

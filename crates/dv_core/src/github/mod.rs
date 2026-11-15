@@ -14,6 +14,8 @@
 //! - [`forget`]: what dv keeps for a pull request going with its last review (PLAN §7).
 //! - [`mirror`]: what GitHub holds about a pull request, cached beside the reviews
 //!   (PLAN §9.4).
+//! - [`threads`]: GitHub's threads in a review: their anchors and placement, the code
+//!   GitHub shows for one, Resolve / Unresolve (PLAN §9.6).
 //! - [`spelling`]: a GitHub name as a component of a store path or of a ref (PLAN §9.3,
 //!   §9.4).
 //! - [`time`]: GitHub's timestamps in dv's milliseconds.
@@ -35,6 +37,7 @@ pub mod pr_ref;
 pub mod refresh;
 pub mod repo;
 pub mod spelling;
+pub mod threads;
 pub mod time;
 
 pub use error::{Elsewhere, GhFailure, GithubError, KEPT_BYTES};
@@ -54,6 +57,10 @@ pub use pr_ref::{InvalidPrRef, PrRef};
 pub use refresh::{Refreshed, refresh};
 pub use repo::{ConfiguredRemote, GITHUB_COM, GithubRepo, Place, Remote, RepoUrl};
 pub use spelling::spell;
+pub use threads::{
+    GithubAnchor, HunkRow, Resolved, Standing, ThreadTexts, anchor_thread, anchor_threads,
+    hunk_rows, set_resolved,
+};
 pub use time::parse_timestamp;
 
 #[cfg(test)]

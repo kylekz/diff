@@ -15,6 +15,9 @@ use serde_json::{Value, json};
 
 use super::*;
 use crate::services::GitHub;
+
+mod threads;
+
 use crate::test_support::{open_shell, register, settle};
 
 /// The fixture GitHub's `dv-fixture/api` with pull request 7 (one commit adding `src/lib.rs`
@@ -77,7 +80,7 @@ impl PrFixture {
     fn answer(&self, first: Vec<Value>) {
         let mut calls = first;
         calls.push(fixture_gh::viewer("kylekz"));
-        calls.extend(self.pr.calls("api"));
+        calls.extend(self.pr.calls_in(&self.github));
         std::fs::write(&self.scenario, json!({ "calls": calls }).to_string()).unwrap();
     }
 

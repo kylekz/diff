@@ -2,15 +2,30 @@
 //! gpui-component's `TextView` over a sanitised source (PLAN §15).
 //!
 //! Every body is untrusted: an agent wrote it, or the reviewer pasted it from anywhere, and a
-//! GitHub thread's body comes from any PR participant. `TextView` fetches the URL of an image
-//! (`![](url)`, raw `<img>`), which would hand whoever wrote the body a tracking pixel (the
-//! reviewer's address and the time they looked), and renders raw HTML. [`sanitize_untrusted`]
-//! removes both before the source reaches it; [`view`] is the one way a view renders a body, so
-//! nothing skips it. Links open through [`crate::system::open_url`], which opens web addresses
-//! only and only records them under automation.
+//! GitHub thread's body comes from any PR participant. `TextView` hands the URL of an image
+//! (`![](url)`, raw `<img>`) to gpui's image loader, which fetches it with the app's HTTP
+//! client: with one installed, that would hand whoever wrote the body a tracking pixel (the
+//! reviewer's address and the time they looked). It also renders raw HTML (formatting tags,
+//! links, tables, images). [`sanitize_untrusted`] removes both before the source reaches it;
+//! [`view`] is the one way a view renders a body, so nothing skips it. Links open through
+//! [`crate::system::open_url`], which opens web addresses only and only records them under
+//! automation.
+//!
+//! **Read as the view reads it.** The sanitiser parses a body with the options `TextView`
+//! parses with ([`view_options`]: GFM with inline and block math, gpui-base's
+//! `MarkdownExtensions::parse_options` with nothing registered), edits the spans that parse
+//! finds, and then reads what it wrote the way `TextView` will ([`is_inert`]): parsed with
+//! those options again, and each math node's source once more without math, since `TextView`
+//! shows math nobody claims as the prose between its dollars (gpui-base's
+//! `flatten_unclaimed_math`). An edit can change what the text around it means (escaping a
+//! tag frees a backtick inside it; escaping an HTML block ends it early), so only the second
+//! reading says whether an image or a tag is left. When one is, the whole body is escaped
+//! coarsely ([`coarse_escape`]), which no parse can read an image or a tag out of.
 
 use gpui::{App, ElementId, SharedString};
 use gpui_component::text::{TextView, TextViewStyle};
+use markdown::ParseOptions;
+use markdown::mdast::Node;
 
 use crate::theme::ActiveTheme as _;
 
@@ -38,6 +53,85 @@ pub fn view_with_links(
     view(id, text, cx).on_link_click(move |url, _event, _window, cx| on_link(url, cx))
 }
 
+/// `source` with every line break inside a paragraph made a hard one, as GitHub shows a
+/// comment (its comments break where they were typed; Markdown elsewhere folds such a break
+/// into a space): two spaces go at the end of each line that has text and is followed by
+/// another that has, unless it already ends in a hard break. Where a line break means
+/// nothing (after a heading, a table's row, a list's item), a hard one means nothing either.
+///
+/// Code keeps its lines as they are. A fenced block is told as CommonMark tells one
+/// ([`fence_run`]): opened by three or more backticks or tildes after at most three spaces
+/// (and any `>` of a quote), closed only by a run of the same character at least as long;
+/// an indented block is a line indented four spaces or a tab after a blank line, and the
+/// indented lines that follow it. An indented line deeper in a list reads as code here and
+/// keeps its break folded. A code span that runs over a line break gains the two spaces
+/// inside it, which a code span shows as one space anyway.
+pub fn with_line_breaks(source: &str) -> String {
+    let mut out = String::with_capacity(source.len() + 16);
+    // The fence that is open: its character and how long it is.
+    let mut fence: Option<(char, usize)> = None;
+    let (mut after_blank, mut indented) = (true, false);
+    let mut lines = source.split('\n').peekable();
+    while let Some(line) = lines.next() {
+        let text = line.trim_end_matches('\r');
+        let open = fence;
+        // A backtick fence's info string holds no backtick: a line that starts with a code
+        // span opens nothing.
+        let run = fence_run(text).filter(|(character, _, info)| {
+            open.is_some() || *character != '`' || !info.contains('`')
+        });
+        match (open, run) {
+            (None, Some((character, length, _))) => fence = Some((character, length)),
+            (Some((opened, least)), Some((character, length, info)))
+                if opened == character && length >= least && info.trim().is_empty() =>
+            {
+                fence = None;
+            }
+            _ => {}
+        }
+        // Inside a fenced block, or the line that opens or closes one.
+        let fenced = open.is_some() || fence.is_some();
+        let blank = text.trim().is_empty();
+        indented = !blank
+            && fence.is_none()
+            && (after_blank || indented)
+            && (text.starts_with("    ") || text.starts_with('\t'));
+        after_blank = blank;
+        out.push_str(text);
+        let next_has_text = lines.peek().is_some_and(|next| !next.trim().is_empty());
+        let code = fenced || indented;
+        if !code && !blank && next_has_text && !text.ends_with("  ") && !text.ends_with('\\') {
+            out.push_str("  ");
+        }
+        if lines.peek().is_some() {
+            out.push('\n');
+        }
+    }
+    out
+}
+
+/// The run of backticks or tildes `line` starts with, when it can open or close a fenced
+/// code block: three or more of one character after at most three spaces of indent, past
+/// the `>` of any quote it is in. With it, the character, the run's length and what follows
+/// it on the line (an opening fence's info string).
+fn fence_run(line: &str) -> Option<(char, usize, &str)> {
+    let mut rest = line;
+    loop {
+        let indent = rest.len() - rest.trim_start_matches(' ').len();
+        if indent > 3 {
+            return None;
+        }
+        rest = &rest[indent..];
+        match rest.strip_prefix('>') {
+            Some(quoted) => rest = quoted.strip_prefix(' ').unwrap_or(quoted),
+            None => break,
+        }
+    }
+    let character = rest.chars().next().filter(|c| matches!(c, '`' | '~'))?;
+    let length = rest.len() - rest.trim_start_matches(character).len();
+    (length >= 3).then(|| (character, length, &rest[length..]))
+}
+
 /// Neutralises the constructs that make `TextView` fetch anything or render markup from an
 /// untrusted body, before the source reaches it:
 ///
@@ -47,20 +141,45 @@ pub fn view_with_links(
 ///   `&amp;`, `<` to `&lt;`) and shows as literal text.
 ///
 /// The edits are made at the spans `markdown::to_mdast` reports, the parser `TextView` uses
-/// itself, so code is left alone for free: text in fenced and indented blocks and inline code
-/// spans lives under `Code`/`InlineCode` nodes, never `Image` or `Html` ones. Everything else
-/// (links, emphasis, tables, lists) passes through. When the parse fails or a span doesn't map
-/// onto the source, the whole body is escaped coarsely instead: uglier, still fetch-proof.
+/// itself, with the options it uses ([`view_options`]), so code is left alone for free: text
+/// in fenced and indented blocks and inline code spans lives under `Code`/`InlineCode` nodes,
+/// never `Image` or `Html` ones. A math node's source is sanitised as the prose `TextView`
+/// shows it as. Everything else (links, emphasis, tables, lists) passes through. The result
+/// is then read as `TextView` will read it ([`is_inert`]); when the parse fails, a span
+/// doesn't map onto the source, or that reading still finds an image or a tag, the whole body
+/// is escaped coarsely instead: uglier, and fetch-proof under any parse.
 pub fn sanitize_untrusted(source: &str) -> String {
-    let Ok(ast) = markdown::to_mdast(source, &markdown::ParseOptions::gfm()) else {
-        return coarse_escape(source);
-    };
+    edited(source, &view_options())
+        .filter(|sanitized| is_inert(sanitized))
+        .unwrap_or_else(|| coarse_escape(source))
+}
+
+/// The options `TextView` parses a body with: gpui-base's
+/// `MarkdownExtensions::parse_options` with no extension registered, as [`view`] builds it.
+/// GFM, with inline and block math on.
+fn view_options() -> ParseOptions {
+    let mut options = ParseOptions::gfm();
+    options.constructs.math_text = true;
+    options.constructs.math_flow = true;
+    options
+}
+
+/// The options `TextView` reads a math node's source with when no plugin claims it
+/// (gpui-base's `flatten_unclaimed_math`): [`view_options`] without math.
+fn prose_options() -> ParseOptions {
+    ParseOptions::gfm()
+}
+
+/// `source` with every span a parse with `options` finds an image or raw HTML in replaced
+/// ([`collect_unsafe_spans`]); `None` when it doesn't parse or a span doesn't map onto it.
+fn edited(source: &str, options: &ParseOptions) -> Option<String> {
+    let ast = markdown::to_mdast(source, options).ok()?;
     let mut edits: Vec<(usize, usize, String)> = Vec::new();
     if !collect_unsafe_spans(&ast, source, &mut edits) {
-        return coarse_escape(source);
+        return None;
     }
     if edits.is_empty() {
-        return source.to_string();
+        return Some(source.to_string());
     }
     edits.sort_by_key(|&(start, _, _)| start);
     let mut out = String::with_capacity(source.len());
@@ -76,7 +195,32 @@ pub fn sanitize_untrusted(source: &str) -> String {
         cursor = end;
     }
     out.push_str(&source[cursor..]);
-    out
+    Some(out)
+}
+
+/// Whether `text`, read as `TextView` reads a body (module docs), holds nothing it fetches
+/// or renders as markup: no `Image`, `ImageReference` or `Html` node in a parse with
+/// [`view_options`], nor in a math node's source read as prose. Text that doesn't parse is
+/// not inert.
+fn is_inert(text: &str) -> bool {
+    fn inert_under(node: &Node, source: &str) -> bool {
+        match node {
+            Node::Image(_) | Node::ImageReference(_) | Node::Html(_) => false,
+            Node::InlineMath(_) | Node::Math(_) => node
+                .position()
+                .and_then(|position| source.get(position.start.offset..position.end.offset))
+                .is_some_and(|literal| {
+                    markdown::to_mdast(literal, &prose_options())
+                        .is_ok_and(|prose| inert_under(&prose, literal))
+                }),
+            other => other
+                .children()
+                .into_iter()
+                .flatten()
+                .all(|child| inert_under(child, source)),
+        }
+    }
+    markdown::to_mdast(text, &view_options()).is_ok_and(|ast| inert_under(&ast, text))
 }
 
 /// The first line of a Markdown body as plain text, for one-line summaries (the comments list,
@@ -87,7 +231,7 @@ pub fn sanitize_untrusted(source: &str) -> String {
 /// its marker. Trimmed; empty for a body with no text. A body that doesn't parse falls back to
 /// its first non-empty line as written.
 pub fn first_line_plain(source: &str) -> String {
-    let parsed = markdown::to_mdast(source, &markdown::ParseOptions::gfm());
+    let parsed = markdown::to_mdast(source, &ParseOptions::gfm());
     match parsed {
         Ok(ast) => block_line(&ast).unwrap_or_default(),
         Err(_) => first_text_line(source).unwrap_or_default(),
@@ -152,14 +296,14 @@ fn first_text_line(text: &str) -> Option<String> {
 }
 
 /// Collects a `(start, end, replacement)` byte-span edit for every image and raw-HTML node
-/// under `node`. `false` when a node's span can't be mapped onto `source` (no position, out of
-/// range, off a char boundary), which makes the caller escape the whole body.
+/// under `node`, and for every math node, whose source is sanitised as the prose `TextView`
+/// shows it as. `false` when a node's span can't be mapped onto `source` (no position, out
+/// of range, off a char boundary), which makes the caller escape the whole body.
 fn collect_unsafe_spans(
-    node: &markdown::mdast::Node,
+    node: &Node,
     source: &str,
     edits: &mut Vec<(usize, usize, String)>,
 ) -> bool {
-    use markdown::mdast::Node;
     let span_of = |node: &Node| -> Option<(usize, usize)> {
         let position = node.position()?;
         let (start, end) = (position.start.offset, position.end.offset);
@@ -176,6 +320,9 @@ fn collect_unsafe_spans(
         Node::Image(image) => edit(node, &|_| image_placeholder(&image.alt)),
         Node::ImageReference(image) => edit(node, &|_| image_placeholder(&image.alt)),
         Node::Html(_) => edit(node, &coarse_escape),
+        Node::InlineMath(_) | Node::Math(_) => edit(node, &|math| {
+            edited(math, &prose_options()).unwrap_or_else(|| coarse_escape(math))
+        }),
         other => match other.children() {
             Some(children) => children
                 .iter()
@@ -203,11 +350,17 @@ fn image_placeholder(alt: &str) -> String {
 /// Escapes HTML (`&`, `<`) and breaks image syntax (`![` to `!\[`), so the result can only
 /// render as literal text: for a raw-HTML node's span (an image inside an HTML block must not
 /// come back to life once the tags are escaped) and for a whole body when span edits aren't
-/// possible.
+/// possible or didn't hold. No `<` and no `![` is left in it, and without one no parser,
+/// whatever its options and however it pairs the rest, reads a tag or an image out of it:
+/// that is what makes it the fallback. A bare address in it is kept from becoming a link (`://` to `:\/\/`, `www.` to
+/// `www\.`): an automatic link runs on through the escaped markup after it (`&lt;/details>`),
+/// which would then show as written and be part of what a click opens.
 fn coarse_escape(text: &str) -> String {
     text.replace('&', "&amp;")
         .replace('<', "&lt;")
         .replace("![", "!\\[")
+        .replace("://", ":\\/\\/")
+        .replace("www.", "www\\.")
 }
 
 #[cfg(test)]

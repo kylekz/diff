@@ -1,7 +1,8 @@
 //! dv's headless domain logic: repo locations, the `Backend` interface and its in-process
 //! `LocalBackend`, review targets and their labels, the git runner, the diff pipeline, the
 //! review event store, anchoring and relocation, GitHub through `gh` (docs/PLAN.md §2,
-//! §5–§9), and the job object that children dying with dv join on Windows (`job`).
+//! §5–§9), the job object that children dying with dv join on Windows (`job`), and which
+//! characters of text dv didn't write may not be printed as they are (`text`).
 //!
 //! gpui: **never**. This crate runs in the CLI, inside WSL distros as part of the backend, and in
 //! fast headless tests; `script/check` fails when gpui appears in its dependency tree
@@ -16,6 +17,7 @@ pub mod label;
 pub mod location;
 pub mod review;
 pub mod target;
+pub mod text;
 
 pub use backend::{Backend, BackendError, LocalBackend, LocalBackendOptions, RepoInfo};
 pub use diff::{DiffError, FileDiff, FileEntry, TextDiff};

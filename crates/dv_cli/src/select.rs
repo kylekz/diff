@@ -6,11 +6,19 @@
 //!
 //! A command that takes a thread id finds the thread's review itself (thread ids are unique
 //! across a repository's reviews), so an agent never needs `--review` for one; `--review`
-//! narrows the search to that review, `$DV_REVIEW` doesn't.
+//! narrows the search to that review, `$DV_REVIEW` doesn't. One of GitHub's threads
+//! (`gh:<node id>`, PLAN §9.6) is in no review's log: it is found in the stored mirror of a
+//! PR review's pull request. Several reviews of one pull request hold it, so there
+//! `$DV_REVIEW` says which is meant, when it names one of them; else the pull request's
+//! open review comes before its finished ones.
 
+use std::sync::Arc;
+
+use dv_core::github::Mirror;
 use dv_core::label::Labels;
 use dv_core::review::{
-    ItemId, ListEntry, Review, ReviewId, ReviewSummary, StoreError, Thread, ThreadId, ops,
+    ItemId, ListEntry, Review, ReviewId, ReviewSummary, StoreError, Thread, ThreadId, ThreadKey,
+    ops,
 };
 use dv_core::target::Target;
 
@@ -269,6 +277,96 @@ pub(crate) fn thread(
     }
     Err(CliError::not_found(format!(
         "no thread {id} in the reviews of {}",
+        repo.root()
+    )))
+}
+
+/// A thread a reading command names, with the review that shows it.
+pub(crate) enum Shown {
+    /// One of the review's own.
+    Local(Review, ThreadId),
+    /// One of GitHub's on the review's pull request: the stored mirror that holds it, and
+    /// its place among the mirror's threads.
+    Github(Review, Arc<Mirror>, usize),
+}
+
+/// The thread `id` names for a command that reads it (`dv comment show`): a thread of a
+/// review ([`thread`]), or, for `gh:<node id>`, one of GitHub's threads on a PR review's pull
+/// request, read from its stored mirror (module docs). `--review` narrows to that review
+/// alone. Without it, the first PR review whose mirror holds the thread: the one
+/// `$DV_REVIEW` names, when it names a PR review of this repository, then the open ones,
+/// then the newest. So `$DV_REVIEW` only chooses among reviews that hold the same thread (a
+/// pull request's earlier submitted review and its open draft) and never keeps one from
+/// being found: one that doesn't parse, or names no PR review here, chooses nothing, as it
+/// is nothing to a thread of a review's own ([`thread`]).
+pub(crate) fn shown(
+    repo: &Repo,
+    global: &GlobalArgs,
+    ctx: &Context,
+    id: &str,
+) -> Result<Shown, CliError> {
+    let key = ThreadKey::parse(id.trim()).map_err(|error| {
+        CliError::usage(format!(
+            "invalid thread id {:?}: {}",
+            crate::pr::shown_id(id),
+            error.reason
+        ))
+    })?;
+    let ThreadKey::Github(node) = key else {
+        return thread(repo, global, id).map(|(review, id)| Shown::Local(review, id));
+    };
+    let held = |review: &Review| {
+        let mirror = crate::pr::mirror(repo, review)?;
+        let index = mirror.threads.iter().position(|thread| thread.id == node)?;
+        Some((mirror, index))
+    };
+    if let Some(review) = &global.review {
+        let review = load(repo, &parse(review, "--review")?)?;
+        let named = crate::pr::shown_id(id);
+        return match held(&review) {
+            Some((mirror, index)) => Ok(Shown::Github(review, mirror, index)),
+            None if review.is_pr_review() && crate::pr::mirror(repo, &review).is_none() => {
+                Err(CliError::not_found(format!(
+                    "no thread {named} to show: review {} is of a pull request, and {}",
+                    review.id,
+                    crate::pr::why_no_mirror(repo, &review)
+                )))
+            }
+            None => Err(CliError::not_found(format!(
+                "no thread {named} on GitHub in what review {} last read of its pull request",
+                review.id
+            ))),
+        };
+    }
+    let mut summaries: Vec<ReviewSummary> = Listing::read(repo)?
+        .summaries
+        .into_iter()
+        .filter(|summary| matches!(summary.target, Target::Pr { .. }))
+        .collect();
+    let preferred = ctx
+        .env
+        .non_empty("DV_REVIEW")
+        .and_then(|id| ReviewId::parse(id.trim()).ok());
+    summaries.sort_by_key(|summary| {
+        (
+            Some(&summary.id) != preferred.as_ref(),
+            !summary.status.is_open(),
+        )
+    });
+    for summary in summaries {
+        let review = match repo.store.load(&summary.id) {
+            Ok(loaded) => loaded.review,
+            Err(StoreError::UnknownReview { .. }) => continue,
+            Err(error) => return Err(error.into()),
+        };
+        if let Some((mirror, index)) = held(&review) {
+            return Ok(Shown::Github(review, mirror, index));
+        }
+    }
+    Err(CliError::not_found(format!(
+        "no thread {} on GitHub in what the PR reviews of {} last read; `dv review \
+         refresh` reads a pull request again",
+        crate::pr::shown_id(id),
         repo.root()
     )))
 }

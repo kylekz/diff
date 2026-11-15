@@ -14,6 +14,8 @@
 //! - [`excerpt`]: the rows of the diff around a thread's lines now, as the CLI prints them
 //!   (PLAN §10.3).
 //! - [`identity`]: the reviewer's name (PLAN §2.5).
+//! - [`key`]: how a review's threads are named where GitHub's show beside its own
+//!   (PLAN §9.6).
 //! - [`home`]: the worktree a review's target resolves in, whichever worktree reads it
 //!   (PLAN §2.2, §2.4).
 //! - [`pins`]: the commits a PR review shows, and every review's two sides (PLAN §9.5).
@@ -31,6 +33,7 @@ pub mod history;
 pub mod home;
 pub mod id;
 pub mod identity;
+pub mod key;
 pub mod model;
 pub mod ops;
 pub mod pins;
@@ -50,6 +53,7 @@ pub use history::{
 pub use home::{Home, HomeError, Worktrees, home, same_worktree};
 pub use id::{CommentId, EventId, InvalidId, ItemId, ReviewId, ThreadId};
 pub use identity::reviewer_identity;
+pub use key::{GITHUB_PREFIX, ThreadKey};
 pub use model::{
     Anchor, AnchorSide, Author, AuthorKind, Comment, PrLink, Review, ReviewStatus, ReviewSummary,
     Round, StateChange, StatusChange, Submission, Thread, ThreadCounts, ThreadState, Verdict,
@@ -58,8 +62,9 @@ pub use ops::{FinishedRound, OpError, Opened};
 pub use pins::Pins;
 pub use relocate::{
     FuzzyLines, MoveKind, Placement, Relocation, SideLines, SideText, ThreadFile, anchored_entry,
-    entry_for, has_side, is_gone, place_thread, place_unlisted, relocate, relocate_with,
-    relocated_anchor, shows_edited, shows_moved, thread_file, unlisted_path,
+    edited_since, entry_for, has_side, is_gone, moved_since, place_anchor, place_thread,
+    place_unlisted, place_unlisted_anchor, relocate, relocate_with, relocated_anchor, shows_edited,
+    shows_moved, thread_file, unlisted_path,
 };
 pub use snapshot::SnapshotError;
 pub use store::{ListEntry, LoadedReview, ReviewStore, StoreError};

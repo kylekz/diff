@@ -135,9 +135,10 @@ fn megabytes(bytes: u64) -> String {
 }
 
 /// "3 open · 1 addressed · 1 resolved", leaving out what is zero; "no comments" when all are.
-/// Then the agent's annotations (PLAN §19.3), "· 5 annotations", "· 5 annotations hidden"
-/// while `A` hides them (`shown` false).
-pub fn thread_counts(counts: ThreadCounts, shown: bool) -> String {
+/// Then GitHub's threads on a PR review that GitHub doesn't call resolved, counted apart
+/// (PLAN §9.6): "· 5 on GitHub". Then the agent's annotations (PLAN §19.3), "· 5
+/// annotations", "· 5 annotations hidden" while `A` hides them (`shown` false).
+pub fn thread_counts(counts: ThreadCounts, on_github: usize, shown: bool) -> String {
     let parts: Vec<String> = [
         (counts.open, "open"),
         (counts.addressed, "addressed"),
@@ -152,6 +153,9 @@ pub fn thread_counts(counts: ThreadCounts, shown: bool) -> String {
     } else {
         parts.join(" · ")
     };
+    if on_github > 0 {
+        text.push_str(&format!(" · {on_github} on GitHub"));
+    }
     if counts.annotation > 0 {
         let noun = if counts.annotation == 1 {
             "annotation"
@@ -211,7 +215,15 @@ impl Shell {
                     "{} · round {} · {}{since}",
                     status_label(review.status),
                     review.shown_round(),
-                    thread_counts(review.summary().threads, session.annotations_shown()),
+                    thread_counts(
+                        review.summary().threads,
+                        session
+                            .github_threads()
+                            .iter()
+                            .filter(|shown| !shown.thread.resolved)
+                            .count(),
+                        session.annotations_shown()
+                    ),
                 )),
                 finish: !session.is_read_only(),
             };
@@ -540,11 +552,23 @@ mod tests {
             resolved,
             annotation: 0,
         };
-        assert_eq!(thread_counts(counts(0, 0, 0), true), "no comments");
-        assert_eq!(thread_counts(counts(3, 0, 1), true), "3 open · 1 resolved");
+        assert_eq!(thread_counts(counts(0, 0, 0), 0, true), "no comments");
         assert_eq!(
-            thread_counts(counts(1, 2, 3), true),
+            thread_counts(counts(3, 0, 1), 0, true),
+            "3 open · 1 resolved"
+        );
+        assert_eq!(
+            thread_counts(counts(1, 2, 3), 0, true),
             "1 open · 2 addressed · 3 resolved"
+        );
+        // GitHub's threads on a PR review, apart (PLAN §9.6).
+        assert_eq!(
+            thread_counts(counts(2, 0, 0), 5, true),
+            "2 open · 5 on GitHub"
+        );
+        assert_eq!(
+            thread_counts(counts(0, 0, 0), 1, true),
+            "no comments · 1 on GitHub"
         );
         // The agent's annotations, apart (PLAN §19.3).
         let annotated = |annotation| ThreadCounts {
@@ -552,12 +576,12 @@ mod tests {
             ..counts(0, 0, 0)
         };
         assert_eq!(
-            thread_counts(annotated(5), true),
+            thread_counts(annotated(5), 0, true),
             "no comments · 5 annotations"
         );
         assert_eq!(
-            thread_counts(annotated(1), false),
-            "no comments · 1 annotation hidden"
+            thread_counts(annotated(1), 2, false),
+            "no comments · 2 on GitHub · 1 annotation hidden"
         );
     }
 }

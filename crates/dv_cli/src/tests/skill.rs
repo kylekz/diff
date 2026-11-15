@@ -12,15 +12,15 @@ use crate::skill::{SKILL_MD, SKILL_NAME};
 
 /// A command line from one of the skill's fenced blocks, with the text it pipes in.
 #[derive(Debug, Clone)]
-struct Shown {
-    line: String,
-    stdin: String,
+pub(crate) struct Shown {
+    pub line: String,
+    pub stdin: String,
 }
 
 /// Every command line the skill's fenced blocks show, in order: `dv …` lines, a heredoc after
 /// `<<'EOF'`, and PowerShell's `@'…'@ | dv …`. Any other line in a block fails the test, so a
 /// new shape is checked here before it ships.
-fn shown() -> Vec<Shown> {
+pub(crate) fn shown() -> Vec<Shown> {
     let mut commands = Vec::new();
     let mut lines = SKILL_MD.lines();
     while let Some(line) = lines.next() {
@@ -105,7 +105,13 @@ const MODEL: &str = "Claude Fable 5.2";
 /// `shown`'s arguments after `dv`, its placeholders filled in (`<agent>`: the agent's name, as
 /// the skill tells it to write its own; `<model>`: [`MODEL`]; `<n>`: the round the agent
 /// worked on).
-fn args(shown: &Shown, thread: &str, review: &str, agent: &str, round: u32) -> Vec<String> {
+pub(crate) fn args(
+    shown: &Shown,
+    thread: &str,
+    review: &str,
+    agent: &str,
+    round: u32,
+) -> Vec<String> {
     let words = words(
         &shown
             .line
@@ -168,6 +174,12 @@ fn the_skill_is_named_and_says_when_to_use_it() {
         "read-only for you",
         "dv review new --pr <number>",
         "dv review refresh <review-id>",
+        // GitHub's threads on it (PLAN §9.6, §9.10).
+        "gh:PRRT_",
+        "github <login>:",
+        "(outdated on GitHub, was <lines>)",
+        "`github` is `{url, resolved, outdated, pending, diff_hunk}`",
+        "every command that writes to a `gh:`",
     ] {
         assert!(SKILL_MD.contains(rule), "{rule:?}");
     }
@@ -198,6 +210,9 @@ fn every_command_the_skill_shows_parses() {
             "dv review done <review-id> --author <agent> --model '<model>' --note-file -",
             "dv comment edit <thread-id> --author <agent> --model '<model>' --body-file -",
             "dv comment delete <thread-id> --author <agent> --model '<model>'",
+            "dv review refresh <review-id>",
+            "dv comment list --review <review-id> --status open",
+            "dv comment show <thread-id> --review <review-id>",
         ],
         "the test below runs each of these in turn; update it with the skill"
     );
@@ -432,6 +447,12 @@ const ANNOTATE_FILE: usize = 14;
 const HAND_OVER: usize = 15;
 const EDIT: usize = 16;
 const DELETE: usize = 17;
+
+/// The command lines of the skill's "A pull request's review" section, which the pull
+/// request's own tests run against the fixture GitHub (`pr::threads`).
+pub(crate) const PR_REFRESH: usize = 18;
+pub(crate) const PR_LIST: usize = 19;
+pub(crate) const PR_SHOW: usize = 20;
 
 #[test]
 fn the_hand_over_the_skill_teaches_runs() {

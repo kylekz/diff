@@ -10,7 +10,9 @@
 //! ```
 //!
 //! An `argv` pattern is an exact string, `"*"` (any one argument) or `"**"` (all remaining
-//! arguments, none included; only last). The first entry whose pattern and `stdin_contains` match
+//! arguments, none included; only last). `stdin_contains` is one string the call's stdin must
+//! contain, or a list of them, all of which it must (a mutation's name and the id it is
+//! about, which a request holds apart). The first entry whose pattern and `stdin_contains` match
 //! and that has calls left (`times`, unlimited when absent) answers, after `delay_ms` when it
 //! has one (a GitHub that is slow to answer, or never does within the caller's timeout).
 
@@ -30,7 +32,8 @@ pub struct Scenario {
 #[derive(Debug)]
 pub struct Entry {
     pub argv: Vec<Pattern>,
-    pub stdin_contains: Option<String>,
+    /// What the call's stdin must contain, every one of them; empty matches any call.
+    pub stdin_contains: Vec<String>,
     pub stdout: Option<Value>,
     pub stderr: Option<String>,
     pub exit: u8,
@@ -60,7 +63,7 @@ struct RawScenario {
 #[serde(deny_unknown_fields)]
 struct RawEntry {
     argv: Vec<String>,
-    stdin_contains: Option<String>,
+    stdin_contains: Option<Needles>,
     stdout: Option<Value>,
     stderr: Option<String>,
     #[serde(default)]
@@ -68,6 +71,14 @@ struct RawEntry {
     times: Option<u32>,
     #[serde(default)]
     delay_ms: u64,
+}
+
+/// An entry's `stdin_contains`: one string, or several.
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum Needles {
+    One(String),
+    All(Vec<String>),
 }
 
 impl Scenario {
@@ -120,7 +131,11 @@ impl Entry {
             .collect::<Result<_>>()?;
         Ok(Self {
             argv,
-            stdin_contains: raw.stdin_contains,
+            stdin_contains: match raw.stdin_contains {
+                None => Vec::new(),
+                Some(Needles::One(needle)) => vec![needle],
+                Some(Needles::All(needles)) => needles,
+            },
             stdout: raw.stdout,
             stderr: raw.stderr,
             exit: raw.exit,
@@ -131,10 +146,10 @@ impl Entry {
 
     /// Whether this entry's `argv` patterns and `stdin_contains` match the call.
     pub fn matches(&self, argv: &[String], stdin: Option<&str>) -> bool {
-        let stdin_ok = match &self.stdin_contains {
-            None => true,
-            Some(needle) => stdin.is_some_and(|stdin| stdin.contains(needle.as_str())),
-        };
+        let stdin_ok = self
+            .stdin_contains
+            .iter()
+            .all(|needle| stdin.is_some_and(|stdin| stdin.contains(needle.as_str())));
         stdin_ok && argv_matches(&self.argv, argv)
     }
 
@@ -209,11 +224,28 @@ mod tests {
     #[test]
     fn stdin_contains_needs_stdin_holding_the_text() {
         let mut needs = entry(&["api", "**"]);
-        needs.stdin_contains = Some("\"event\":\"APPROVE\"".into());
+        needs.stdin_contains = vec!["\"event\":\"APPROVE\"".into()];
         let argv = args("api --input -");
         assert!(needs.matches(&argv, Some("{\"event\":\"APPROVE\",\"body\":\"\"}")));
         assert!(!needs.matches(&argv, Some("{\"event\":\"COMMENT\"}")));
         assert!(!needs.matches(&argv, None));
+    }
+
+    #[test]
+    fn a_list_of_needles_must_all_be_in_stdin() {
+        let scenario = Scenario::parse(
+            r#"{"calls": [
+                {"argv": ["api", "**"], "stdin_contains": ["resolveReviewThread", "PRRT_1"]},
+                {"argv": ["api", "**"], "stdin_contains": "unresolveReviewThread"}
+            ]}"#,
+        )
+        .unwrap();
+        let argv = args("api graphql --input -");
+        let pick = |stdin: &str| scenario.pick(&argv, Some(stdin), |_| 0);
+        assert_eq!(pick("resolveReviewThread … PRRT_1"), Some(0));
+        assert_eq!(pick("resolveReviewThread … PRRT_2"), None);
+        assert_eq!(pick("unresolveReviewThread … PRRT_2"), Some(1));
+        assert_eq!(scenario.pick(&argv, None, |_| 0), None);
     }
 
     #[test]

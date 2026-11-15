@@ -57,6 +57,7 @@ impl Render for DiffPane {
         self.hover_before_frame(window, cx);
         self.focus_waiting_composer(window, cx);
         self.reveal_laid_out_composer(window, cx);
+        self.reveal_laid_out_thread(window, cx);
         self.open_waiting_reply(window, cx);
         // What the viewport shows is worked out again after this frame's layout, when it moved.
         if self.viewport_key != Some(self.current_viewport_key()) && !self.viewport_pending {

@@ -2,14 +2,14 @@
 //! with the count and "Copy as prompt", then `listBtn` rows with a dot, `path:line` in mono and
 //! the comment's first line), and a row's right-click menu, in the file menu's style.
 
-use dv_core::review::ThreadState;
+use dv_core::review::{ThreadId, ThreadKey, ThreadState};
 use gpui::{
     AnyElement, Context, ElementId, FontWeight, InteractiveElement as _, IntoElement, MouseButton,
     MouseDownEvent, ParentElement as _, Render, StatefulInteractiveElement as _, Styled as _,
     Window, anchored, deferred, div, prelude::FluentBuilder as _, px,
 };
 
-use super::{CommentRow, CommentsList};
+use super::{CommentRow, CommentsList, GithubRow};
 use crate::automation::AutomationTargetExt as _;
 use crate::components::{
     count_badge, icon, menu_item, menu_panel, small_button, small_icon_button, tooltip,
@@ -42,6 +42,11 @@ impl Render for CommentsList {
         let resolved = count(ThreadState::Resolved);
         let annotations = count(ThreadState::Annotation);
         let focused = self.diff_pane.read(cx).focused_thread().cloned();
+        let focused_key = self.diff_pane.read(cx).focused_key().cloned();
+        // GitHub's threads on a PR review, in a group of their own (DESIGN §4.5).
+        let github = super::github_rows(session.read(cx), true);
+        let on_github = github.iter().filter(|row| !row.resolved).count();
+        let github_resolved = github.len() - on_github;
         let (waiting_rows, rest): (Vec<&CommentRow>, Vec<&CommentRow>) =
             all.iter().partition(|row| row.state.is_waiting());
         let annotation_rows: Vec<&CommentRow> = rest
@@ -67,8 +72,10 @@ impl Render for CommentsList {
         let copy = copy
             .ml_auto()
             .debug_selector(|| "comments-copy".into())
-            .when(open == 0, |this| this.opacity(0.5).cursor_default())
-            .when(open > 0, |this| {
+            .when(open + on_github == 0, |this| {
+                this.opacity(0.5).cursor_default()
+            })
+            .when(open + on_github > 0, |this| {
                 this.on_click(cx.listener(|this, _, _, cx| this.copy_as_prompt(cx)))
             })
             .automation_target("comments_list/copy");
@@ -177,6 +184,69 @@ impl Render for CommentsList {
                     .iter()
                     .map(|row| self.render_row(row, focused.as_ref() == Some(&row.id), &theme, cx)),
             );
+        }
+        if !github.is_empty() {
+            rows.push(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(theme.spacing.sm)
+                    .px(theme.spacing.md)
+                    .pt(theme.spacing.md)
+                    .pb(theme.spacing.xs)
+                    .text_spec(&theme.text.secondary)
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .text_color(c.fg2)
+                    .child(icon(DvIcon::Github, px(12.), c.fg3))
+                    .child("On GitHub")
+                    .child(count_badge(&theme).child(on_github.to_string()))
+                    .automation_target("comments_list/github")
+                    .into_any_element(),
+            );
+            let is_focused = |row: &GithubRow| focused_key.as_ref() == Some(&row.key());
+            rows.extend(
+                github
+                    .iter()
+                    .filter(|row| !row.resolved)
+                    .map(|row| self.render_github_row(row, is_focused(row), &theme, cx)),
+            );
+            if github_resolved > 0 {
+                let hover = c.control_hover;
+                let show = self.show_github_resolved;
+                rows.push(
+                    div()
+                        .id("comments-github-resolved")
+                        .flex()
+                        .items_center()
+                        .gap(theme.spacing.sm)
+                        .w_full()
+                        .px(theme.spacing.md)
+                        .py(px(5.))
+                        .rounded(theme.radii.control)
+                        .text_spec(&theme.text.secondary)
+                        .text_color(c.fg2)
+                        .cursor_pointer()
+                        .hover(move |style| style.bg(hover))
+                        .child(icon(DvIcon::CircleCheck, px(13.), c.green))
+                        .child(format!(
+                            "{github_resolved} resolved on GitHub · {}",
+                            if show { "hide" } else { "show" }
+                        ))
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.set_show_github_resolved(!show, cx)
+                        }))
+                        .automation_target("comments_list/github_resolved")
+                        .into_any_element(),
+                );
+                if show {
+                    rows.extend(
+                        github
+                            .iter()
+                            .filter(|row| row.resolved)
+                            .map(|row| self.render_github_row(row, is_focused(row), &theme, cx)),
+                    );
+                }
+            }
         }
         div()
             .flex_none()
@@ -405,15 +475,262 @@ impl CommentsList {
             .into_any_element()
     }
 
+    /// One of GitHub's threads' row (module docs, "On GitHub"): GitHub's mark (a green check
+    /// once resolved), where it stands, its flags, then its author's login and its comment's
+    /// first line.
+    fn render_github_row(
+        &self,
+        row: &GithubRow,
+        focused: bool,
+        theme: &DvTheme,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let c = &theme.colors;
+        let hover = c.control_hover;
+        let key = row.key();
+        let marker = if row.resolved {
+            icon(DvIcon::CircleCheck, px(11.), c.green).into_any_element()
+        } else {
+            icon(DvIcon::Github, px(11.), c.fg2).into_any_element()
+        };
+        let split = if row.file_level {
+            row.location
+                .rfind(" (file")
+                .map(|at| row.location.split_at(at))
+        } else {
+            row.location.rfind(':').map(|at| row.location.split_at(at))
+        };
+        let (path, line) = match split {
+            Some((path, line)) => (path.to_string(), line.to_string()),
+            None => (row.location.clone(), String::new()),
+        };
+        let flag = |text: &'static str, color, weight| {
+            div()
+                .flex_none()
+                .text_size(px(11.))
+                .font_weight(weight)
+                .text_color(color)
+                .child(text)
+        };
+        let mut flags = Vec::new();
+        if row.unplaced {
+            flags.push(flag("can't be placed", c.yellow, FontWeight::MEDIUM));
+        } else if row.outdated {
+            flags.push(flag("outdated", c.yellow, FontWeight::MEDIUM));
+        }
+        if row.pending_on_github {
+            flags.push(flag("pending", c.fg3, FontWeight::NORMAL));
+        }
+        if row.not_in_comparison {
+            flags.push(flag("all changes", c.fg3, FontWeight::NORMAL));
+        }
+        let menu_open = self.menu_key() == Some(&key);
+        let node = row.id.clone();
+        div()
+            .id(ElementId::Name(format!("comment-row-{key}").into()))
+            .flex()
+            .flex_col()
+            .gap(px(2.))
+            .w_full()
+            .px(theme.spacing.md)
+            .py(px(5.))
+            .rounded(theme.radii.control)
+            .cursor_pointer()
+            .map(|this| {
+                if focused {
+                    this.bg(c.sel)
+                } else if menu_open {
+                    this.bg(hover)
+                } else {
+                    this.hover(move |style| style.bg(hover))
+                }
+            })
+            .on_click({
+                let node = node.clone();
+                cx.listener(move |this, _, _, cx| this.reveal_github(&node, cx))
+            })
+            .on_mouse_down(MouseButton::Right, {
+                let key = key.clone();
+                cx.listener(move |this, event: &MouseDownEvent, _, cx| {
+                    this.open_menu(&key, event.position, cx);
+                    cx.stop_propagation();
+                })
+            })
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(theme.spacing.sm)
+                    .min_w_0()
+                    .font_family(theme.fonts.mono.clone())
+                    .text_size(px(11.5))
+                    .line_height(px(16.))
+                    .font_weight(FontWeight::MEDIUM)
+                    .text_color(if row.pending { c.fg3 } else { c.fg2 })
+                    .child(marker)
+                    .child(
+                        div()
+                            .min_w_0()
+                            .flex()
+                            .child(
+                                div()
+                                    .min_w_0()
+                                    .overflow_hidden()
+                                    .whitespace_nowrap()
+                                    .text_ellipsis_start()
+                                    .text_right()
+                                    .child(path),
+                            )
+                            .child(div().flex_none().text_color(c.fg3).child(line)),
+                    )
+                    .when(!flags.is_empty(), |this| {
+                        this.child(
+                            div()
+                                .flex_none()
+                                .ml_auto()
+                                .flex()
+                                .items_center()
+                                .gap(theme.spacing.sm)
+                                .children(flags),
+                        )
+                    }),
+            )
+            .child(
+                div()
+                    .pl(px(13.))
+                    .flex()
+                    .gap(theme.spacing.sm)
+                    .min_w_0()
+                    .text_spec(&theme.text.body)
+                    // A long login is cut so the comment's first line keeps half the row.
+                    .child(
+                        div()
+                            .flex_shrink(1.)
+                            .min_w_0()
+                            .max_w(gpui::relative(0.5))
+                            .truncate()
+                            .text_color(c.fg3)
+                            .child(format!("@{}", row.author)),
+                    )
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .truncate()
+                            .text_color(if row.resolved { c.fg3 } else { c.fg })
+                            .child(row.summary.clone()),
+                    ),
+            )
+            .automation_target(format!("comments_list/{key}"))
+            .into_any_element()
+    }
+
+    /// A GitHub row's menu (module docs, "On GitHub"): Resolve or Unresolve where GitHub
+    /// allows the viewer, Open on GitHub when its link is a page of the pull request's
+    /// host, and Copy as prompt.
+    fn render_github_menu(
+        &self,
+        node: &str,
+        position: gpui::Point<gpui::Pixels>,
+        theme: &DvTheme,
+        cx: &mut Context<Self>,
+    ) -> Option<AnyElement> {
+        let c = &theme.colors;
+        let (resolved, allowed, resolving, has_url) = {
+            let session = self.session.as_ref()?.read(cx);
+            let thread = &session.github_thread(node)?.thread;
+            (
+                thread.resolved,
+                if thread.resolved {
+                    thread.viewer_can_unresolve
+                } else {
+                    thread.viewer_can_resolve
+                },
+                session.resolving(node).is_some(),
+                session.github_url(node).is_some(),
+            )
+        };
+        let item = |key: &'static str, label: &'static str, glyph: DvIcon, enabled: bool| {
+            menu_item(
+                ElementId::Name(format!("comments-menu-{key}").into()),
+                label,
+                glyph,
+                enabled,
+                theme,
+            )
+        };
+        let mut items: Vec<AnyElement> = Vec::new();
+        if allowed {
+            let (key, label, glyph) = if resolved {
+                ("unresolve", "Unresolve", DvIcon::RotateCw)
+            } else {
+                ("resolve", "Resolve", DvIcon::CircleCheck)
+            };
+            let node = node.to_string();
+            items.push(
+                item(key, label, glyph, !resolving)
+                    .when(!resolving, |this| {
+                        this.on_click(cx.listener(move |this, _, _, cx| {
+                            this.toggle_github_resolved(&node, cx);
+                        }))
+                    })
+                    .automation_target(format!("comments_list/menu/{key}")),
+            );
+        }
+        if has_url {
+            let node = node.to_string();
+            items.push(
+                item("open", "Open on GitHub", DvIcon::Github, true)
+                    .on_click(cx.listener(move |this, _, _, cx| this.open_github(&node, cx)))
+                    .automation_target("comments_list/menu/open"),
+            );
+        }
+        if !items.is_empty() {
+            items.push(
+                div()
+                    .h(px(1.))
+                    .my(theme.spacing.xs)
+                    .bg(c.line)
+                    .into_any_element(),
+            );
+        }
+        let node = node.to_string();
+        items.push(
+            item("copy", "Copy as prompt", DvIcon::Copy, true)
+                .on_click(cx.listener(move |this, _, _, cx| this.copy_github_thread(&node, cx)))
+                .automation_target("comments_list/menu/copy"),
+        );
+        let panel = menu_panel("comments-menu", theme)
+            .on_mouse_down_out(cx.listener(|this, _, _, cx| this.close_menu(cx)))
+            .children(items)
+            .automation_target("comments_list/menu");
+        Some(
+            deferred(
+                anchored()
+                    .position(position)
+                    .snap_to_window_with_margin(px(8.))
+                    .child(panel),
+            )
+            .with_priority(MENU_PRIORITY)
+            .into_any_element(),
+        )
+    }
+
     /// The open row menu, at the pointer where it was opened (module docs): the card's actions
     /// for the thread's state, Reply, and Copy as prompt.
     fn render_menu(&self, theme: &DvTheme, cx: &mut Context<Self>) -> Option<AnyElement> {
         let menu = self.menu.clone()?;
+        let thread_id: ThreadId = match &menu.thread {
+            ThreadKey::Local(id) => id.clone(),
+            ThreadKey::Github(node) => {
+                return self.render_github_menu(node, menu.position, theme, cx);
+            }
+        };
         let found = self.session.as_ref().and_then(|session| {
             let session = session.read(cx);
             let thread = session
                 .review()
-                .thread(&menu.thread)
+                .thread(&thread_id)
                 .filter(|thread| !thread.is_deleted())?;
             Some((thread.state, session.is_read_only()))
         });
@@ -423,7 +740,13 @@ impl CommentsList {
         let c = &theme.colors;
         let writable = !read_only;
         if state == ThreadState::Annotation {
-            return Some(self.render_annotation_menu(menu, writable, theme, cx));
+            return Some(self.render_annotation_menu(
+                &thread_id,
+                menu.position,
+                writable,
+                theme,
+                cx,
+            ));
         }
         let states: &[(&'static str, &'static str, DvIcon, ThreadState)] = match state {
             ThreadState::Annotation => &[],
@@ -457,7 +780,7 @@ impl CommentsList {
         let mut items: Vec<AnyElement> = states
             .iter()
             .map(|&(key, label, glyph, state)| {
-                let thread = menu.thread.clone();
+                let thread = thread_id.clone();
                 item(key, label, glyph, writable)
                     .when(writable, |this| {
                         this.on_click(cx.listener(move |this, _, _, cx| {
@@ -467,7 +790,7 @@ impl CommentsList {
                     .automation_target(format!("comments_list/menu/{key}"))
             })
             .collect();
-        let thread = menu.thread.clone();
+        let thread = thread_id.clone();
         items.push(
             item("reply", "Reply", DvIcon::MessageSquare, writable)
                 .when(writable, |this| {
@@ -484,7 +807,7 @@ impl CommentsList {
                 .bg(c.line)
                 .into_any_element(),
         );
-        let thread = menu.thread.clone();
+        let thread = thread_id.clone();
         items.push(
             item("copy", "Copy as prompt", DvIcon::Copy, true)
                 .on_click(cx.listener(move |this, _, _, cx| this.copy_thread(&thread, cx)))
@@ -510,12 +833,13 @@ impl CommentsList {
     /// Resolve (nothing waits on it) and no Copy as prompt.
     fn render_annotation_menu(
         &self,
-        menu: super::RowMenu,
+        thread: &ThreadId,
+        position: gpui::Point<gpui::Pixels>,
         writable: bool,
         theme: &DvTheme,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        let thread = menu.thread.clone();
+        let thread = thread.clone();
         let ask = menu_item(
             ElementId::Name("comments-menu-ask".into()),
             "Ask",
@@ -536,7 +860,7 @@ impl CommentsList {
             .automation_target("comments_list/menu");
         deferred(
             anchored()
-                .position(menu.position)
+                .position(position)
                 .snap_to_window_with_margin(px(8.))
                 .child(panel),
         )

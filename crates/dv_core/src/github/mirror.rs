@@ -129,6 +129,12 @@ pub struct Mirror {
     /// When it was read, in ms since the Unix epoch.
     pub read_at: u64,
     pub pr: PullRequest,
+    /// The old side of the pull request's diff at [`PullRequest::head_oid`]: the merge base
+    /// of that head and the base branch as the refresh fetched them (PLAN §9.3 step 3), which
+    /// a thread on the old side at that head is read in (PLAN §9.6). `None` in a mirror that
+    /// doesn't say.
+    #[serde(default)]
+    pub merge_base_oid: Option<Oid>,
     pub checks: Checks,
     /// Every review thread with every comment (PLAN §9.6), the viewer's own pending comments
     /// included.
@@ -239,6 +245,38 @@ pub struct GithubThread {
     pub comments: Vec<GithubComment>,
 }
 
+impl GithubThread {
+    /// Whether the thread is the viewer's own, not yet submitted: its first comment belongs
+    /// to a pending review, which only its author sees (PLAN §9.6).
+    pub fn is_pending(&self) -> bool {
+        self.comments.first().is_some_and(GithubComment::is_pending)
+    }
+
+    /// The thread on GitHub: its first comment's URL.
+    pub fn url(&self) -> Option<&str> {
+        self.comments.first().map(|comment| comment.url.as_str())
+    }
+
+    /// [`GithubThread::url`] when it is a page of `host` over https, the only kind of link
+    /// dv opens, prints or hands on for a thread (PLAN §9.6): `https://<authority>/…` whose
+    /// authority is `host` itself (so no user before it, and a port only when the mirror's
+    /// host carries one), with no whitespace and nothing that moves or hides text
+    /// (`crate::text::is_unprintable`) anywhere. What the mirror holds is GitHub's answer,
+    /// not dv's own text.
+    pub fn url_on(&self, host: &str) -> Option<&str> {
+        let url = self.url()?;
+        let (authority, _) = url.strip_prefix("https://")?.split_once('/')?;
+        (authority.eq_ignore_ascii_case(host)
+            && !url.contains(|c: char| c.is_whitespace() || crate::text::is_unprintable(c)))
+        .then_some(url)
+    }
+
+    /// Whether the thread is on the whole file.
+    pub fn is_file_level(&self) -> bool {
+        self.subject == ThreadSubject::File
+    }
+}
+
 /// What a thread is on.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -298,6 +336,15 @@ pub struct GithubComment {
     pub reply_to: Option<String>,
     /// The review the comment belongs to.
     pub review: Option<CommentReview>,
+}
+
+impl GithubComment {
+    /// Whether the comment belongs to a review that isn't submitted yet: the viewer's own.
+    pub fn is_pending(&self) -> bool {
+        self.review
+            .as_ref()
+            .is_some_and(|review| review.state == ReviewState::Pending)
+    }
 }
 
 /// The review a comment was posted with.

@@ -1,6 +1,6 @@
 //! GitHub in the app (PLAN §11 `GitHub`, §9): the app's one `gh` runner
-//! (`dv_core::github::Gh`), and the opens and refreshes of pull requests it runs off the UI
-//! thread.
+//! (`dv_core::github::Gh`), and what it runs off the UI thread: the opens and refreshes of
+//! pull requests, and Resolve / Unresolve of GitHub's threads.
 //!
 //! One runner for the whole app, so its pace holds across every review (calls one at a time,
 //! mutations a second apart, PLAN §9.2) and the viewer's login is asked once a session. It
@@ -15,7 +15,9 @@ use std::sync::Arc;
 
 use dv_cli::checks::Seams;
 use dv_core::Backend;
-use dv_core::github::{self, Gh, GhOptions, Mirror, OpenedPr, PrRef, Refreshed};
+use dv_core::github::{
+    self, Gh, GhOptions, Mirror, MirrorKey, OpenedPr, PrRef, Refreshed, Resolved,
+};
 use dv_core::review::{Pins, Review, reviewer_identity};
 use futures::channel::oneshot;
 use gpui::{AppContext as _, Context, Task};
@@ -28,6 +30,10 @@ use crate::failure::Failure;
 pub struct PrRead {
     /// The mirror to show: the one the refresh wrote, or the last one stored when it failed.
     pub mirror: Option<Arc<Mirror>>,
+    /// Whether `mirror` is one read from GitHub by this refresh (`Refreshed::fresh`), or by
+    /// the refresh of another process the session followed: what GitHub holds now, though a
+    /// draft's pins may not have moved (`stale`).
+    pub fresh: bool,
     /// Why the refresh failed, which makes `mirror` stale.
     pub stale: Option<Failure>,
     /// The review's pins after it.
@@ -40,6 +46,7 @@ impl From<Refreshed> for PrRead {
     fn from(refreshed: Refreshed) -> Self {
         Self {
             mirror: refreshed.mirror.map(|mirror| Arc::new(*mirror)),
+            fresh: refreshed.fresh,
             stale: refreshed.stale.as_ref().map(Failure::from),
             pins: refreshed.pins,
             moved_from: refreshed.moved_from,
@@ -126,6 +133,27 @@ impl GitHub {
         let job = self.run(cx, move || Ok(github::refresh(&backend, &gh, &review)));
         // The app closing cuts a refresh short: nothing read, nothing moved.
         cx.background_spawn(async move { job.await.unwrap_or_default() })
+    }
+
+    /// Resolves (`resolved`) or unresolves GitHub's thread `thread` of `review`'s pull
+    /// request, whose mirror is `key`'s, then refreshes the mirror
+    /// (`dv_core::github::set_resolved`, PLAN §9.6): dv's one write to GitHub beside a
+    /// submission. An error is the mutation's, and nothing changed; once GitHub took it,
+    /// its answer comes back beside the refresh's outcome.
+    pub fn set_resolved(
+        &mut self,
+        backend: Arc<dyn Backend>,
+        review: Review,
+        key: MirrorKey,
+        thread: String,
+        resolved: bool,
+        cx: &mut Context<Self>,
+    ) -> Task<Result<Resolved, Failure>> {
+        let gh = self.gh.clone();
+        self.run(cx, move || {
+            github::set_resolved(&backend, &gh, &review, &key, &thread, resolved)
+                .map_err(|error| Failure::from(&error))
+        })
     }
 
     /// Runs `work` on a background thread, counted until it ends whether or not the caller

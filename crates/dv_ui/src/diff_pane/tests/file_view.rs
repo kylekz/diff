@@ -193,7 +193,7 @@ fn an_unchanged_file_takes_a_comment_that_stands_in_it_not_in_the_diff(cx: &mut 
         let rows = &view.blocks[0].rows;
         let at = rows
             .iter()
-            .position(|row| row.thread() == Some(&thread.id))
+            .position(|row| row.thread().and_then(ThreadKey::local) == Some(&thread.id))
             .expect("the card is in the file view");
         assert_eq!(rows[at - 1], Row::Line(2));
     });

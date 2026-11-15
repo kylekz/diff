@@ -21,6 +21,9 @@
 //! now and where a write records them (PLAN §8), `pr` a command's `gh` and what a PR review
 //! adds to it (PLAN §9.10), `body` reads a command's text (`--body`,
 //! `--body-file`, stdin), and `commands` does the work.
+//!
+//! - [`escape`]: text dv didn't write made safe to print as text (PLAN §10.3), for the text
+//!   output and for what the app hands an agent as text.
 
 pub mod args;
 mod body;
@@ -29,6 +32,7 @@ mod commands;
 mod context;
 pub mod dto;
 pub mod error;
+pub mod escape;
 mod executable;
 mod identity;
 pub mod output;

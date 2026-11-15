@@ -2,13 +2,15 @@
 //! §9.11): the fetch and the old side ([`fetching`]), opening ([`opening`]), refreshing
 //! ([`refreshing`]), what goes with a pull
 //! request's last review ([`lifecycle`]), openers and fetches at once and a backend that
-//! fails under them ([`contending`]), and the fixture they share.
+//! fails under them ([`contending`]), GitHub's threads placed and resolved ([`threads`]), and
+//! the fixture they share.
 
 mod contending;
 mod fetching;
 mod lifecycle;
 mod opening;
 mod refreshing;
+mod threads;
 
 use std::sync::Arc;
 
@@ -76,7 +78,7 @@ impl PrFixture {
     fn answer(&self, first: Vec<Value>) {
         let mut calls = first;
         calls.push(fixture_gh::viewer(VIEWER));
-        calls.extend(self.pr.calls(self.github.name()));
+        calls.extend(self.pr.calls_in(&self.github));
         self.mock.answer(Value::Array(calls));
     }
 

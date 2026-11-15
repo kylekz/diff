@@ -616,7 +616,7 @@ impl Shell {
         let session = session.read(cx);
         // Threads whose files left the review keep the stream: its "Not in the diff" section
         // shows them, with the empty state's words and action as a row under it (DESIGN §4.1).
-        if session.threads_not_in_diff().next().is_some() {
+        if session.cards_not_in_diff().next().is_some() {
             return None;
         }
         EmptyState::of_session(session)

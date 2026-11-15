@@ -40,7 +40,9 @@
 //!
 //! **A PR review** (PLAN §9.4, §9.5, `pr`): its sides are its pins, which a refresh of its
 //! pull request moves; it is refreshed as it opens and when the reviewer asks, and follows a
-//! refresh made by another process.
+//! refresh made by another process. GitHub's threads on the pull request show beside the
+//! review's own (PLAN §9.6, `github`): read from the mirror, placed as the review's threads
+//! are, never written to its log.
 //!
 //! **Comparison** (PLAN §2.3, `comparison`): what the files and diffs are, the interdiff since
 //! a closed round or all changes. Switching ([`ReviewSession::set_comparison`]) lists again
@@ -59,6 +61,7 @@
 
 mod comparison;
 mod connection;
+mod github;
 mod history;
 mod load;
 mod placement;
@@ -78,7 +81,7 @@ use std::time::Duration;
 use dv_core::diff::{FileDiff, FileEntry, FileStatus};
 use dv_core::review::{
     Anchor, AnchorError, AnchorPlace, AnchorSide, Author, LogWarning, Review, ReviewId,
-    ReviewStore, ThreadId, anchor_selection, has_side, side_lines,
+    ReviewStore, ThreadId, ThreadKey, anchor_selection, has_side, side_lines,
 };
 use dv_core::{Backend, DiffSpec, GitRepo, Location};
 use gpui::{Context, EventEmitter, Task};
@@ -88,6 +91,7 @@ use crate::services::reviews::OpenedReview;
 use crate::syntax::FileHighlights;
 pub use comparison::{Comparison, comparison_available, default_comparison};
 use dv_core::label::{LabelContext, side_labels, target_label};
+pub use github::{Card, GithubShown, ResolveAsked};
 pub use load::Batch;
 use load::ReviewText;
 pub use placement::ThreadPlacement;
@@ -201,7 +205,8 @@ pub enum SessionEvent {
     /// draws changed, nothing else.
     AnnotationsShown,
     /// What is known of the review's pull request changed: a refresh landed, or another
-    /// process's was read (`pr`).
+    /// process's was read (`pr`); GitHub's threads on it, or a Resolve of one, with it
+    /// (`github`).
     PrChanged,
 }
 
@@ -239,8 +244,8 @@ pub struct ReviewSession {
     /// The diff each file showed before a refresh (or Retry, "Load anyway") sent it to load
     /// again; it stays on screen until the new one lands.
     previous: HashMap<String, Previous>,
-    /// Where each thread was last placed (`placement`).
-    placements: RefCell<HashMap<ThreadId, placement::Cached>>,
+    /// Where each thread, the review's own or GitHub's, was last placed (`placement`).
+    placements: RefCell<HashMap<ThreadKey, placement::Cached>>,
     /// The fuzzy step's form of each side placed against, shared by its threads.
     fuzzy: RefCell<FuzzyTables>,
     /// The review's own uncapped diffs of files whose threads the stream can't place against
@@ -320,6 +325,8 @@ pub struct ReviewSession {
     replying_to: Option<ThreadId>,
     /// A PR review's pull request as last refreshed (`pr`).
     pr: pr::PrState,
+    /// GitHub's threads on that pull request (`github`).
+    github: github::GithubState,
 }
 
 impl EventEmitter<SessionEvent> for ReviewSession {}
@@ -398,6 +405,7 @@ impl ReviewSession {
             annotations_shown: true,
             replying_to: None,
             pr: pr::PrState::default(),
+            github: github::GithubState::default(),
         };
         session.follow_connection(cx);
         // The watch first, so it is registered as early as possible; what the first list reads
@@ -455,6 +463,12 @@ impl ReviewSession {
     pub fn target_label(&self) -> String {
         pr::label(&self.review, self.pr.read.as_ref())
             .unwrap_or_else(|| target_label(&self.review.target, &self.labels))
+    }
+
+    /// The target as a prompt names it: in dv's own words alone. A pull request is
+    /// `owner/repo#482`, without its title, which its author wrote (PLAN §9.6).
+    pub fn prompt_label(&self) -> String {
+        target_label(&self.review.target, &self.labels)
     }
 
     /// What the stream's side labels call the old and the new side (`main` / `working tree`;
@@ -736,6 +750,7 @@ impl ReviewSession {
             && !self.histories_loading()
             && !self.side_reads_loading()
             && self.pr.is_settled()
+            && self.github.is_settled()
             && wanted_landed
     }
 

@@ -366,7 +366,9 @@ fn a_thread_shows_in_full() {
                 "author": {"kind": "agent", "name": "claude-code", "model": null},
                 "body": "On it.",
                 "created_at": thread.replies[0].created_at,
+                "pending": false,
             }],
+            "github": null,
         })
     );
 

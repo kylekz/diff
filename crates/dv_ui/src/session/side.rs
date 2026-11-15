@@ -337,15 +337,15 @@ impl ReviewSession {
             return;
         }
         let wanted: Vec<String> = self
-            .review
-            .live_threads()
-            .filter(|thread| {
-                matches!(
-                    self.thread_file_with(thread, self.history_for(thread)),
-                    ThreadFile::Gone
-                )
+            .cards()
+            .filter(|&card| {
+                card.is_anchored()
+                    && matches!(
+                        self.card_file_with(card, self.card_history(card)),
+                        ThreadFile::Gone
+                    )
             })
-            .map(|thread| unlisted_path(&thread.anchor, self.history_for(thread)))
+            .map(|card| unlisted_path(card.anchor(), self.card_history(card)))
             .collect();
         for path in wanted {
             self.ensure_side_file(AnchorSide::New, &path, false, cx);

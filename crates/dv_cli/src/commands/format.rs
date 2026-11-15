@@ -3,24 +3,44 @@
 //! whitespace except within a label or a comment's summary, which come last or between fixed
 //! words. Whatever a person or an agent wrote (a comment, a reply, a note, a round's summary) is
 //! indented by [`BODY_INDENT`], so it never reaches column 0, where headers and code rows stand.
+//! A path, a name or a row of code that holds a line break can't either: `output::text` spells
+//! out every control character in a line it prints (`crate::escape`).
 
+use dv_core::diff::LineKind;
+use dv_core::github::hunk_rows;
+use dv_core::review::AnchorSide;
 use dv_core::review::excerpt::{code_row, hidden_span};
 
-use crate::dto::{PrDto, ReviewDto, RoundDto, ThreadCountsDto, ThreadDto, TrailDto};
+use crate::dto::{
+    GithubCountsDto, GithubDto, PrDto, ReviewDto, RoundDto, ThreadCountsDto, ThreadDto, TrailDto,
+};
+use crate::escape;
 
 /// What every line someone wrote starts with.
 pub(crate) const BODY_INDENT: &str = "    ";
 
-/// `r-…  working tree vs main  changes_requested  round 2  1 open, 0 addressed, 2 resolved`.
+/// `r-…  working tree vs main  changes_requested  round 2  1 open, 0 addressed, 2 resolved`;
+/// a PR review whose pull request has threads of GitHub's own ends with them, counted apart
+/// (PLAN §9.6): `…  on GitHub: 5 open, 1 resolved`.
 pub(crate) fn review_line(review: &ReviewDto) -> String {
-    format!(
+    let mut line = format!(
         "{}  {}  {}  round {}  {}",
         review.id,
         review.target.label,
         review.status,
         review.round,
         counts(&review.threads)
-    )
+    );
+    let github = review.pr.as_ref().and_then(|pr| pr.threads);
+    if let Some(github) = github.filter(|github| github.open + github.resolved > 0) {
+        line.push_str(&format!("  on GitHub: {}", github_counts(&github)));
+    }
+    line
+}
+
+/// `5 open, 1 resolved`: GitHub's threads on a pull request.
+pub(crate) fn github_counts(counts: &GithubCountsDto) -> String {
+    format!("{} open, {} resolved", counts.open, counts.resolved)
 }
 
 /// A PR review's pull request: `pull request: https://github.com/acme/api/pull/482  open
@@ -64,22 +84,43 @@ pub(crate) fn thread_line(thread: &ThreadDto) -> String {
 /// under `<kind> <name>, round <n>:`, each reply under `<kind> <name>:` and the last state
 /// change's note under `<state> note:`, each body indented. A comment on the whole file has
 /// no code: one line says so ([`file_level_line`]).
+///
+/// One of GitHub's threads (PLAN §9.10) reads `as commented on GitHub` where a review's own
+/// names its round; one without a place in the diff shows the end of its diff hunk as GitHub
+/// shows it ([`hunk_lines`]) in place of its code, under `(outdated there)` when GitHub calls
+/// it outdated and `(can't be placed here)` when dv can't tell which code it is on, and that line
+/// alone when GitHub gives no hunk; its comments stand under `github <login>:` (`github
+/// <login> (pending):` for the viewer's own, not submitted yet); and its block ends with `on
+/// GitHub: <its URL>`.
 pub(crate) fn thread_block(thread: &ThreadDto) -> Vec<String> {
-    let round = thread.anchor.original.round;
+    let commented = match &thread.github {
+        Some(_) => "as commented on GitHub".to_string(),
+        None => format!("as commented in round {}", thread.anchor.original.round),
+    };
     let mut lines = vec![thread_line(thread)];
-    match &thread.excerpt {
+    match (&thread.excerpt, &thread.github) {
         _ if thread.file_level => lines.push(file_level_line(thread)),
-        Some(excerpt) => {
+        (Some(excerpt), _) => {
             lines.extend(excerpt.split('\n').map(str::to_string));
             if thread.current_code.as_deref() != Some(thread.code.as_str()) {
-                lines.push(format!("as commented in round {round}:"));
+                lines.push(format!("{commented}:"));
                 lines.extend(commented_code(&thread.code));
             }
         }
-        None => {
-            lines.push(format!(
-                "as commented in round {round} (not found in the file now):"
-            ));
+        // Read from the diff hunk alone: the code as GitHub shows it.
+        (None, Some(github)) if thread.hunk_only => {
+            let why = if github.outdated {
+                "outdated there"
+            } else {
+                "can't be placed here"
+            };
+            let rows = hunk_lines(thread, github);
+            let ends = if rows.is_empty() { "" } else { ":" };
+            lines.push(format!("{commented} ({why}){ends}"));
+            lines.extend(rows);
+        }
+        (None, _) => {
+            lines.push(format!("{commented} (not found in the file now):"));
             let (before, after) = match &thread.code_context {
                 Some(context) => (context.before.as_slice(), context.after.as_slice()),
                 None => (&[][..], &[][..]),
@@ -92,20 +133,65 @@ pub(crate) fn thread_block(thread: &ThreadDto) -> Vec<String> {
             }
         }
     }
-    lines.push(format!(
-        "{} {}, round {round}:",
-        thread.author.kind, thread.author.name
-    ));
+    let pending = |pending: bool| if pending { " (pending)" } else { "" };
+    lines.push(match &thread.github {
+        Some(github) => format!(
+            "{} {}{}:",
+            thread.author.kind,
+            thread.author.name,
+            pending(github.pending)
+        ),
+        None => format!(
+            "{} {}, round {}:",
+            thread.author.kind, thread.author.name, thread.anchor.original.round
+        ),
+    });
     lines.extend(indented(&thread.body));
     for reply in &thread.replies {
-        lines.push(format!("{} {}:", reply.author.kind, reply.author.name));
+        lines.push(format!(
+            "{} {}{}:",
+            reply.author.kind,
+            reply.author.name,
+            pending(reply.pending)
+        ));
         lines.extend(indented(&reply.body));
     }
     if let Some(note) = &thread.note {
         lines.push(format!("{} note:", thread.state));
         lines.extend(indented(note));
     }
+    if let Some(url) = thread
+        .github
+        .as_ref()
+        .and_then(|github| github.url.as_ref())
+    {
+        lines.push(format!("on GitHub: {url}"));
+    }
     lines
+}
+
+/// The end of a GitHub thread's diff hunk, as GitHub shows it above the thread
+/// (`dv_core::github::hunk_rows`): each row unnumbered, `>` on a commented line, then `+`,
+/// `-` or a space as the hunk marks it; nothing for a thread GitHub gives no hunk.
+fn hunk_lines(thread: &ThreadDto, github: &GithubDto) -> Vec<String> {
+    let original = &thread.anchor.original;
+    let side = match thread.side {
+        "old" => AnchorSide::Old,
+        _ => AnchorSide::New,
+    };
+    let count = original.end_line.saturating_sub(original.start_line) + 1;
+    hunk_rows(&github.diff_hunk, side, count)
+        .iter()
+        .map(|row| {
+            let mark = if row.commented { '>' } else { ' ' };
+            let sign = match row.kind {
+                LineKind::Added => '+',
+                LineKind::Removed => '-',
+                LineKind::Context => ' ',
+            };
+            code_row(&format!("{mark} {sign} |"), &row.text)
+        })
+        .collect()
 }
 
 /// What a comment on the whole file is about (PLAN §10.3): `on the whole file`; once its file
@@ -221,6 +307,9 @@ pub(crate) fn round_line(round: &RoundDto) -> String {
 /// file's lines as they are now; the GUI names it the same way (DESIGN §4.1). A comment on the
 /// whole file is `src/a.ts (file)`, `(file, old)` on the old side, `(file, not in the diff)` on
 /// a file the review doesn't change and `(file, outdated)` once its file is gone or deleted.
+/// One of GitHub's threads without a place in the diff is `src/a.ts (outdated on GitHub, was
+/// 12)` when GitHub calls it outdated, and `src/a.ts (can't be placed here, was 12)` when dv can't
+/// tell which code it is on.
 pub(crate) fn location(thread: &ThreadDto) -> String {
     if thread.file_level {
         let mut notes = vec!["file"];
@@ -255,7 +344,11 @@ pub(crate) fn location(thread: &ThreadDto) -> String {
             )
         }
         None => {
-            notes.push(format!("outdated, was {was}"));
+            notes.push(match &thread.github {
+                Some(github) if github.outdated => format!("outdated on GitHub, was {was}"),
+                Some(_) if thread.hunk_only => format!("can't be placed here, was {was}"),
+                _ => format!("outdated, was {was}"),
+            });
             if let Some(trail) = &thread.trail {
                 notes.push(
                     match (trail.start_line, trail.end_line, trail.before_line) {
@@ -288,8 +381,7 @@ pub(crate) fn lines(start: u32, end: u32) -> String {
 /// The first line of `text` that has anything on it, trimmed and cut at 100 characters.
 pub(crate) fn first_line(text: &str) -> String {
     const MAX: usize = 100;
-    let line = text
-        .lines()
+    let line = escape::breaks(text)
         .map(str::trim)
         .find(|line| !line.is_empty())
         .unwrap_or("");
@@ -303,9 +395,11 @@ pub(crate) fn first_line(text: &str) -> String {
 
 /// `text`'s lines, each indented by [`BODY_INDENT`] and without whitespace at its end; a blank
 /// line stays empty. (A Markdown hard break, two spaces at a line's end, reads as a line break
-/// here anyway.)
+/// here anyway.) A line ends at `\n`, `\r\n` or a lone `\r` (`escape::breaks`), so nothing in
+/// a body reaches column 0; what else would move the cursor is spelled out when the line is
+/// printed (`output::text`).
 pub(crate) fn indented(text: &str) -> Vec<String> {
-    text.lines()
+    escape::breaks(text)
         .map(|line| {
             let line = line.trim_end();
             if line.is_empty() {

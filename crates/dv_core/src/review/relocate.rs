@@ -723,9 +723,15 @@ impl Placement {
 /// recording either on the next event changes nothing anyone sees. The GUI's "· moved" and the
 /// CLI's `placement: "moved"` both mean this.
 pub fn shows_moved(thread: &Thread, placement: &Placement) -> bool {
-    let first = thread.first_anchor();
+    moved_since(thread.first_anchor(), &thread.anchor, placement)
+}
+
+/// [`shows_moved`] for a thread anchored at `anchor` now and written on `first`: one of
+/// GitHub's (PLAN §9.6), whose two are the same anchor, is moved wherever relocation finds it
+/// at other lines than GitHub has it at.
+pub fn moved_since(first: &Anchor, anchor: &Anchor, placement: &Placement) -> bool {
     placement
-        .lines(&thread.anchor)
+        .lines(anchor)
         .is_some_and(|(start, _)| start != first.start_line)
 }
 
@@ -734,7 +740,13 @@ pub fn shows_moved(thread: &Thread, placement: &Placement) -> bool {
 /// event recorded whose text isn't the text it was written on. The CLI's `placement:
 /// "edited"`; the GUI marks nothing for it, since nothing moved.
 pub fn shows_edited(thread: &Thread, placement: &Placement) -> bool {
-    if shows_moved(thread, placement) {
+    edited_since(thread.first_anchor(), &thread.anchor, placement)
+}
+
+/// [`shows_edited`] for a thread anchored at `anchor` now and written on `first`
+/// ([`moved_since`]).
+pub fn edited_since(first: &Anchor, anchor: &Anchor, placement: &Placement) -> bool {
+    if moved_since(first, anchor, placement) {
         return false;
     }
     match placement {
@@ -747,7 +759,7 @@ pub fn shows_edited(thread: &Thread, placement: &Placement) -> bool {
             ..
         } => true,
         Placement::Unchanged { .. } | Placement::Moved { .. } | Placement::Unlisted { .. } => {
-            thread.anchor.text != thread.first_anchor().text
+            anchor.text != first.text
         }
         Placement::Pending { .. }
         | Placement::Outdated { .. }
@@ -860,8 +872,24 @@ pub fn place_thread<L: SideLines>(
     history: History<'_>,
     text: impl FnOnce(&FileEntry, AnchorSide) -> SideText<L>,
 ) -> Placement {
-    let anchor = &thread.anchor;
-    let entry = match thread_file(anchor, history, |path, old| entry_for(path, old, entries)) {
+    place_anchor(
+        &thread.anchor,
+        |path, old| entry_for(path, old, entries),
+        history,
+        text,
+    )
+}
+
+/// [`place_thread`] for an anchor alone, its file looked up through `find` ([`thread_file`]):
+/// the review's own threads by [`entry_for`] over the list, GitHub's (PLAN §9.6,
+/// `crate::github::threads`) by a rule that also follows a rename back.
+pub fn place_anchor<'e, L: SideLines>(
+    anchor: &Anchor,
+    find: impl Fn(&str, Option<&str>) -> Option<&'e FileEntry>,
+    history: History<'_>,
+    text: impl FnOnce(&FileEntry, AnchorSide) -> SideText<L>,
+) -> Placement {
+    let entry = match thread_file(anchor, history, find) {
         ThreadFile::Found(entry) => entry,
         ThreadFile::Pending(entry) => {
             return Placement::Pending {
@@ -954,7 +982,16 @@ pub fn place_unlisted<L: SideLines>(
     present: bool,
     text: SideText<L>,
 ) -> Placement {
-    let anchor = &thread.anchor;
+    place_unlisted_anchor(&thread.anchor, path, present, text)
+}
+
+/// [`place_unlisted`] for an anchor alone.
+pub fn place_unlisted_anchor<L: SideLines>(
+    anchor: &Anchor,
+    path: &str,
+    present: bool,
+    text: SideText<L>,
+) -> Placement {
     let gone = Placement::Outdated {
         file: None,
         trail: None,

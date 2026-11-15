@@ -1,5 +1,7 @@
 //! Printing (docs/PLAN.md §10.3): with `--json` one JSON document on stdout ([`json`]), else
-//! short stable lines without colour ([`text`]); errors always on stderr, and with `--json` also
+//! short stable lines without colour ([`text`]), what would break or redraw a line spelled
+//! out (`escape`), as it is on stderr, where a message that holds a line break goes on
+//! indented ([`message`]); errors always on stderr, and with `--json` also
 //! as `{"schema": 1, "error": {…}}` on stdout ([`error`]), clap's own parse errors included
 //! ([`parse_error`]).
 
@@ -11,6 +13,7 @@ use serde::Serialize;
 use crate::context::Context;
 use crate::dto::{Document, ErrorDoc, ErrorDto};
 use crate::error::{CliError, Exit, code};
+use crate::escape;
 
 /// Prints `body` as one compact JSON document, `"schema": 1` first, and a newline.
 pub(crate) fn json<T: Serialize>(ctx: &mut Context, body: &T) -> Result<(), CliError> {
@@ -24,11 +27,13 @@ pub(crate) fn json<T: Serialize>(ctx: &mut Context, body: &T) -> Result<(), CliE
     write_out(ctx, &format!("{text}\n"))
 }
 
-/// Prints `lines` on stdout, each ending in a newline.
+/// Prints `lines` on stdout, each ending in a newline and each one line whatever is in it
+/// (`escape::line`): a path, a name or a comment dv didn't write can hold a line break or a
+/// terminal escape, and may not start a line of its own or redraw the terminal (PLAN §10.3).
 pub(crate) fn text(ctx: &mut Context, lines: &[String]) -> Result<(), CliError> {
     let mut out = String::new();
     for line in lines {
-        out.push_str(line);
+        out.push_str(&escape::line(line));
         out.push('\n');
     }
     write_out(ctx, &out)
@@ -77,30 +82,46 @@ pub(crate) fn warning(ctx: &mut Context, text: &str) -> Result<(), CliError> {
 /// Prints `dv: <text>` on stderr: what a command does besides its work, which a person waits
 /// on (installing dv in a distro). Best effort, like [`error`].
 pub(crate) fn notice(ctx: &mut Context, text: &str) {
-    let _ = ctx.stderr.write_all(format!("dv: {text}\n").as_bytes());
+    let mut text = message(text).join("\n");
+    text.push('\n');
+    let _ = ctx.stderr.write_all(text.as_bytes());
     let _ = ctx.stderr.flush();
 }
 
-/// Reports `error`: `dv: <message>` on stderr, then its candidates (`id  label  status  round
-/// n  worktree`, PLAN §10.2: the worktree tells apart two worktrees' reviews whose labels read
-/// the same) and its detail; with `json` also the error document on stdout. Returns its exit
-/// code. Printing is best effort: a closed stream can't report anything anyway.
+/// `text` as stderr prints a message (PLAN §10.3): `dv: ` and its first line, then each
+/// line after a line break indented two spaces, as an error's detail is, so nothing a
+/// message holds (a path, a name) starts a line that reads as dv's own; each line escaped
+/// (`escape::line`).
+fn message(text: &str) -> Vec<String> {
+    let mut lines = escape::breaks(text).map(escape::line);
+    let first = lines.next().unwrap_or_default();
+    std::iter::once(format!("dv: {first}"))
+        .chain(lines.map(|line| format!("  {line}")))
+        .collect()
+}
+
+/// Reports `error`: `dv: <message>` on stderr ([`message`]), then its candidates (`id  label
+/// status  round n  worktree`, PLAN §10.2: the worktree tells apart two worktrees' reviews
+/// whose labels read the same) and its detail, each line indented and escaped; with `json`
+/// also the error document on stdout. Returns its exit code. Printing is best effort: a
+/// closed stream can't report anything anyway.
 pub fn error(ctx: &mut Context, json: bool, error: &CliError) -> Exit {
-    let mut lines = vec![format!("dv: {}", error.message)];
+    let mut lines = message(&error.message);
     if let Some(candidates) = &error.candidates {
         lines.extend(candidates.iter().map(|candidate| {
-            format!(
+            let line = format!(
                 "  {}  {}  {}  round {}  {}",
                 candidate.id,
                 candidate.label,
                 candidate.status,
                 candidate.round,
                 candidate.worktree
-            )
+            );
+            escape::line(&line).into_owned()
         }));
     }
     if let Some(detail) = &error.detail {
-        lines.extend(detail.lines().map(|line| format!("  {line}")));
+        lines.extend(escape::breaks(detail).map(|line| format!("  {}", escape::line(line))));
     }
     let mut text = lines.join("\n");
     text.push('\n');
@@ -123,7 +144,10 @@ pub fn error(ctx: &mut Context, json: bool, error: &CliError) -> Exit {
 /// Reports a command line clap couldn't parse, given the arguments it was parsing (the program
 /// name first). `--help` and `--version` print on stdout and exit 0; a real error prints on
 /// stderr and exits 2, and when `--json` is anywhere on the line it is also the JSON error
-/// document (`usage`) on stdout, so an agent that asked for JSON always gets JSON.
+/// document (`usage`) on stdout, so an agent that asked for JSON always gets JSON. clap
+/// quotes what was typed in its errors: each of their lines is escaped as dv's own are, and
+/// when an argument itself holds a line break, every line after the first is indented, so
+/// what follows the break in clap's quote of it starts no line.
 pub fn parse_error(error: &clap::Error, args: &[OsString], ctx: &mut Context) -> Exit {
     let rendered = error.render().to_string();
     if error.exit_code() == 0 {
@@ -131,7 +155,22 @@ pub fn parse_error(error: &clap::Error, args: &[OsString], ctx: &mut Context) ->
         let _ = ctx.stdout.flush();
         return Exit::Ok;
     }
-    let _ = ctx.stderr.write_all(rendered.as_bytes());
+    let broken = args
+        .iter()
+        .any(|arg| arg.to_string_lossy().contains(['\n', '\r']));
+    let lines: Vec<String> = rendered
+        .split('\n')
+        .enumerate()
+        .map(|(index, line)| {
+            let line = escape::line(line);
+            if broken && index > 0 && !line.is_empty() && !line.starts_with(' ') {
+                format!("  {line}")
+            } else {
+                line.into_owned()
+            }
+        })
+        .collect();
+    let _ = ctx.stderr.write_all(lines.join("\n").as_bytes());
     let _ = ctx.stderr.flush();
     if asks_for_json(args) {
         let message = match error.kind() {

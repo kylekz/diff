@@ -74,7 +74,18 @@ fn header_files_must_exist_beside_the_scenario() {
 #[test]
 fn actions_parse_and_reject_unknown_options() {
     let parse = |json: Value| serde_json::from_value::<DvAction>(json);
-    assert_eq!(parse(json!({"gh_log": {}})).unwrap(), DvAction::GhLog {});
+    assert_eq!(
+        parse(json!({"gh_log": {}})).unwrap(),
+        DvAction::GhLog {
+            stdin_contains: None
+        }
+    );
+    assert_eq!(
+        parse(json!({"gh_log": {"stdin_contains": "resolveReviewThread("}})).unwrap(),
+        DvAction::GhLog {
+            stdin_contains: Some("resolveReviewThread(".to_string())
+        }
+    );
     assert_eq!(
         parse(json!({"lsp_log": {}})).unwrap(),
         DvAction::LspLog { wait_ms: None }
@@ -214,16 +225,48 @@ fn logs_read_as_arrays_and_lsp_log_waits() {
     let dir = tempfile::tempdir().unwrap();
     let out = dir.path().join("out");
     let mut plain = fixture(&DvHeader::default(), dir.path(), &out);
-    assert_eq!(plain.run(&DvAction::GhLog {}).unwrap(), json!([]));
+    assert_eq!(
+        plain
+            .run(&DvAction::GhLog {
+                stdin_contains: None,
+            })
+            .unwrap(),
+        json!([])
+    );
     std::fs::write(
         out.join(GH_LOG_FILE),
         "{\"argv\": [\"pr\", \"view\"]}\n\n{\"argv\": [\"api\"]}\n",
     )
     .unwrap();
     assert_eq!(
-        plain.run(&DvAction::GhLog {}).unwrap(),
+        plain
+            .run(&DvAction::GhLog {
+                stdin_contains: None,
+            })
+            .unwrap(),
         json!([{"argv": ["pr", "view"]}, {"argv": ["api"]}])
     );
+    // Only the calls whose stdin holds the text asked for.
+    std::fs::write(
+        out.join(GH_LOG_FILE),
+        "{\"argv\": [\"api\"], \"stdin\": \"{ resolveReviewThread(\"}\n\
+         {\"argv\": [\"pr\"], \"stdin\": null}\n\
+         {\"argv\": [\"api\"], \"stdin\": \"{ unresolveReviewThread(\"}\n",
+    )
+    .unwrap();
+    let mut asked = |text: &str| {
+        plain
+            .run(&DvAction::GhLog {
+                stdin_contains: Some(text.to_string()),
+            })
+            .unwrap()
+    };
+    assert_eq!(asked("esolveReviewThread(").as_array().unwrap().len(), 2);
+    assert_eq!(
+        asked("{ resolveReviewThread("),
+        json!([{"argv": ["api"], "stdin": "{ resolveReviewThread("}])
+    );
+    assert_eq!(asked("reviewThreads"), json!([]));
     std::fs::write(out.join(LSP_LOG_FILE), "not json\n").unwrap();
     let err = read_log(&out.join(LSP_LOG_FILE)).unwrap_err();
     assert!(
@@ -231,7 +274,12 @@ fn logs_read_as_arrays_and_lsp_log_waits() {
         "{err:#}"
     );
 
-    assert_eq!(plain.retry_for(&DvAction::GhLog {}), None);
+    assert_eq!(
+        plain.retry_for(&DvAction::GhLog {
+            stdin_contains: None,
+        }),
+        None
+    );
     assert_eq!(
         plain.retry_for(&DvAction::LspLog {
             wait_ms: Some(3000)

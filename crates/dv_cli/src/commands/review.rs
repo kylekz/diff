@@ -92,6 +92,12 @@ fn show_text(review: &ReviewDto) -> Vec<String> {
     ];
     if let Some(pr) = &review.pr {
         lines.push(format::pr_line(pr));
+        if let Some(threads) = &pr.threads {
+            lines.push(format!(
+                "threads on GitHub: {}",
+                format::github_counts(threads)
+            ));
+        }
     }
     lines.extend(review.submissions.iter().map(|submission| {
         format!(

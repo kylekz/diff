@@ -21,7 +21,7 @@ use dv_core::diff::{
     DiffLine, FileDiff, HunkRange, LineKind, Segment, TextDiff, hunk_range, split_rows,
 };
 use dv_core::git::Oid;
-use dv_core::review::{AnchorSide, ThreadId};
+use dv_core::review::{AnchorSide, ThreadKey};
 
 use crate::services::ViewMode;
 
@@ -117,10 +117,11 @@ pub struct Gap {
     pub below: bool,
 }
 
-/// What goes between rows: a thread card or the composer.
+/// What goes between rows: a thread card (one of the review's own threads or one of GitHub's,
+/// PLAN §9.6) or the composer.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum InsertItem {
-    Thread(ThreadId),
+    Thread(ThreadKey),
     Composer,
 }
 
@@ -219,7 +220,7 @@ impl Row {
     }
 
     /// The thread whose card this row is, if it is one.
-    pub fn thread(&self) -> Option<&ThreadId> {
+    pub fn thread(&self) -> Option<&ThreadKey> {
         match self {
             Self::Insert(Insert {
                 item: InsertItem::Thread(id),

@@ -83,7 +83,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use dv_core::diff::{DiffLine, Expand, FileDiff, Segment, expand_gap};
-use dv_core::review::{AnchorSide, ThreadId};
+use dv_core::review::{AnchorSide, ThreadId, ThreadKey};
 use gpui::{
     App, Context, Entity, EventEmitter, FocusHandle, Focusable, ListAlignment, ListOffset,
     ListState, Pixels, Point, Subscription, Task, px,
@@ -92,7 +92,7 @@ use gpui::{
 use crate::failure::Failure;
 use crate::services::{ActiveServices as _, ViewMode};
 use crate::session::{Comparison, FileState, ReviewSession, SessionEvent};
-use crate::thread::Composer;
+use crate::thread::{Composer, GithubNotice};
 pub use find::{FIND_DEBOUNCE, FindSummary};
 use rows::{
     Content, InsertItem, LinePos, Row, RowKey, RowsSpec, file_rows, selected_numbers, side_number,
@@ -281,25 +281,36 @@ pub struct DiffPane {
     composer_focus: Option<FocusHandle>,
     /// A frame is about to hand the keyboard back to the stream.
     refocus_pending: bool,
-    /// The keyboard's thread: `]`/`[` move it, `R` replies to it, `X` resolves it.
-    focused_thread: Option<ThreadId>,
+    /// The keyboard's thread, one of the review's own or one of GitHub's (PLAN §9.6):
+    /// `]`/`[` move it, `R` replies to it, `X` resolves it.
+    focused_thread: Option<ThreadKey>,
     /// A thread shown before its card was built (its file loading, or collapsed): it is
     /// scrolled into view once the card is there.
-    pending_thread: Option<ThreadId>,
+    pending_thread: Option<ThreadKey>,
     /// A thread shown while another comparison was being listed: it is shown again once the
     /// list lands (the comments list's "all changes" rows, `threads`).
-    reveal_after_listing: Option<ThreadId>,
+    reveal_after_listing: Option<ThreadKey>,
     /// A draft the comparison shown can't hold, asked for (`C`) while all changes are being
     /// listed: it takes the keyboard once its row is there (`threads`).
     focus_composer_after_listing: bool,
     /// Frames to wait before the composer's row is brought wholly into view: it was just opened
     /// or grew, and its height is known once the list has laid it out again (`threads`).
     reveal_composer_in: u8,
+    /// The focused thread's card being placed again over the frames after it was revealed
+    /// (`threads`, `reveal_laid_out_thread`): the scroll that showed it worked from the
+    /// heights of the cards on the way as last laid out, which aren't final yet. `None`
+    /// once the card stays where it was placed, something else scrolled the stream, or the
+    /// frames ran out.
+    revealing: Option<threads::Revealing>,
     /// A reply asked for (the comments list's menu) before its thread's card was built: the
     /// reply composer opens in the card once it is (`threads`).
     reply_when_shown: Option<ThreadId>,
     /// Resolved threads the reviewer opened; the rest show collapsed (DESIGN §4.1).
-    opened_threads: HashSet<ThreadId>,
+    opened_threads: HashSet<ThreadKey>,
+    /// The GitHub thread whose card says why a key did nothing on it (`R`: replying arrives
+    /// with submitting; `X`: GitHub doesn't let the viewer, PLAN §9.6), by node id, until
+    /// another thread takes the keyboard.
+    github_notice: Option<(String, GithubNotice)>,
     /// Why the last change to a thread's state failed, by thread.
     thread_error: Option<(ThreadId, Failure)>,
     /// Posts and thread-state changes whose follow-up hasn't landed.
@@ -388,8 +399,10 @@ impl DiffPane {
             reveal_after_listing: None,
             focus_composer_after_listing: false,
             reveal_composer_in: 0,
+            revealing: None,
             reply_when_shown: None,
             opened_threads: HashSet::new(),
+            github_notice: None,
             thread_error: None,
             writes: 0,
             text_selection: None,
@@ -418,10 +431,12 @@ impl DiffPane {
                     cx.subscribe(session, |this, _, event: &SessionEvent, cx| match event {
                         SessionEvent::FilesChanged => this.rebuild_all(cx),
                         SessionEvent::FileLoaded(path) => this.file_changed(path, cx),
+                        // GitHub's threads come and change with the pull request's mirror.
                         SessionEvent::ReviewChanged
                         | SessionEvent::HistoryLoaded
-                        | SessionEvent::AnnotationsShown => this.refresh_blocks(cx),
-                        SessionEvent::Error | SessionEvent::PrChanged => cx.notify(),
+                        | SessionEvent::AnnotationsShown
+                        | SessionEvent::PrChanged => this.refresh_blocks(cx),
+                        SessionEvent::Error => cx.notify(),
                         SessionEvent::WorktreeChanged { .. } => {}
                     }),
                     cx.observe(session, |this, _, cx| {
@@ -463,8 +478,10 @@ impl DiffPane {
         self.reveal_after_listing = None;
         self.focus_composer_after_listing = false;
         self.reveal_composer_in = 0;
+        self.revealing = None;
         self.reply_when_shown = None;
         self.opened_threads.clear();
+        self.github_notice = None;
         self.thread_error = None;
         self.clear_text_selection();
         self.caret = None;
@@ -517,10 +534,11 @@ impl DiffPane {
         self.h_offset
     }
 
-    /// Nothing is waiting on the next frame, and no post or thread change is on its way:
-    /// automation's `settled`.
+    /// Nothing is waiting on the next frame (a revealed card still being placed among
+    /// them), and no post or thread change is on its way: automation's `settled`.
     pub fn is_settled(&self) -> bool {
         !self.viewport_pending
+            && self.revealing.is_none()
             && self.writes == 0
             && !self.find_pending()
             && !self.hover_ui.is_waiting()

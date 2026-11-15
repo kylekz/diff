@@ -32,7 +32,7 @@ impl DiffPane {
         let count = self
             .session
             .as_ref()
-            .map_or(0, |session| session.read(cx).threads_not_in_diff().count());
+            .map_or(0, |session| session.read(cx).cards_not_in_diff().count());
         let collapsed = match self.blocks.get(block).and_then(|block| block.rows.first()) {
             Some(&Row::Header { collapsed, .. }) => collapsed && !pinned,
             _ => false,
@@ -69,7 +69,6 @@ impl DiffPane {
                 this.set_open(SECTION, collapsed, cx);
             }))
             .automation_target(format!("{base}/chevron"));
-        let noun = if count == 1 { "comment" } else { "comments" };
         div()
             .flex()
             .items_center()
@@ -98,7 +97,7 @@ impl DiffPane {
                     .truncate()
                     .text_spec(&theme.text.secondary)
                     .text_color(c.fg3)
-                    .child(format!("{noun} on files the review doesn't change now")),
+                    .child(self.section_subtitle(cx)),
             )
             .automation_target(if pinned {
                 base

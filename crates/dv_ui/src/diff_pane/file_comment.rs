@@ -10,7 +10,7 @@
 //! file's new side, or its old side for a deleted file; an interdiff's old column is a round's
 //! snapshot, so there a deleted file takes none, as `C` takes no comment on that column.
 
-use dv_core::review::ThreadId;
+use dv_core::review::ThreadKey;
 use gpui::{App, Context, Window};
 
 use super::DiffPane;
@@ -25,19 +25,18 @@ pub(super) fn heading_items(
     path: &str,
     session: &ReviewSession,
     composer: Option<&ComposerTarget>,
-    outdated: Vec<ThreadId>,
+    outdated: Vec<ThreadKey>,
 ) -> Vec<InsertItem> {
     let mut items: Vec<InsertItem> = session
-        .review()
-        .live_threads()
-        .filter(|thread| thread.anchor.is_file_level())
-        .filter(|thread| {
-            let placement = session.placement(thread);
+        .cards()
+        .filter(|card| card.anchor().is_file_level())
+        .filter(|&card| {
+            let placement = session.card_placement(card);
             placement.file() == Some(path)
                 && !placement.is_pending()
-                && session.shows_card(thread, &placement)
+                && session.shows(card, &placement)
         })
-        .map(|thread| InsertItem::Thread(thread.id.clone()))
+        .map(|card| InsertItem::Thread(card.key()))
         .collect();
     if composer.is_some_and(|target| target.is_file() && target.path == path) {
         items.push(InsertItem::Composer);

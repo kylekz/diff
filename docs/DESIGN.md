@@ -509,7 +509,8 @@ inactive: material falls back to its inactive appearance (OS-managed); dv dims n
   while a review is open; **Reviews**, every repository's targets and open reviews as the
   switcher lists them (the switcher's glyph, the repository's name at 500, the label in `fg2`,
   an open review's status chip and "round n" in `fg3`); **Files**, once something is typed with
-  a review open, the file finder's first five matches as its rows show them. A command passes
+  a review open, the file finder's first five matches as its rows show them. A query that is a
+  PR reference puts **Pull request** before them all (§4.5). A command passes
   when every typed word is in its title or the few other words it is known by; reviews filter
   as in the switcher. 30-high rows radius 6, the selected one on `sel`; the first row is
   selected and `↑`/`↓` move across the sections, wrapping. A 40-high footer holds the keys (`↑`
@@ -888,6 +889,17 @@ Setup unchanged.
   title; a reference the field parses opens directly on `Enter`. While the list loads it shows
   the session's last list, else a shimmer row; a failure shows the setup check's words ("Sign in
   to GitHub: `gh auth login`") in place of the list, the field still working.
+- **The palette's PR row** (`Ctrl K`, §4.1; PLAN §9.9): a query that is a PR's URL or
+  `owner/repo#n` (`#n` for the repository in view) puts a **Pull request** section first, there
+  as soon as the text is. A row per known clone of that repository, the most recently opened
+  first: GitHub's mark (`fg2`), "Open pull request" at 500, `acme/frontend#482` in mono `fg2`,
+  the PR's title in `fg2` when the session's PR list has it, and at the right the clone's name
+  in `fg3` as the switcher names it, only when there are several rows. No clone known: one row,
+  a `folder` glyph, "acme/frontend isn't open in dv yet" and **Choose its folder** in accent;
+  `Enter` opens the folder picker, and a folder that isn't that repository leaves the palette
+  open with why in `red` under the row ("`~/code/web` is acme/web, not acme/frontend"). `Enter`
+  on a clone's row closes the palette and opens the PR, the window moving to that repository;
+  an open that fails shows where a review's does.
 - **PR strip** (§2: under the title bar, `chrome`, 34 high, PR reviews only): `#482` mono `fg3`,
   the title `fg1` 13 semibold (truncated), the author, `base ← head` in mono 12 (`owner:head` for
   a fork), the PR's state chip (Open accent, Draft grey, Merged violet, Closed red), the checks as

@@ -10,6 +10,7 @@
 pub mod backend;
 pub mod diff;
 pub mod git;
+pub mod github;
 pub mod job;
 pub mod label;
 pub mod location;
@@ -19,6 +20,7 @@ pub mod target;
 pub use backend::{Backend, BackendError, LocalBackend, LocalBackendOptions, RepoInfo};
 pub use diff::{DiffError, FileDiff, FileEntry, TextDiff};
 pub use git::{GitError, GitRepo, ObjectFormat, Oid};
+pub use github::{Gh, GithubError, GithubRepo, PrRef};
 pub use label::{LabelContext, side_labels, target_label};
 pub use location::{Location, LocationError};
 pub use review::{Review, ReviewId, ReviewStore, StoreError};

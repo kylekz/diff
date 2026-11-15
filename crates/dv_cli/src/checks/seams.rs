@@ -13,7 +13,7 @@ use super::user_path::{MACHINE_PATH_FILE_VAR, USER_PATH_FILE_VAR, UserPath};
 use crate::context::{Context, Env};
 
 /// The variable naming the program dv runs as `gh` (PLAN D7; tests point it at `mock_gh`).
-pub const GH_VAR: &str = "DV_GH";
+pub use dv_core::github::GH_VAR;
 
 /// The variable that, when set, names the only WSL distros the checks may reach, separated by
 /// commas (empty: none): an automation run's, and its `cli` children's (CLAUDE.md).
@@ -91,9 +91,7 @@ impl Seams {
             ),
             vars: env.clone(),
             exe: crate::this_executable(env).ok(),
-            gh: env
-                .non_empty(GH_VAR)
-                .map_or_else(|| OsString::from("gh"), OsString::from),
+            gh: dv_core::github::program(env.non_empty(GH_VAR).map(OsString::from)),
             child_env,
             linux_dir: install::linux_dir(env.var(LINUX_DIR_VAR)),
             wsl_home: env.var_lossy(WSL_HOME_VAR),

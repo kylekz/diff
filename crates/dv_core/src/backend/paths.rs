@@ -27,8 +27,9 @@ pub(crate) fn worktree_path(root: &Path, rel: &str) -> Result<PathBuf, BackendEr
 }
 
 /// `rel` joined onto the store root, after validation. Store names are dv's own (`reviews/
-/// r-<ulid>.jsonl`), so components are limited to ASCII letters, digits, `.`, `_` and `-`, and
-/// may not start with `.`. An empty `rel` is the store root itself when `allow_root` is set.
+/// r-<ulid>.jsonl`), so components are limited to ASCII letters, digits, `.`, `_`, `-` and
+/// `%` (the escape a GitHub name is spelled with, `github/<host>/…`, PLAN §9.4), and may not
+/// start with `.`. An empty `rel` is the store root itself when `allow_root` is set.
 pub(crate) fn store_path(
     root: &Path,
     rel: &str,
@@ -42,11 +43,11 @@ pub(crate) fn store_path(
         if component.starts_with('.') {
             return Err(invalid(rel, "a store path component starts with '.'"));
         }
-        let plain = |c: char| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-');
+        let plain = |c: char| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-' | '%');
         if !component.chars().all(plain) {
             return Err(invalid(
                 rel,
-                "store paths use only ASCII letters, digits, '.', '_' and '-'",
+                "store paths use only ASCII letters, digits, '.', '_', '-' and '%'",
             ));
         }
     }
@@ -241,7 +242,12 @@ mod tests {
     #[test]
     fn store_paths_are_plain_names() {
         let root = Path::new("store");
-        for ok in ["reviews/r-01hzy.jsonl", "reviews/r-01hzy.state.json", "x"] {
+        for ok in [
+            "reviews/r-01hzy.jsonl",
+            "reviews/r-01hzy.state.json",
+            "x",
+            "github/ghe.example.com%3a8443/acme/%2egithub/pr-7/kylekz.json",
+        ] {
             assert!(store_path(root, ok, false).is_ok(), "{ok}");
         }
         assert_eq!(store_path(root, "", true).unwrap(), root);

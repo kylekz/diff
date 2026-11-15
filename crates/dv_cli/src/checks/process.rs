@@ -1,4 +1,5 @@
-//! Running the small programs the checks ask (git, `gh`) through `toolbox_process`: to their
+//! Running the small programs the checks ask (git; `gh` runs through `dv_core::github::Gh`,
+//! which does the same) through `toolbox_process`: to their
 //! end or a timeout, stdin empty, output collected, no console window (the app runs detached,
 //! and a console child of it would flash one), in a tree of their own that dies with dv.
 
@@ -14,12 +15,6 @@ pub(crate) struct Ran {
     pub code: Option<i32>,
     pub stdout: String,
     pub stderr: String,
-}
-
-impl Ran {
-    pub fn success(&self) -> bool {
-        self.code == Some(0)
-    }
 }
 
 /// Runs `command` to its end, killing it and everything it started after `timeout`

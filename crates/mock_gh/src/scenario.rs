@@ -4,13 +4,15 @@
 //! {"calls": [
 //!   {"argv": ["pr", "view", "482", "--json", "*"], "stdout": {"number": 482}, "times": 1},
 //!   {"argv": ["api", "**"], "stdin_contains": "\"event\":\"REQUEST_CHANGES\"", "stdout": {"id": 7}},
-//!   {"argv": ["api", "**"], "stderr": "gh: HTTP 422\n", "exit": 1}
+//!   {"argv": ["api", "**"], "stderr": "gh: HTTP 422\n", "exit": 1},
+//!   {"argv": ["pr", "list", "**"], "stdout": [], "delay_ms": 2000}
 //! ]}
 //! ```
 //!
 //! An `argv` pattern is an exact string, `"*"` (any one argument) or `"**"` (all remaining
 //! arguments, none included; only last). The first entry whose pattern and `stdin_contains` match
-//! and that has calls left (`times`, unlimited when absent) answers.
+//! and that has calls left (`times`, unlimited when absent) answers, after `delay_ms` when it
+//! has one (a GitHub that is slow to answer, or never does within the caller's timeout).
 
 use std::path::Path;
 
@@ -34,6 +36,8 @@ pub struct Entry {
     pub exit: u8,
     /// How many calls this entry answers over the whole call log; `None` is unlimited.
     pub times: Option<u32>,
+    /// How long the answer takes, in ms.
+    pub delay_ms: u64,
 }
 
 /// One element of an entry's `argv`.
@@ -62,6 +66,8 @@ struct RawEntry {
     #[serde(default)]
     exit: u8,
     times: Option<u32>,
+    #[serde(default)]
+    delay_ms: u64,
 }
 
 impl Scenario {
@@ -119,6 +125,7 @@ impl Entry {
             stderr: raw.stderr,
             exit: raw.exit,
             times: raw.times,
+            delay_ms: raw.delay_ms,
         })
     }
 
@@ -171,6 +178,7 @@ mod tests {
             stderr: None,
             exit: 0,
             times: None,
+            delay_ms: 0,
         })
         .unwrap()
     }

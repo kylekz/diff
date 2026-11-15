@@ -38,7 +38,7 @@ use dv_core::review::{
     Verdict, anchor_selection, ops,
 };
 use dv_core::target::Target;
-use dv_test_support::FixtureRepo;
+use dv_test_support::{FixtureRepo, mock_gh};
 use serde_json::Value;
 
 use crate::{Context, Env, Exit};
@@ -142,21 +142,6 @@ pub(crate) struct Fixture {
 /// A folder without a Linux build of dv (module docs of [`Fixture::env`]).
 pub(crate) fn no_linux_build() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("no-linux-build")
-}
-
-/// `mock_gh`, the fake `gh` (PLAN §14.2), where cargo builds it beside this test executable
-/// (`target/debug/deps`'s parent): `cargo test --workspace` builds it with every crate, as
-/// `script/check` runs it. A run of this crate's tests alone needs it built first.
-pub(crate) fn mock_gh() -> PathBuf {
-    let exe = std::env::current_exe().unwrap();
-    let dir = exe.parent().unwrap().parent().unwrap();
-    let mock = dir.join(format!("mock_gh{}", std::env::consts::EXE_SUFFIX));
-    assert!(
-        mock.is_file(),
-        "{} isn't built: run `cargo build -p mock_gh` (or `cargo test --workspace`) first",
-        mock.display()
-    );
-    mock
 }
 
 /// The committed `src/app.ts`: twenty lines of distinct code.

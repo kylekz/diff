@@ -12,8 +12,8 @@
 //!    has calls left. Without `DV_MOCK_GH` there are no entries;
 //! 3. appends `{"argv", "stdin", "matched"}` to the call log `DV_MOCK_GH_LOG` (`log.rs`), if
 //!    set, before printing anything, so a caller that has the answer can already read the log;
-//! 4. writes the entry's stdout and stderr and exits with its code; an unmatched call writes
-//!    `mock_gh: no scenario entry for argv [...]` to stderr and exits 64.
+//! 4. waits for the entry's `delay_ms`, writes its stdout and stderr and exits with its code; an
+//!    unmatched call writes `mock_gh: no scenario entry for argv [...]` to stderr and exits 64.
 
 mod log;
 mod scenario;
@@ -21,6 +21,7 @@ mod scenario;
 use std::io::{Read as _, Write as _};
 use std::path::PathBuf;
 use std::process::ExitCode;
+use std::time::Duration;
 
 use crate::log::{CallLog, Record};
 use crate::scenario::Scenario;
@@ -87,6 +88,7 @@ fn main() -> ExitCode {
         eprintln!("mock_gh: no scenario entry for argv {argv:?} in {source}");
         return ExitCode::from(UNMATCHED);
     };
+    std::thread::sleep(Duration::from_millis(entry.delay_ms));
     // A caller that stopped reading has made up its mind; the exit code still reports the
     // scripted outcome, so write errors are ignored.
     let mut stdout = std::io::stdout().lock();

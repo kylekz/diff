@@ -273,6 +273,19 @@ fn concurrent_calls_never_overrun_times() {
 }
 
 #[test]
+fn a_delayed_answer_comes_after_its_delay() {
+    let fixture = Fixture::new(
+        r#"{"calls": [{"argv": ["pr", "list"], "stdout": "late\n", "delay_ms": 400}]}"#,
+    );
+    let started = Instant::now();
+    let outcome = fixture.run(&["pr", "list"]);
+    assert!(started.elapsed() >= Duration::from_millis(400));
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    assert_eq!(outcome.stdout, "late\n");
+    assert_eq!(fixture.calls().len(), 1);
+}
+
+#[test]
 fn a_bad_scenario_exits_65_and_the_call_is_still_logged() {
     let fixture = Fixture::new(r#"{"calls": [{"argv": ["**", "pr"]}]}"#);
     let outcome = fixture.run(&["pr", "list"]);

@@ -471,7 +471,8 @@ all the rest (possibly none; it must be last). The first entry that matches
 (argv, and `stdin_contains` when given) and has calls left (`times`,
 unlimited by default) answers with its `stdout` (a string as-is, or any other
 JSON value as compact JSON plus a newline, as `gh --json` prints), `stderr`
-and `exit` (0 by default). A call no entry answers writes `mock_gh: no
+and `exit` (0 by default), after `delay_ms` when it has one (a slow GitHub, or
+one past the caller's timeout). A call no entry answers writes `mock_gh: no
 scenario entry for argv [...] in <scenario>` to stderr and exits 64. Unknown
 fields are errors. Keep these files in `tests/fixtures/gh/` (`"gh":
 "../fixtures/gh/pr_482.json"` from a scenario here), where other tests can

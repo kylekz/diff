@@ -19,12 +19,13 @@ ignore = [
     # `ZipArchive::extract` can also abort the process on a symlink entry that declares a huge
     # size; velopack never calls it (it reads entries with `by_index`), and the archives it opens
     # are those same checked packages. Velopack builds zip without `legacy-zip` (Shrink, Reduce and
-    # Implode) and never reads an archive as a stream (`ZipStreamReader`). Goes when velopack moves
-    # to zip 9.
+    # Implode) or `aes-crypto` (password-protected entries) and never reads an archive as a stream
+    # (`ZipStreamReader`). Goes when velopack moves to zip 9.
     { id = "RUSTSEC-2026-0367", reason = "zip via velopack: extracts only dv's own checked packages" },
     { id = "RUSTSEC-2026-0368", reason = "zip via velopack: extracts only dv's own checked packages" },
     { id = "RUSTSEC-2026-0369", reason = "zip via velopack: extracts only dv's own checked packages" },
     { id = "RUSTSEC-2026-0429", reason = "zip via velopack: never calls ZipArchive::extract" },
+    { id = "RUSTSEC-2026-0545", reason = "zip via velopack: built without the aes-crypto feature" },
     { id = "RUSTSEC-2026-0546", reason = "zip via velopack: never calls ZipArchive::extract" },
     { id = "RUSTSEC-2026-0547", reason = "zip via velopack: built without the legacy-zip feature" },
     { id = "RUSTSEC-2026-0548", reason = "zip via velopack: never uses ZipStreamReader" },

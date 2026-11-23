@@ -185,7 +185,7 @@ jobs:
           echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
       - name: Rust toolchain (rust-toolchain.toml)
         run: rustup toolchain install && rustc --version
-      - uses: actions/setup-dotnet@a98b56852c35b8e3190ac28c8c2271da59106c68 # v6.0.0
+      - uses: actions/setup-dotnet@0f4a354dd5547a28c70b7853dbd95d5b67886e73 # v6.1.0
         with:
           dotnet-version: 8.0.x
       - name: vpk 1.2.161 (the velopack crate's version)
@@ -219,7 +219,7 @@ jobs:
       - name: Rust toolchain (rust-toolchain.toml)
         shell: bash
         run: rustup toolchain install && rustc --version
-      - uses: actions/setup-dotnet@a98b56852c35b8e3190ac28c8c2271da59106c68 # v6.0.0
+      - uses: actions/setup-dotnet@0f4a354dd5547a28c70b7853dbd95d5b67886e73 # v6.1.0
         with:
           dotnet-version: 8.0.x
       - name: vpk 1.2.161 (the velopack crate's version)
@@ -286,7 +286,7 @@ jobs:
           persist-credentials: false
       - name: Rust toolchain (rust-toolchain.toml)
         run: rustup toolchain install && rustc --version
-      - uses: actions/setup-dotnet@a98b56852c35b8e3190ac28c8c2271da59106c68 # v6.0.0
+      - uses: actions/setup-dotnet@0f4a354dd5547a28c70b7853dbd95d5b67886e73 # v6.1.0
         with:
           dotnet-version: 8.0.x
       - name: vpk 1.2.161 (the velopack crate's version)
